@@ -1,0 +1,24 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "What is the weather in San Francisco?" },
+    {
+      "role": "assistant",
+      "content": "Let me check the weather for you.",
+      "tool_calls": [
+        {
+          "id": "call_abc123",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"San Francisco\"}"
+          }
+        }
+      ]
+    },
+    { "role": "tool", "tool_call_id": "call_abc123", "content": "sunny, 72F" }
+  ],
+  "temperature": 0.7,
+  "max_tokens": 100
+}

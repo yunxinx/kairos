@@ -24,7 +24,7 @@ use axum::{
     routing::post,
 };
 use futures_util::stream;
-use kairos::{gateway, store};
+use kairos::{config, gateway, store};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
@@ -161,6 +161,12 @@ impl IntoResponse for UpstreamBehavior {
     }
 }
 
+/// 测试用下游令牌 key。
+pub const TEST_TOKEN_KEY: &str = "sk-test-token";
+
+/// 测试用可用模型。
+pub const TEST_MODEL: &str = "gpt-4o";
+
 /// 一个已启动的网关 + mock 上游 + SQLite 组件的完整测试环境。
 pub struct TestGateway {
     pub addr: SocketAddr,
@@ -171,6 +177,9 @@ pub struct TestGateway {
 
 impl TestGateway {
     /// 启动完整测试环境：mock 上游 + SQLite 建库 + 网关监听随机端口。
+    ///
+    /// 默认配置一个指向 mock 上游的 openai_chat 渠道（`TEST_MODEL`）与一个
+    /// `TEST_TOKEN_KEY` 令牌。
     pub async fn start() -> Self {
         let upstream = MockUpstream::start().await;
 
@@ -180,7 +189,8 @@ impl TestGateway {
             .await
             .expect("SQLite 建库与迁移应成功");
 
-        let app = gateway::router(pool.clone(), upstream.base_url());
+        let cfg = test_config(&upstream.base_url());
+        let app = gateway::router(&cfg, pool.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -200,5 +210,40 @@ impl TestGateway {
     /// 网关 base URL。
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+}
+
+/// 构造指向 mock 上游的测试配置：一个 openai_chat 渠道 + 一个测试令牌。
+pub fn test_config(upstream_base: &str) -> config::Config {
+    config::Config {
+        listen: config::Listen {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+        },
+        database: config::Database {
+            path: "test.db".into(),
+        },
+        logging: config::Logging { full_body: false },
+        tokens: vec![config::Token {
+            key: TEST_TOKEN_KEY.to_string(),
+            name: "dev".to_string(),
+            limit_usd: None,
+            balance_usd: 0.0,
+        }],
+        channels: vec![config::Channel {
+            name: "test-channel".to_string(),
+            protocol: config::Protocol::OpenAiChat,
+            base_url: upstream_base.to_string(),
+            api_key: "sk-upstream".to_string(),
+            models: vec![TEST_MODEL.to_string()],
+            model_aliases: [("fast".to_string(), "gpt-4o-mini".to_string())]
+                .into_iter()
+                .collect(),
+            priority: 1,
+            weight: 1,
+            timeout_ms: 1000,
+            max_retries: 0,
+        }],
+        prices: Default::default(),
     }
 }

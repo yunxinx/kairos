@@ -1,70 +1,13 @@
-//! 端到端冒烟测试：axum SSE 端点 → reqwest 流式出站（连 mock 上游）→ sqlx 落库。
+//! 端到端冒烟测试：验证 SQLite 迁移与可编程 mock 上游基建。
 //!
-//! 验证技术栈全链路，并沉淀后续票复用的测试基建。
+//! 原来的透传 relay 端点已被 #03 的 Chat Completions 真实 handler 取代，
+//! 其端到端覆盖由 `chat_completions_test.rs` 承接。
 
 mod common;
 
-use common::{TestGateway, UpstreamBehavior};
+use common::TestGateway;
 use futures_util::StreamExt;
 use serde_json::json;
-
-/// axum SSE 端点 → reqwest 流式转发 mock 上游 → sqlx 写入一行，断言全绿。
-#[tokio::test]
-async fn smoke_axum_sse_reqwest_stream_sqlx_persist() {
-    let mut gw = TestGateway::start().await;
-
-    // mock 上游返回三段 SSE 文本。
-    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
-        "hello".into(),
-        " ".into(),
-        "world".into(),
-    ]));
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/v1/chat/completions", gw.base_url()))
-        .json(&json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "hi" }] }))
-        .send()
-        .await
-        .expect("下游请求应能到达网关");
-
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "网关应透传 200");
-
-    // 读取 SSE 事件流，累积原始字节后解析。
-    let mut raw = Vec::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("SSE 分片应可读");
-        raw.extend_from_slice(&chunk);
-    }
-    let body = String::from_utf8_lossy(&raw);
-
-    // 按空行分隔事件，提取每个事件的 `data:` 载荷，去掉 SSE 字段与内容之间的单个空格。
-    let collected: String = body
-        .split("\n\n")
-        .filter_map(|event| {
-            event
-                .lines()
-                .find_map(|line| line.strip_prefix("data:"))
-                .map(|data| data.strip_prefix(' ').unwrap_or(data))
-        })
-        .collect();
-    assert_eq!(collected, "hello world", "下游应收齐全部 SSE 帧");
-
-    // 断言 mock 上游收到一条出站请求，且 body 与入站一致。
-    let received = gw.upstream.received();
-    assert_eq!(received.len(), 1, "mock 上游应收一条请求");
-    assert_eq!(received[0]["model"], "gpt-4o", "出站请求应携带模型字段");
-
-    // 断言 SQLite 落了一行冒烟记录（流结束后写入）。
-    let rows = sqlx::query_as::<_, (String,)>("SELECT note FROM smoke_probe")
-        .fetch_all(&gw.pool)
-        .await
-        .expect("应能查询冒烟记录");
-
-    assert_eq!(rows.len(), 1, "应恰好落一行冒烟记录");
-    assert_eq!(rows[0].0, "relayed status 200", "冒烟记录应反映上游状态码");
-}
 
 /// 冒烟表也应建出，验证迁移机制可用。
 #[tokio::test]

@@ -1,38 +1,48 @@
-//! HTTP 网关：入站路由 + 出站流式转发到上游 Provider。
+//! HTTP 网关：入站路由 + 令牌认证 + 渠道选择 + 出站调用 + 请求日志。
 //!
-//! 本模块承载 axum Router 的组装与一个最小可用的流式转发端点，供后续
-//! 协议适配器、渠道选择与计费逻辑接入。当前票只验证技术栈全链路：
-//! 请求侧经 JSON 往返转发，上游响应字节流原样透传；请求侧的字节直通
-//! 快路径在后续票落地。
+//! 本模块承载 Chat Completions 非流式垂直切片的完整链路：下游以 OpenAI Chat
+//! Completions 协议带令牌发请求，网关认证后经 IR 转换出站到目标渠道，返回入站
+//! 协议格式的响应，并在 SQLite 落一条请求日志。协议转换由 `core::openai_chat`
+//! 适配器承担，wire 类型不出适配器边界。
 
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use async_stream::stream;
 use axum::{
     Json, Router,
-    body::Body,
     extract::State,
-    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
 };
-use bytes::Bytes;
-use futures_util::{StreamExt, stream::Stream};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use crate::store;
+use crate::{
+    config::{Channel, Config, Token},
+    core::openai_chat,
+    store,
+};
 
-/// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 目标上游地址。
+/// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 认证令牌表 + 渠道表。
 #[derive(Clone)]
 pub struct Deps {
-    pub pool: SqlitePool,
-    pub client: reqwest::Client,
-    pub upstream_base: String,
+    pool: SqlitePool,
+    client: reqwest::Client,
+    tokens: HashMap<String, Token>,
+    channels: Vec<Channel>,
 }
 
-/// 组装网关路由。`upstream_base` 是无 slash 尾缀的上游 base URL。
-pub fn router(pool: SqlitePool, upstream_base: String) -> Router {
+/// 组装网关路由。`cfg` 持有认证令牌与渠道配置。
+pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
+    let tokens: HashMap<String, Token> = cfg
+        .tokens
+        .iter()
+        .map(|token| (token.key.clone(), token.clone()))
+        .collect();
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -41,11 +51,12 @@ pub fn router(pool: SqlitePool, upstream_base: String) -> Router {
     let deps = Deps {
         pool,
         client,
-        upstream_base,
+        tokens,
+        channels: cfg.channels.clone(),
     };
 
     Router::new()
-        .route("/v1/chat/completions", post(relay))
+        .route("/v1/chat/completions", post(chat_completions))
         .fallback(not_found)
         .with_state(deps)
 }
@@ -55,51 +66,242 @@ async fn not_found() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "路径未实现")
 }
 
-/// 流式转发端点：将入站 body 透传给上游，上游的 SSE 字节流以 `text/event-stream`
-/// 原样回传下游，流结束后写一条冒烟记录。
-async fn relay(State(deps): State<Deps>, Json(body): Json<Value>) -> Response {
-    let upstream_url = format!("{}/chat/completions", deps.upstream_base);
+/// Chat Completions 非流式端点：认证 → 解码 → 准入 → 出站 → 响应 → 落日志。
+async fn chat_completions(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let started = unix_millis();
 
-    let upstream = deps.client.post(&upstream_url).json(&body).send().await;
-    let (status, byte_stream) = match upstream {
-        Ok(resp) => {
-            let status = resp.status();
-            (status.as_u16(), resp.bytes_stream())
-        }
-        Err(_) => {
-            return (axum::http::StatusCode::BAD_GATEWAY, "上游不可达").into_response();
+    // 1. 认证：Bearer 或 x-api-key 两种头都接受。
+    let token = match authenticate(&deps, &headers) {
+        Ok(token) => token,
+        Err(err) => {
+            let message = err.to_string();
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                &message,
+                &deps,
+                None,
+                None,
+                started,
+            )
+            .await;
         }
     };
 
-    let pool = deps.pool.clone();
-    let body = Body::from_stream(forward_stream(byte_stream, pool, status));
+    // 2. 解码入站请求为 IR。
+    let request = match openai_chat::decode_request(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            let message = format!("请求体无法解析为 Chat Completions: {err}");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &message,
+                &deps,
+                Some(token),
+                None,
+                started,
+            )
+            .await;
+        }
+    };
 
-    Response::builder()
-        .header(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))
-        .body(body)
-        .expect("构造流式响应不应失败")
-}
+    // 非流式范围：本票拒绝 stream=true。
+    if request.stream {
+        let message = "流式请求（stream=true）尚未支持，本票仅覆盖非流式";
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            message,
+            &deps,
+            Some(token),
+            Some(&request.model),
+            started,
+        )
+        .await;
+    }
 
-/// 把上游字节流原样透传给下游，并在流结束后写一条冒烟记录。
-fn forward_stream(
-    byte_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    pool: SqlitePool,
-    status: u16,
-) -> impl Stream<Item = Result<Bytes, reqwest::Error>> {
-    stream! {
-        let mut chunks = Box::pin(byte_stream);
-        while let Some(chunk) = chunks.next().await {
-            match chunk {
-                Ok(bytes) => yield Ok(bytes),
-                Err(err) => yield Err(err),
+    // 3. 准入：模型必须有候选渠道。
+    let channel = match select_channel(&deps.channels, &request.model) {
+        Some(channel) => channel,
+        None => {
+            let message = format!("模型 {} 未配置任何可用渠道", request.model);
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &message,
+                &deps,
+                Some(token),
+                Some(&request.model),
+                started,
+            )
+            .await;
+        }
+    };
+
+    // 4. 出站：编码 IR 为出站协议，调用上游。
+    let outbound = openai_chat::encode_request(&request);
+    let upstream_url = format!(
+        "{}/chat/completions",
+        channel.base_url.trim_end_matches('/')
+    );
+
+    let upstream = deps
+        .client
+        .post(&upstream_url)
+        .bearer_auth(&channel.api_key)
+        .json(&outbound)
+        .send()
+        .await;
+
+    match upstream {
+        Ok(resp) => {
+            let status = resp.status();
+            let status_code = status.as_u16();
+            let upstream_body = resp.text().await.unwrap_or_default();
+            let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+
+            if status.is_success() {
+                // 5. 响应：解码上游响应为 IR，再重编码为入站协议返回。
+                match openai_chat::decode_response(&parsed) {
+                    Ok(ir) => {
+                        let inbound = openai_chat::encode_response(&ir);
+                        log_request(
+                            &deps,
+                            token,
+                            &request.model,
+                            &channel.name,
+                            status_code,
+                            started,
+                        )
+                        .await;
+                        Json(inbound).into_response()
+                    }
+                    Err(err) => {
+                        let message = format!("上游响应无法解析: {err}");
+                        error_response(
+                            StatusCode::BAD_GATEWAY,
+                            &message,
+                            &deps,
+                            Some(token),
+                            Some(&request.model),
+                            started,
+                        )
+                        .await
+                    }
+                }
+            } else {
+                // 上游错误：状态码原样 + OpenAI 错误格式（可解析则透传，否则合成）。
+                let body = if parsed.is_object() {
+                    parsed
+                } else {
+                    openai_chat::encode_error(status_code, "上游返回了非标准错误响应")
+                };
+                log_request(
+                    &deps,
+                    token,
+                    &request.model,
+                    &channel.name,
+                    status_code,
+                    started,
+                )
+                .await;
+                (status, Json(body)).into_response()
             }
         }
-
-        // 流结束后落库，验证 axum SSE → reqwest 流式 → sqlx 全链路闭环。
-        let note = format!("relayed status {status}");
-        if let Err(err) = store::insert_smoke(&pool, &note).await {
-            // 冒烟阶段的临时日志：正式日志落库在后续票接入，此处先保证错误可见。
-            eprintln!("冒烟记录落库失败: {err}");
+        Err(_) => {
+            let message = "上游不可达";
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                message,
+                &deps,
+                Some(token),
+                Some(&request.model),
+                started,
+            )
+            .await
         }
     }
+}
+
+/// 从请求头提取并校验令牌 key，返回匹配的令牌。
+fn authenticate<'a>(deps: &'a Deps, headers: &HeaderMap) -> anyhow::Result<&'a Token> {
+    let key = extract_key(headers).ok_or_else(|| {
+        anyhow::anyhow!("缺少认证令牌：请提供 Authorization: Bearer <key> 或 x-api-key")
+    })?;
+    deps.tokens
+        .get(&key)
+        .ok_or_else(|| anyhow::anyhow!("无效的认证令牌"))
+}
+
+/// 从两种头任一种提取令牌 key。
+fn extract_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get("authorization") {
+        let value = value.to_str().ok()?;
+        if let Some(key) = value.strip_prefix("Bearer ") {
+            return Some(key.trim().to_string());
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+}
+
+/// 选择 `model` 的候选渠道：取第一个（路由/failover 属 #06）。
+///
+/// 命中条件：渠道 `models` 列表含该模型，或别名短名（`model_aliases` 的 key）
+/// 匹配。别名指向的上游真实模型名（value）不参与匹配，出站模型名重写在 #06 落地。
+fn select_channel<'a>(channels: &'a [Channel], model: &str) -> Option<&'a Channel> {
+    channels
+        .iter()
+        .find(|c| c.models.iter().any(|m| m == model) || c.model_aliases.contains_key(model))
+}
+
+/// 构造 OpenAI 错误格式的响应，并落一条请求日志。
+async fn error_response(
+    status: StatusCode,
+    message: &str,
+    deps: &Deps,
+    token: Option<&Token>,
+    model: Option<&str>,
+    started: i64,
+) -> Response {
+    let body = openai_chat::encode_error(status.as_u16(), message);
+    if let (Some(token), Some(model)) = (token, model) {
+        log_request(deps, token, model, "", status.as_u16(), started).await;
+    }
+    (status, Json(body)).into_response()
+}
+
+/// 落一条请求日志。await 以保证响应返回时日志已落库（测试与后续对账依赖）。
+async fn log_request(
+    deps: &Deps,
+    token: &Token,
+    model: &str,
+    channel: &str,
+    status: u16,
+    started: i64,
+) {
+    let now = unix_millis();
+    let log = store::RequestLog {
+        created_at: now,
+        token_name: token.name.clone(),
+        inbound_protocol: "openai_chat".to_string(),
+        model: model.to_string(),
+        channel: channel.to_string(),
+        status_code: status as i64,
+        latency_ms: now - started,
+    };
+    if let Err(err) = store::insert_request_log(&deps.pool, &log).await {
+        eprintln!("请求日志落库失败: {err}");
+    }
+}
+
+/// 当前 unix 毫秒时间戳。
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

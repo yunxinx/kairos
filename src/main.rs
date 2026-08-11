@@ -22,15 +22,7 @@ async fn main() -> anyhow::Result<()> {
     let pool = store::open(&cfg.database.path).await?;
 
     let listen = format!("{}:{}", cfg.listen.host, cfg.listen.port);
-    // 冒烟阶段的 relay 端点仍以单上游转发；渠道选择在路由票据落地后替换。
-    let upstream_base = match cfg.channels.first() {
-        Some(channel) => channel.base_url.trim_end_matches('/').to_string(),
-        None => {
-            eprintln!("警告：未配置任何渠道，转发端点将不可用");
-            String::new()
-        }
-    };
-    let app = gateway::router(pool, upstream_base);
+    let app = gateway::router(&cfg, pool);
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     println!("kairos 网关监听 {listen}");

@@ -1,7 +1,7 @@
-//! SQLite 存储层：版本化迁移 + 冒烟落库。
+//! SQLite 存储层：版本化迁移 + 请求日志落库。
 //!
-//! 本模块当前只承载动态状态的落库验证（冒烟表），令牌余额、用量、日志等
-//! 计费相关表在对应票据落地，避免超前实现。
+//! 本模块当前承载请求日志（`request_log` 表）与冒烟记录（`smoke_probe`）；
+//! 令牌余额、usage 与费用等计费相关列在对应票据接入。
 
 use std::path::Path;
 
@@ -47,6 +47,40 @@ pub async fn insert_smoke(pool: &SqlitePool, note: &str) -> Result<i64, StoreErr
         .execute(pool)
         .await
         .map_err(StoreError::Query)?;
+
+    Ok(result.last_insert_rowid())
+}
+
+/// 一条请求日志的可持久化字段。
+#[derive(Debug, Clone)]
+pub struct RequestLog {
+    /// unix 毫秒时间戳。
+    pub created_at: i64,
+    pub token_name: String,
+    pub inbound_protocol: String,
+    pub model: String,
+    pub channel: String,
+    pub status_code: i64,
+    pub latency_ms: i64,
+}
+
+/// 落一条请求日志，返回插入的自增 id。
+pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i64, StoreError> {
+    let result = sqlx::query(
+        "INSERT INTO request_log \
+         (created_at, token_name, inbound_protocol, model, channel, status_code, latency_ms) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(log.created_at)
+    .bind(&log.token_name)
+    .bind(&log.inbound_protocol)
+    .bind(&log.model)
+    .bind(&log.channel)
+    .bind(log.status_code)
+    .bind(log.latency_ms)
+    .execute(pool)
+    .await
+    .map_err(StoreError::Query)?;
 
     Ok(result.last_insert_rowid())
 }

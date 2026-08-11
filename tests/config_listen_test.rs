@@ -35,12 +35,7 @@ async fn config_driven_listen_and_fallback() {
 
     let cfg = config::Config::load(&config_path).expect("配置应可解析");
     let pool = store::open(&cfg.database.path).await.expect("建库应成功");
-    let upstream_base = cfg
-        .channels
-        .first()
-        .map(|c| c.base_url.trim_end_matches('/').to_string())
-        .unwrap_or_default();
-    let app = gateway::router(pool, upstream_base);
+    let app = gateway::router(&cfg, pool);
 
     let listen = format!("{}:{}", cfg.listen.host, cfg.listen.port);
     let listener = tokio::net::TcpListener::bind(&listen)
