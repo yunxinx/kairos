@@ -1,1 +1,24 @@
+# Rust 构建产物
 /target
+
+# SQLite 动态状态（令牌余额、用量、日志）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 本地运行配置（含上游密钥与下游令牌，禁止入库）
+/config.json
+/kairos.json
+
+# 运行时日志
+*.log
+
+# 编辑器与工具
+.vscode/
+.idea/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db

@@ -1,0 +1,12 @@
+# doc_markdown 白名单：领域与技术专名，避免文档注释被误报
+doc-valid-idents = [
+    "OpenAI",
+    "Anthropic",
+    "SQLite",
+    "SSE",
+    "USD",
+    "Axum",
+    "Reqwest",
+    "SQLx",
+    "Tokio",
+]
