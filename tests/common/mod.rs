@@ -172,7 +172,7 @@ pub struct TestGateway {
     pub addr: SocketAddr,
     pub upstream: MockUpstream,
     pub pool: sqlx::SqlitePool,
-    _db_path: tempfile::TempPath,
+    pub db_path: tempfile::TempPath,
 }
 
 impl TestGateway {
@@ -181,6 +181,12 @@ impl TestGateway {
     /// 默认配置一个指向 mock 上游的 openai_chat 渠道（`TEST_MODEL`）与一个
     /// `TEST_TOKEN_KEY` 令牌。
     pub async fn start() -> Self {
+        Self::start_with(test_config).await
+    }
+
+    /// 用自定义配置启动完整测试环境。`make_cfg` 接收 mock 上游 base URL，
+    /// 返回完整的网关配置（计费/渠道可在其中定制）。
+    pub async fn start_with(make_cfg: impl Fn(&str) -> config::Config) -> Self {
         let upstream = MockUpstream::start().await;
 
         let db = tempfile::NamedTempFile::new().expect("应能创建临时库文件");
@@ -189,7 +195,7 @@ impl TestGateway {
             .await
             .expect("SQLite 建库与迁移应成功");
 
-        let cfg = test_config(&upstream.base_url());
+        let cfg = make_cfg(&upstream.base_url());
         let app = gateway::router(&cfg, pool.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -203,7 +209,7 @@ impl TestGateway {
             addr,
             upstream,
             pool,
-            _db_path: db_path,
+            db_path,
         }
     }
 
@@ -228,7 +234,7 @@ pub fn test_config(upstream_base: &str) -> config::Config {
             key: TEST_TOKEN_KEY.to_string(),
             name: "dev".to_string(),
             limit_usd: None,
-            balance_usd: 0.0,
+            balance_usd: 5.0,
         }],
         channels: vec![config::Channel {
             name: "test-channel".to_string(),
@@ -244,6 +250,30 @@ pub fn test_config(upstream_base: &str) -> config::Config {
             timeout_ms: 1000,
             max_retries: 0,
         }],
-        prices: Default::default(),
+        prices: config::Prices(
+            [
+                (
+                    TEST_MODEL.to_string(),
+                    config::Price {
+                        input: 2.5,
+                        output: 10.0,
+                        cache_read: Some(1.25),
+                        cache_write: Some(10.0),
+                    },
+                ),
+                // 别名短名 `fast` 也是计费模型名（本票按 request.model 计价）。
+                (
+                    "fast".to_string(),
+                    config::Price {
+                        input: 0.15,
+                        output: 0.6,
+                        cache_read: None,
+                        cache_write: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
     }
 }

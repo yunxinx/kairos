@@ -21,21 +21,25 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 use crate::{
-    config::{Channel, Config, Token},
+    config::{Channel, Config, Price, Token},
+    core::billing,
+    core::billing::PriceSnapshot,
+    core::ir::Usage,
     core::openai_chat,
     store,
 };
 
-/// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 认证令牌表 + 渠道表。
+/// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 认证令牌表 + 渠道表 + 价格表。
 #[derive(Clone)]
 pub struct Deps {
     pool: SqlitePool,
     client: reqwest::Client,
     tokens: HashMap<String, Token>,
     channels: Vec<Channel>,
+    prices: HashMap<String, Price>,
 }
 
-/// 组装网关路由。`cfg` 持有认证令牌与渠道配置。
+/// 组装网关路由。`cfg` 持有认证令牌、渠道与价格配置。
 pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
     let tokens: HashMap<String, Token> = cfg
         .tokens
@@ -53,6 +57,7 @@ pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
         client,
         tokens,
         channels: cfg.channels.clone(),
+        prices: cfg.prices.0.clone(),
     };
 
     Router::new()
@@ -139,7 +144,73 @@ async fn chat_completions(
         }
     };
 
-    // 4. 出站：编码 IR 为出站协议，调用上游。
+    // 4. 计费准入：模型必须配置价格；令牌余额与累计上限须通过。
+    let price = match deps.prices.get(&request.model) {
+        Some(price) => billing::PriceSnapshot::from_price(price),
+        None => {
+            let message = format!("模型 {} 未配置价格，无法计费", request.model);
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &message,
+                &deps,
+                Some(token),
+                Some(&request.model),
+                started,
+            )
+            .await;
+        }
+    };
+    let mut conn = match deps.pool.acquire().await {
+        Ok(conn) => conn,
+        Err(err) => return db_error_response(&deps, token, &request.model, started, err).await,
+    };
+    let balance = match store::ensure_token_balance(
+        &mut conn,
+        &token.key,
+        token.balance_usd,
+        started,
+    )
+    .await
+    {
+        Ok(balance) => balance,
+        Err(err) => return db_error_response(&deps, token, &request.model, started, err).await,
+    };
+    if balance.balance_usd_micros <= 0 {
+        let message = format!(
+            "令牌 {} 余额不足（当前 {:.2} USD）",
+            token.name,
+            balance.balance_usd_micros as f64 / 1_000_000.0
+        );
+        return error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            &message,
+            &deps,
+            Some(token),
+            Some(&request.model),
+            started,
+        )
+        .await;
+    }
+    if let Some(limit) = token.limit_usd {
+        let limit_micros = (limit * 1_000_000.0).round() as i64;
+        if balance.settled_usd_micros >= limit_micros {
+            let message = format!(
+                "令牌 {} 累计结算已超上限（limit_usd = {:.2}）",
+                token.name, limit
+            );
+            return error_response(
+                StatusCode::PAYMENT_REQUIRED,
+                &message,
+                &deps,
+                Some(token),
+                Some(&request.model),
+                started,
+            )
+            .await;
+        }
+    }
+
+    // 5. 出站：编码 IR 为出站协议，调用上游。
     let outbound = openai_chat::encode_request(&request);
     let upstream_url = format!(
         "{}/chat/completions",
@@ -162,9 +233,18 @@ async fn chat_completions(
             let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
 
             if status.is_success() {
-                // 5. 响应：解码上游响应为 IR，再重编码为入站协议返回。
+                // 6. 响应：解码上游响应为 IR，结算费用，再重编码为入站协议返回。
                 match openai_chat::decode_response(&parsed) {
                     Ok(ir) => {
+                        let usage = &ir.usage;
+                        let cost = billing::cost_micros(usage, &price);
+                        // 成功且 usage 非零才结算；失败或零输出不扣费。
+                        if cost > 0
+                            && let Err(err) =
+                                store::settle_charge(&mut conn, &token.key, cost).await
+                        {
+                            eprintln!("结算失败: {err}");
+                        }
                         let inbound = openai_chat::encode_response(&ir);
                         log_request(
                             &deps,
@@ -173,6 +253,11 @@ async fn chat_completions(
                             &channel.name,
                             status_code,
                             started,
+                            Billing {
+                                usage: usage.clone(),
+                                price,
+                                cost_usd_micros: cost,
+                            },
                         )
                         .await;
                         Json(inbound).into_response()
@@ -204,6 +289,11 @@ async fn chat_completions(
                     &channel.name,
                     status_code,
                     started,
+                    Billing {
+                        usage: Usage::default(),
+                        price: PriceSnapshot::default(),
+                        cost_usd_micros: 0,
+                    },
                 )
                 .await;
                 (status, Json(body)).into_response()
@@ -258,7 +348,7 @@ fn select_channel<'a>(channels: &'a [Channel], model: &str) -> Option<&'a Channe
         .find(|c| c.models.iter().any(|m| m == model) || c.model_aliases.contains_key(model))
 }
 
-/// 构造 OpenAI 错误格式的响应，并落一条请求日志。
+/// 构造 OpenAI 错误格式的响应，并落一条请求日志（无计费数据）。
 async fn error_response(
     status: StatusCode,
     message: &str,
@@ -269,9 +359,50 @@ async fn error_response(
 ) -> Response {
     let body = openai_chat::encode_error(status.as_u16(), message);
     if let (Some(token), Some(model)) = (token, model) {
-        log_request(deps, token, model, "", status.as_u16(), started).await;
+        log_request(
+            deps,
+            token,
+            model,
+            "",
+            status.as_u16(),
+            started,
+            Billing {
+                usage: Usage::default(),
+                price: PriceSnapshot::default(),
+                cost_usd_micros: 0,
+            },
+        )
+        .await;
     }
     (status, Json(body)).into_response()
+}
+
+/// 准入阶段数据库错误：500 + OpenAI 错误格式 + 落日志。
+async fn db_error_response(
+    deps: &Deps,
+    token: &Token,
+    model: &str,
+    started: i64,
+    err: impl std::fmt::Display,
+) -> Response {
+    let message = format!("计费状态读取失败: {err}");
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &message,
+        deps,
+        Some(token),
+        Some(model),
+        started,
+    )
+    .await
+}
+
+/// 一次请求的计费结果，供日志落库。
+#[derive(Debug, Clone)]
+struct Billing {
+    usage: Usage,
+    price: PriceSnapshot,
+    cost_usd_micros: i64,
 }
 
 /// 落一条请求日志。await 以保证响应返回时日志已落库（测试与后续对账依赖）。
@@ -282,16 +413,24 @@ async fn log_request(
     channel: &str,
     status: u16,
     started: i64,
+    billing: Billing,
 ) {
     let now = unix_millis();
     let log = store::RequestLog {
         created_at: now,
         token_name: token.name.clone(),
+        token_key: token.key.clone(),
         inbound_protocol: "openai_chat".to_string(),
         model: model.to_string(),
         channel: channel.to_string(),
         status_code: status as i64,
         latency_ms: now - started,
+        input_tokens: billing.usage.input_tokens,
+        output_tokens: billing.usage.output_tokens,
+        cache_read_tokens: billing.usage.cache_read_tokens,
+        cache_write_tokens: billing.usage.cache_write_tokens,
+        price: billing.price,
+        cost_usd_micros: billing.cost_usd_micros,
     };
     if let Err(err) = store::insert_request_log(&deps.pool, &log).await {
         eprintln!("请求日志落库失败: {err}");

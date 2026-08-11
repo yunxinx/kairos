@@ -108,7 +108,7 @@ pub struct FinishReason {
 
 /// usage 四分量 + raw 兜底。四分量对齐价格表四档（input/output/cache_read/cache_write），
 /// `raw` 保留上游原始 usage 形状，供后续计费与对账。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
