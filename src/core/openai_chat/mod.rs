@@ -643,6 +643,23 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
     })
 }
 
+/// 直通快路径的 usage 嗅探：从单个 SSE 帧或非流式响应体提取 `usage` 字段折算为 IR
+/// usage 四分量，供计费，不做完整解码。
+///
+/// OpenAI Chat Completions 的 usage 在非流式响应顶层与流式帧顶层均为 `usage`；
+/// 此处从任意 JSON 值顶层取 `usage`，缺失或非对象时返回 `None`（该帧无计费数据）。
+/// 与 IR 完整路径共用 `convert_usage`，保证直通与 IR 计费口径一致。
+pub fn sniff_chat_usage(value: &Value) -> Option<Usage> {
+    let usage = value.get("usage")?.as_object()?;
+    let wire =
+        serde_json::from_value::<WireUsage>(Value::Object(usage.clone())).unwrap_or(WireUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            prompt_tokens_details: None,
+        });
+    Some(convert_usage(wire))
+}
+
 /// usage 四分量折算：input = prompt - cached - cache_write，output = completion。
 /// `raw` 保留上游原始 usage 形状。
 fn convert_usage(wire: WireUsage) -> Usage {
@@ -1293,6 +1310,41 @@ mod tests {
             StreamEvent::ToolInputDelta { id, delta, .. }
                 if id == "call_1" && delta == r#"{"city":"SF"}"#
         ));
+    }
+
+    /// 直通快路径 usage 嗅探：从非流式响应顶层与流式帧顶层提取四分量，与 IR
+    /// 完整路径共用 `convert_usage`，计费口径一致。
+    #[test]
+    fn sniff_chat_usage_extracts_four_components() {
+        // 非流式响应顶层 usage（带缓存细节）。
+        let resp = json!({
+            "usage": {
+                "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
+                "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
+            }
+        });
+        let usage = sniff_chat_usage(&resp).expect("应提取 usage");
+        assert_eq!(
+            usage.input_tokens, 1000,
+            "input = prompt - cached - cache_write"
+        );
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.cache_read_tokens, 200);
+        assert_eq!(usage.cache_write_tokens, 50);
+
+        // 流式独立末帧（`include_usage` 帧型：顶层 usage）。
+        let frame = json!({
+            "id": "chatcmpl-s", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+        });
+        let usage = sniff_chat_usage(&frame).expect("流式帧应提取 usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
+
+        // 无 usage 字段的帧返回 None。
+        let no_usage = json!({ "choices": [{ "index": 0, "delta": { "content": "hi" } }] });
+        assert!(sniff_chat_usage(&no_usage).is_none());
     }
 
     /// IR 流事件编码为入站 chunk 帧：首帧 text 带 role，finish 帧带 usage。

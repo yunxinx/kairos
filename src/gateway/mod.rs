@@ -1,9 +1,10 @@
 //! HTTP 网关：入站路由 + 令牌认证 + 渠道选择 + 出站调用 + 请求日志。
 //!
-//! 本模块承载 Chat Completions 非流式垂直切片的完整链路：下游以 OpenAI Chat
-//! Completions 协议带令牌发请求，网关认证后经 IR 转换出站到目标渠道，返回入站
-//! 协议格式的响应，并在 SQLite 落一条请求日志。协议转换由 `core::openai_chat`
-//! 适配器承担，wire 类型不出适配器边界。
+//! 本模块承载 Chat Completions 的完整链路：下游以 OpenAI Chat Completions 协议
+//! 带令牌发请求，网关认证与计费准入后出站到目标渠道。同协议且未命中别名时走
+//! 直通快路径（请求体仅目标性补丁、响应字节流直通、逐帧嗅探 usage 计费）；
+//! 跨协议或命中别名时经 IR 完整路径转换。协议转换由 `core::openai_chat` 适配器
+//! 承担，wire 类型不出适配器边界。
 
 use std::{
     collections::HashMap,
@@ -12,6 +13,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{
@@ -20,12 +22,12 @@ use axum::{
     },
     routing::post,
 };
-use futures_util::Stream;
+use futures_util::{Stream, future::BoxFuture};
 use serde_json::{Value, json};
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::SqlitePool;
 
 use crate::{
-    config::{Channel, Config, Price, Token},
+    config::{Channel, Config, Price, Protocol, Token},
     core::billing,
     core::billing::PriceSnapshot,
     core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage},
@@ -44,6 +46,9 @@ pub struct Deps {
     tokens: HashMap<String, Token>,
     channels: Vec<Channel>,
     prices: HashMap<String, Price>,
+    /// 入站 wire 协议。v1 只暴露 Chat Completions 端点；直通快路径要求入站与
+    /// 出站同协议，此处固定为入站协议。
+    inbound_protocol: Protocol,
 }
 
 /// 组装网关路由。`cfg` 持有认证令牌、渠道与价格配置。
@@ -66,6 +71,7 @@ pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
         tokens,
         channels: cfg.channels.clone(),
         prices: cfg.prices.0.clone(),
+        inbound_protocol: Protocol::OpenAiChat,
     };
 
     Router::new()
@@ -79,15 +85,18 @@ async fn not_found() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "路径未实现")
 }
 
-/// Chat Completions 非流式端点：认证 → 解码 → 准入 → 出站 → 响应 → 落日志。
+/// Chat Completions 端点：认证 → 解码 → 准入 →（直通快路径 | IR 完整路径）。
+///
+/// 同协议且未命中别名时，向下游原样透传响应字节流（仅出站请求做目标性补丁），
+/// 逐帧嗅探 usage 计费；否则走 IR 完整路径。
 async fn chat_completions(
     State(deps): State<Deps>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: axum::body::Bytes,
 ) -> Response {
     let started = unix_millis();
 
-    // 1. 认证：Bearer 或 x-api-key 两种头都接受。
+    // 1. 认证：Bearer 或 x-api-key 两种头都接受。认证先行，未认证不出站。
     let token = match authenticate(&deps, &headers) {
         Ok(token) => token,
         Err(err) => {
@@ -104,8 +113,23 @@ async fn chat_completions(
         }
     };
 
-    // 2. 解码入站请求为 IR。
-    let request = match openai_chat::decode_request(&body) {
+    // 2. 解码入站请求为 IR（同时用于准入与出站路径选择）。
+    let parsed: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(err) => {
+            let message = format!("请求体不是合法 JSON: {err}");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &message,
+                &deps,
+                Some(token),
+                None,
+                started,
+            )
+            .await;
+        }
+    };
+    let request = match openai_chat::decode_request(&parsed) {
         Ok(request) => request,
         Err(err) => {
             let message = format!("请求体无法解析为 Chat Completions: {err}");
@@ -204,8 +228,27 @@ async fn chat_completions(
         }
     }
 
-    // 5. 出站：按流式/非流式统一走渠道路由 + failover 重试。
-    outbound_with_failover(&deps, &request, &route, token, price, started, &mut conn).await
+    // 5. 出站：同协议且未命中别名时走直通快路径，否则经 IR 完整路径。
+    // 快路径不免认证与计费（上面已准入），且 failover 同样只发生在首字节之前。
+    // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
+    let passthrough = request.model == route.outbound_model
+        && route
+            .channels
+            .iter()
+            .all(|c| c.protocol == deps.inbound_protocol);
+    if passthrough {
+        let passthrough_ctx = PassthroughCtx {
+            deps: &deps,
+            request: &request,
+            token,
+            price,
+            started,
+            raw_body: &body,
+        };
+        return passthrough_with_failover(&passthrough_ctx, &route).await;
+    }
+
+    outbound_with_failover(&deps, &request, &route, token, price, started).await
 }
 
 /// 出站调用的结果：成功携带响应，失败携带可重试判定与上游状态码。
@@ -239,7 +282,6 @@ struct CallCtx<'a> {
     token: &'a Token,
     price: PriceSnapshot,
     started: i64,
-    conn: &'a mut SqliteConnection,
 }
 
 /// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
@@ -254,29 +296,83 @@ async fn outbound_with_failover(
     token: &Token,
     price: PriceSnapshot,
     started: i64,
-    conn: &mut SqliteConnection,
 ) -> Response {
+    run_failover(
+        route,
+        |channel| {
+            let channel = channel.clone();
+            Box::pin(async move {
+                let mut ctx = CallCtx {
+                    deps,
+                    request,
+                    route,
+                    token,
+                    price,
+                    started,
+                };
+                if request.stream {
+                    stream_completion(&mut ctx, &channel).await
+                } else {
+                    non_stream_completion(&mut ctx, &channel).await
+                }
+            })
+        },
+        |channel, status, _failover| {
+            let channel = channel.to_string();
+            Box::pin(async move {
+                log_request(
+                    deps,
+                    token,
+                    &request.model,
+                    &channel,
+                    status,
+                    started,
+                    Billing::default(),
+                )
+                .await;
+            })
+        },
+    )
+    .await
+}
+
+/// 直通快路径的请求侧共享上下文：出站目标、计费与日志所需的请求级信息。
+///
+/// 打包 `passthrough_*_completion` 的公共参数，避免过长参数列表。`raw_body`
+/// 用于出站请求的目标性补丁。
+struct PassthroughCtx<'a> {
+    deps: &'a Deps,
+    request: &'a ChatRequest,
+    token: &'a Token,
+    price: PriceSnapshot,
+    started: i64,
+    raw_body: &'a [u8],
+}
+
+/// IR 完整路径与直通快路径共用的 failover 驱动：按渠道路由顺序发起出站调用，
+/// 遇可重试错误自动切换到下一候选。
+///
+/// 两条路径各自的单次出站调用由 `attempt` 闭包提供；`log_failure` 闭包在每条
+/// 错误响应（Fatal 或全部候选耗尽）时落请求日志。驱动统一处理：每个候选渠道
+/// 按其自身 `max_retries` 尝试（首试 + max_retries 次重试）、Fatal 直接返回、
+/// 渠道耗尽或全部候选失败时透传最后一次可重试错误。failover 只发生在首字节之前。
+async fn run_failover<'a, A, L>(
+    route: &'a routing::Route,
+    mut attempt: A,
+    log_failure: L,
+) -> Response
+where
+    A: FnMut(&Channel) -> BoxFuture<'a, Outbound>,
+    L: Fn(&str, u16, bool) -> BoxFuture<'a, ()>,
+{
     let mut last_retryable: Option<(String, Option<u16>, String)> = None;
     let attempts = &route.channels;
 
     for channel in attempts {
         // 每个渠道的最大尝试次数 = 1（首试）+ max_retries 次重试。
         let max_attempts = (channel.max_retries + 1) as usize;
-        for attempt in 0..max_attempts {
-            let mut ctx = CallCtx {
-                deps,
-                request,
-                route,
-                token,
-                price,
-                started,
-                conn,
-            };
-            let result = if request.stream {
-                stream_completion(&mut ctx, channel).await
-            } else {
-                non_stream_completion(&mut ctx, channel).await
-            };
+        for attempt_no in 0..max_attempts {
+            let result = attempt(channel).await;
             match result {
                 Outbound::Success(resp) => return resp,
                 Outbound::Fatal {
@@ -285,17 +381,8 @@ async fn outbound_with_failover(
                     message,
                 } => {
                     // 不可重试：直接返回，不 failover。状态码原样 + 归因。
+                    log_failure(&channel, status, false).await;
                     let body = upstream_error_body(status, &message, &channel, false);
-                    log_request(
-                        deps,
-                        token,
-                        &request.model,
-                        &channel,
-                        status,
-                        started,
-                        Billing::default(),
-                    )
-                    .await;
                     return (
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                         Json(body),
@@ -310,7 +397,7 @@ async fn outbound_with_failover(
                     // 记录最后一次可重试错误，渠道耗尽后透传。
                     last_retryable = Some((channel, status, message));
                     // 本渠道 budget 内重试（同一渠道再用一次）。
-                    if attempt + 1 < max_attempts {
+                    if attempt_no + 1 < max_attempts {
                         continue;
                     }
                     // 本渠道 budget 耗尽：break 触发 failover 到下一渠道。
@@ -329,27 +416,345 @@ async fn outbound_with_failover(
         )
     });
     let status_code = status.unwrap_or(502);
+    log_failure(&channel, status_code, true).await;
     let body = upstream_error_body(status_code, &message, &channel, true);
-    let status_code_u16 = status_code;
-    log_request(
-        deps,
-        token,
-        &request.model,
-        &channel,
-        status_code_u16,
-        started,
-        Billing {
-            usage: Usage::default(),
-            price: PriceSnapshot::default(),
-            cost_usd_micros: 0,
-        },
-    )
-    .await;
     (
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
         Json(body),
     )
         .into_response()
+}
+
+/// 直通快路径：按渠道路由顺序发起同协议出站调用，遇可重试错误自动 failover。
+///
+/// 与 IR 路径的 failover 语义一致（共用 [`run_failover`]）：可重试错误（网络
+/// 错误/429/5xx）在首字节之前切换下一渠道重试；不可重试 4xx 直接返回。快路径
+/// 同样不免认证与计费（已在准入阶段完成）。
+async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Route) -> Response {
+    run_failover(
+        route,
+        |channel| {
+            let channel = channel.clone();
+            Box::pin(async move {
+                if ctx.request.stream {
+                    passthrough_stream_completion(ctx, &channel).await
+                } else {
+                    passthrough_non_stream_completion(ctx, &channel).await
+                }
+            })
+        },
+        |channel, status, _failover| {
+            let channel = channel.to_string();
+            Box::pin(async move {
+                log_request(
+                    ctx.deps,
+                    ctx.token,
+                    &ctx.request.model,
+                    &channel,
+                    status,
+                    ctx.started,
+                    Billing::default(),
+                )
+                .await;
+            })
+        },
+    )
+    .await
+}
+
+/// 直通快路径的流式出站：字节流直通转发，逐 SSE 帧嗅探 usage 计费。
+///
+/// 请求体仅做目标性补丁（强制 `stream=true` 并注入 `stream_options.include_usage`，
+/// 供计费），响应以字节流直通到下游，不做完整解码。流结束后按嗅探累积的 usage
+/// 结算并落日志。渠道 timeout 只约束到响应头。
+async fn passthrough_stream_completion(ctx: &PassthroughCtx<'_>, channel: &Channel) -> Outbound {
+    let outbound = passthrough_patch_request(ctx.raw_body, true);
+    let upstream_url = passthrough_upstream_url(channel);
+
+    let upstream = tokio::time::timeout(
+        Duration::from_millis(channel.timeout_ms),
+        ctx.deps
+            .client
+            .post(&upstream_url)
+            .bearer_auth(&channel.api_key)
+            .header("content-type", "application/json")
+            .body(outbound)
+            .send(),
+    )
+    .await;
+
+    let resp = match upstream {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                message: "直通流式上游不可达".to_string(),
+            };
+        }
+        Err(_) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                message: "直通流式上游响应超时".to_string(),
+            };
+        }
+    };
+
+    let status_code = resp.status().as_u16();
+    if !resp.status().is_success() {
+        let upstream_body = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+        if is_retryable_status(status_code) {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: Some(status_code),
+                message: "上游返回可重试错误".to_string(),
+            };
+        }
+        return Outbound::Fatal {
+            channel: channel.name.clone(),
+            status: status_code,
+            message: upstream_error_message(&parsed, status_code),
+        };
+    }
+
+    // 逐 SSE 帧嗅探 usage 计费，同时原样转发字节流到下游。
+    let task = PassthroughStreamTask {
+        deps: ctx.deps.clone(),
+        token: ctx.token.clone(),
+        request: ctx.request.clone(),
+        channel: channel.clone(),
+        status_code,
+        started: ctx.started,
+        price: ctx.price,
+    };
+    let byte_stream = resp.bytes_stream();
+    let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
+    tokio::spawn(async move {
+        pipe_passthrough_stream(byte_stream, tx, task).await;
+    });
+
+    let stream = tokio_stream_patch(rx);
+    Outbound::Success(Sse::new(stream).into_response())
+}
+
+/// 直通快路径的非流式出站：响应体整体透传，从响应 JSON 嗅探 usage 计费。
+///
+/// 请求体仅做目标性补丁（强制 `stream=false`），响应体原样返回，不做完整解码。
+async fn passthrough_non_stream_completion(
+    ctx: &PassthroughCtx<'_>,
+    channel: &Channel,
+) -> Outbound {
+    let outbound = passthrough_patch_request(ctx.raw_body, false);
+    let upstream_url = passthrough_upstream_url(channel);
+
+    let upstream = tokio::time::timeout(
+        Duration::from_millis(channel.timeout_ms),
+        ctx.deps
+            .client
+            .post(&upstream_url)
+            .bearer_auth(&channel.api_key)
+            .header("content-type", "application/json")
+            .body(outbound)
+            .send(),
+    )
+    .await;
+
+    let resp = match upstream {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                message: "直通非流式上游不可达".to_string(),
+            };
+        }
+        Err(_) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                message: "直通非流式上游响应超时".to_string(),
+            };
+        }
+    };
+
+    let status_code = resp.status().as_u16();
+    let is_success = resp.status().is_success();
+    // 字节级透传：直接取上游响应字节，不经 String 转码。
+    let upstream_body = resp.bytes().await.unwrap_or_default();
+    let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
+
+    if is_success {
+        // 响应体原样透传（字节级一致），从 JSON 嗅探 usage 计费。
+        let usage = openai_chat::sniff_chat_usage(&parsed).unwrap_or_default();
+        let cost = billing::cost_micros(&usage, &ctx.price);
+        // 成功且 usage 非零才结算；失败或零输出不扣费。
+        if cost > 0 {
+            match ctx.deps.pool.acquire().await {
+                Ok(mut settle_conn) => {
+                    if let Err(err) =
+                        store::settle_charge(&mut settle_conn, &ctx.token.key, cost).await
+                    {
+                        eprintln!("直通非流式结算失败: {err}");
+                    }
+                }
+                Err(err) => eprintln!("直通非流式结算连接失败: {err}"),
+            }
+        }
+        log_request(
+            ctx.deps,
+            ctx.token,
+            &ctx.request.model,
+            &channel.name,
+            status_code,
+            ctx.started,
+            Billing {
+                usage,
+                price: ctx.price,
+                cost_usd_micros: cost,
+            },
+        )
+        .await;
+        Outbound::Success(Response::new(Body::from(upstream_body)))
+    } else if is_retryable_status(status_code) {
+        Outbound::Retryable {
+            channel: channel.name.clone(),
+            status: Some(status_code),
+            message: "上游返回可重试错误".to_string(),
+        }
+    } else {
+        Outbound::Fatal {
+            channel: channel.name.clone(),
+            status: status_code,
+            message: upstream_error_message(&parsed, status_code),
+        }
+    }
+}
+
+/// 直通快路径的出站请求体：以下游请求体为准，仅做目标性 JSON 补丁。
+///
+/// spec 授权的补丁仅一项：流式时注入 `stream_options.include_usage`（供逐帧
+/// 嗅探 usage 计费；非流式响应体已自带顶层 usage，无需注入）。非流式请求体
+/// 字节级原样转发。别名不命中，出站模型名原样；`stream` 字段由下游请求自带，
+/// 不做改写。
+fn passthrough_patch_request(raw_body: &[u8], stream: bool) -> Vec<u8> {
+    if !stream {
+        return raw_body.to_vec();
+    }
+    let mut value: Value = match serde_json::from_slice(raw_body) {
+        Ok(value) => value,
+        Err(_) => return raw_body.to_vec(),
+    };
+    if let Value::Object(map) = &mut value {
+        map.insert(
+            "stream_options".into(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| raw_body.to_vec())
+}
+
+/// 直通快路径的出站 URL：base + 路径。
+fn passthrough_upstream_url(channel: &Channel) -> String {
+    format!(
+        "{}/chat/completions",
+        channel.base_url.trim_end_matches('/')
+    )
+}
+
+/// 直通快路径流式请求的共享任务数据：出站目标、计费与日志所需的请求侧信息。
+#[derive(Clone)]
+struct PassthroughStreamTask {
+    deps: Deps,
+    token: Token,
+    request: ChatRequest,
+    channel: Channel,
+    status_code: u16,
+    started: i64,
+    price: PriceSnapshot,
+}
+
+/// 把上游 SSE 字节流逐帧转发到下游，同时逐帧嗅探 usage 计费。
+///
+/// 每收到一个完整 SSE 数据帧，原样转发给下游（不改装帧），并嗅探帧内顶层
+/// `usage` 字段累积计费。上游流结束时按嗅探累积的 usage 结算并落日志。
+async fn pipe_passthrough_stream<S>(
+    byte_stream: S,
+    tx: tokio::sync::mpsc::Sender<SseEvent>,
+    ctx: PassthroughStreamTask,
+) where
+    S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+{
+    use futures_util::StreamExt as _;
+
+    let mut usage = Usage::default();
+    let mut sse_buffer: Vec<u8> = Vec::new();
+    let mut downstream_open = true;
+    let mut byte_stream = Box::pin(byte_stream);
+
+    loop {
+        // 尝试从已缓冲字节提取完整 SSE 数据帧。
+        if let Some((frame, rest)) = take_sse_frame(&sse_buffer) {
+            sse_buffer = rest;
+            if frame.is_empty() {
+                continue;
+            }
+            // 逐帧嗅探 usage 计费（不完整解码）。
+            if let Ok(chunk) = serde_json::from_slice::<Value>(&frame)
+                && let Some(sniffed) = openai_chat::sniff_chat_usage(&chunk)
+            {
+                usage = sniffed;
+            }
+            if downstream_open {
+                let data = String::from_utf8_lossy(&frame).into_owned();
+                if tx.send(SseEvent::default().data(data)).await.is_err() {
+                    // 下游断开：停止发送，但继续消费上游直至结算。
+                    downstream_open = false;
+                }
+            }
+            continue;
+        }
+
+        // 缓冲不足一帧：从上游读取更多字节。
+        match byte_stream.next().await {
+            Some(Ok(bytes)) => sse_buffer.extend_from_slice(&bytes),
+            Some(Err(_)) | None => {
+                // 流结束：按嗅探累积的 usage 结算并落日志。
+                let cost = billing::cost_micros(&usage, &ctx.price);
+                if cost > 0 {
+                    match ctx.deps.pool.acquire().await {
+                        Ok(mut settle_conn) => {
+                            if let Err(err) =
+                                store::settle_charge(&mut settle_conn, &ctx.token.key, cost).await
+                            {
+                                eprintln!("直通流式结算失败: {err}");
+                            }
+                        }
+                        Err(err) => eprintln!("直通流式结算连接失败: {err}"),
+                    }
+                }
+                log_request(
+                    &ctx.deps,
+                    &ctx.token,
+                    &ctx.request.model,
+                    &ctx.channel.name,
+                    ctx.status_code,
+                    ctx.started,
+                    Billing {
+                        usage,
+                        price: ctx.price,
+                        cost_usd_micros: cost,
+                    },
+                )
+                .await;
+                if downstream_open {
+                    let _ = tx.send(SseEvent::default().data("[DONE]")).await;
+                }
+                return;
+            }
+        }
+    }
 }
 
 /// 非流式出站调用单个渠道，返回可重试判定。
@@ -407,10 +812,17 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                 let usage = &ir.usage;
                 let cost = billing::cost_micros(usage, &price);
                 // 成功且 usage 非零才结算；失败或零输出不扣费。
-                if cost > 0
-                    && let Err(err) = store::settle_charge(ctx.conn, &token.key, cost).await
-                {
-                    eprintln!("结算失败: {err}");
+                if cost > 0 {
+                    match deps.pool.acquire().await {
+                        Ok(mut settle_conn) => {
+                            if let Err(err) =
+                                store::settle_charge(&mut settle_conn, &token.key, cost).await
+                            {
+                                eprintln!("结算失败: {err}");
+                            }
+                        }
+                        Err(err) => eprintln!("结算连接失败: {err}"),
+                    }
                 }
                 let inbound = openai_chat::encode_response(&ir);
                 log_request(
@@ -706,15 +1118,14 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
     let usage = &response.usage;
     let cost = billing::cost_micros(usage, &ctx.price);
     if cost > 0 {
-        let mut conn = match ctx.deps.pool.acquire().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                eprintln!("流式结算连接失败: {err}");
-                return;
+        match ctx.deps.pool.acquire().await {
+            Ok(mut settle_conn) => {
+                if let Err(err) = store::settle_charge(&mut settle_conn, &ctx.token.key, cost).await
+                {
+                    eprintln!("流式结算失败: {err}");
+                }
             }
-        };
-        if let Err(err) = store::settle_charge(&mut conn, &ctx.token.key, cost).await {
-            eprintln!("流式结算失败: {err}");
+            Err(err) => eprintln!("流式结算连接失败: {err}"),
         }
     }
     log_request(
