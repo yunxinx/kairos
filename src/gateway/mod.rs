@@ -21,8 +21,8 @@ use axum::{
     routing::post,
 };
 use futures_util::Stream;
-use serde_json::Value;
-use sqlx::SqlitePool;
+use serde_json::{Value, json};
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::{
     config::{Channel, Config, Price, Token},
@@ -33,6 +33,8 @@ use crate::{
     core::stream::StreamAccumulator,
     store,
 };
+
+mod routing;
 
 /// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 认证令牌表 + 渠道表 + 价格表。
 #[derive(Clone)]
@@ -52,8 +54,9 @@ pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
         .map(|token| (token.key.clone(), token.clone()))
         .collect();
 
+    // 不设客户端级 timeout：reqwest 的 timeout 覆盖到响应体读完，会截断长流式
+    // 响应；超时统一按渠道在请求级施加（非流式 `.timeout`，流式仅约束到响应头）。
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
         .build()
         .expect("reqwest client 构建不应失败");
 
@@ -118,11 +121,9 @@ async fn chat_completions(
         }
     };
 
-    let is_stream = request.stream;
-
-    // 3. 准入：模型必须有候选渠道。
-    let channel = match select_channel(&deps.channels, &request.model) {
-        Some(channel) => channel,
+    // 3. 准入：模型必须有候选渠道（按 failover 顺序排列）。
+    let route = match routing::route(&deps.channels, &request.model) {
+        Some(route) => route,
         None => {
             let message = format!("模型 {} 未配置任何可用渠道", request.model);
             return error_response(
@@ -203,137 +204,168 @@ async fn chat_completions(
         }
     }
 
-    // 5. 出站：按流式/非流式分支处理。
-    if is_stream {
-        stream_completion(&deps, &request, channel, token, price, started).await
-    } else {
-        // 非流式：编码 IR 为出站协议，调用上游。
-        let outbound = openai_chat::encode_request(&request);
-        let upstream_url = format!(
-            "{}/chat/completions",
-            channel.base_url.trim_end_matches('/')
-        );
-
-        let upstream = deps
-            .client
-            .post(&upstream_url)
-            .bearer_auth(&channel.api_key)
-            .json(&outbound)
-            .send()
-            .await;
-
-        match upstream {
-            Ok(resp) => {
-                let status = resp.status();
-                let status_code = status.as_u16();
-                let upstream_body = resp.text().await.unwrap_or_default();
-                let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
-
-                if status.is_success() {
-                    // 6. 响应：解码上游响应为 IR，结算费用，再重编码为入站协议返回。
-                    match openai_chat::decode_response(&parsed) {
-                        Ok(ir) => {
-                            let usage = &ir.usage;
-                            let cost = billing::cost_micros(usage, &price);
-                            // 成功且 usage 非零才结算；失败或零输出不扣费。
-                            if cost > 0
-                                && let Err(err) =
-                                    store::settle_charge(&mut conn, &token.key, cost).await
-                            {
-                                eprintln!("结算失败: {err}");
-                            }
-                            let inbound = openai_chat::encode_response(&ir);
-                            log_request(
-                                &deps,
-                                token,
-                                &request.model,
-                                &channel.name,
-                                status_code,
-                                started,
-                                Billing {
-                                    usage: usage.clone(),
-                                    price,
-                                    cost_usd_micros: cost,
-                                },
-                            )
-                            .await;
-                            Json(inbound).into_response()
-                        }
-                        Err(err) => {
-                            let message = format!("上游响应无法解析: {err}");
-                            error_response(
-                                StatusCode::BAD_GATEWAY,
-                                &message,
-                                &deps,
-                                Some(token),
-                                Some(&request.model),
-                                started,
-                            )
-                            .await
-                        }
-                    }
-                } else {
-                    // 上游错误：状态码原样 + OpenAI 错误格式（可解析则透传，否则合成）。
-                    let body = if parsed.is_object() {
-                        parsed
-                    } else {
-                        openai_chat::encode_error(status_code, "上游返回了非标准错误响应")
-                    };
-                    log_request(
-                        &deps,
-                        token,
-                        &request.model,
-                        &channel.name,
-                        status_code,
-                        started,
-                        Billing {
-                            usage: Usage::default(),
-                            price: PriceSnapshot::default(),
-                            cost_usd_micros: 0,
-                        },
-                    )
-                    .await;
-                    (status, Json(body)).into_response()
-                }
-            }
-            Err(_) => {
-                let message = "上游不可达";
-                error_response(
-                    StatusCode::BAD_GATEWAY,
-                    message,
-                    &deps,
-                    Some(token),
-                    Some(&request.model),
-                    started,
-                )
-                .await
-            }
-        }
-    }
+    // 5. 出站：按流式/非流式统一走渠道路由 + failover 重试。
+    outbound_with_failover(&deps, &request, &route, token, price, started, &mut conn).await
 }
 
-/// 流式出站：IR 完整路径处理 SSE 全链路。
+/// 出站调用的结果：成功携带响应，失败携带可重试判定与上游状态码。
+enum Outbound {
+    /// 成功：响应已就绪，可直接交给下游。
+    Success(Response),
+    /// 可重试错误（网络错误/429/5xx）：failover 到下一渠道。
+    Retryable {
+        /// 出错渠道的名称，用于归因与日志。
+        channel: String,
+        /// 上游 HTTP 状态码（网络错误时为 `None`）。
+        status: Option<u16>,
+        /// 供错误响应体使用的错误消息。
+        message: String,
+    },
+    /// 不可重试错误（其他 4xx）：直接返回，不 failover。
+    Fatal {
+        /// 出错渠道的名称，用于归因与日志。
+        channel: String,
+        status: u16,
+        message: String,
+    },
+}
+
+/// 单次出站调用的请求侧上下文：入站请求、路由、认证令牌与计费/日志所需的
+/// 请求级信息。作为 `*_completion` 的参数打包，避免过长参数列表。
+struct CallCtx<'a> {
+    deps: &'a Deps,
+    request: &'a ChatRequest,
+    route: &'a routing::Route,
+    token: &'a Token,
+    price: PriceSnapshot,
+    started: i64,
+    conn: &'a mut SqliteConnection,
+}
+
+/// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
 ///
-/// 编码 IR 请求并注入 `stream_options.include_usage`，向上游发起流式请求；
-/// 逐 SSE 帧解码为 IR 流事件，累积为 `ChatResponse` 以取 usage 计费，同时
-/// 重编码为入站协议 SSE 帧流回下游。流结束后按累积 usage 结算并落日志。
-async fn stream_completion(
+/// 每个候选渠道按其自身 `max_retries` 尝试（首试 + max_retries 次重试）；
+/// 渠道耗尽或请求须整体失败时切换到下一候选。剩余候选全失败或遇到不可
+/// 重试 4xx 时返回最终错误响应。成功时返回下游响应。
+async fn outbound_with_failover(
     deps: &Deps,
     request: &ChatRequest,
-    channel: &Channel,
+    route: &routing::Route,
     token: &Token,
     price: PriceSnapshot,
     started: i64,
+    conn: &mut SqliteConnection,
 ) -> Response {
-    let mut outbound = openai_chat::encode_request(request);
-    // 目标性 JSON 补丁：请求流式并请求 usage（对齐 AI SDK doStream 的注入）。
-    if let Value::Object(map) = &mut outbound {
-        map.insert("stream".into(), Value::Bool(true));
-        map.insert(
-            "stream_options".into(),
-            serde_json::json!({ "include_usage": true }),
-        );
+    let mut last_retryable: Option<(String, Option<u16>, String)> = None;
+    let attempts = &route.channels;
+
+    for channel in attempts {
+        // 每个渠道的最大尝试次数 = 1（首试）+ max_retries 次重试。
+        let max_attempts = (channel.max_retries + 1) as usize;
+        for attempt in 0..max_attempts {
+            let mut ctx = CallCtx {
+                deps,
+                request,
+                route,
+                token,
+                price,
+                started,
+                conn,
+            };
+            let result = if request.stream {
+                stream_completion(&mut ctx, channel).await
+            } else {
+                non_stream_completion(&mut ctx, channel).await
+            };
+            match result {
+                Outbound::Success(resp) => return resp,
+                Outbound::Fatal {
+                    channel,
+                    status,
+                    message,
+                } => {
+                    // 不可重试：直接返回，不 failover。状态码原样 + 归因。
+                    let body = upstream_error_body(status, &message, &channel, false);
+                    log_request(
+                        deps,
+                        token,
+                        &request.model,
+                        &channel,
+                        status,
+                        started,
+                        Billing::default(),
+                    )
+                    .await;
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(body),
+                    )
+                        .into_response();
+                }
+                Outbound::Retryable {
+                    channel,
+                    status,
+                    message,
+                } => {
+                    // 记录最后一次可重试错误，渠道耗尽后透传。
+                    last_retryable = Some((channel, status, message));
+                    // 本渠道 budget 内重试（同一渠道再用一次）。
+                    if attempt + 1 < max_attempts {
+                        continue;
+                    }
+                    // 本渠道 budget 耗尽：break 触发 failover 到下一渠道。
+                    break;
+                }
+            }
+        }
     }
+
+    // 所有候选渠道均失败：返回最后一次可重试错误（含归因）。
+    let (channel, status, message) = last_retryable.unwrap_or_else(|| {
+        (
+            String::from("unknown"),
+            None,
+            String::from("所有渠道均不可用"),
+        )
+    });
+    let status_code = status.unwrap_or(502);
+    let body = upstream_error_body(status_code, &message, &channel, true);
+    let status_code_u16 = status_code;
+    log_request(
+        deps,
+        token,
+        &request.model,
+        &channel,
+        status_code_u16,
+        started,
+        Billing {
+            usage: Usage::default(),
+            price: PriceSnapshot::default(),
+            cost_usd_micros: 0,
+        },
+    )
+    .await;
+    (
+        StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+        Json(body),
+    )
+        .into_response()
+}
+
+/// 非流式出站调用单个渠道，返回可重试判定。
+async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
+    let deps = ctx.deps;
+    let request = ctx.request;
+    let route = ctx.route;
+    let token = ctx.token;
+    let price = ctx.price;
+    let started = ctx.started;
+    // 别名重写：请求模型用出站真实名。
+    let mut outbound_value = openai_chat::encode_request(request);
+    if let Value::Object(map) = &mut outbound_value {
+        map.insert("model".into(), Value::String(route.outbound_model.clone()));
+    }
+
     let upstream_url = format!(
         "{}/chat/completions",
         channel.base_url.trim_end_matches('/')
@@ -342,24 +374,142 @@ async fn stream_completion(
     let upstream = deps
         .client
         .post(&upstream_url)
+        .timeout(Duration::from_millis(channel.timeout_ms))
         .bearer_auth(&channel.api_key)
-        .json(&outbound)
+        .json(&outbound_value)
         .send()
         .await;
 
     let resp = match upstream {
         Ok(resp) => resp,
         Err(_) => {
-            let message = "流式上游不可达";
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                message,
-                deps,
-                Some(token),
-                Some(&request.model),
-                started,
-            )
-            .await;
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                message: "上游不可达".to_string(),
+            };
+        }
+    };
+
+    let status = resp.status();
+    let status_code = status.as_u16();
+    let upstream_body = resp.text().await.unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+
+    if status.is_success() {
+        // 解码上游响应为 IR，结算费用，再重编码为入站协议返回。
+        // 命中别名时重写响应模型名为入站短名。
+        match openai_chat::decode_response(&parsed) {
+            Ok(mut ir) => {
+                if request.model != route.outbound_model {
+                    ir.model = request.model.clone();
+                }
+                let usage = &ir.usage;
+                let cost = billing::cost_micros(usage, &price);
+                // 成功且 usage 非零才结算；失败或零输出不扣费。
+                if cost > 0
+                    && let Err(err) = store::settle_charge(ctx.conn, &token.key, cost).await
+                {
+                    eprintln!("结算失败: {err}");
+                }
+                let inbound = openai_chat::encode_response(&ir);
+                log_request(
+                    deps,
+                    token,
+                    &request.model,
+                    &channel.name,
+                    status_code,
+                    started,
+                    Billing {
+                        usage: usage.clone(),
+                        price,
+                        cost_usd_micros: cost,
+                    },
+                )
+                .await;
+                Outbound::Success(Json(inbound).into_response())
+            }
+            Err(err) => {
+                let message = format!("上游响应无法解析: {err}");
+                Outbound::Fatal {
+                    channel: channel.name.clone(),
+                    status: 502,
+                    message,
+                }
+            }
+        }
+    } else if is_retryable_status(status_code) {
+        // 可重试错误（429/5xx）：failover 到下一渠道。
+        Outbound::Retryable {
+            channel: channel.name.clone(),
+            status: Some(status_code),
+            message: "上游返回可重试错误".to_string(),
+        }
+    } else {
+        // 不可重试 4xx：直接返回，状态码原样 + OpenAI 错误格式。
+        Outbound::Fatal {
+            channel: channel.name.clone(),
+            status: status_code,
+            message: upstream_error_message(&parsed, status_code),
+        }
+    }
+}
+
+/// 流式出站调用单个渠道：SSE 全链路，返回可重试判定。
+///
+/// 编码 IR 请求并注入 `stream_options.include_usage`，向上游发起流式请求；
+/// 逐 SSE 帧解码为 IR 流事件，累积为 `ChatResponse` 以取 usage 计费，同时
+/// 重编码为入站协议 SSE 帧流回下游。流结束后按累积 usage 结算并落日志。
+async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
+    let deps = ctx.deps;
+    let request = ctx.request;
+    let route = ctx.route;
+    let token = ctx.token;
+    let price = ctx.price;
+    let started = ctx.started;
+    let mut outbound = openai_chat::encode_request(request);
+    // 目标性 JSON 补丁：请求流式并请求 usage（对齐 AI SDK doStream 的注入）。
+    if let Value::Object(map) = &mut outbound {
+        map.insert("stream".into(), Value::Bool(true));
+        map.insert(
+            "stream_options".into(),
+            serde_json::json!({ "include_usage": true }),
+        );
+        // 别名重写：出站模型名用真实名。
+        map.insert("model".into(), Value::String(route.outbound_model.clone()));
+    }
+    let upstream_url = format!(
+        "{}/chat/completions",
+        channel.base_url.trim_end_matches('/')
+    );
+
+    // 渠道 timeout 只约束到响应头（send 返回）：reqwest 的 `.timeout` 覆盖到
+    // 响应体读完，会把长流式响应截断；流一旦开始，时长不受 timeout 限制。
+    let upstream = tokio::time::timeout(
+        Duration::from_millis(channel.timeout_ms),
+        deps.client
+            .post(&upstream_url)
+            .bearer_auth(&channel.api_key)
+            .json(&outbound)
+            .send(),
+    )
+    .await;
+
+    let resp = match upstream {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                message: "流式上游不可达".to_string(),
+            };
+        }
+        Err(_) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                message: "流式上游响应超时".to_string(),
+            };
         }
     };
 
@@ -368,23 +518,19 @@ async fn stream_completion(
     // 上游非 2xx：SSE 流此时尚未开始，直接按错误处理。
     if !status.is_success() {
         let upstream_body = resp.text().await.unwrap_or_default();
-        let body = serde_json::from_str::<Value>(&upstream_body)
-            .unwrap_or_else(|_| openai_chat::encode_error(status_code, "上游返回了非标准错误响应"));
-        log_request(
-            deps,
-            token,
-            &request.model,
-            &channel.name,
-            status_code,
-            started,
-            Billing {
-                usage: Usage::default(),
-                price: PriceSnapshot::default(),
-                cost_usd_micros: 0,
-            },
-        )
-        .await;
-        return (status, Json(body)).into_response();
+        let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+        if is_retryable_status(status_code) {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: Some(status_code),
+                message: "上游返回可重试错误".to_string(),
+            };
+        }
+        return Outbound::Fatal {
+            channel: channel.name.clone(),
+            status: status_code,
+            message: upstream_error_message(&parsed, status_code),
+        };
     }
 
     // 逐上游 SSE 帧处理：解码 → 累积（计费）→ 重编码为入站 SSE 帧。
@@ -396,6 +542,7 @@ async fn stream_completion(
         token: token.clone(),
         request: request.clone(),
         channel: channel.clone(),
+        inbound_model: (request.model != route.outbound_model).then(|| request.model.clone()),
         status_code,
         started,
         price,
@@ -405,7 +552,7 @@ async fn stream_completion(
     });
 
     let stream = tokio_stream_patch(rx);
-    Sse::new(stream).into_response()
+    Outbound::Success(Sse::new(stream).into_response())
 }
 
 /// 流式请求的共享任务数据：出站目标、计费与日志所需的请求侧信息。
@@ -415,6 +562,8 @@ struct StreamTask {
     token: Token,
     request: ChatRequest,
     channel: Channel,
+    /// 别名命中时入站模型名（用于重写响应模型名）；`None` 表示不覆盖。
+    inbound_model: Option<String>,
     status_code: u16,
     started: i64,
     price: PriceSnapshot,
@@ -431,7 +580,7 @@ where
     use futures_util::StreamExt as _;
 
     let mut decoder = openai_chat::StreamDecoder::default();
-    let mut encoder = openai_chat::StreamEncoder::default();
+    let mut encoder = openai_chat::StreamEncoder::new(ctx.inbound_model.clone());
     let mut accumulator = StreamAccumulator::new();
     // 以字节缓冲、帧边界后再转文本：多字节 UTF-8 可能被拆在两个字节块里，
     // 提前转换会截坏字符。
@@ -608,14 +757,45 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
         .map(|value| value.trim().to_string())
 }
 
-/// 选择 `model` 的候选渠道：取第一个（路由/failover 属 #06）。
+/// 判断上游 HTTP 状态码是否可重试：网络错误与 429/5xx 允许 failover。
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// 从上游错误 body 提取可读消息（OpenAI/Anthropic 均为 `error.message`），
+/// 避免把整个 JSON 串塞进下游 message。
+fn upstream_error_message(parsed: &Value, status: u16) -> String {
+    parsed
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("上游返回状态码 {status}"))
+}
+
+/// 构造带网关归因的错误响应体：上游状态码原样 + OpenAI 错误格式 + 归因字段。
 ///
-/// 命中条件：渠道 `models` 列表含该模型，或别名短名（`model_aliases` 的 key）
-/// 匹配。别名指向的上游真实模型名（value）不参与匹配，出站模型名重写在 #06 落地。
-fn select_channel<'a>(channels: &'a [Channel], model: &str) -> Option<&'a Channel> {
-    channels
-        .iter()
-        .find(|c| c.models.iter().any(|m| m == model) || c.model_aliases.contains_key(model))
+/// 归因字段标识出错渠道与是否已 failover，供排障定位问题段。
+fn upstream_error_body(status: u16, message: &str, channel: &str, failover: bool) -> Value {
+    let mut error = serde_json::Map::new();
+    error.insert("message".into(), json!(message));
+    error.insert(
+        "type".into(),
+        json!(if (400..500).contains(&status) {
+            "invalid_request_error"
+        } else {
+            "api_error"
+        }),
+    );
+    error.insert("code".into(), Value::Null);
+    error.insert(
+        "gateway".into(),
+        json!({
+            "channel": channel,
+            "failover": failover,
+        }),
+    );
+    json!({ "error": Value::Object(error) })
 }
 
 /// 构造 OpenAI 错误格式的响应，并落一条请求日志（无计费数据）。
@@ -668,7 +848,7 @@ async fn db_error_response(
 }
 
 /// 一次请求的计费结果，供日志落库。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct Billing {
     usage: Usage,
     price: PriceSnapshot,

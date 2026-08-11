@@ -39,8 +39,17 @@ pub enum UpstreamBehavior {
     Status429,
     /// 返回 5xx（可重试）。
     Status5xx(u16),
+    /// 返回任意给定状态码（不可重试 4xx 用于测试）。
+    Status(u16),
     /// 发送部分字节后突然断开连接。
     Disconnect,
+}
+
+impl UpstreamBehavior {
+    /// 返回给定状态码的纯文本响应。
+    pub fn for_status(status: u16) -> Self {
+        UpstreamBehavior::Status(status)
+    }
 }
 
 /// 记录 mock 上游收到过的请求体，供断言出站请求。
@@ -53,14 +62,16 @@ pub struct ReceivedLog {
 #[derive(Clone)]
 pub struct MockUpstream {
     pub addr: SocketAddr,
-    behavior: Arc<Mutex<Option<UpstreamBehavior>>>,
+    /// 行为队列，逐请求消费；`set_behavior` 追加，`push_behavior` 也追加。
+    behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>>,
     received: Arc<Mutex<ReceivedLog>>,
 }
 
 impl MockUpstream {
-    /// 启动 mock 上游，初始化行为为 `Sse(vec![])`。
+    /// 启动 mock 上游，初始化行为为空队列。
     pub async fn start() -> Self {
-        let behavior: Arc<Mutex<Option<UpstreamBehavior>>> = Arc::new(Mutex::new(None));
+        let behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
         let received: Arc<Mutex<ReceivedLog>> = Arc::new(Mutex::new(ReceivedLog::default()));
 
         let app = Router::new()
@@ -87,9 +98,17 @@ impl MockUpstream {
         }
     }
 
-    /// 设置下一个请求的行为。
+    /// 设置下一个请求的行为。重复调用会追加到行为队列（逐请求消费）。
     pub fn set_behavior(&mut self, behavior: UpstreamBehavior) {
-        *self.behavior.lock().expect("behavior 锁不应被污染") = Some(behavior);
+        self.behavior
+            .lock()
+            .expect("behavior 锁不应被污染")
+            .push_back(behavior);
+    }
+
+    /// 追加一个行为到队列末尾（与 `set_behavior` 等价，语义更明确）。
+    pub fn push_behavior(&mut self, behavior: UpstreamBehavior) {
+        self.set_behavior(behavior);
     }
 
     /// base URL，供网关作为上游地址。
@@ -109,7 +128,7 @@ impl MockUpstream {
 
 #[derive(Clone)]
 struct MockDeps {
-    behavior: Arc<Mutex<Option<UpstreamBehavior>>>,
+    behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>>,
     received: Arc<Mutex<ReceivedLog>>,
 }
 
@@ -121,11 +140,12 @@ async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Respon
         .requests
         .push(body);
 
+    // 从行为队列取出下一个；队列空时默认返回空 SSE（200）。
     let behavior = deps
         .behavior
         .lock()
         .expect("behavior 锁不应被污染")
-        .take()
+        .pop_front()
         .unwrap_or(UpstreamBehavior::Sse(vec![]));
     behavior.into_response()
 }
@@ -149,6 +169,12 @@ impl IntoResponse for UpstreamBehavior {
                     panic!("UpstreamBehavior::Status5xx 要求合法 5xx 状态码，收到 {code}")
                 });
                 (status, "server error").into_response()
+            }
+            UpstreamBehavior::Status(code) => {
+                let status = StatusCode::from_u16(code).unwrap_or_else(|_| {
+                    panic!("UpstreamBehavior::Status 要求合法状态码，收到 {code}")
+                });
+                (status, "client error").into_response()
             }
             UpstreamBehavior::Disconnect => {
                 // 发送一个 SSE 帧后立即结束连接（axum 关闭响应体即断连）。
@@ -211,6 +237,45 @@ impl TestGateway {
             pool,
             db_path,
         }
+    }
+
+    /// 用多个 mock 上游启动完整测试环境（多渠道路由/failover）。
+    ///
+    /// `make_cfg` 接收各 mock 上游的 base URL，返回使用多个渠道的完整配置；
+    /// 返回的 `Vec<MockUpstream>` 与传入顺序对应，便于分渠道注入行为。
+    pub async fn start_with_multi(
+        count: usize,
+        make_cfg: impl Fn(&[String]) -> config::Config,
+    ) -> (Self, Vec<MockUpstream>) {
+        let mut upstreams = Vec::with_capacity(count);
+        for _ in 0..count {
+            upstreams.push(MockUpstream::start().await);
+        }
+        let bases: Vec<String> = upstreams.iter().map(|u| u.base_url()).collect();
+
+        let db = tempfile::NamedTempFile::new().expect("应能创建临时库文件");
+        let db_path = db.into_temp_path();
+        let pool = store::open(&db_path)
+            .await
+            .expect("SQLite 建库与迁移应成功");
+
+        let cfg = make_cfg(&bases);
+        let app = gateway::router(&cfg, pool.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("网关应能绑定随机端口");
+        let addr = listener.local_addr().expect("网关应能获取监听地址");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("网关服务应运行");
+        });
+
+        let gw = Self {
+            addr,
+            upstream: upstreams[0].clone(),
+            pool,
+            db_path,
+        };
+        (gw, upstreams)
     }
 
     /// 网关 base URL。

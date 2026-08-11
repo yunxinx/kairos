@@ -923,6 +923,19 @@ pub struct StreamEncoder {
     /// 从 ResponseMetadata 记录的响应 id 与 model，用于各 chunk 帧。
     id: String,
     model: String,
+    /// 入站模型名覆盖：别名命中时，出站响应模型名须重写回入站短名。
+    /// `Some` 时无视 ResponseMetadata 携带的上游模型名。
+    inbound_model: Option<String>,
+}
+
+impl StreamEncoder {
+    /// 指定入站模型名覆盖（别名重写响应模型名）；`None` 表示不覆盖。
+    pub fn new(inbound_model: Option<String>) -> Self {
+        Self {
+            inbound_model,
+            ..Self::default()
+        }
+    }
 }
 
 /// 入站侧进行中的工具调用，按 OpenAI 约定的 index 排序。
@@ -1040,7 +1053,9 @@ impl StreamEncoder {
             }),
         );
         obj.insert("object".into(), json!("chat.completion.chunk"));
-        obj.insert("model".into(), json!(self.model));
+        // 别名命中时用入站模型名覆盖上游模型名，让下游看到稳定短名。
+        let model = self.inbound_model.as_deref().unwrap_or(&self.model);
+        obj.insert("model".into(), json!(model));
         obj.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
         Value::Object(obj)
     }
