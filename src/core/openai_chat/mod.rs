@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role, Tool,
-    Usage,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
+    StreamEvent, Tool, Usage,
 };
 
 // ---- 错误 ----
@@ -195,6 +195,63 @@ struct WirePromptTokensDetails {
     cached_tokens: u64,
     #[serde(default)]
     cache_write_tokens: u64,
+}
+
+// ---- 流式 wire 类型 ----
+
+/// Chat Completions 流式 chunk（`chat.completion.chunk`）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireStreamChunk {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<WireStreamChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireStreamChoice {
+    #[serde(default)]
+    delta: Option<WireStreamDelta>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireStreamDelta {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<WireStreamToolCall>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireStreamToolCall {
+    /// 工具调用在流中的稳定序号（跨帧一致），对齐 AI SDK 的 index 语义。
+    #[serde(default)]
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<WireStreamToolCallFunction>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireStreamToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 // ---- 入站解码：wire 请求 → IR ----
@@ -663,47 +720,6 @@ pub fn encode_response(response: &ChatResponse) -> Value {
         message.insert("tool_calls".into(), Value::Array(tool_calls));
     }
 
-    let details = if response.usage.cache_read_tokens > 0 || response.usage.cache_write_tokens > 0 {
-        let mut d = serde_json::Map::new();
-        d.insert(
-            "cached_tokens".into(),
-            json!(response.usage.cache_read_tokens),
-        );
-        d.insert(
-            "cache_write_tokens".into(),
-            json!(response.usage.cache_write_tokens),
-        );
-        Some(Value::Object(d))
-    } else {
-        None
-    };
-
-    let mut usage = serde_json::Map::new();
-    usage.insert(
-        "prompt_tokens".into(),
-        json!(
-            response.usage.input_tokens
-                + response.usage.cache_read_tokens
-                + response.usage.cache_write_tokens
-        ),
-    );
-    usage.insert(
-        "completion_tokens".into(),
-        json!(response.usage.output_tokens),
-    );
-    usage.insert(
-        "total_tokens".into(),
-        json!(
-            response.usage.input_tokens
-                + response.usage.output_tokens
-                + response.usage.cache_read_tokens
-                + response.usage.cache_write_tokens
-        ),
-    );
-    if let Some(details) = details {
-        usage.insert("prompt_tokens_details".into(), details);
-    }
-
     json!({
         "id": response.id,
         "object": "chat.completion",
@@ -714,8 +730,320 @@ pub fn encode_response(response: &ChatResponse) -> Value {
             "logprobs": null,
             "finish_reason": response.finish_reason.raw.clone().unwrap_or_else(|| "stop".into()),
         }],
-        "usage": usage,
+        "usage": encode_usage(&response.usage),
     })
+}
+
+/// 编码 IR usage 四分量 + 缓存细节为 wire usage 对象。
+fn encode_usage(usage: &Usage) -> Value {
+    let details = if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
+        let mut d = serde_json::Map::new();
+        d.insert("cached_tokens".into(), json!(usage.cache_read_tokens));
+        d.insert("cache_write_tokens".into(), json!(usage.cache_write_tokens));
+        Some(Value::Object(d))
+    } else {
+        None
+    };
+
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "prompt_tokens".into(),
+        json!(usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens),
+    );
+    obj.insert("completion_tokens".into(), json!(usage.output_tokens));
+    obj.insert(
+        "total_tokens".into(),
+        json!(
+            usage.input_tokens
+                + usage.output_tokens
+                + usage.cache_read_tokens
+                + usage.cache_write_tokens
+        ),
+    );
+    if let Some(details) = details {
+        obj.insert("prompt_tokens_details".into(), details);
+    }
+    Value::Object(obj)
+}
+
+// ---- 流式：上游 chunk → IR 流事件 ----
+
+/// 流式解码器：把上游 Chat Completions 流式 chunk 解码为 IR 流事件。
+///
+/// 对齐 AI SDK 的 `StreamingToolCallTracker`：跨帧维护 tool-call 的 index→id
+/// 映射，后续只带 index 的增量帧能匹配到首帧记录的 id。text delta 产出
+/// text-start/delta/end，tool-call delta 按 index 累积为 tool-input-start/delta/end，
+/// usage 与 finish_reason 在出现时产出生命周期事件。
+#[derive(Debug, Default)]
+pub struct StreamDecoder {
+    tool_ids_by_index: HashMap<usize, String>,
+    /// 最近一次出现的 finish_reason：usage 独立末帧（无 finish_reason）复用，
+    /// 避免 Finish 退化为 Other 并在下游编码时误落回 "stop"。
+    last_finish_reason: Option<FinishReason>,
+}
+
+impl StreamDecoder {
+    /// 解码单个上游 chunk 为若干 IR 流事件。
+    pub fn process(&mut self, chunk: &Value) -> DecodeStreamChunk {
+        let wire = match serde_json::from_value::<WireStreamChunk>(chunk.clone()) {
+            Ok(wire) => wire,
+            Err(_) => return DecodeStreamChunk::delivery(Vec::new()),
+        };
+
+        let mut events = Vec::new();
+        let mut is_output = false;
+
+        if let Some(id) = &wire.id
+            && let Some(model) = &wire.model
+        {
+            events.push(StreamEvent::ResponseMetadata {
+                id: id.clone(),
+                model: model.clone(),
+            });
+        }
+
+        let choice = wire.choices.first();
+        if let Some(choice) = choice
+            && let Some(delta) = &choice.delta
+        {
+            // role 只出现在文本流的首帧：以此开启文本块（对齐 AI SDK isActiveText）。
+            if delta.role.is_some() {
+                events.push(StreamEvent::TextStart {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                });
+            }
+            if let Some(content) = &delta.content
+                && !content.is_empty()
+            {
+                is_output = true;
+                events.push(StreamEvent::TextDelta {
+                    id: "0".to_string(),
+                    delta: content.clone(),
+                    provider_options: HashMap::new(),
+                });
+            }
+            if let Some(tool_calls) = &delta.tool_calls {
+                for tc in tool_calls {
+                    let index = tc.index;
+                    let id = match &tc.id {
+                        Some(id) => {
+                            // 首帧携带 id：记录 index→id 并产出工具起始。
+                            self.tool_ids_by_index.insert(index, id.clone());
+                            events.push(StreamEvent::ToolInputStart {
+                                id: id.clone(),
+                                tool_name: tc
+                                    .function
+                                    .as_ref()
+                                    .and_then(|f| f.name.clone())
+                                    .unwrap_or_default(),
+                                provider_options: HashMap::new(),
+                            });
+                            id.clone()
+                        }
+                        // 后续帧只带 index：回查首帧记录的 id。
+                        None => self
+                            .tool_ids_by_index
+                            .get(&index)
+                            .cloned()
+                            .unwrap_or_else(|| format!("{index}")),
+                    };
+                    if let Some(function) = &tc.function
+                        && let Some(arguments) = &function.arguments
+                        && !arguments.is_empty()
+                    {
+                        events.push(StreamEvent::ToolInputDelta {
+                            id,
+                            delta: arguments.clone(),
+                            provider_options: HashMap::new(),
+                        });
+                    }
+                    is_output = true;
+                }
+            }
+        }
+
+        // finish/usage：真实 OpenAI 把 usage 放在 `include_usage` 的独立末帧
+        // （choices 为空），与 finish_reason 分离。只要出现 usage 或 finish_reason
+        // 即产出 Finish，保证计费不因末帧形状而漏采。
+        if choice.is_some_and(|c| c.finish_reason.is_some()) || wire.usage.is_some() {
+            // 本帧带 finish_reason 则更新记忆；usage 独立末帧复用上一次的值，
+            // 否则 Finish 退化为 Other、下游编码误落回 "stop"。
+            if let Some(raw) = choice.and_then(|c| c.finish_reason.clone()) {
+                self.last_finish_reason = Some(FinishReason {
+                    unified: map_finish_reason(Some(raw.as_str())),
+                    raw: Some(raw),
+                });
+            }
+            let finish_reason = self.last_finish_reason.clone().unwrap_or(FinishReason {
+                unified: FinishReasonUnified::Other,
+                raw: None,
+            });
+            events.push(StreamEvent::Finish {
+                finish_reason,
+                usage: wire
+                    .usage
+                    .clone()
+                    .map(convert_usage)
+                    .unwrap_or_else(Usage::default),
+                provider_metadata: HashMap::new(),
+            });
+        }
+
+        DecodeStreamChunk { events, is_output }
+    }
+}
+
+/// 单个 chunk 解码结果：IR 事件 + 是否产出任何输出内容。
+#[derive(Debug)]
+pub struct DecodeStreamChunk {
+    pub events: Vec<StreamEvent>,
+    pub is_output: bool,
+}
+
+impl DecodeStreamChunk {
+    fn delivery(events: Vec<StreamEvent>) -> Self {
+        Self {
+            events,
+            is_output: false,
+        }
+    }
+}
+
+// ---- 流式：IR 流事件 → 入站 SSE 帧 ----
+
+/// 把 IR 流事件编码为入站 Chat Completions SSE 帧（`data:` 行）。
+///
+/// 维护进行中的 text/tool-input 块状态，把事件还原为 `chat.completion.chunk`
+/// wire 形状。调用方负责把每帧包成 `data: <json>\n\n` 的 SSE 发送。
+#[derive(Debug, Default)]
+pub struct StreamEncoder {
+    text_open: bool,
+    tool_calls: Vec<OpenToolCall>,
+    /// 从 ResponseMetadata 记录的响应 id 与 model，用于各 chunk 帧。
+    id: String,
+    model: String,
+}
+
+/// 入站侧进行中的工具调用，按 OpenAI 约定的 index 排序。
+#[derive(Debug)]
+struct OpenToolCall {
+    index: usize,
+    id: String,
+    arguments: String,
+}
+
+impl StreamEncoder {
+    /// 编码一个 IR 流事件，返回需要下发的 SSE 帧（可能为空）。
+    pub fn encode(&mut self, event: &StreamEvent) -> Vec<Value> {
+        match event {
+            StreamEvent::StreamStart => Vec::new(),
+            StreamEvent::ResponseMetadata { id, model } => {
+                self.id = id.clone();
+                self.model = model.clone();
+                Vec::new()
+            }
+            StreamEvent::TextStart { .. } => {
+                self.text_open = true;
+                Vec::new()
+            }
+            StreamEvent::TextDelta { delta, .. } => {
+                let mut choice = serde_json::Map::new();
+                choice.insert("index".into(), json!(0));
+                let mut delta_obj = serde_json::Map::new();
+                delta_obj.insert("content".into(), json!(delta));
+                if self.text_open {
+                    delta_obj.insert("role".into(), json!("assistant"));
+                    self.text_open = false;
+                }
+                choice.insert("delta".into(), Value::Object(delta_obj));
+                vec![self.chunk_frame(choice)]
+            }
+            StreamEvent::TextEnd { .. } => Vec::new(),
+            StreamEvent::ReasoningStart { .. }
+            | StreamEvent::ReasoningDelta { .. }
+            | StreamEvent::ReasoningEnd { .. } => Vec::new(),
+            StreamEvent::ToolInputStart { id, tool_name, .. } => {
+                let index = self.tool_calls.len();
+                self.tool_calls.push(OpenToolCall {
+                    index,
+                    id: id.clone(),
+                    arguments: String::new(),
+                });
+                let mut function = serde_json::Map::new();
+                function.insert("name".into(), json!(tool_name));
+                function.insert("arguments".into(), json!(""));
+                let mut tc = serde_json::Map::new();
+                tc.insert("index".into(), json!(index));
+                tc.insert("id".into(), json!(id));
+                tc.insert("type".into(), json!("function"));
+                tc.insert("function".into(), Value::Object(function));
+                let mut delta_obj = serde_json::Map::new();
+                delta_obj.insert("tool_calls".into(), Value::Array(vec![Value::Object(tc)]));
+                let mut choice = serde_json::Map::new();
+                choice.insert("index".into(), json!(0));
+                choice.insert("delta".into(), Value::Object(delta_obj));
+                vec![self.chunk_frame(choice)]
+            }
+            StreamEvent::ToolInputDelta { id, delta, .. } => {
+                if let Some(tool) = self.tool_calls.iter_mut().find(|t| t.id == *id) {
+                    tool.arguments.push_str(delta);
+                }
+                let index = self
+                    .tool_calls
+                    .iter()
+                    .find(|t| t.id == *id)
+                    .map(|t| t.index)
+                    .unwrap_or(0);
+                let mut function = serde_json::Map::new();
+                function.insert("arguments".into(), json!(delta));
+                let mut tc = serde_json::Map::new();
+                tc.insert("index".into(), json!(index));
+                tc.insert("function".into(), Value::Object(function));
+                let mut delta_obj = serde_json::Map::new();
+                delta_obj.insert("tool_calls".into(), Value::Array(vec![Value::Object(tc)]));
+                let mut choice = serde_json::Map::new();
+                choice.insert("index".into(), json!(0));
+                choice.insert("delta".into(), Value::Object(delta_obj));
+                vec![self.chunk_frame(choice)]
+            }
+            StreamEvent::ToolInputEnd { .. } => Vec::new(),
+            StreamEvent::ToolCall { .. } => Vec::new(),
+            StreamEvent::Finish {
+                finish_reason,
+                usage,
+                ..
+            } => {
+                let mut choice = serde_json::Map::new();
+                choice.insert("index".into(), json!(0));
+                choice.insert(
+                    "finish_reason".into(),
+                    json!(finish_reason.raw.clone().unwrap_or_else(|| "stop".into())),
+                );
+                let mut obj = serde_json::Map::new();
+                obj.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
+                obj.insert("usage".into(), encode_usage(usage));
+                vec![Value::Object(obj)]
+            }
+        }
+    }
+
+    /// 构造一个 `chat.completion.chunk` 帧，携带记录的响应 id/model。
+    fn chunk_frame(&self, choice: serde_json::Map<String, Value>) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "id".into(),
+            json!(if self.id.is_empty() {
+                "chatcmpl-stream"
+            } else {
+                self.id.as_str()
+            }),
+        );
+        obj.insert("object".into(), json!("chat.completion.chunk"));
+        obj.insert("model".into(), json!(self.model));
+        obj.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
+        Value::Object(obj)
+    }
 }
 
 // ---- 错误编码 ----
@@ -790,5 +1118,205 @@ mod tests {
             decode_request(&wire),
             Err(DecodeError::UnknownRole { index: 0 })
         ));
+    }
+
+    /// 黄金样例流式往返：解码流式 chunk → 累积，与非流式 `response.json` 解码结果同构。
+    #[test]
+    fn stream_fixture_accumulates_to_response() {
+        use crate::core::stream::StreamAccumulator;
+
+        let mut decoder = StreamDecoder::default();
+        let mut accumulator = StreamAccumulator::new();
+
+        let frames = [
+            include_str!("__fixtures__/stream_text_1.json"),
+            include_str!("__fixtures__/stream_text_2.json"),
+            include_str!("__fixtures__/stream_tool_start.json"),
+            include_str!("__fixtures__/stream_tool_args.json"),
+            include_str!("__fixtures__/stream_finish.json"),
+        ];
+        for raw in frames {
+            let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+            for event in decoder.process(&wire).events {
+                accumulator.push(event);
+            }
+        }
+        let streamed = accumulator.finish();
+
+        // 非流式黄金样例：response.json（同一文本 + 一个 tool_call + usage）。
+        let raw = include_str!("__fixtures__/response.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let non_stream = decode_response(&wire).expect("fixture 应可解码");
+
+        // 同构：流式累积结果与非流式解码完全一致（text + tool-call + usage + finish_reason）。
+        assert_eq!(streamed, non_stream);
+    }
+
+    /// 上游流式 chunk 解码为 IR 流事件：text delta → text-delta，finish 帧带 usage。
+    #[test]
+    fn stream_chunk_decodes_to_ir_events() {
+        let text_chunk = json!({
+            "id": "chatcmpl-9", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "Hel" } }]
+        });
+        let decoded = StreamDecoder::default().process(&text_chunk);
+        assert!(decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![
+                StreamEvent::ResponseMetadata {
+                    id: "chatcmpl-9".to_string(),
+                    model: "gpt-4o".to_string(),
+                },
+                // 首帧带 role，开启文本块。
+                StreamEvent::TextStart {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::TextDelta {
+                    id: "0".to_string(),
+                    delta: "Hel".to_string(),
+                    provider_options: HashMap::new(),
+                },
+            ]
+        );
+
+        let finish_chunk = json!({
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+        });
+        let decoded = StreamDecoder::default().process(&finish_chunk);
+        assert!(!decoded.is_output);
+        assert_eq!(decoded.events.len(), 1);
+        match &decoded.events[0] {
+            StreamEvent::Finish {
+                finish_reason,
+                usage,
+                ..
+            } => {
+                assert_eq!(finish_reason.unified, FinishReasonUnified::Stop);
+                assert_eq!(usage.input_tokens, 5);
+                assert_eq!(usage.output_tokens, 2);
+            }
+            other => panic!("应产出 Finish 事件，实际 {other:?}"),
+        }
+    }
+
+    /// usage 独立末帧（`include_usage` 真实帧型：choices 为空、仅带 usage）仍产出
+    /// Finish，保证计费不漏采。
+    #[test]
+    fn usage_only_frame_emits_finish() {
+        // 真实 OpenAI 把 usage 放在独立末帧，choices 为空数组。
+        let usage_chunk = json!({
+            "id": "chatcmpl-9", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+        });
+        let decoded = StreamDecoder::default().process(&usage_chunk);
+        // 帧含 id/model，先产出 ResponseMetadata，再产出 Finish。
+        assert_eq!(
+            decoded.events.len(),
+            2,
+            "usage-only 帧应产出 ResponseMetadata + Finish"
+        );
+        match &decoded.events[1] {
+            StreamEvent::Finish { usage, .. } => {
+                assert_eq!(usage.input_tokens, 5);
+                assert_eq!(usage.output_tokens, 2);
+            }
+            other => panic!("应产出 Finish 事件，实际 {other:?}"),
+        }
+    }
+
+    /// usage 独立末帧复用先前帧的 finish_reason（真实流 finish 与 usage 分离）。
+    #[test]
+    fn usage_only_frame_reuses_finish_reason() {
+        let finish_chunk = json!({
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+        });
+        let usage_chunk = json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+        });
+        let mut decoder = StreamDecoder::default();
+        decoder.process(&finish_chunk);
+        let decoded = decoder.process(&usage_chunk);
+        match decoded.events.last().expect("应产出 Finish") {
+            StreamEvent::Finish { finish_reason, .. } => {
+                assert_eq!(finish_reason.unified, FinishReasonUnified::ToolCalls);
+                assert_eq!(finish_reason.raw.as_deref(), Some("tool_calls"));
+            }
+            other => panic!("应产出 Finish 事件，实际 {other:?}"),
+        }
+    }
+
+    /// 工具调用跨多帧累积：首帧带 id 与 name，后续帧只带 arguments 片段。
+    #[test]
+    fn stream_tool_call_deltas_accumulate() {
+        let first = json!({
+            "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": { "name": "get_weather", "arguments": "" }
+            }] } }]
+        });
+        let second = json!({
+            "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                "index": 0, "function": { "arguments": r#"{"city":"SF"}"# }
+            }] } }]
+        });
+
+        let mut decoder = StreamDecoder::default();
+        let first_events = decoder.process(&first).events;
+        let second_events = decoder.process(&second).events;
+        assert!(matches!(
+            &first_events[0],
+            StreamEvent::ToolInputStart { id, tool_name, .. }
+                if id == "call_1" && tool_name == "get_weather"
+        ));
+        assert!(matches!(
+            &second_events[0],
+            StreamEvent::ToolInputDelta { id, delta, .. }
+                if id == "call_1" && delta == r#"{"city":"SF"}"#
+        ));
+    }
+
+    /// IR 流事件编码为入站 chunk 帧：首帧 text 带 role，finish 帧带 usage。
+    #[test]
+    fn stream_events_encode_to_chunk_frames() {
+        let mut encoder = StreamEncoder::default();
+        let frames = encoder.encode(&StreamEvent::TextStart {
+            id: "0".to_string(),
+            provider_options: HashMap::new(),
+        });
+        assert!(frames.is_empty(), "text-start 不应产出帧");
+
+        let frames = encoder.encode(&StreamEvent::TextDelta {
+            id: "0".to_string(),
+            delta: "Hi".to_string(),
+            provider_options: HashMap::new(),
+        });
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["object"], "chat.completion.chunk");
+        assert_eq!(frames[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hi");
+
+        let frames = encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: Some("stop".to_string()),
+            },
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                raw: None,
+            },
+            provider_metadata: HashMap::new(),
+        });
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["choices"][0]["finish_reason"], "stop");
+        assert_eq!(frames[0]["usage"]["completion_tokens"], 2);
+        assert_eq!(frames[0]["usage"]["prompt_tokens"], 3);
     }
 }

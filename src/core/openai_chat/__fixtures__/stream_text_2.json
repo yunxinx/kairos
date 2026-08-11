@@ -1,0 +1,12 @@
+{
+  "id": "chatcmpl-123",
+  "object": "chat.completion.chunk",
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "delta": { "content": "sunny and 72F." },
+      "finish_reason": null
+    }
+  ]
+}

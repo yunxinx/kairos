@@ -1,0 +1,12 @@
+{
+  "id": "chatcmpl-123",
+  "object": "chat.completion.chunk",
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "delta": { "role": "assistant", "content": "The weather in San Francisco is " },
+      "finish_reason": null
+    }
+  ]
+}

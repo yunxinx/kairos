@@ -14,9 +14,13 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event as SseEvent, Sse},
+    },
     routing::post,
 };
+use futures_util::Stream;
 use serde_json::Value;
 use sqlx::SqlitePool;
 
@@ -24,8 +28,9 @@ use crate::{
     config::{Channel, Config, Price, Token},
     core::billing,
     core::billing::PriceSnapshot,
-    core::ir::Usage,
+    core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage},
     core::openai_chat,
+    core::stream::StreamAccumulator,
     store,
 };
 
@@ -113,19 +118,7 @@ async fn chat_completions(
         }
     };
 
-    // 非流式范围：本票拒绝 stream=true。
-    if request.stream {
-        let message = "流式请求（stream=true）尚未支持，本票仅覆盖非流式";
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            message,
-            &deps,
-            Some(token),
-            Some(&request.model),
-            started,
-        )
-        .await;
-    }
+    let is_stream = request.stream;
 
     // 3. 准入：模型必须有候选渠道。
     let channel = match select_channel(&deps.channels, &request.model) {
@@ -210,8 +203,137 @@ async fn chat_completions(
         }
     }
 
-    // 5. 出站：编码 IR 为出站协议，调用上游。
-    let outbound = openai_chat::encode_request(&request);
+    // 5. 出站：按流式/非流式分支处理。
+    if is_stream {
+        stream_completion(&deps, &request, channel, token, price, started).await
+    } else {
+        // 非流式：编码 IR 为出站协议，调用上游。
+        let outbound = openai_chat::encode_request(&request);
+        let upstream_url = format!(
+            "{}/chat/completions",
+            channel.base_url.trim_end_matches('/')
+        );
+
+        let upstream = deps
+            .client
+            .post(&upstream_url)
+            .bearer_auth(&channel.api_key)
+            .json(&outbound)
+            .send()
+            .await;
+
+        match upstream {
+            Ok(resp) => {
+                let status = resp.status();
+                let status_code = status.as_u16();
+                let upstream_body = resp.text().await.unwrap_or_default();
+                let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+
+                if status.is_success() {
+                    // 6. 响应：解码上游响应为 IR，结算费用，再重编码为入站协议返回。
+                    match openai_chat::decode_response(&parsed) {
+                        Ok(ir) => {
+                            let usage = &ir.usage;
+                            let cost = billing::cost_micros(usage, &price);
+                            // 成功且 usage 非零才结算；失败或零输出不扣费。
+                            if cost > 0
+                                && let Err(err) =
+                                    store::settle_charge(&mut conn, &token.key, cost).await
+                            {
+                                eprintln!("结算失败: {err}");
+                            }
+                            let inbound = openai_chat::encode_response(&ir);
+                            log_request(
+                                &deps,
+                                token,
+                                &request.model,
+                                &channel.name,
+                                status_code,
+                                started,
+                                Billing {
+                                    usage: usage.clone(),
+                                    price,
+                                    cost_usd_micros: cost,
+                                },
+                            )
+                            .await;
+                            Json(inbound).into_response()
+                        }
+                        Err(err) => {
+                            let message = format!("上游响应无法解析: {err}");
+                            error_response(
+                                StatusCode::BAD_GATEWAY,
+                                &message,
+                                &deps,
+                                Some(token),
+                                Some(&request.model),
+                                started,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    // 上游错误：状态码原样 + OpenAI 错误格式（可解析则透传，否则合成）。
+                    let body = if parsed.is_object() {
+                        parsed
+                    } else {
+                        openai_chat::encode_error(status_code, "上游返回了非标准错误响应")
+                    };
+                    log_request(
+                        &deps,
+                        token,
+                        &request.model,
+                        &channel.name,
+                        status_code,
+                        started,
+                        Billing {
+                            usage: Usage::default(),
+                            price: PriceSnapshot::default(),
+                            cost_usd_micros: 0,
+                        },
+                    )
+                    .await;
+                    (status, Json(body)).into_response()
+                }
+            }
+            Err(_) => {
+                let message = "上游不可达";
+                error_response(
+                    StatusCode::BAD_GATEWAY,
+                    message,
+                    &deps,
+                    Some(token),
+                    Some(&request.model),
+                    started,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// 流式出站：IR 完整路径处理 SSE 全链路。
+///
+/// 编码 IR 请求并注入 `stream_options.include_usage`，向上游发起流式请求；
+/// 逐 SSE 帧解码为 IR 流事件，累积为 `ChatResponse` 以取 usage 计费，同时
+/// 重编码为入站协议 SSE 帧流回下游。流结束后按累积 usage 结算并落日志。
+async fn stream_completion(
+    deps: &Deps,
+    request: &ChatRequest,
+    channel: &Channel,
+    token: &Token,
+    price: PriceSnapshot,
+    started: i64,
+) -> Response {
+    let mut outbound = openai_chat::encode_request(request);
+    // 目标性 JSON 补丁：请求流式并请求 usage（对齐 AI SDK doStream 的注入）。
+    if let Value::Object(map) = &mut outbound {
+        map.insert("stream".into(), Value::Bool(true));
+        map.insert(
+            "stream_options".into(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
     let upstream_url = format!(
         "{}/chat/completions",
         channel.base_url.trim_end_matches('/')
@@ -225,93 +347,241 @@ async fn chat_completions(
         .send()
         .await;
 
-    match upstream {
-        Ok(resp) => {
-            let status = resp.status();
-            let status_code = status.as_u16();
-            let upstream_body = resp.text().await.unwrap_or_default();
-            let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
-
-            if status.is_success() {
-                // 6. 响应：解码上游响应为 IR，结算费用，再重编码为入站协议返回。
-                match openai_chat::decode_response(&parsed) {
-                    Ok(ir) => {
-                        let usage = &ir.usage;
-                        let cost = billing::cost_micros(usage, &price);
-                        // 成功且 usage 非零才结算；失败或零输出不扣费。
-                        if cost > 0
-                            && let Err(err) =
-                                store::settle_charge(&mut conn, &token.key, cost).await
-                        {
-                            eprintln!("结算失败: {err}");
-                        }
-                        let inbound = openai_chat::encode_response(&ir);
-                        log_request(
-                            &deps,
-                            token,
-                            &request.model,
-                            &channel.name,
-                            status_code,
-                            started,
-                            Billing {
-                                usage: usage.clone(),
-                                price,
-                                cost_usd_micros: cost,
-                            },
-                        )
-                        .await;
-                        Json(inbound).into_response()
-                    }
-                    Err(err) => {
-                        let message = format!("上游响应无法解析: {err}");
-                        error_response(
-                            StatusCode::BAD_GATEWAY,
-                            &message,
-                            &deps,
-                            Some(token),
-                            Some(&request.model),
-                            started,
-                        )
-                        .await
-                    }
-                }
-            } else {
-                // 上游错误：状态码原样 + OpenAI 错误格式（可解析则透传，否则合成）。
-                let body = if parsed.is_object() {
-                    parsed
-                } else {
-                    openai_chat::encode_error(status_code, "上游返回了非标准错误响应")
-                };
-                log_request(
-                    &deps,
-                    token,
-                    &request.model,
-                    &channel.name,
-                    status_code,
-                    started,
-                    Billing {
-                        usage: Usage::default(),
-                        price: PriceSnapshot::default(),
-                        cost_usd_micros: 0,
-                    },
-                )
-                .await;
-                (status, Json(body)).into_response()
-            }
-        }
+    let resp = match upstream {
+        Ok(resp) => resp,
         Err(_) => {
-            let message = "上游不可达";
-            error_response(
+            let message = "流式上游不可达";
+            return error_response(
                 StatusCode::BAD_GATEWAY,
                 message,
-                &deps,
+                deps,
                 Some(token),
                 Some(&request.model),
                 started,
             )
-            .await
+            .await;
+        }
+    };
+
+    let status = resp.status();
+    let status_code = status.as_u16();
+    // 上游非 2xx：SSE 流此时尚未开始，直接按错误处理。
+    if !status.is_success() {
+        let upstream_body = resp.text().await.unwrap_or_default();
+        let body = serde_json::from_str::<Value>(&upstream_body)
+            .unwrap_or_else(|_| openai_chat::encode_error(status_code, "上游返回了非标准错误响应"));
+        log_request(
+            deps,
+            token,
+            &request.model,
+            &channel.name,
+            status_code,
+            started,
+            Billing {
+                usage: Usage::default(),
+                price: PriceSnapshot::default(),
+                cost_usd_micros: 0,
+            },
+        )
+        .await;
+        return (status, Json(body)).into_response();
+    }
+
+    // 逐上游 SSE 帧处理：解码 → 累积（计费）→ 重编码为入站 SSE 帧。
+    // 在派生任务中消费上游字节流并推送到 mpsc 通道，主函数把通道接成 SSE 响应。
+    let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
+    let byte_stream = resp.bytes_stream();
+    let ctx = StreamTask {
+        deps: deps.clone(),
+        token: token.clone(),
+        request: request.clone(),
+        channel: channel.clone(),
+        status_code,
+        started,
+        price,
+    };
+    tokio::spawn(async move {
+        pipe_stream(byte_stream, tx, ctx).await;
+    });
+
+    let stream = tokio_stream_patch(rx);
+    Sse::new(stream).into_response()
+}
+
+/// 流式请求的共享任务数据：出站目标、计费与日志所需的请求侧信息。
+#[derive(Clone)]
+struct StreamTask {
+    deps: Deps,
+    token: Token,
+    request: ChatRequest,
+    channel: Channel,
+    status_code: u16,
+    started: i64,
+    price: PriceSnapshot,
+}
+
+/// 把上游 SSE 字节流逐帧解码 → 累积 → 重编码，推送到下游通道。
+///
+/// 每收到一个完整 SSE 数据帧，解码为 IR 流事件并累积（供计费），同时重编码为
+/// 入站协议 chunk 帧推给下游。上游流结束时按累积 usage 结算并落日志。
+async fn pipe_stream<S>(byte_stream: S, tx: tokio::sync::mpsc::Sender<SseEvent>, ctx: StreamTask)
+where
+    S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+{
+    use futures_util::StreamExt as _;
+
+    let mut decoder = openai_chat::StreamDecoder::default();
+    let mut encoder = openai_chat::StreamEncoder::default();
+    let mut accumulator = StreamAccumulator::new();
+    // 以字节缓冲、帧边界后再转文本：多字节 UTF-8 可能被拆在两个字节块里，
+    // 提前转换会截坏字符。
+    let mut sse_buffer: Vec<u8> = Vec::new();
+    let mut saw_finish = false;
+    let mut downstream_open = true;
+    let mut byte_stream = Box::pin(byte_stream);
+
+    loop {
+        // 尝试从已缓冲字节提取完整 SSE 数据帧。
+        if let Some((frame, rest)) = take_sse_frame(&sse_buffer) {
+            sse_buffer = rest;
+            // 空载荷帧（keep-alive 注释、[DONE] 哨兵）直接消费。
+            if frame.is_empty() {
+                continue;
+            }
+            let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
+            let decoded = decoder.process(&chunk);
+            for event in &decoded.events {
+                if matches!(event, StreamEvent::Finish { .. }) {
+                    saw_finish = true;
+                }
+                accumulator.push(event.clone());
+                if downstream_open {
+                    for frame_value in encoder.encode(event) {
+                        let data = serde_json::to_string(&frame_value).unwrap_or_default();
+                        if tx.send(SseEvent::default().data(data)).await.is_err() {
+                            // 下游断开：停止发送，但继续消费上游直至结算。
+                            downstream_open = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        // 缓冲不足一帧：从上游读取更多字节。
+        match byte_stream.next().await {
+            Some(Ok(bytes)) => sse_buffer.extend_from_slice(&bytes),
+            Some(Err(_)) | None => {
+                // 流结束：若上游未发 finish 帧（异常中断），补发一个。
+                let response = accumulator.finish();
+                if !saw_finish && downstream_open {
+                    let finish_event = StreamEvent::Finish {
+                        finish_reason: response.finish_reason.clone(),
+                        usage: response.usage.clone(),
+                        provider_metadata: response.provider_metadata.clone(),
+                    };
+                    for frame_value in encoder.encode(&finish_event) {
+                        let data = serde_json::to_string(&frame_value).unwrap_or_default();
+                        if tx.send(SseEvent::default().data(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                // 先结算再发终止哨兵：下游读到 [DONE] 时计费必定已落库。
+                settle_and_log(&ctx, response).await;
+                // OpenAI 协议约定：数据流以 `data: [DONE]` 结束，下游 SDK 依此识别流终止。
+                if downstream_open {
+                    let _ = tx.send(SseEvent::default().data("[DONE]")).await;
+                }
+                return;
+            }
         }
     }
+}
+
+/// 把 tokio mpsc 接收端适配为 axum SSE 可消费的流。
+///
+/// axum 的 `Sse` 需要 `Stream<Item = Result<Event, E>>`；这里把 `Receiver` 的一
+/// 个个事件包成 `Ok`。通道关闭（发送端 drop）即流结束。
+fn tokio_stream_patch(
+    mut rx: tokio::sync::mpsc::Receiver<SseEvent>,
+) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> + Send + 'static {
+    async_stream::stream! {
+        while let Some(event) = rx.recv().await {
+            yield std::result::Result::Ok(event) as Result<SseEvent, std::convert::Infallible>;
+        }
+    }
+}
+
+/// 从 SSE 缓冲中取出一帧 `data:` 内容；不足一帧返回 `None`。
+///
+/// Chat Completions 帧以空行分隔（`\n\n`，兼容 `\r\n\r\n`）。返回该帧的数据
+/// 载荷与剩余缓冲；keep-alive 注释行（`:` 开头）、空数据与 `[DONE]` 哨兵
+/// 同样消费该帧但返回空载荷。全程字节操作，避免在帧边界前转换文本截坏
+/// 跨块的多字节 UTF-8。
+fn take_sse_frame(buffer: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| (p, 4));
+    let lf = buffer.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
+    let (end, sep) = match (crlf, lf) {
+        (Some(a), Some(b)) => {
+            if a.0 <= b.0 {
+                a
+            } else {
+                b
+            }
+        }
+        (Some(x), None) | (None, Some(x)) => x,
+        (None, None) => return None,
+    };
+    let frame_text = &buffer[..end];
+    let rest = buffer[end + sep..].to_vec();
+
+    // 提取所有 data 行，跳过空数据与结束哨兵。
+    let data_lines: Vec<&[u8]> = frame_text
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            line.strip_prefix(b"data:").map(<[u8]>::trim_ascii)
+        })
+        .filter(|d| !d.is_empty() && *d != b"[DONE]")
+        .collect();
+    Some((data_lines.join(&b'\n'), rest))
+}
+
+/// 结算流式请求费用并落日志。
+async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
+    let usage = &response.usage;
+    let cost = billing::cost_micros(usage, &ctx.price);
+    if cost > 0 {
+        let mut conn = match ctx.deps.pool.acquire().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                eprintln!("流式结算连接失败: {err}");
+                return;
+            }
+        };
+        if let Err(err) = store::settle_charge(&mut conn, &ctx.token.key, cost).await {
+            eprintln!("流式结算失败: {err}");
+        }
+    }
+    log_request(
+        &ctx.deps,
+        &ctx.token,
+        &ctx.request.model,
+        &ctx.channel.name,
+        ctx.status_code,
+        ctx.started,
+        Billing {
+            usage: response.usage.clone(),
+            price: ctx.price,
+            cost_usd_micros: cost,
+        },
+    )
+    .await;
 }
 
 /// 从请求头提取并校验令牌 key，返回匹配的令牌。

@@ -6,6 +6,7 @@
 mod common;
 
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 /// 有效令牌 + mock 上游成功：断言出站请求体、下游响应、SQLite 日志。
@@ -198,10 +199,31 @@ async fn upstream_error_status_is_passthrough() {
     assert_eq!(rows[0].0, 429);
 }
 
-/// 流式请求在非流式范围内被拒绝（400）。
+/// 流式请求经 IR 完整路径返回 SSE：mock 上游以 SSE 流响应，下游逐帧收到
+/// `chat.completion.chunk`，且 SQLite 落流式计费日志。
 #[tokio::test]
-async fn stream_request_is_rejected_400() {
-    let gw = TestGateway::start().await;
+async fn stream_request_returns_sse_and_logs() {
+    let mut gw = TestGateway::start().await;
+
+    // mock 上游以 SSE 流返回：两个文本增量帧 + 一个 finish 帧（含 usage）。
+    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-s", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "Hel" } }]
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-s", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "content": "lo" } }]
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-s", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+        }))
+        .unwrap(),
+    ]));
 
     let client = reqwest::Client::new();
     let resp = client
@@ -215,12 +237,62 @@ async fn stream_request_is_rejected_400() {
         .send()
         .await
         .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "流式应 200");
 
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::BAD_REQUEST,
-        "流式应 400"
+    // 消费 SSE 帧，累积文本与 usage。
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        content_type.contains("text/event-stream"),
+        "应返回 SSE，实际 {content_type}"
     );
+
+    let mut text = String::new();
+    let mut saw_finish_usage = false;
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("响应流应可读");
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        // 按空行切分完整帧，保留尾部可能不完整的数据。
+        while let Some(end) = buffer.find("\n\n") {
+            let frame: String = buffer.drain(..end + 2).collect();
+            for line in frame.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(data).unwrap_or(Value::Null);
+                    if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+                        text.push_str(delta);
+                    }
+                    if value["usage"].is_object() {
+                        saw_finish_usage = true;
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(text, "Hello", "应累积出完整文本");
+    assert!(saw_finish_usage, "finish 帧应携带 usage");
+
+    // 流式计费落库：usage 10/2 → input 10 × 2.5 + output 2 × 10 = 25 + 20 = 45 micro-USD。
+    let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_micros \
+         FROM request_log",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应落一条流式日志");
+    assert_eq!(row.0, 10);
+    assert_eq!(row.1, 2);
+    assert_eq!(row.4, 45);
 }
 
 /// 别名匹配查短名（key）：短名命中渠道，别名指向的上游真实名不命中。

@@ -6,3 +6,4 @@
 pub mod billing;
 pub mod ir;
 pub mod openai_chat;
+pub mod stream;

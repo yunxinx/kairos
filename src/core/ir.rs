@@ -170,3 +170,91 @@ pub struct ChatResponse {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub provider_metadata: ProviderOptions,
 }
+
+/// 流式事件（IR 侧）：start/delta/end 成对事件 + 生命周期事件。
+///
+/// 形状遵循 ADR-0001 与 AI SDK `LanguageModelV4StreamPart`：text/reasoning/
+/// tool-input 三类 content 各以 start/delta/end 成对出现，tool-call 在 input
+/// 汇聚完成后单发，生命周期事件含 stream-start/response-metadata/finish。
+/// 流式与非流式同构——`StreamAccumulator` 可将流无损归约为 `ChatResponse`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamEvent {
+    /// 文本块开始。
+    TextStart {
+        id: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 文本增量。
+    TextDelta {
+        id: String,
+        delta: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 文本块结束。
+    TextEnd {
+        id: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 推理块开始。
+    ReasoningStart {
+        id: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 推理增量。
+    ReasoningDelta {
+        id: String,
+        delta: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 推理块结束。
+    ReasoningEnd {
+        id: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 工具输入开始，携带工具名。
+    ToolInputStart {
+        id: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 工具输入增量（arguments 字符串片段）。
+    ToolInputDelta {
+        id: String,
+        delta: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 工具输入结束。
+    ToolInputEnd {
+        id: String,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 工具调用完成时单发，`input` 为已解析的 JSON 值。
+    ToolCall {
+        tool_call_id: String,
+        tool_name: String,
+        input: Value,
+        #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+        provider_options: ProviderOptions,
+    },
+    /// 生命周期：流开始。
+    StreamStart,
+    /// 生命周期：响应元数据（id/model）。
+    ResponseMetadata { id: String, model: String },
+    /// 生命周期：流结束，携带 finish_reason 与 usage。
+    Finish {
+        finish_reason: FinishReason,
+        usage: Usage,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        provider_metadata: ProviderOptions,
+    },
+}
