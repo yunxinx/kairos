@@ -7,9 +7,8 @@
 *.db-wal
 *.db-shm
 
-# 本地运行配置（含上游密钥与下游令牌，禁止入库）
-/config.json
-/kairos.json
+# 本地运行目录 .kairos/（配置文件与数据库，含上游密钥与下游令牌，禁止入库）
+/.kairos/
 
 # 运行时日志
 *.log

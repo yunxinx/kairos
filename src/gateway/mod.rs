@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::State,
-    http::{HeaderValue, header::CONTENT_TYPE},
+    http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::post,
 };
@@ -46,7 +46,13 @@ pub fn router(pool: SqlitePool, upstream_base: String) -> Router {
 
     Router::new()
         .route("/v1/chat/completions", post(relay))
+        .fallback(not_found)
         .with_state(deps)
+}
+
+/// 未实现路径的确定响应：404 + 可读提示。
+async fn not_found() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_FOUND, "路径未实现")
 }
 
 /// 流式转发端点：将入站 body 透传给上游，上游的 SSE 字节流以 `text/event-stream`

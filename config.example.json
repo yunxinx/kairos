@@ -1,0 +1,30 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 8787 },
+  "database": { "path": "./kairos.db" },
+  "logging": { "full_body": false },
+  "tokens": [
+    { "key": "sk-kairos-dev-token", "name": "dev", "limit_usd": 50.0, "balance_usd": 5.0 }
+  ],
+  "channels": [
+    {
+      "name": "openai-main",
+      "protocol": "openai_chat",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "sk-example",
+      "models": ["gpt-4o"],
+      "model_aliases": { "fast": "gpt-4o-mini" },
+      "priority": 1,
+      "weight": 1,
+      "timeout_ms": 120000,
+      "max_retries": 2
+    }
+  ],
+  "prices": {
+    "gpt-4o": {
+      "input": 2.5,
+      "output": 10.0,
+      "cache_read": 1.25,
+      "cache_write": 10.0
+    }
+  }
+}
