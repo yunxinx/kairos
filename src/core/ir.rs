@@ -82,6 +82,27 @@ pub enum MediaSource {
     Url { url: String },
 }
 
+/// 从 data URL 提取 `(media_type, base64 载荷)`；非 data URL 返回 `None`。
+///
+/// data URL 形如 `data:<media_type>;base64,<base64 字节>`。`;base64` 标记缺失时
+/// 按明文载荷容忍处理（缺省 media_type 空串），进出拼装对称故往返不受影响。
+/// 三种协议出站把 `MediaSource::Data` 拼回 data URL 时共用同一拆分，保证
+/// 拆分/拼装互为逆运算。
+pub fn split_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, base64) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64").unwrap_or_default().to_string();
+    Some((media_type, base64.to_string()))
+}
+
+/// 媒体类型顶层段（`image/png` → `image`）；无 `/` 时原样返回。
+///
+/// 对齐 AI SDK `getTopLevelMediaType`：目标协议按顶层段判定媒体类别（Anthropic
+/// 据此分派 `image`/`document`，Responses 据此分派 `input_image`/`input_file`）。
+pub fn top_level_media_type(media_type: &str) -> &str {
+    media_type.split('/').next().unwrap_or(media_type)
+}
+
 /// 消息内容 part 枚举。`type` 为 serde tag，序列化为 `snake_case`。
 ///
 /// `media` 由 ADR-0001 预留的占位演进为携带真实载荷的媒体 part（形状演进

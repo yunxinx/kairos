@@ -7,8 +7,9 @@
 //! `anthropic-messages-language-model.ts`：
 //! - 请求侧：首个 system 消息提升为顶层 `system`；assistant 内容块
 //!   `text`/`thinking`/`redacted_thinking`/`tool_use` 与 user 内容块
-//!   `text`/`tool_result` 双向映射；thinking signature 经 part 逃生舱
-//!   `provider_options["anthropic"]["signature"]` 无损往返。
+//!   `text`/`tool_result`/`image`/`document`（base64/URL source）双向映射；
+//!   thinking signature 经 part 逃生舱 `provider_options["anthropic"]["signature"]`
+//!   无损往返。
 //! - 响应侧：`stop_reason` 双轨映射，usage 输入侧为「input 不含缓存、
 //!   缓存单独计」的加法约定（与口径一致）。
 //! - 流式：事件名驱动的 SSE（`event:` 名），`signature_delta` 以零长增量携带
@@ -126,6 +127,43 @@ enum WireBlock {
         content: Option<Value>,
         #[serde(default)]
         is_error: Option<bool>,
+    },
+    /// 媒体内容块：`image`（图片）或 `document`（文档）。source 可为
+    /// base64 字节、URL 或 provider 托管引用（`file_id`/`text`）。
+    Image {
+        #[serde(default)]
+        source: Option<WireMediaSource>,
+    },
+    Document {
+        #[serde(default)]
+        source: Option<WireMediaSource>,
+    },
+}
+
+/// Anthropic 媒体 source：`base64`/`url` 两种网关承载载体，`file`（托管引用）
+/// 与 `text`（纯文本文档）经逃生舱回传。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WireMediaSource {
+    Base64 {
+        #[serde(default)]
+        media_type: Option<String>,
+        #[serde(default)]
+        data: Option<String>,
+    },
+    Url {
+        #[serde(default)]
+        url: Option<String>,
+    },
+    File {
+        #[serde(default)]
+        file_id: Option<String>,
+    },
+    Text {
+        #[serde(default)]
+        media_type: Option<String>,
+        #[serde(default)]
+        data: Option<String>,
     },
 }
 
@@ -431,6 +469,8 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Vec<Message>, Deco
                     WireBlock::ToolResult { .. } => {
                         return Err(DecodeError::UnknownContentBlock { index });
                     }
+                    // assistant 消息不应携带媒体内容块；容错跳过（不产出）。
+                    WireBlock::Image { .. } | WireBlock::Document { .. } => {}
                 }
             }
             Ok(vec![Message {
@@ -496,6 +536,13 @@ fn decode_user(content: &WireContent, index: usize) -> Result<Vec<Message>, Deco
                     },
                 });
             }
+            WireBlock::Image { source } | WireBlock::Document { source } => {
+                let block_type = match block {
+                    WireBlock::Image { .. } => "image",
+                    _ => "document",
+                };
+                text_parts.push(decode_media_part(source, index, block_type)?);
+            }
             _ => return Err(DecodeError::UnknownContentBlock { index }),
         }
     }
@@ -531,6 +578,68 @@ impl WireContent {
             WireContent::Text(_) => Err(DecodeError::MissingContent { index }),
         }
     }
+}
+
+/// 解码 Anthropic 媒体 source 为 IR 媒体 part。
+///
+/// `base64` source → `MediaSource::Data`（media_type 缺省空串兜底）；`url` source →
+/// `MediaSource::Url`。`file`（provider 托管引用）与 `text`（纯文本文档）网关不
+/// 承载，以空 `MediaSource::Data` 占位跨协议族丢弃时记 warning（逃生舱哲学）。
+/// `block_type`（`image`/`document`）在缺省 media_type 时兜底为顶层段。
+fn decode_media_part(
+    source: &Option<WireMediaSource>,
+    index: usize,
+    block_type: &str,
+) -> Result<ContentPart, DecodeError> {
+    let (media_type, data, provider_options) = match source {
+        Some(WireMediaSource::Base64 {
+            media_type,
+            data: base64,
+        }) => (
+            media_type.clone().unwrap_or_else(|| block_type.to_string()),
+            crate::core::ir::MediaSource::Data {
+                base64: base64.clone().unwrap_or_default(),
+            },
+            HashMap::new(),
+        ),
+        Some(WireMediaSource::Url { url }) => (
+            block_type.to_string(),
+            crate::core::ir::MediaSource::Url {
+                url: url.clone().unwrap_or_default(),
+            },
+            HashMap::new(),
+        ),
+        Some(WireMediaSource::File { file_id }) => (
+            block_type.to_string(),
+            crate::core::ir::MediaSource::Data {
+                base64: String::new(),
+            },
+            [(
+                "anthropic".to_string(),
+                json!({ "media_source": "file", "file_id": file_id }),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        Some(WireMediaSource::Text { media_type, data }) => (
+            media_type.clone().unwrap_or_else(|| block_type.to_string()),
+            crate::core::ir::MediaSource::Data {
+                base64: String::new(),
+            },
+            [(
+                "anthropic".to_string(),
+                json!({ "media_source": "text", "data": data }),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        None => return Err(DecodeError::UnknownContentBlock { index }),
+    };
+    Ok(ContentPart::Media {
+        media_type,
+        data,
+        provider_options,
+    })
 }
 
 // ---- 出站编码：IR → wire 请求 ----
@@ -617,6 +726,17 @@ fn encode_messages(
     for message in ir_messages {
         match message.role {
             Role::System => {
+                // System 消息仅取文本；媒体等非文本 part 丢弃并记 warning。
+                for part in &message.content {
+                    if let ContentPart::Media { media_type, .. } = part {
+                        warnings.push(Warning::unsupported(
+                            "media",
+                            format!(
+                                "Anthropic Messages 系统消息不支持媒体内容（{media_type}），已丢弃"
+                            ),
+                        ));
+                    }
+                }
                 let text = text_parts(&message.content).unwrap_or_default();
                 if system_out.is_none() {
                     system_out = Some(text);
@@ -626,27 +746,27 @@ fn encode_messages(
                 }
             }
             Role::User => {
-                for part in &message.content {
-                    match part {
-                        ContentPart::Media { media_type, .. } => {
-                            warnings.push(Warning::unsupported(
-                                "media",
-                                format!(
-                                    "网关尚未实现 Anthropic 多模态媒体内容（{media_type}），已丢弃"
-                                ),
-                            ));
-                        }
-                        ContentPart::Custom { kind, .. } => {
-                            warnings.push(Warning::unsupported(
-                                "custom",
-                                format!("Anthropic Messages 不支持 {kind} 内容块，已丢弃"),
-                            ));
-                        }
-                        _ => {}
-                    }
+                let blocks = encode_user_blocks(&message.content, warnings);
+                if blocks.is_empty() {
+                    continue;
                 }
-                let text = text_parts(&message.content).unwrap_or_default();
-                push_user_text(&mut wire_messages, &text);
+                // 单一纯文本 user 消息编码为字符串（Anthropic 惯例，保持既有往返形状）；
+                // 含媒体等非文本 part 时按序编码为数组，保持文本与媒体混排顺序。
+                let single_text = (blocks.len() == 1)
+                    .then(|| blocks[0].get("type").and_then(Value::as_str))
+                    .flatten()
+                    .filter(|t| *t == "text")
+                    .map(|_| {
+                        blocks[0]
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    });
+                if let Some(text) = single_text {
+                    push_user_text(&mut wire_messages, text);
+                } else {
+                    push_user_blocks(&mut wire_messages, blocks);
+                }
             }
             Role::Assistant => {
                 let blocks = encode_assistant_blocks(&message.content, warnings);
@@ -700,12 +820,143 @@ fn push_user_text(wire_messages: &mut Vec<Value>, text: &str) {
         && last.get("role").and_then(Value::as_str) == Some("user")
         && let Some(content) = last.get("content").and_then(Value::as_str)
     {
-        // 连续 user 文本合并；以换保留消息边界，避免 "hi"+"there" 粘成 "hithere"。
+        // 连续 user 文本合并；以换行保留消息边界，避免 "hi"+"there" 粘成 "hithere"。
         let new_text = format!("{content}\n{text}");
         *last.get_mut("content").expect("已确认 content 为字符串") = json!(new_text);
         return;
     }
     wire_messages.push(json!({ "role": "user", "content": text }));
+}
+
+/// 以内容块数组追加 user 消息（媒体混排时保留顺序）。
+///
+/// 与 `push_user_text` 并存：纯文本走字符串形状，含媒体等非文本 part 时按序
+/// 编码为数组。与既有 user 文本消息合并时以换行分隔（保持消息边界）。
+fn push_user_blocks(wire_messages: &mut Vec<Value>, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(last) = wire_messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("user")
+        && let Some(content) = last.get("content").and_then(Value::as_str)
+    {
+        // 连续 user 文本合并；以换行保留消息边界，避免 "hi"+"there" 粘成 "hithere"。
+        let new_text = format!("{content}\n");
+        let mut new_blocks = Vec::new();
+        new_blocks.push(json!({ "type": "text", "text": new_text }));
+        new_blocks.extend(blocks);
+        *last.get_mut("content").expect("已确认 content 为字符串") = Value::Array(new_blocks);
+        return;
+    }
+    wire_messages.push(json!({ "role": "user", "content": Value::Array(blocks) }));
+}
+
+/// 编码 user 消息的内容块序列（文本与媒体混排保持顺序）。
+///
+/// 文本 → `text` 块；媒体 part → `image`/`document` 块（base64/URL source 按
+/// 数据源分派，媒体类型经顶层段判定）。目标协议不支持的媒体类型（非 image/
+/// application/text 顶层段）丢弃并记 warning。
+fn encode_user_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            ContentPart::Text { text, .. } => {
+                blocks.push(json!({ "type": "text", "text": text }));
+            }
+            ContentPart::Media {
+                media_type,
+                data,
+                provider_options,
+            } => {
+                if let Some(block) =
+                    encode_media_block(media_type, data, provider_options, warnings)
+                {
+                    blocks.push(block);
+                }
+            }
+            ContentPart::Custom { kind, .. } => {
+                warnings.push(Warning::unsupported(
+                    "custom",
+                    format!("Anthropic Messages 不支持 {kind} 内容块，已丢弃"),
+                ));
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// 编码单个 IR 媒体 part 为 Anthropic `image`/`document` 内容块。
+///
+/// 顶层段 `image` → `image` 块；`application`/`text` → `document` 块。base64
+/// 数据源 → `base64` source（media_type 缺省空串直接拼装）；URL 数据源 → `url`
+/// source。provider 托管形态（`file`/`text` source）经逃生舱回传。其余媒体类型
+/// 丢弃并记 warning。
+fn encode_media_block(
+    media_type: &str,
+    data: &crate::core::ir::MediaSource,
+    provider_options: &crate::core::ir::ProviderOptions,
+    warnings: &mut Vec<Warning>,
+) -> Option<Value> {
+    let top_level = crate::core::ir::top_level_media_type(media_type);
+    // `document` 为入站 document 块 URL/file source 的缺省占位 media_type
+    //（wire source 无 media_type 字段），必须放行否则往返断裂。
+    if top_level != "image"
+        && top_level != "application"
+        && top_level != "text"
+        && top_level != "document"
+    {
+        warnings.push(Warning::unsupported(
+            "media",
+            format!("Anthropic Messages 不支持 {top_level} 媒体类型（{media_type}），已丢弃"),
+        ));
+        return None;
+    }
+    let block_type = if top_level == "image" {
+        "image"
+    } else {
+        "document"
+    };
+
+    // provider 托管形态（file/text source）经逃生舱回传（同协议族无损）。
+    let anthropic = provider_options.get("anthropic");
+    if let Some(Value::String(media_source)) = anthropic.and_then(|a| a.get("media_source"))
+        && media_source == "file"
+    {
+        let file_id = anthropic
+            .and_then(|a| a.get("file_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Some(json!({
+            "type": block_type,
+            "source": { "type": "file", "file_id": file_id },
+        }));
+    }
+    if let Some(Value::String(media_source)) = anthropic.and_then(|a| a.get("media_source"))
+        && media_source == "text"
+    {
+        let text_data = anthropic
+            .and_then(|a| a.get("data"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Some(json!({
+            "type": block_type,
+            "source": { "type": "text", "media_type": media_type, "data": text_data },
+        }));
+    }
+
+    let source = match data {
+        crate::core::ir::MediaSource::Data { base64 } => json!({
+            "type": "base64",
+            "media_type": media_type,
+            "data": base64,
+        }),
+        crate::core::ir::MediaSource::Url { url } => json!({
+            "type": "url",
+            "url": url,
+        }),
+    };
+    Some(json!({ "type": block_type, "source": source }))
 }
 
 /// 把内容块追加到既有 wire 消息的 `content` 数组。
@@ -768,9 +1019,11 @@ fn encode_assistant_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -
                 }));
             }
             ContentPart::Media { media_type, .. } => {
+                // Anthropic 媒体内容块仅允许出现在 user 消息；assistant 侧媒体
+                // 非标准，跨协议族转换时丢弃并记 warning。
                 warnings.push(Warning::unsupported(
                     "media",
-                    format!("网关尚未实现 Anthropic 多模态媒体内容（{media_type}），已丢弃"),
+                    format!("Anthropic Messages 助手消息不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
@@ -1559,6 +1812,159 @@ mod tests {
         let reencoded = encode_request(&ir, &mut warnings);
         assert_eq!(reencoded, wire, "往返应还原 wire 请求");
         assert!(warnings.is_empty(), "同协议往返不应产出 warning");
+    }
+
+    /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。
+    ///
+    /// 覆盖 base64/URL 两种 source、image/document 两种块、6 part 混排顺序。
+    #[test]
+    fn multimodal_fixture_roundtrip() {
+        let raw = include_str!("__fixtures__/request_multimodal.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let ir = decode_request(&wire).expect("fixture 应可解码为 IR");
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "往返应还原 wire 请求（含混排顺序）");
+        assert!(warnings.is_empty(), "同协议图片/文档往返不应产出 warning");
+
+        // 混排顺序：text → 图片(base64) → text → 文档(base64) → text → 图片(URL)。
+        let parts = &ir.messages[0].content;
+        assert_eq!(parts.len(), 6, "应保留 6 个 part");
+        assert!(matches!(parts[0], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::Media {
+                media_type,
+                data: crate::core::ir::MediaSource::Data { base64 },
+                ..
+            } if media_type == "image/png" && base64 == "iVBORw0KGgoAAAANSUhEUg=="
+        ));
+        assert!(matches!(parts[2], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[3],
+            ContentPart::Media {
+                media_type,
+                data: crate::core::ir::MediaSource::Data { base64 },
+                ..
+            } if media_type == "application/pdf" && base64 == "JVBERi0xLjQK"
+        ));
+        assert!(matches!(parts[4], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[5],
+            ContentPart::Media {
+                data: crate::core::ir::MediaSource::Url { url },
+                ..
+            } if url == "https://example.com/image.png"
+        ));
+    }
+
+    /// URL source 的 image 块 decode → encode 往返：media_type 缺省空串，出站按
+    /// image 顶层段兜底为 `image` 块。
+    #[test]
+    fn url_image_roundtrips_with_default_media_type() {
+        let wire = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": { "type": "url", "url": "https://example.com/x.png" }
+                }]
+            }]
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Media {
+                data: crate::core::ir::MediaSource::Url { url },
+                ..
+            } if url == "https://example.com/x.png"
+        ));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "URL source 往返应还原 wire");
+        assert!(warnings.is_empty());
+    }
+
+    /// URL source 的 document 块 decode → encode 往返：media_type 缺省占位为
+    /// `document`，出站经顶层段放行还原为 document 块（不丢弃记 warning）。
+    #[test]
+    fn url_document_roundtrips_with_placeholder_media_type() {
+        let wire = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "document",
+                    "source": { "type": "url", "url": "https://example.com/doc.pdf" }
+                }]
+            }]
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Media {
+                media_type,
+                data: crate::core::ir::MediaSource::Url { url },
+                ..
+            } if media_type == "document" && url == "https://example.com/doc.pdf"
+        ));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "document URL source 往返应还原 wire");
+        assert!(warnings.is_empty(), "document URL 往返不应记 warning");
+    }
+
+    /// 目标协议不支持的媒体类型（非 image/application/text 顶层段）出站时丢弃并记 warning。
+    #[test]
+    fn unsupported_media_is_dropped_with_warning() {
+        use crate::core::ir::Message;
+        let request = ChatRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::Media {
+                    media_type: "video/mp4".to_string(),
+                    data: crate::core::ir::MediaSource::Url {
+                        url: "https://example.com/v.mp4".to_string(),
+                    },
+                    provider_options: HashMap::new(),
+                }],
+                provider_options: HashMap::new(),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: Some(100),
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            provider_options: HashMap::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        // 非支持媒体被丢弃：user 消息整体跳过（无内容可编码）。
+        assert!(
+            encoded["messages"]
+                .as_array()
+                .map(Vec::is_empty)
+                .unwrap_or(true),
+            "全 media 丢弃后 user 消息应整体跳过"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, Warning::Unsupported { feature, .. } if feature == "media")),
+            "媒体丢弃应记 warning"
+        );
     }
 
     /// 黄金样例响应 decode → encode 往返还原 wire。

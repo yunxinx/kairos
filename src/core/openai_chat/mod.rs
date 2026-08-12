@@ -475,10 +475,7 @@ fn decode_user_part(part: &WireContentPart, index: usize) -> Result<ContentPart,
 /// data URL 形如 `data:<media_type>;base64,<base64 字节>`；`media_type` 缺省时
 /// 以空串占位（出站编码时按目标协议兜底）。远程 URL 原样保留。
 fn split_data_url(url: &str) -> (String, MediaSource) {
-    if let Some(rest) = url.strip_prefix("data:")
-        && let Some((meta, base64)) = rest.split_once(',')
-    {
-        let media_type = meta.strip_suffix(";base64").unwrap_or_default().to_string();
+    if let Some((media_type, base64)) = crate::core::ir::split_data_url(url) {
         return (
             media_type,
             MediaSource::Data {
@@ -497,7 +494,7 @@ fn split_data_url(url: &str) -> (String, MediaSource) {
 
 /// 顶层媒体段是否为图片（对齐 AI SDK `getTopLevelMediaType`）。
 fn is_image_media(media_type: &str) -> bool {
-    media_type.split('/').next().unwrap_or(media_type) == "image"
+    crate::core::ir::top_level_media_type(media_type) == "image"
 }
 
 // ---- 出站编码：IR → wire 请求 ----

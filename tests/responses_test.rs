@@ -565,6 +565,160 @@ async fn responses_inbound_error_uses_responses_shape() {
     assert!(gw.upstream.received().is_empty(), "未认证不应出站");
 }
 
+/// Responses 入站 → openai_chat 渠道：多模态跨协议转换。
+///
+/// 入站 input_image/input_file 解码为 IR 媒体 part，出站重编码为 OpenAI chat
+/// `image_url`（data URL / 远程 URL）；非图片媒体（input_file 文档）在 chat 出站
+/// 丢弃并记 warning。
+#[tokio::test]
+async fn responses_inbound_multimodal_to_openai_chat() {
+    let mut gw = TestGateway::start().await; // 默认 openai_chat 渠道。
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-mm", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" },
+                      "logprobs": null, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/responses", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "input": [{ "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": "What's in this?" },
+                { "type": "input_image",
+                  "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" },
+                { "type": "input_file",
+                  "filename": "doc.pdf",
+                  "file_data": "data:application/pdf;base64,JVBERi0xLjQK" }
+            ] }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 出站请求：图片映射为 image_url（data URL），文档（非图片）在 chat 丢弃。
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    let content = received[0]["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    );
+    assert_eq!(content.len(), 2, "文档媒体应在 chat 出站丢弃");
+
+    // 下游响应显式 warning：文档媒体丢弃。
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(body["gateway"]["warnings"][0]["type"], "unsupported");
+    assert_eq!(body["gateway"]["warnings"][0]["feature"], "media");
+}
+
+/// Responses 入站 → Responses 渠道（同协议直通）：多模态字节级原样送达上游。
+#[tokio::test]
+async fn responses_multimodal_passthrough_preserves_bytes() {
+    let mut gw = TestGateway::start_with(responses_channel_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "resp_mm", "object": "response", "status": "completed", "model": TEST_MODEL,
+        "output": [
+            { "id": "msg_1", "type": "message", "role": "assistant",
+              "content": [ { "type": "output_text", "text": "ok", "annotations": [] } ] }
+        ],
+        "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+    })));
+
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": TEST_MODEL,
+        "input": [{ "type": "message", "role": "user", "content": [
+            { "type": "input_text", "text": "What's in this?" },
+            { "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+        ] }]
+    });
+    let resp = client
+        .post(format!("{}/v1/responses", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 直通：出站请求体与入站字节级一致（Responses 直通无 JSON 补丁）。
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0], body, "同协议直通应字节级原样送达上游");
+}
+
+/// Responses 入站 → openai_chat 渠道：多模态流式跨协议转换。
+///
+/// 入站 input_image 解码为 IR 媒体 part，出站流式重编码为 openai chat `image_url`
+/// （data URL）；请求侧媒体转换的 warning 随 `stream-start` 首帧下发。
+#[tokio::test]
+async fn responses_inbound_multimodal_to_openai_chat_streaming() {
+    let mut gw = TestGateway::start().await; // 默认 openai_chat 渠道。
+    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-mm", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "ok" } }]
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-mm", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+        }))
+        .unwrap(),
+    ]));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/responses", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "stream": true,
+            "input": [{ "type": "message", "role": "user", "content": [
+                { "type": "input_text", "text": "What's in this?" },
+                { "type": "input_image",
+                  "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+            ] }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 出站请求：图片映射为 image_url（data URL）。
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    let content = received[0]["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    );
+
+    // 下游流式收到 Responses 事件帧，文本累积完整；图片可表达，流首不含 warning。
+    let frames = collect_sse_frames(resp).await;
+    let text: String = frames
+        .iter()
+        .filter(|(_, d)| d["type"] == "response.output_text.delta")
+        .filter_map(|(_, d)| d["delta"].as_str())
+        .collect();
+    assert_eq!(text, "ok");
+    assert!(
+        frames.iter().all(|(_, d)| d.get("gateway").is_none()),
+        "图片可在 openai chat 表达，不应有 warning"
+    );
+}
+
 /// 构造指向 mock 上游的 Anthropic 渠道 seed（其余沿用测试默认）。
 fn anthropic_channel_seed(base: &str) -> common::Seed {
     let mut seed = common::test_seed(base);

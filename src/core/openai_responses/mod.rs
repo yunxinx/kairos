@@ -8,6 +8,8 @@
 //! - 请求侧：`input` 数组的 message/function_call/function_call_output/reasoning
 //!   项映射为对应 IR 消息；顶层 `instructions` 提升为首条 System 消息；`text`/
 //!   `reasoning` 面板经请求级逃生舱 `provider_options["openai"]` 无损往返。
+//!   多模态 input_image/input_file 解码为 IR 媒体 part（base64 data URL / 远程
+//!   URL 两种载体）。
 //! - 响应侧：`output` 数组的 message/reasoning/function_call 项映射为 IR content；
 //!   reasoning 的 encrypted_content 经 part 逃生舱无损回传；finish_reason 由
 //!   `status`/`incomplete_details.reason` 双轨映射。
@@ -241,6 +243,8 @@ struct WireStreamResponse {
 const OPENAI_PROVIDER: &str = "openai";
 const REASONING_ENCRYPTED: &str = "reasoning_encrypted_content";
 const ITEM_ID: &str = "item_id";
+const IMAGE_DETAIL: &str = "image_detail";
+const FILE_NAME: &str = "filename";
 /// 有状态特性（Out of Scope）的留存键，出站时显式警告并丢弃。
 const STATEFUL_STORE: &str = "store";
 const STATEFUL_PREVIOUS_RESPONSE_ID: &str = "previous_response_id";
@@ -391,8 +395,9 @@ fn decode_message_item(item: &Value, index: usize) -> Result<Message, DecodeErro
 
 /// 解码消息 content（字符串或 part 数组）为 IR parts。
 ///
-/// 文本 part（`input_text`/`output_text`/`text`）映射为 Text；image/file 等
-/// 多模态 part 以 File 占位（v1 声明不实现，跨协议族出站时记 warning）。
+/// 文本 part（`input_text`/`output_text`/`text`）映射为 Text；多模态 part
+/// （`input_image`/`image`/`input_file`/`file`）映射为 IR 媒体 part，携带真实
+/// 数据源（base64 或 URL）。跨协议族不支持的媒体类型在出站时记 warning。
 fn decode_content_parts(content: &Value, index: usize) -> Result<Vec<ContentPart>, DecodeError> {
     match content {
         Value::String(text) => Ok(vec![ContentPart::Text {
@@ -414,16 +419,16 @@ fn decode_content_parts(content: &Value, index: usize) -> Result<Vec<ContentPart
                             provider_options: HashMap::new(),
                         });
                     }
-                    // 多模态 part v1 仅声明：以 Media 占位，跨协议族丢弃时记 warning。
-                    // 06 票把占位做实（携带真实数据源）。
-                    "input_image" | "image" | "input_file" | "file" | "input_audio" | "audio" => {
-                        out.push(ContentPart::Media {
-                            media_type: part_type.to_string(),
-                            data: crate::core::ir::MediaSource::Data {
-                                base64: String::new(),
-                            },
-                            provider_options: HashMap::new(),
-                        });
+                    // 多模态 part：input_image/image → 图片，input_file/file → 文件。
+                    // base64 data URL 拆为 Data，远程 URL 为 Url；filename/detail
+                    // 等 OpenResponses 特有字段经逃生舱保留。
+                    "input_image" | "image" | "input_file" | "file" => {
+                        out.push(decode_media_part(part, index)?);
+                    }
+                    // 音频 part：Responses 出站无一等音频 part（出站按 input_file
+                    // 编码），入站仍需承载，否则下游音频输入被静默丢弃。
+                    "input_audio" | "audio" => {
+                        out.push(decode_audio_part(part, index)?);
                     }
                     _ => {}
                 }
@@ -432,6 +437,111 @@ fn decode_content_parts(content: &Value, index: usize) -> Result<Vec<ContentPart
         }
         _ => Err(DecodeError::MissingContent { index }),
     }
+}
+
+/// 解码单个多模态 part 为 IR 媒体 part。
+///
+/// `image_url`/`file_url` → `MediaSource::Url`；`file_data` → `MediaSource::Data`
+/// （data URL 拆出 media_type + base64）。`file_id` 为 provider 托管引用，网关不
+/// 承载，以空 `MediaSource::Data` 占位跨协议族丢弃时记 warning。
+fn decode_media_part(part: &Value, index: usize) -> Result<ContentPart, DecodeError> {
+    let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
+    let image = part_type == "input_image" || part_type == "image";
+    let mut provider_options = HashMap::new();
+    let mut openai = serde_json::Map::new();
+
+    // 图片 `detail` 档位与文件 `filename` 经逃生舱保留（跨协议转换不静默丢失）。
+    if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+        openai.insert(IMAGE_DETAIL.into(), json!(detail));
+    }
+    if let Some(filename) = part.get("filename").and_then(Value::as_str) {
+        openai.insert(FILE_NAME.into(), json!(filename));
+    }
+
+    let (media_type, data) = if let Some(url) = part.get("image_url").and_then(Value::as_str) {
+        if let Some((media_type, base64)) = crate::core::ir::split_data_url(url) {
+            (media_type, crate::core::ir::MediaSource::Data { base64 })
+        } else {
+            // 远程图片 URL 隐含图片：以顶层 `image` 兜底。
+            (
+                "image".to_string(),
+                crate::core::ir::MediaSource::Url {
+                    url: url.to_string(),
+                },
+            )
+        }
+    } else if let Some(url) = part.get("file_url").and_then(Value::as_str) {
+        if let Some((media_type, base64)) = crate::core::ir::split_data_url(url) {
+            (media_type, crate::core::ir::MediaSource::Data { base64 })
+        } else {
+            (
+                "file".to_string(),
+                crate::core::ir::MediaSource::Url {
+                    url: url.to_string(),
+                },
+            )
+        }
+    } else if let Some(file_data) = part.get("file_data").and_then(Value::as_str) {
+        if let Some((media_type, base64)) = crate::core::ir::split_data_url(file_data) {
+            (media_type, crate::core::ir::MediaSource::Data { base64 })
+        } else {
+            // 无 data URL 标记的 file_data（OpenAI 规范要求 data URL，容忍畸形输入）。
+            (
+                "file".to_string(),
+                crate::core::ir::MediaSource::Data {
+                    base64: file_data.to_string(),
+                },
+            )
+        }
+    } else if let Some(file_id) = part.get("file_id").and_then(Value::as_str) {
+        // provider 托管引用：以空 Data 占位，逃生舱保留 file_id。
+        openai.insert("file_id".into(), json!(file_id));
+        (
+            if image {
+                "image".to_string()
+            } else {
+                "file".to_string()
+            },
+            crate::core::ir::MediaSource::Data {
+                base64: String::new(),
+            },
+        )
+    } else {
+        return Err(DecodeError::UnknownInputItem { index });
+    };
+
+    if !openai.is_empty() {
+        provider_options.insert(OPENAI_PROVIDER.into(), Value::Object(openai));
+    }
+    Ok(ContentPart::Media {
+        media_type,
+        data,
+        provider_options,
+    })
+}
+
+/// 解码音频 part 为 IR 媒体 part。
+///
+/// 载荷形状对齐 OpenAI chat 的 `input_audio`：`{ data, format }`（嵌套于同名子
+/// 对象或平铺均容忍）；`data` 为 base64 字节，`format` 缺省兜底 `wav`。出站
+/// 无对应 part 类型时按 `input_file` 编码（见 `encode_media_part`）。
+fn decode_audio_part(part: &Value, index: usize) -> Result<ContentPart, DecodeError> {
+    let nested = part.get("input_audio").unwrap_or(part);
+    let base64 = nested
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or(DecodeError::UnknownInputItem { index })?;
+    let format = nested
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("wav");
+    Ok(ContentPart::Media {
+        media_type: format!("audio/{format}"),
+        data: crate::core::ir::MediaSource::Data {
+            base64: base64.to_string(),
+        },
+        provider_options: HashMap::new(),
+    })
 }
 
 /// 解码 function_call 项为 Assistant 消息（含 ToolCall part）。
@@ -585,7 +695,7 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
                 ContentPart::Media { media_type, .. } => {
                     warnings.push(Warning::unsupported(
                         "media",
-                        format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
+                        format!("OpenAI Responses 系统消息不支持媒体内容（{media_type}），已丢弃"),
                     ));
                 }
                 ContentPart::Custom { kind, .. } => {
@@ -685,7 +795,11 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     Value::Object(obj)
 }
 
-/// 编码 user 消息为 message 项；多模态 File part 丢弃并记 warning。
+/// 编码 user 消息为 message 项；媒体 part 映射为 `input_image`/`input_file`。
+///
+/// 图片（顶层段 `image`）→ `input_image`（base64 data URL / 远程 URL，detail
+/// 逃生舱写回）；其他媒体与音频 → `input_file`（file_data data URL / file_url，
+/// filename 逃生舱写回）。目标协议不支持的媒体类型丢弃并记 warning。
 fn encode_user_item(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Value> {
     let mut parts = Vec::new();
     for part in &message.content {
@@ -693,11 +807,14 @@ fn encode_user_item(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Value
             ContentPart::Text { text, .. } => {
                 parts.push(json!({ "type": "input_text", "text": text }));
             }
-            ContentPart::Media { media_type, .. } => {
-                warnings.push(Warning::unsupported(
-                    "media",
-                    format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
-                ));
+            ContentPart::Media {
+                media_type,
+                data,
+                provider_options,
+            } => {
+                if let Some(part) = encode_media_part(media_type, data, provider_options) {
+                    parts.push(part);
+                }
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
@@ -712,6 +829,80 @@ fn encode_user_item(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Value
         return Vec::new();
     }
     vec![json!({ "type": "message", "role": "user", "content": Value::Array(parts) })]
+}
+
+/// 编码单个 IR 媒体 part 为 Responses `input_image`/`input_file` part。
+///
+/// 顶层段 `image` → `input_image`（base64 数据源拼 data URL，URL 数据源原样）；
+/// 其余媒体（含音频）→ `input_file`（base64 → file_data，URL → file_url）。图片
+/// `detail` 与文件 `filename` 从逃生舱写回。`file_id` 引用类 provider 托管形态
+/// 经逃生舱回传。
+fn encode_media_part(
+    media_type: &str,
+    data: &crate::core::ir::MediaSource,
+    provider_options: &crate::core::ir::ProviderOptions,
+) -> Option<Value> {
+    let openai = provider_options.get(OPENAI_PROVIDER);
+    // provider 托管引用（file_id）经逃生舱回传（同协议族无损）。
+    if let Some(file_id) = openai
+        .and_then(|o| o.get("file_id"))
+        .and_then(Value::as_str)
+    {
+        let top_level = crate::core::ir::top_level_media_type(media_type);
+        let part_type = if top_level == "image" {
+            "input_image"
+        } else {
+            "input_file"
+        };
+        let mut part = serde_json::Map::new();
+        part.insert("type".into(), json!(part_type));
+        part.insert("file_id".into(), json!(file_id));
+        return Some(Value::Object(part));
+    }
+
+    let is_image = crate::core::ir::top_level_media_type(media_type) == "image";
+    let part_type = if is_image {
+        "input_image"
+    } else {
+        "input_file"
+    };
+
+    let mut part = serde_json::Map::new();
+    part.insert("type".into(), json!(part_type));
+    match data {
+        crate::core::ir::MediaSource::Data { base64 } => {
+            if is_image {
+                part.insert(
+                    "image_url".into(),
+                    json!(format!("data:{media_type};base64,{base64}")),
+                );
+                if let Some(detail) = openai.and_then(|o| o.get(IMAGE_DETAIL)) {
+                    part.insert("detail".into(), detail.clone());
+                }
+            } else {
+                let filename = openai
+                    .and_then(|o| o.get(FILE_NAME))
+                    .and_then(Value::as_str)
+                    .unwrap_or("data");
+                part.insert("filename".into(), json!(filename));
+                part.insert(
+                    "file_data".into(),
+                    json!(format!("data:{media_type};base64,{base64}")),
+                );
+            }
+        }
+        crate::core::ir::MediaSource::Url { url } => {
+            if is_image {
+                part.insert("image_url".into(), json!(url));
+                if let Some(detail) = openai.and_then(|o| o.get(IMAGE_DETAIL)) {
+                    part.insert("detail".into(), detail.clone());
+                }
+            } else {
+                part.insert("file_url".into(), json!(url));
+            }
+        }
+    }
+    Some(Value::Object(part))
 }
 
 /// 编码 assistant 消息为 message/function_call/reasoning 项。
@@ -775,7 +966,7 @@ fn encode_assistant_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec
             ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
                     "media",
-                    format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
+                    format!("OpenAI Responses 助手消息不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
@@ -1209,7 +1400,7 @@ pub fn encode_response(response: &ChatResponse) -> Value {
             ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
                     "media",
-                    format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
+                    format!("OpenAI Responses 响应输出不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
@@ -1972,6 +2163,147 @@ mod tests {
         let reencoded = encode_request(&ir, &mut warnings);
         assert_eq!(reencoded, wire, "往返应还原 wire 请求");
         assert!(warnings.is_empty(), "同协议往返不应产出 warning");
+    }
+
+    /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。
+    ///
+    /// 覆盖 input_image（base64 data URL + detail / 远程 URL）与 input_file
+    /// （file_data data URL + filename）两种载体，6 part 混排顺序。
+    #[test]
+    fn multimodal_fixture_roundtrip() {
+        let raw = include_str!("__fixtures__/request_multimodal.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let ir = decode_request(&wire).expect("fixture 应可解码为 IR");
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "往返应还原 wire 请求（含混排顺序）");
+        assert!(warnings.is_empty(), "同协议图片/文件往返不应产出 warning");
+
+        // 混排顺序：text → 图片(data URL) → text → 文件(data URL) → text → 图片(URL)。
+        let parts = &ir.messages[0].content;
+        assert_eq!(parts.len(), 6, "应保留 6 个 part");
+        assert!(matches!(parts[0], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::Media {
+                media_type,
+                data: crate::core::ir::MediaSource::Data { base64 },
+                provider_options,
+            } if media_type == "image/png" && base64 == "iVBORw0KGgoAAAANSUhEUg=="
+                && provider_options.get("openai").and_then(|o| o.get(IMAGE_DETAIL))
+                    == Some(&Value::String("low".to_string()))
+        ));
+        assert!(matches!(parts[2], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[3],
+            ContentPart::Media {
+                media_type,
+                data: crate::core::ir::MediaSource::Data { base64 },
+                provider_options,
+            } if media_type == "application/pdf" && base64 == "JVBERi0xLjQK"
+                && provider_options.get("openai").and_then(|o| o.get(FILE_NAME))
+                    == Some(&Value::String("doc.pdf".to_string()))
+        ));
+        assert!(matches!(parts[4], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[5],
+            ContentPart::Media {
+                data: crate::core::ir::MediaSource::Url { url },
+                ..
+            } if url == "https://example.com/image.png"
+        ));
+    }
+
+    /// 跨协议：音频媒体（audio/mp3）在 Responses 出站编码为 `input_file`（对齐
+    /// AI SDK：Responses 无 input_audio 输入 part，音频媒体映射为文件）。
+    #[test]
+    fn audio_media_encodes_to_input_file() {
+        use crate::core::ir::Message;
+        let request = ChatRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::Media {
+                    media_type: "audio/mp3".to_string(),
+                    data: crate::core::ir::MediaSource::Data {
+                        base64: "UklGRg==".to_string(),
+                    },
+                    provider_options: HashMap::new(),
+                }],
+                provider_options: HashMap::new(),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            provider_options: HashMap::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        let part = &encoded["input"][0]["content"][0];
+        assert_eq!(part["type"], "input_file", "音频媒体应映射为 input_file");
+        assert_eq!(
+            part["file_data"], "data:audio/mp3;base64,UklGRg==",
+            "文件载荷应为 data URL"
+        );
+        assert!(warnings.is_empty(), "音频映射为 input_file 不应记 warning");
+    }
+
+    /// `input_audio` 入站解码：音频载荷解码为 `audio/<format>` 媒体 part，出站
+    /// 编码为 `input_file`（Responses 无一等音频 part）；音频不被静默丢弃。
+    #[test]
+    fn input_audio_decodes_and_encodes_to_input_file() {
+        let wire = json!({
+            "model": "gpt-4.1",
+            "input": [{ "type": "message", "role": "user",
+                        "content": [{ "type": "input_audio",
+                                      "input_audio": { "data": "UklGRg==", "format": "mp3" } }] }]
+        });
+        let ir = decode_request(&wire).expect("input_audio 应可解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Media {
+                media_type,
+                data: crate::core::ir::MediaSource::Data { base64 },
+                ..
+            } if media_type == "audio/mp3" && base64 == "UklGRg=="
+        ));
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        let part = &encoded["input"][0]["content"][0];
+        assert_eq!(part["type"], "input_file", "音频应编码为 input_file");
+        assert_eq!(part["file_data"], "data:audio/mp3;base64,UklGRg==");
+        assert!(warnings.is_empty(), "音频映射不应记 warning");
+    }
+
+    /// `file_id` provider 托管引用经逃生舱往返：入站存逃生舱，出站回传。
+    #[test]
+    fn file_id_reference_roundtrips_via_provider_options() {
+        let wire = json!({
+            "model": "gpt-4.1",
+            "input": [{ "type": "message", "role": "user",
+                        "content": [{ "type": "input_image", "file_id": "file-abc123" }] }]
+        });
+        let ir = decode_request(&wire).expect("带 file_id 的 input_image 应可解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Media { provider_options, .. }
+                if provider_options.get("openai").and_then(|o| o.get("file_id"))
+                    == Some(&Value::String("file-abc123".to_string()))
+        ));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "往返应还原 file_id");
+        assert!(warnings.is_empty());
     }
 
     /// 黄金样例响应 decode → encode 往返还原 wire。

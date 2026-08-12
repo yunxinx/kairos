@@ -403,3 +403,165 @@ async fn anthropic_inbound_error_uses_anthropic_shape() {
     assert!(body["error"]["message"].is_string());
     assert!(gw.upstream.received().is_empty(), "未认证不应出站");
 }
+
+/// Anthropic 入站 → OpenAI chat 渠道：多模态跨协议转换。
+///
+/// 入站 image/document content block 解码为 IR 媒体 part，出站重编码为 OpenAI
+/// chat `image_url`（data URL / 远程 URL）；非图片媒体（文档）在 chat 出站丢弃
+/// 并记 warning。
+#[tokio::test]
+async fn anthropic_inbound_multimodal_to_openai_chat() {
+    let mut gw = TestGateway::start().await; // 默认 openai_chat 渠道。
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-mm", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" },
+                      "logprobs": null, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .header("x-api-key", TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "What's in this?" },
+                { "type": "image",
+                  "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUg==" } },
+                { "type": "document",
+                  "source": { "type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK" } }
+            ] }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 出站请求：图片映射为 image_url（data URL），文档（非图片）在 chat 丢弃。
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    let content = received[0]["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    );
+    // 文档被丢弃：chat 仅支持图片媒体。
+    assert_eq!(content.len(), 2, "文档媒体应在 chat 出站丢弃");
+
+    // 下游响应显式 warning：文档媒体丢弃。
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(body["gateway"]["warnings"][0]["type"], "unsupported");
+    assert_eq!(body["gateway"]["warnings"][0]["feature"], "media");
+}
+
+/// Anthropic 入站 → Anthropic 渠道（同协议直通）：多模态字节级原样送达上游。
+#[tokio::test]
+async fn anthropic_multimodal_passthrough_preserves_bytes() {
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_mm", "type": "message", "role": "assistant", "model": TEST_MODEL,
+        "content": [{ "type": "text", "text": "ok" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": { "input_tokens": 10, "output_tokens": 2 }
+    })));
+
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": TEST_MODEL,
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "What's in this?" },
+            { "type": "image",
+              "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUg==" } }
+        ] }]
+    });
+    let resp = client
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .header("x-api-key", TEST_TOKEN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 直通：出站请求体与入站字节级一致（Anthropic 直通无 JSON 补丁）。
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0], body, "同协议直通应字节级原样送达上游");
+}
+
+/// Anthropic 入站 → openai_chat 渠道：多模态流式跨协议转换。
+///
+/// 入站 image/document content block 解码为 IR 媒体 part，出站流式重编码为
+/// openai chat `image_url`（data URL）；文档在 chat 出站丢弃，其 warning 随
+/// `stream-start` 首帧（`ping` 事件）下发。
+#[tokio::test]
+async fn anthropic_inbound_multimodal_to_openai_chat_streaming() {
+    let mut gw = TestGateway::start().await; // 默认 openai_chat 渠道。
+    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-mm", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "ok" } }]
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-mm", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+        }))
+        .unwrap(),
+    ]));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .header("x-api-key", TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 1024,
+            "stream": true,
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "What's in this?" },
+                { "type": "image",
+                  "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUg==" } },
+                { "type": "document",
+                  "source": { "type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK" } }
+            ] }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 出站请求：图片映射为 image_url（data URL），文档在 chat 出站丢弃。
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    let content = received[0]["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    );
+    assert_eq!(content.len(), 2, "文档媒体应在 chat 出站丢弃");
+
+    // 下游流式收到 Anthropic 事件帧（入站协议为 anthropic），文本累积完整。
+    let frames = collect_sse_frames(resp).await;
+    let text: String = frames
+        .iter()
+        .filter(|f| f["type"] == "content_block_delta" && f["delta"]["type"] == "text_delta")
+        .filter_map(|f| f["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "ok");
+    // 文档丢弃的 warning 随流首 ping 帧下发（Anthropic 无标准 warnings 通道）。
+    let warning_frame = frames
+        .iter()
+        .find(|f| f.get("warnings").is_some())
+        .expect("流首应有携带 warnings 的 ping 帧");
+    assert_eq!(warning_frame["warnings"][0]["type"], "unsupported");
+    assert_eq!(warning_frame["warnings"][0]["feature"], "media");
+}
