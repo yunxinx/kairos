@@ -17,6 +17,47 @@ use serde_json::Value;
 /// 均经此往返。
 pub type ProviderOptions = HashMap<String, Value>;
 
+/// 转换过程中无法表达的内容或设置，随响应显式回传给下游。
+///
+/// 形状对齐 AI SDK `SharedV4Warning`。跨协议族转换是有损的（ADR-0001）：丢失的
+/// reasoning、目标协议不支持的采样参数等一律记 warning，不静默吞掉。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Warning {
+    /// 目标协议不支持该特性，已丢弃。
+    Unsupported {
+        feature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<String>,
+    },
+    /// 以兼容方式处理，结果可能次优（如补默认值）。
+    Compatibility {
+        feature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<String>,
+    },
+    /// 其他情况。
+    Other { message: String },
+}
+
+impl Warning {
+    /// 构造 `Unsupported` warning。
+    pub fn unsupported(feature: impl Into<String>, details: impl Into<String>) -> Self {
+        Self::Unsupported {
+            feature: feature.into(),
+            details: Some(details.into()),
+        }
+    }
+
+    /// 构造 `Compatibility` warning。
+    pub fn compatibility(feature: impl Into<String>, details: impl Into<String>) -> Self {
+        Self::Compatibility {
+            feature: feature.into(),
+            details: Some(details.into()),
+        }
+    }
+}
+
 /// 消息角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +159,23 @@ pub struct Usage {
     pub raw: Option<Value>,
 }
 
+impl Usage {
+    /// 逐分量取更大的合并：直通快路径跨帧嗅探 usage 时使用。
+    ///
+    /// Anthropic 的 usage 分散在各事件（`message_start` 有输入侧 input/cache 早期值，
+    /// `message_delta` 有最终 output），任一帧都不完整；逐分量取 max 可无顺序依赖地
+    /// 合并出最终值（bifrost passthrough 同款机制）。
+    pub fn union_max(&mut self, other: Usage) {
+        self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.output_tokens = self.output_tokens.max(other.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        if self.raw.is_none() {
+            self.raw = other.raw;
+        }
+    }
+}
+
 /// 工具定义（出站请求侧）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tool {
@@ -139,6 +197,10 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    /// top-k 采样。Anthropic Messages 原生支持；OpenAI 两个协议不支持，出站时
+    /// 丢弃并记 warning。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,6 +219,13 @@ pub struct ChatRequest {
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    /// 请求级逃生舱：入站解析留存的 provider 特有请求设置。
+    ///
+    /// Anthropic 的 `thinking`（budget_tokens/display）是请求级而非消息级配置：
+    /// 同协议族经 IR 路径出站（命中别名时）必须原样回传，否则多轮 thinking 的
+    /// 预算设置丢失。跨协议族出站时丢弃并记 warning。
+    #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+    pub provider_options: ProviderOptions,
 }
 
 /// 非流式聊天响应的 IR 中枢。
@@ -169,6 +238,10 @@ pub struct ChatResponse {
     pub usage: Usage,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub provider_metadata: ProviderOptions,
+    /// 本次转换中无法表达的内容（跨协议族丢弃的 reasoning、目标协议不支持的
+    /// 设置）。适配器编码入站响应时把它暴露给下游。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
 }
 
 /// 流式事件（IR 侧）：start/delta/end 成对事件 + 生命周期事件。
@@ -246,8 +319,11 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 生命周期：流开始。
-    StreamStart,
+    /// 生命周期：流开始，携带本次转换的 warnings（对齐 AI SDK `stream-start`）。
+    StreamStart {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<Warning>,
+    },
     /// 生命周期：响应元数据（id/model）。
     ResponseMetadata { id: String, model: String },
     /// 生命周期：流结束，携带 finish_reason 与 usage。

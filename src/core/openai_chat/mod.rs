@@ -14,8 +14,9 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
-    StreamEvent, Tool, Usage,
+    StreamEvent, Tool, Usage, Warning,
 };
+use crate::core::stream::SseFrame;
 
 // ---- 错误 ----
 
@@ -274,6 +275,8 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         stream: wire.stream,
         temperature: wire.temperature,
         top_p: wire.top_p,
+        // Chat Completions 没有 top_k 字段；入站解码不产出该值。
+        top_k: None,
         max_tokens: wire.max_tokens,
         n: wire.n,
         stop: wire.stop.unwrap_or_default(),
@@ -292,6 +295,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             })
             .collect(),
         tool_choice: wire.tool_choice,
+        provider_options: HashMap::new(),
     })
 }
 
@@ -427,8 +431,29 @@ impl WireContent {
 // ---- 出站编码：IR → wire 请求 ----
 
 /// 编码 IR 请求为出站 Chat Completions 请求体。
-pub fn encode_request(request: &ChatRequest) -> Value {
-    let messages: Vec<Value> = request.messages.iter().map(encode_message).collect();
+///
+/// 目标协议无法表达的内容（`top_k`、reasoning part）追加到 `warnings`，由网关
+/// 随响应回传给下游（对齐 AI SDK `doGenerate` 的 warnings 累积）。
+pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .map(|message| encode_message(message, warnings))
+        .collect();
+
+    if request.top_k.is_some() {
+        warnings.push(Warning::unsupported(
+            "top_k",
+            "OpenAI Chat Completions 无 top_k 参数，已丢弃",
+        ));
+    }
+    // 请求级逃生舱（如 Anthropic thinking 配置）在 OpenAI Chat 无对应字段，显式丢弃。
+    for provider in request.provider_options.keys() {
+        warnings.push(Warning::unsupported(
+            "provider_options",
+            format!("{provider} 的请求级逃生舱设置无法表达，已丢弃"),
+        ));
+    }
 
     let mut obj = serde_json::Map::new();
     obj.insert("model".into(), json!(request.model));
@@ -492,7 +517,20 @@ pub fn encode_request(request: &ChatRequest) -> Value {
 }
 
 /// 编码单条 IR 消息为 wire 消息。
-fn encode_message(message: &Message) -> Value {
+///
+/// `reasoning` part 在 Chat Completions 无对应字段：跨协议族转换时丢弃并记
+/// warning（ADR-0001 设计行为，不静默吞掉）。
+fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
+    if message
+        .content
+        .iter()
+        .any(|p| matches!(p, ContentPart::Reasoning { .. }))
+    {
+        warnings.push(Warning::unsupported(
+            "reasoning",
+            "OpenAI Chat Completions 无 reasoning 内容块，助手消息中的推理内容已丢弃",
+        ));
+    }
     match message.role {
         Role::System => {
             let text = text_parts(&message.content).unwrap_or_default();
@@ -640,6 +678,7 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
         },
         usage,
         provider_metadata: HashMap::new(),
+        warnings: Vec::new(),
     })
 }
 
@@ -697,10 +736,41 @@ fn map_finish_reason(raw: Option<&str>) -> FinishReasonUnified {
     }
 }
 
+/// 把 IR unified finish reason 映射为 Chat Completions wire 值。
+///
+/// 跨协议族转换时 `finish_reason.raw` 是出站协议的值（如 Anthropic 的 `end_turn`），
+/// 不能透传给入站；统一从 `unified` 映射，保证跨协议族语义正确。
+fn encode_finish_reason(finish_reason: &FinishReason) -> &'static str {
+    match finish_reason.unified {
+        FinishReasonUnified::Stop => "stop",
+        FinishReasonUnified::Length => "length",
+        FinishReasonUnified::ContentFilter => "content_filter",
+        FinishReasonUnified::ToolCalls => "tool_calls",
+        FinishReasonUnified::Error | FinishReasonUnified::Other => "stop",
+    }
+}
+
 // ---- 入站响应编码：IR → wire ----
 
 /// 编码 IR 响应为入站 Chat Completions 响应体。
+///
+/// 转换过程的 warnings（跨协议族丢弃的 reasoning 等）以顶层 `gateway.warnings`
+/// 暴露给下游，与错误体的 `error.gateway` 归因字段对称；无 warning 时不写该字段，
+/// 响应与官方形状字节一致。响应 content 中的 reasoning part 在此丢弃并记 warning。
 pub fn encode_response(response: &ChatResponse) -> Value {
+    // OpenAI Chat Completions 无 reasoning 内容块：响应中的推理内容在重编码时
+    // 被丢弃，显式记 warning（ADR-0001 设计行为，不静默吞掉）。
+    let mut warnings = response.warnings.clone();
+    if response
+        .content
+        .iter()
+        .any(|p| matches!(p, ContentPart::Reasoning { .. }))
+    {
+        warnings.push(Warning::unsupported(
+            "reasoning",
+            "OpenAI Chat Completions 无 reasoning 内容块，响应中的推理内容已丢弃",
+        ));
+    }
     let text = text_parts(&response.content).unwrap_or_default();
     let tool_calls: Vec<Value> = response
         .content
@@ -737,18 +807,39 @@ pub fn encode_response(response: &ChatResponse) -> Value {
         message.insert("tool_calls".into(), Value::Array(tool_calls));
     }
 
-    json!({
-        "id": response.id,
-        "object": "chat.completion",
-        "model": response.model,
-        "choices": [{
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".into(), json!(response.id));
+    obj.insert("object".into(), json!("chat.completion"));
+    obj.insert("model".into(), json!(response.model));
+    obj.insert(
+        "choices".into(),
+        json!([{
             "index": 0,
             "message": message,
             "logprobs": null,
-            "finish_reason": response.finish_reason.raw.clone().unwrap_or_else(|| "stop".into()),
-        }],
-        "usage": encode_usage(&response.usage),
-    })
+            "finish_reason": encode_finish_reason(&response.finish_reason),
+        }]),
+    );
+    obj.insert("usage".into(), encode_usage(&response.usage));
+    if let Some(gateway) = encode_warnings(&warnings) {
+        obj.insert("gateway".into(), gateway);
+    }
+    Value::Object(obj)
+}
+
+/// 把 IR warnings 编码为 `gateway` 归因对象；无 warning 时返回 `None`。
+///
+/// 两个 OpenAI 协议面共用该形状（`{"warnings":[...]}`），Anthropic 面同理，
+/// 让下游无论以哪种协议入站都能读到同一份信息损失说明。
+pub fn encode_warnings(warnings: &[Warning]) -> Option<Value> {
+    if warnings.is_empty() {
+        return None;
+    }
+    let items: Vec<Value> = warnings
+        .iter()
+        .map(|w| serde_json::to_value(w).unwrap_or(Value::Null))
+        .collect();
+    Some(json!({ "warnings": items }))
 }
 
 /// 编码 IR usage 四分量 + 缓存细节为 wire usage 对象。
@@ -929,10 +1020,11 @@ impl DecodeStreamChunk {
 
 // ---- 流式：IR 流事件 → 入站 SSE 帧 ----
 
-/// 把 IR 流事件编码为入站 Chat Completions SSE 帧（`data:` 行）。
+/// 把 IR 流事件编码为入站 Chat Completions SSE 帧（`data:` 行，无事件名）。
 ///
 /// 维护进行中的 text/tool-input 块状态，把事件还原为 `chat.completion.chunk`
-/// wire 形状。调用方负责把每帧包成 `data: <json>\n\n` 的 SSE 发送。
+/// wire 形状。`StreamStart` 的 warnings 以首帧 `gateway.warnings` 下发，
+/// 与非流式响应的 `gateway` 字段对称。
 #[derive(Debug, Default)]
 pub struct StreamEncoder {
     text_open: bool,
@@ -943,6 +1035,9 @@ pub struct StreamEncoder {
     /// 入站模型名覆盖：别名命中时，出站响应模型名须重写回入站短名。
     /// `Some` 时无视 ResponseMetadata 携带的上游模型名。
     inbound_model: Option<String>,
+    /// 流中是否出现过 reasoning 事件：Chat Completions 无 reasoning 内容块，
+    /// 丢弃后须在 finish 帧显式 warning。
+    saw_reasoning: bool,
 }
 
 impl StreamEncoder {
@@ -965,9 +1060,28 @@ struct OpenToolCall {
 
 impl StreamEncoder {
     /// 编码一个 IR 流事件，返回需要下发的 SSE 帧（可能为空）。
-    pub fn encode(&mut self, event: &StreamEvent) -> Vec<Value> {
+    pub fn encode(&mut self, event: &StreamEvent) -> Vec<SseFrame> {
+        self.encode_chunks(event)
+            .into_iter()
+            .map(|value| SseFrame::data(serde_json::to_string(&value).unwrap_or_default()))
+            .collect()
+    }
+
+    /// 编码一个 IR 流事件为 `chat.completion.chunk` wire 值序列。
+    fn encode_chunks(&mut self, event: &StreamEvent) -> Vec<Value> {
         match event {
-            StreamEvent::StreamStart => Vec::new(),
+            // warnings 以独立首帧下发，让下游在收到任何内容前就感知信息损失。
+            StreamEvent::StreamStart { warnings } => match encode_warnings(warnings) {
+                Some(gateway) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("id".into(), json!("chatcmpl-stream"));
+                    obj.insert("object".into(), json!("chat.completion.chunk"));
+                    obj.insert("choices".into(), Value::Array(Vec::new()));
+                    obj.insert("gateway".into(), gateway);
+                    vec![Value::Object(obj)]
+                }
+                None => Vec::new(),
+            },
             StreamEvent::ResponseMetadata { id, model } => {
                 self.id = id.clone();
                 self.model = model.clone();
@@ -990,9 +1104,12 @@ impl StreamEncoder {
                 vec![self.chunk_frame(choice)]
             }
             StreamEvent::TextEnd { .. } => Vec::new(),
-            StreamEvent::ReasoningStart { .. }
-            | StreamEvent::ReasoningDelta { .. }
-            | StreamEvent::ReasoningEnd { .. } => Vec::new(),
+            StreamEvent::ReasoningStart { .. } => {
+                // Chat Completions 无 reasoning 通道：丢弃并在 finish 帧记 warning。
+                self.saw_reasoning = true;
+                Vec::new()
+            }
+            StreamEvent::ReasoningDelta { .. } | StreamEvent::ReasoningEnd { .. } => Vec::new(),
             StreamEvent::ToolInputStart { id, tool_name, .. } => {
                 let index = self.tool_calls.len();
                 self.tool_calls.push(OpenToolCall {
@@ -1048,11 +1165,21 @@ impl StreamEncoder {
                 choice.insert("index".into(), json!(0));
                 choice.insert(
                     "finish_reason".into(),
-                    json!(finish_reason.raw.clone().unwrap_or_else(|| "stop".into())),
+                    json!(encode_finish_reason(finish_reason)),
                 );
                 let mut obj = serde_json::Map::new();
                 obj.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
                 obj.insert("usage".into(), encode_usage(usage));
+                // 流中丢弃过 reasoning：finish 帧显式 warning，供下游感知信息损失。
+                if self.saw_reasoning {
+                    let warning = Warning::unsupported(
+                        "reasoning",
+                        "OpenAI Chat Completions 无 reasoning 内容块，推理内容已丢弃",
+                    );
+                    if let Some(gateway) = encode_warnings(&[warning]) {
+                        obj.insert("gateway".into(), gateway);
+                    }
+                }
                 vec![Value::Object(obj)]
             }
         }
@@ -1109,8 +1236,10 @@ mod tests {
         let raw = include_str!("__fixtures__/request.json");
         let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
         let ir = decode_request(&wire).expect("fixture 应可解码为 IR");
-        let reencoded = encode_request(&ir);
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
         assert_eq!(reencoded, wire, "往返应还原 wire 请求");
+        assert!(warnings.is_empty(), "同协议往返不应产出 warning");
     }
 
     /// 黄金样例响应 decode → encode 往返还原 wire。
@@ -1347,6 +1476,12 @@ mod tests {
         assert!(sniff_chat_usage(&no_usage).is_none());
     }
 
+    /// 解析 SSE 帧的 `data:` 载荷为 JSON，供帧内容断言。
+    fn frame_json(frame: &SseFrame) -> Value {
+        assert_eq!(frame.event, None, "Chat Completions 帧不应带事件名");
+        serde_json::from_str(&frame.data).expect("帧载荷应为合法 JSON")
+    }
+
     /// IR 流事件编码为入站 chunk 帧：首帧 text 带 role，finish 帧带 usage。
     #[test]
     fn stream_events_encode_to_chunk_frames() {
@@ -1363,9 +1498,10 @@ mod tests {
             provider_options: HashMap::new(),
         });
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0]["object"], "chat.completion.chunk");
-        assert_eq!(frames[0]["choices"][0]["delta"]["role"], "assistant");
-        assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hi");
+        let chunk = frame_json(&frames[0]);
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunk["choices"][0]["delta"]["content"], "Hi");
 
         let frames = encoder.encode(&StreamEvent::Finish {
             finish_reason: FinishReason {
@@ -1382,8 +1518,105 @@ mod tests {
             provider_metadata: HashMap::new(),
         });
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0]["choices"][0]["finish_reason"], "stop");
-        assert_eq!(frames[0]["usage"]["completion_tokens"], 2);
-        assert_eq!(frames[0]["usage"]["prompt_tokens"], 3);
+        let chunk = frame_json(&frames[0]);
+        assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
+        assert_eq!(chunk["usage"]["completion_tokens"], 2);
+        assert_eq!(chunk["usage"]["prompt_tokens"], 3);
+    }
+
+    /// 无 warning 时响应体不含 `gateway` 字段（与官方形状一致）；有 warning 时
+    /// 以 `gateway.warnings` 暴露，不静默吞掉。
+    #[test]
+    fn warnings_surface_in_response_and_stream_start() {
+        let mut response = ChatResponse {
+            id: "chatcmpl-w".to_string(),
+            model: "gpt-4o".to_string(),
+            content: vec![ContentPart::Text {
+                text: "ok".to_string(),
+                provider_options: HashMap::new(),
+            }],
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: Some("stop".to_string()),
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        assert!(
+            encode_response(&response).get("gateway").is_none(),
+            "无 warning 不应写 gateway 字段"
+        );
+
+        response.warnings = vec![Warning::unsupported("reasoning", "跨协议族丢弃")];
+        let encoded = encode_response(&response);
+        assert_eq!(encoded["gateway"]["warnings"][0]["type"], "unsupported");
+        assert_eq!(encoded["gateway"]["warnings"][0]["feature"], "reasoning");
+
+        // 流式以独立首帧下发同一份 warnings。
+        let mut encoder = StreamEncoder::default();
+        let frames = encoder.encode(&StreamEvent::StreamStart {
+            warnings: response.warnings.clone(),
+        });
+        assert_eq!(frames.len(), 1, "有 warning 时 stream-start 应产出一帧");
+        let chunk = frame_json(&frames[0]);
+        assert_eq!(chunk["gateway"]["warnings"][0]["feature"], "reasoning");
+
+        // 无 warning 时 stream-start 不产出帧。
+        let mut encoder = StreamEncoder::default();
+        assert!(
+            encoder
+                .encode(&StreamEvent::StreamStart {
+                    warnings: Vec::new()
+                })
+                .is_empty()
+        );
+    }
+
+    /// 出站编码时 IR 的 top_k 与 reasoning 无法表达：丢弃并记 warning。
+    #[test]
+    fn unsupported_ir_features_produce_warnings() {
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentPart::Reasoning {
+                    text: "思考".to_string(),
+                    provider_options: HashMap::new(),
+                }],
+                provider_options: HashMap::new(),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: Some(40),
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            provider_options: HashMap::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert!(
+            encoded.get("top_k").is_none(),
+            "Chat Completions 无 top_k 字段"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, Warning::Unsupported { feature, .. } if feature == "top_k"))
+        );
+        assert!(
+            warnings.iter().any(
+                |w| matches!(w, Warning::Unsupported { feature, .. } if feature == "reasoning")
+            ),
+            "reasoning part 丢弃应记 warning"
+        );
     }
 }

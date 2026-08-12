@@ -76,6 +76,7 @@ impl MockUpstream {
 
         let app = Router::new()
             .route("/chat/completions", post(handle))
+            .route("/messages", post(handle))
             .with_state(MockDeps {
                 behavior: behavior.clone(),
                 received: received.clone(),

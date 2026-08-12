@@ -1,0 +1,22 @@
+{
+  "model": "claude-sonnet-4-5",
+  "id": "msg_01XrsJCi8CQoLcnnWdY8RsJz",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "925 divided by 5 = 185",
+      "signature": "Er4BCkYICxgCKkA"
+    },
+    { "type": "text", "text": "925 ÷ 5 = 185" }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 69,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 33
+  }
+}

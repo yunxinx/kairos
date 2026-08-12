@@ -257,26 +257,33 @@ async fn alias_hit_falls_back_to_ir_path() {
 /// 跨协议通道：回落 IR 完整路径，出站请求体经 IR 重编码（非直通），不注入直通补丁。
 #[tokio::test]
 async fn cross_protocol_falls_back_to_ir_path() {
-    // 渠道协议为 openai_responses（≠ 入站 openai_chat），触发 IR 完整路径。
+    // 渠道协议为 anthropic_messages（≠ 入站 openai_chat），触发 IR 完整路径。
     let mut gw = TestGateway::start_with(|base| {
         let mut cfg = common::test_config(base);
-        cfg.channels[0].protocol = config::Protocol::OpenAiResponses;
+        cfg.channels[0].protocol = config::Protocol::AnthropicMessages;
         cfg
     })
     .await;
+    // 上游以 Anthropic Messages 格式响应（stub 同协议，网关解码为 IR 再重编码为 openai）。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
-        "id": "chatcmpl-x", "object": "chat.completion", "model": "gpt-4o",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
-                     "logprobs": null, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        "id": "msg_01x", "type": "message", "role": "assistant", "model": "gpt-4o",
+        "content": [{ "type": "text", "text": "ok" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
     })));
 
     let resp = send_completion(&gw.base_url()).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // 入站协议格式：下游收到 openai chat.completion 响应。
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
 
-    // 出站请求体经 IR 重编码：不含直通补丁字段（非直通路径）。
+    // 出站请求体经 IR 重编码为 Anthropic 格式：不含直通补丁字段（非直通路径）。
     let received = gw.upstream.received();
-    assert_eq!(received.len(), 1);
+    assert_eq!(received.len(), 1, "mock 上游应收一条请求");
+    assert_eq!(received[0]["model"], TEST_MODEL);
+    assert_eq!(received[0]["messages"][0]["role"], "user");
     assert!(
         received[0].get("stream_options").is_none(),
         "跨协议回落 IR 路径，不应注入直通补丁"
