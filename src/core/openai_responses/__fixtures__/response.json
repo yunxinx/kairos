@@ -1,0 +1,28 @@
+{
+  "id": "resp_123",
+  "object": "response",
+  "status": "completed",
+  "model": "gpt-4.1",
+  "output": [
+    {
+      "id": "msg_1",
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        { "type": "output_text", "text": "The weather in San Francisco is sunny and 72F.", "annotations": [] }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_abc123",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"San Francisco\"}"
+    }
+  ],
+  "usage": {
+    "input_tokens": 25,
+    "input_tokens_details": { "cached_tokens": 5 },
+    "output_tokens": 12,
+    "total_tokens": 37
+  }
+}

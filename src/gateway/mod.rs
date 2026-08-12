@@ -73,6 +73,7 @@ pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(responses))
         .fallback(not_found)
         .with_state(deps)
 }
@@ -98,6 +99,15 @@ async fn messages(
     body: axum::body::Bytes,
 ) -> Response {
     handle_request(deps, Protocol::AnthropicMessages, headers, body).await
+}
+
+/// OpenAI Responses 入站端点。
+async fn responses(
+    State(deps): State<Deps>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    handle_request(deps, Protocol::OpenAiResponses, headers, body).await
 }
 
 /// 入站端点公共处理：认证 → 解码 → 准入 →（直通快路径 | IR 完整路径）。

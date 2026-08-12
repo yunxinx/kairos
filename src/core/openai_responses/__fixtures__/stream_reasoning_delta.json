@@ -1,0 +1,7 @@
+{
+  "type": "response.reasoning_summary_text.delta",
+  "item_id": "reason_1",
+  "output_index": 0,
+  "summary_index": 0,
+  "delta": "先算 925 ÷ 5"
+}

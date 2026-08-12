@@ -1,0 +1,6 @@
+{
+  "type": "response.function_call_arguments.delta",
+  "item_id": "fc_1",
+  "output_index": 1,
+  "delta": "{\"city\":\"San Francisco\"}"
+}

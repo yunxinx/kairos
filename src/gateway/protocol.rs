@@ -20,7 +20,9 @@ pub fn decode_request(value: &Value, protocol: Protocol) -> Result<ChatRequest, 
         Protocol::AnthropicMessages => {
             crate::core::anthropic_messages::decode_request(value).map_err(|e| e.to_string())
         }
-        Protocol::OpenAiResponses => Err("OpenAI Responses 协议尚未实现".to_string()),
+        Protocol::OpenAiResponses => {
+            crate::core::openai_responses::decode_request(value).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -35,7 +37,9 @@ pub fn encode_request(
         Protocol::AnthropicMessages => {
             crate::core::anthropic_messages::encode_request(request, warnings)
         }
-        Protocol::OpenAiResponses => unreachable!("OpenAI Responses 出站尚未实现"),
+        Protocol::OpenAiResponses => {
+            crate::core::openai_responses::encode_request(request, warnings)
+        }
     }
 }
 
@@ -48,7 +52,9 @@ pub fn decode_response(value: &Value, protocol: Protocol) -> Result<ChatResponse
         Protocol::AnthropicMessages => {
             crate::core::anthropic_messages::decode_response(value).map_err(|e| e.to_string())
         }
-        Protocol::OpenAiResponses => Err("OpenAI Responses 协议尚未实现".to_string()),
+        Protocol::OpenAiResponses => {
+            crate::core::openai_responses::decode_response(value).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -57,7 +63,7 @@ pub fn encode_response(response: &ChatResponse, protocol: Protocol) -> Value {
     match protocol {
         Protocol::OpenAiChat => crate::core::openai_chat::encode_response(response),
         Protocol::AnthropicMessages => crate::core::anthropic_messages::encode_response(response),
-        Protocol::OpenAiResponses => unreachable!("OpenAI Responses 入站尚未实现"),
+        Protocol::OpenAiResponses => crate::core::openai_responses::encode_response(response),
     }
 }
 
@@ -67,7 +73,7 @@ pub fn sniff_usage(value: &Value, protocol: Protocol) -> Option<Usage> {
     match protocol {
         Protocol::OpenAiChat => crate::core::openai_chat::sniff_chat_usage(value),
         Protocol::AnthropicMessages => crate::core::anthropic_messages::sniff_usage(value),
-        Protocol::OpenAiResponses => None,
+        Protocol::OpenAiResponses => crate::core::openai_responses::sniff_usage(value),
     }
 }
 
@@ -78,7 +84,7 @@ pub fn encode_error(status: u16, message: &str, protocol: Protocol) -> Value {
         Protocol::AnthropicMessages => {
             crate::core::anthropic_messages::encode_error(status, message)
         }
-        Protocol::OpenAiResponses => crate::core::openai_chat::encode_error(status, message),
+        Protocol::OpenAiResponses => crate::core::openai_responses::encode_error(status, message),
     }
 }
 
@@ -122,7 +128,9 @@ pub fn make_decoder(protocol: Protocol) -> Box<dyn ChatStreamDecoder + Send> {
         Protocol::AnthropicMessages => Box::new(AnthropicStreamDecoder(
             crate::core::anthropic_messages::StreamDecoder::default(),
         )),
-        Protocol::OpenAiResponses => unreachable!("OpenAI Responses 流尚未实现"),
+        Protocol::OpenAiResponses => Box::new(ResponsesStreamDecoder(
+            crate::core::openai_responses::StreamDecoder::default(),
+        )),
     }
 }
 
@@ -138,7 +146,9 @@ pub fn make_encoder(
         Protocol::AnthropicMessages => Box::new(AnthropicStreamEncoder(
             crate::core::anthropic_messages::StreamEncoder::new(inbound_model),
         )),
-        Protocol::OpenAiResponses => unreachable!("OpenAI Responses 流尚未实现"),
+        Protocol::OpenAiResponses => Box::new(ResponsesStreamEncoder(
+            crate::core::openai_responses::StreamEncoder::new(inbound_model),
+        )),
     }
 }
 
@@ -153,6 +163,15 @@ impl ChatStreamDecoder for OpenAiStreamDecoder {
 
 struct AnthropicStreamDecoder(crate::core::anthropic_messages::StreamDecoder);
 impl ChatStreamDecoder for AnthropicStreamDecoder {
+    fn process(&mut self, value: &Value) -> DecodeChunk {
+        DecodeChunk {
+            events: self.0.process(value).events,
+        }
+    }
+}
+
+struct ResponsesStreamDecoder(crate::core::openai_responses::StreamDecoder);
+impl ChatStreamDecoder for ResponsesStreamDecoder {
     fn process(&mut self, value: &Value) -> DecodeChunk {
         DecodeChunk {
             events: self.0.process(value).events,
@@ -182,6 +201,20 @@ impl ChatStreamEncoder for AnthropicStreamEncoder {
         self.0.encode(event)
     }
     fn terminator(&self) -> Option<String> {
+        None
+    }
+}
+
+struct ResponsesStreamEncoder(crate::core::openai_responses::StreamEncoder);
+impl ChatStreamEncoder for ResponsesStreamEncoder {
+    fn message_start(&self) -> Option<SseFrame> {
+        None
+    }
+    fn encode(&mut self, event: &StreamEvent) -> Vec<SseFrame> {
+        self.0.encode(event)
+    }
+    fn terminator(&self) -> Option<String> {
+        // Responses 以 `response.completed` 事件收尾，无 `[DONE]` 哨兵。
         None
     }
 }

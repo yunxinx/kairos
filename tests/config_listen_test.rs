@@ -46,9 +46,10 @@ async fn config_driven_listen_and_fallback() {
     });
 
     // 配置的端口上，未实现路径返回确定 404。
+    // （embeddings 属 spec Out of Scope，任何方法都不应命中已实现端点。）
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://127.0.0.1:{port}/v1/responses"))
+        .get(format!("http://127.0.0.1:{port}/v1/embeddings"))
         .send()
         .await
         .expect("应能请求网关未实现路径");

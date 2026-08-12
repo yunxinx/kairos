@@ -1,0 +1,26 @@
+{
+  "model": "gpt-4.1",
+  "instructions": "You are a helpful assistant.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        { "type": "input_text", "text": "What is the weather in San Francisco?" }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_abc123",
+      "name": "get_weather",
+      "arguments": "{\"city\":\"San Francisco\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_abc123",
+      "output": "sunny, 72F"
+    }
+  ],
+  "temperature": 0.7,
+  "max_output_tokens": 100
+}
