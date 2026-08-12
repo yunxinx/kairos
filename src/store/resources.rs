@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
@@ -13,7 +14,12 @@ use crate::config::Protocol;
 use crate::store::StoreError;
 
 /// 渠道：指向一个上游端点的出站接入单元。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 管理 API 以其 JSON 形态作为 wire 契约（`protocol`/`models`/`model_aliases` 等
+/// 字段直接序列化），故派生 `Serialize`/`Deserialize`；`deny_unknown_fields` 使
+/// 字段拼写错误直接报错而非静默忽略。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Channel {
     pub name: String,
     pub protocol: Protocol,
@@ -28,7 +34,8 @@ pub struct Channel {
 }
 
 /// 令牌：认证与计费的最小单位；余额独立存 `token_balance` 表。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Token {
     pub token_key: String,
     pub name: String,
@@ -37,7 +44,8 @@ pub struct Token {
 }
 
 /// 单模型四档单价（micro-USD / 1M tokens）；缓存档 `None` 表示回退 input 价。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Price {
     pub model: String,
     pub input_micros: i64,

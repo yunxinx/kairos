@@ -179,6 +179,22 @@ pub async fn get_token_balance(
     }))
 }
 
+/// 删除令牌余额行；不存在视为成功（幂等）。
+///
+/// 供删除令牌时同事务清理：余额行若残留，同 key 重建令牌会经
+/// `ensure_token_balance` 的冲突跳过复活旧余额。
+pub async fn delete_token_balance(
+    conn: &mut SqliteConnection,
+    token_key: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM token_balance WHERE token_key = ?")
+        .bind(token_key)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
+}
+
 /// 结算一次费用：余额扣减（可为负）、累计结算增加。返回结算后的余额。
 ///
 /// 以 `UPDATE` 原子完成，避免并发读改写；SQLite 单写者串行化保证单调。

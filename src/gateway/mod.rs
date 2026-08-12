@@ -3,6 +3,7 @@
 //! 具体的 HTTP 入站、认证、准入、出站与日志实现位于 [`http`]。保留本模块作为
 //! facade，使二进制入口和端到端测试继续使用稳定的 `gateway::router` API。
 
+mod admin;
 mod failover;
 mod http;
 mod logging;
@@ -10,4 +11,5 @@ mod protocol;
 mod routing;
 mod sse;
 
+pub use admin::router as admin_router;
 pub use http::{Deps, router};

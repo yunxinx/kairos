@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// 默认配置文件路径，相对当前工作目录。
@@ -45,7 +45,7 @@ pub struct Database {
 }
 
 /// wire 协议：三种出站/入站协议共用同一枚举。
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Protocol {
     #[serde(rename = "openai_chat")]
     OpenAiChat,

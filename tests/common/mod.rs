@@ -320,12 +320,17 @@ pub fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// 测试用管理 API 静态密钥（Bearer 认证）。
+pub const TEST_ADMIN_KEY: &str = "sk-admin-test";
+
 /// 一个已启动的网关 + mock 上游 + SQLite 组件的完整测试环境。
 pub struct TestGateway {
     pub addr: SocketAddr,
     pub upstream: MockUpstream,
     pub pool: sqlx::SqlitePool,
     pub db_path: tempfile::TempPath,
+    /// 独立管理监听地址；未启用管理面时为 `None`。
+    pub admin_addr: Option<SocketAddr>,
 }
 
 impl TestGateway {
@@ -340,6 +345,17 @@ impl TestGateway {
     /// 用自定义 seed 启动完整测试环境。`make_seed` 接收 mock 上游 base URL，
     /// 返回要播种进数据库的资源（计费/渠道可在其中定制）。
     pub async fn start_with(make_seed: impl Fn(&str) -> Seed) -> Self {
+        Self::start_with_opts(make_seed, false).await
+    }
+
+    /// 带独立管理监听启动：协议面与 `start_with` 相同，另起一个以
+    /// `TEST_ADMIN_KEY` 认证的管理监听，`admin_addr` 记录其地址。
+    pub async fn start_with_admin(make_seed: impl Fn(&str) -> Seed) -> Self {
+        Self::start_with_opts(make_seed, true).await
+    }
+
+    /// 内部统一启动逻辑：建库 → 播种 → 加载快照 →（可选）起管理监听 → 起网关。
+    async fn start_with_opts(make_seed: impl Fn(&str) -> Seed, with_admin: bool) -> Self {
         let upstream = MockUpstream::start().await;
 
         let db = tempfile::NamedTempFile::new().expect("应能创建临时库文件");
@@ -355,6 +371,28 @@ impl TestGateway {
             .await
             .expect("应能加载运行时快照");
         let snapshot = runtime::snapshot_handle(snapshot);
+
+        // 管理面与协议面共用同一快照句柄：管理写库后换快照，协议请求路径读到
+        // 新资源，端到端断言「写后即时生效」。
+        let admin_addr = if with_admin {
+            let admin_app =
+                gateway::admin_router(pool.clone(), snapshot.clone(), TEST_ADMIN_KEY.to_string());
+            let admin_listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("管理监听应能绑定随机端口");
+            let admin_addr = admin_listener
+                .local_addr()
+                .expect("管理监听应能获取监听地址");
+            tokio::spawn(async move {
+                axum::serve(admin_listener, admin_app)
+                    .await
+                    .expect("管理面服务应运行");
+            });
+            Some(admin_addr)
+        } else {
+            None
+        };
+
         let app = gateway::router(pool.clone(), snapshot).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -369,6 +407,7 @@ impl TestGateway {
             upstream,
             pool,
             db_path,
+            admin_addr,
         }
     }
 
@@ -413,6 +452,7 @@ impl TestGateway {
             upstream: upstreams[0].clone(),
             pool,
             db_path,
+            admin_addr: None,
         };
         (gw, upstreams)
     }
@@ -420,5 +460,13 @@ impl TestGateway {
     /// 网关 base URL。
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// 管理面 base URL；未启用管理面时 panic（调用方应先 `start_with_admin`）。
+    pub fn admin_base_url(&self) -> String {
+        let addr = self
+            .admin_addr
+            .expect("管理面未启用：请用 start_with_admin 启动");
+        format!("http://{addr}")
     }
 }
