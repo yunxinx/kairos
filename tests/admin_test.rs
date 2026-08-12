@@ -5,6 +5,7 @@
 
 mod common;
 
+use base64::Engine as _;
 use common::{TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use kairos::store;
 use serde_json::{Value, json};
@@ -63,6 +64,33 @@ fn completion_body() -> Value {
         }],
         "usage": { "prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3 }
     })
+}
+
+/// 让请求路径成功落一条日志：设置上游成功行为并发一条 Chat 请求断言 200。
+async fn make_successful_request(gw: &mut TestGateway) {
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let resp = chat_request(gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+/// 读最近一条日志的两份 body 列。
+async fn fetch_bodies(pool: &sqlx::SqlitePool) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    sqlx::query_as("SELECT request_body, response_body FROM request_log ORDER BY id DESC LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .expect("应有请求日志")
+}
+
+/// 以 `TEST_ADMIN_KEY` 认证、携带 JSON body 的 PUT 请求。
+async fn admin_put(gw: &TestGateway, path: &str, body: Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .put(format!("{}{path}", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("管理请求应可达")
 }
 
 /// 未配置管理监听时管理面整体关闭：协议监听上没有任何管理路由。
@@ -430,4 +458,322 @@ async fn recreated_token_does_not_resurrect_balance() {
         reqwest::StatusCode::PAYMENT_REQUIRED,
         "重建令牌应为零余额，不复活旧余额"
     );
+}
+
+// --- 04 票：设置、余额调整与日志查询 ---
+
+/// 设置读写：缺省读回、写后返回变更后设置、body 上限即时生效（新上限立刻拦截超限请求）。
+#[tokio::test]
+async fn settings_write_takes_effect_immediately() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 缺省设置：full_body 关闭、body 上限为正。
+    let resp = client
+        .get(format!("{admin}/settings"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可读设置");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let settings: Value = resp.json().await.expect("设置应可解析");
+    assert_eq!(settings["full_body"], false);
+    assert!(settings["max_request_bytes"].as_u64().unwrap() > 0);
+
+    // 写设置：body 上限压到 100 字节，返回变更后设置。
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({ "full_body": false, "max_request_bytes": 100 }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let settings: Value = resp.json().await.expect("设置应可解析");
+    assert_eq!(settings["max_request_bytes"], 100);
+
+    // 新上限立即生效：超限请求被 413 拦截且不出站。
+    let big = "x".repeat(2000);
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({ "model": TEST_MODEL, "messages": [{ "role": "user", "content": big }] }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "新 body 上限应立即拦截超限请求"
+    );
+    assert!(gw.upstream.received().is_empty(), "超限不应出站");
+}
+
+/// 设置写入开启 full_body：后续请求的完整 body 落库，且 /logs 以 base64 返回 body。
+#[tokio::test]
+async fn settings_toggle_full_body_enables_body_logging() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 开启 full_body。
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({ "full_body": true, "max_request_bytes": 100_000_000 }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 发一条成功请求。
+    make_successful_request(&mut gw).await;
+
+    // 日志应带 body。
+    let (request_body, response_body) = fetch_bodies(&gw.pool).await;
+    assert!(request_body.is_some(), "开启 full_body 后应落请求 body");
+    assert!(response_body.is_some(), "开启 full_body 后应落响应 body");
+
+    // /logs 的 body 以 base64 返回。
+    let resp = client
+        .get(format!("{admin}/logs?page_size=1"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可查日志");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    let entry = &page["items"][0];
+    let request_b64 = entry["request_body"]
+        .as_str()
+        .expect("request_body 应为字符串");
+    let decoded = base64::prelude::BASE64_STANDARD
+        .decode(request_b64)
+        .expect("request_body 应为合法 base64");
+    assert!(
+        String::from_utf8_lossy(&decoded).contains("model"),
+        "解码后的请求体应含 model 字段"
+    );
+}
+
+/// 余额调整为相对量：扣减至零余额 → 计费准入拒绝（402）；充值后恢复可用。
+#[tokio::test]
+async fn balance_adjustment_reflected_in_admission() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
+    let resp = client
+        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "delta_usd_micros": -5_000_000 }))
+        .send()
+        .await
+        .expect("应可调整余额");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let balance: Value = resp.json().await.expect("余额应可解析");
+    assert_eq!(balance["balance_usd_micros"], 0);
+    assert_eq!(balance["token_key"], TEST_TOKEN_KEY);
+
+    // 零余额：计费准入拒绝。
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYMENT_REQUIRED,
+        "零余额应 402"
+    );
+
+    // 充值后恢复可用。
+    let resp = client
+        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "delta_usd_micros": 5_000_000 }))
+        .send()
+        .await
+        .expect("应可充值");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    make_successful_request(&mut gw).await;
+}
+
+/// 修改令牌其他属性不重置余额：充值 → 改 name → 余额保持。
+#[tokio::test]
+async fn token_attr_update_does_not_reset_balance() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 充值 1 USD（初始 5 USD → 6 USD）。
+    let resp = client
+        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "delta_usd_micros": 1_000_000 }))
+        .send()
+        .await
+        .expect("应可充值");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 修改令牌其他属性（name）。
+    let resp = admin_put(
+        &gw,
+        &format!("/tokens/{TEST_TOKEN_KEY}"),
+        json!({ "token_key": TEST_TOKEN_KEY, "name": "renamed", "limit_usd_micros": null }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 余额不变：以 delta 0 读回应仍为 6_000_000。
+    let resp = client
+        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "delta_usd_micros": 0 }))
+        .send()
+        .await
+        .expect("应可读余额");
+    let balance: Value = resp.json().await.expect("余额应可解析");
+    assert_eq!(
+        balance["balance_usd_micros"], 6_000_000,
+        "修改令牌属性不应重置余额"
+    );
+}
+
+/// 日志分页与过滤：全量、按模型过滤、分页取数正确，时间倒序。
+#[tokio::test]
+async fn logs_paginate_and_filter() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 生成 3 条成功请求日志。
+    for _ in 0..3 {
+        make_successful_request(&mut gw).await;
+    }
+
+    // 全量：total 反映日志总数，默认每页 20 条。
+    let resp = client
+        .get(format!("{admin}/logs"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可查日志");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 3);
+    assert_eq!(page["items"].as_array().unwrap().len(), 3);
+    assert_eq!(page["items"][0]["model"], TEST_MODEL);
+
+    // 按模型过滤：命中全部 3 条。
+    let resp = client
+        .get(format!("{admin}/logs?model={TEST_MODEL}"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可过滤日志");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 3);
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["model"] == TEST_MODEL)
+    );
+
+    // 按令牌过滤：命中全部 3 条（同一令牌）。
+    let resp = client
+        .get(format!("{admin}/logs?token_key={TEST_TOKEN_KEY}"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可过滤日志");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 3);
+
+    // 分页：page_size=2 → 第一页 2 条、第二页 1 条。
+    let resp = client
+        .get(format!("{admin}/logs?page=1&page_size=2"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可分页");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+    assert_eq!(page["page_size"], 2);
+    assert_eq!(page["total"], 3);
+
+    let resp = client
+        .get(format!("{admin}/logs?page=2&page_size=2"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可分页");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+
+    // 分页 + 时间过滤：from_created_at 远在过去 → 仍命中全部。
+    let resp = client
+        .get(format!("{admin}/logs?from_created_at=1&page_size=2"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可过滤日志");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 3);
+}
+
+/// 新端点的非法输入返回结构化错误：设置上限为 0、未知设置字段、余额调不存在令牌、
+/// 日志非法查询参数。
+#[tokio::test]
+async fn new_endpoints_structured_errors() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 设置：max_request_bytes=0 → 400。
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({ "full_body": false, "max_request_bytes": 0 }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "invalid_body");
+
+    // 设置：未知字段 → 400（deny_unknown_fields）。
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({ "full_body": false, "max_request_bytes": 100, "bogus": 1 }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 余额：不存在的令牌 → 404。
+    let resp = client
+        .post(format!("{admin}/tokens/nope/balance"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "delta_usd_micros": 100 }))
+        .send()
+        .await
+        .expect("应可调整余额");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 日志：非法查询参数 → 400 结构化错误。
+    let resp = client
+        .get(format!("{admin}/logs?page=abc"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可查日志");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "invalid_body");
+
+    // 日志：未知查询参数 → 400（deny_unknown_fields，拼写错误不静默返回未过滤结果）。
+    let resp = client
+        .get(format!("{admin}/logs?tokne_key=sk-x"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可查日志");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }

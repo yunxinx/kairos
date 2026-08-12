@@ -62,6 +62,8 @@ pub async fn insert_smoke(pool: &SqlitePool, note: &str) -> Result<i64, StoreErr
 /// 一条请求日志的可持久化字段。
 #[derive(Debug, Clone)]
 pub struct RequestLog {
+    /// 自增主键：新增时由库分配，读回后才有效（插入构造时填 0）。
+    pub id: i64,
     /// unix 毫秒时间戳。
     pub created_at: i64,
     pub token_name: String,
@@ -288,9 +290,15 @@ pub async fn query_request_logs(
     push_request_log_filters(&mut qb, filter);
     qb.push(" ORDER BY id DESC");
     // 分页参数在查询边界防御：`page`/`page_size` 可能为 0（`Default` 派生或
-    // 结构体字面量绕过构造器夹取），用 saturating 运算避免下溢。
+    // 结构体字面量绕过构造器夹取），用 saturating 运算避免下溢。offset 再夹到
+    // `i64::MAX` 上限再转 i64，防止超大页码（如外部传入 u64::MAX）经 `as i64`
+    // 回绕成负偏移（SQLite 拒绝负 OFFSET 报错）；超大偏移只返回空页，优雅降级。
     let page_size = filter.page_size.max(1);
-    let offset = filter.page.saturating_sub(1).saturating_mul(page_size);
+    let offset = filter
+        .page
+        .saturating_sub(1)
+        .saturating_mul(page_size)
+        .min(i64::MAX as u64);
     qb.push(" LIMIT ").push_bind(page_size as i64);
     qb.push(" OFFSET ").push_bind(offset as i64);
 
@@ -369,6 +377,7 @@ fn map_request_log_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestLog, Stor
             .map_err(StoreError::Query)?,
     };
     Ok(RequestLog {
+        id: row.try_get("id").map_err(StoreError::Query)?,
         created_at: row.try_get("created_at").map_err(StoreError::Query)?,
         token_name: row.try_get("token_name").map_err(StoreError::Query)?,
         token_key: row.try_get("token_key").map_err(StoreError::Query)?,
@@ -446,6 +455,7 @@ mod tests {
             insert_request_log(
                 &pool,
                 &RequestLog {
+                    id: 0,
                     created_at: 1000 + i as i64,
                     token_name: format!("t{i}"),
                     token_key: "sk-a".to_string(),
@@ -518,6 +528,7 @@ mod tests {
         insert_request_log(
             &pool,
             &RequestLog {
+                id: 0,
                 created_at: 1000,
                 token_name: "t".to_string(),
                 token_key: "sk-a".to_string(),
@@ -544,5 +555,12 @@ mod tests {
             .await
             .expect("page=0 不应 panic");
         assert_eq!(rows.len(), 1, "page=0 视作第一页且 page_size 至少为 1");
+
+        // 超大页码：offset 经 i64::MAX 夹取不回绕成负偏移，SQLite 不报错，返回空页。
+        let huge = RequestLogQuery::new(u64::MAX, 200);
+        let rows = query_request_logs(&pool, &huge)
+            .await
+            .expect("超大页码不应触发负 OFFSET 报错");
+        assert!(rows.is_empty(), "超大页码应返回空页而非报错");
     }
 }

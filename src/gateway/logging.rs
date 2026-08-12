@@ -35,6 +35,7 @@ pub(super) async fn log_request(
 ) {
     let now = unix_millis();
     let log = store::RequestLog {
+        id: 0,
         created_at: now,
         token_name: token.name.clone(),
         token_key: token.token_key.clone(),

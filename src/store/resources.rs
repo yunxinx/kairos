@@ -59,6 +59,19 @@ pub const SETTING_FULL_BODY: &str = "full_body";
 /// 运行时开关键：入站请求体大小上限（字节）。
 pub const SETTING_MAX_REQUEST_BYTES: &str = "max_request_bytes";
 
+/// 运行时设置的聚合契约：`full_body` 与入站请求体上限。
+///
+/// 落库时拆成两条键值记录（`settings` 表），管理 API 以其 JSON 形态作为
+/// wire 契约（成对读写），故派生 `Serialize`/`Deserialize` 并拒绝未知字段。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    /// 是否落完整请求/响应 body。
+    pub full_body: bool,
+    /// 入站请求体大小上限（字节）。
+    pub max_request_bytes: u64,
+}
+
 /// `Protocol` 落库用的 wire 字符串。
 fn protocol_to_wire(p: Protocol) -> &'static str {
     match p {
@@ -219,6 +232,22 @@ pub async fn delete_token(conn: &mut SqliteConnection, token_key: &str) -> Resul
     Ok(())
 }
 
+/// 判断令牌定义是否存在。
+///
+/// 供余额调整等「先校验存在再写余额」的原语在事务内使用，与后续写持同一写锁，
+/// 避免并发删除令牌后仍写出一条孤儿余额行、被后续重建令牌复活。
+pub async fn token_exists(
+    conn: &mut SqliteConnection,
+    token_key: &str,
+) -> Result<bool, StoreError> {
+    let row = sqlx::query("SELECT 1 FROM tokens WHERE token_key = ?")
+        .bind(token_key)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(row.is_some())
+}
+
 /// 读出全部价格（每模型一行）。
 pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
     let rows = sqlx::query(
@@ -327,6 +356,24 @@ pub async fn delete_setting(conn: &mut SqliteConnection, key: &str) -> Result<()
     Ok(())
 }
 
+/// 成对写入运行时设置：`full_body` 与 `max_request_bytes` 一同落库（幂等）。
+///
+/// 供管理 API 的 `/settings` 写操作使用：两条开关在同一个事务内写入，保证聚合
+/// 契约的原子性。读回经 `list_settings` 由调用方聚合。
+pub async fn upsert_settings(
+    conn: &mut SqliteConnection,
+    settings: &Settings,
+) -> Result<(), StoreError> {
+    set_setting(conn, SETTING_FULL_BODY, &Value::Bool(settings.full_body)).await?;
+    set_setting(
+        conn,
+        SETTING_MAX_REQUEST_BYTES,
+        &Value::from(settings.max_request_bytes),
+    )
+    .await?;
+    Ok(())
+}
+
 /// 把 serde 序列化错误包装为存储层错误。
 fn serde_error(err: serde_json::Error) -> StoreError {
     StoreError::InvalidResource(format!("JSON 序列化失败: {err}"))
@@ -427,6 +474,31 @@ mod tests {
         assert_eq!(tokens, vec![token]);
     }
 
+    /// 令牌定义存在性判断：存在返回 true，不存在返回 false。
+    #[tokio::test]
+    async fn token_exists_truthiness() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        assert!(
+            !token_exists(&mut conn, "sk-a").await.expect("应能查询"),
+            "未播种的令牌不存在"
+        );
+        upsert_token(
+            &mut conn,
+            &Token {
+                token_key: "sk-a".to_string(),
+                name: "dev".to_string(),
+                limit_usd_micros: None,
+            },
+        )
+        .await
+        .expect("应能写令牌");
+        assert!(
+            token_exists(&mut conn, "sk-a").await.expect("应能查询"),
+            "播种后的令牌应存在"
+        );
+    }
+
     /// 令牌属性更新不触碰余额：余额存 token_balance 表，令牌表只存定义。
     #[tokio::test]
     async fn token_attr_update_keeps_balance_separate() {
@@ -525,6 +597,38 @@ mod tests {
         let settings = list_settings(&pool).await.expect("应能读开关");
         assert!(!settings.contains_key(SETTING_FULL_BODY));
         assert!(settings.contains_key(SETTING_MAX_REQUEST_BYTES));
+    }
+
+    /// 设置成对写入 → 读回往返一致；覆盖后单份值更新。
+    #[tokio::test]
+    async fn settings_upsert_roundtrip() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let settings = Settings {
+            full_body: true,
+            max_request_bytes: 8_000_000,
+        };
+        upsert_settings(&mut conn, &settings)
+            .await
+            .expect("应能写设置");
+
+        let map = list_settings(&pool).await.expect("应能读开关");
+        assert_eq!(map[SETTING_FULL_BODY], Value::Bool(true));
+        assert_eq!(map[SETTING_MAX_REQUEST_BYTES], Value::from(8_000_000u64));
+
+        // 覆盖：仅改上限，full_body 保留。
+        upsert_settings(
+            &mut conn,
+            &Settings {
+                full_body: true,
+                max_request_bytes: 1_000,
+            },
+        )
+        .await
+        .expect("应能覆盖设置");
+        let map = list_settings(&pool).await.expect("应能读开关");
+        assert_eq!(map[SETTING_MAX_REQUEST_BYTES], Value::from(1_000u64));
+        assert_eq!(map[SETTING_FULL_BODY], Value::Bool(true));
     }
 
     /// 事务中途失败不污染库：事务内有效写入随回滚一并撤销。
