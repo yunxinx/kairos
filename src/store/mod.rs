@@ -3,9 +3,11 @@
 //! 本模块承载请求日志（`request_log`）、冒烟记录（`smoke_probe`）与令牌计费
 //! 余额（`token_balance`）。金额一律整数 micro-USD（ADR-0002）。
 
+pub mod resources;
+
 use std::path::Path;
 
-use sqlx::{SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions};
 use thiserror::Error;
 
 use crate::core::billing::PriceSnapshot;
@@ -21,6 +23,8 @@ pub enum StoreError {
     Query(sqlx::Error),
     #[error("令牌 {0} 的余额记录在写入后仍不存在")]
     MissingToken(String),
+    #[error("资源数据非法: {0}")]
+    InvalidResource(String),
 }
 
 /// 打开 SQLite 连接池并在事务内按序应用编号迁移。
@@ -199,4 +203,330 @@ pub async fn settle_charge(
     get_token_balance(conn, token_key)
         .await?
         .ok_or(StoreError::MissingToken(token_key.to_string()))
+}
+
+/// 相对调整令牌余额：充值传正数、扣减传负数，原子完成。返回调整后余额。
+///
+/// 与 `settle_charge` 不同，本原语只动余额、不动累计结算额，供运营调账使用。
+pub async fn adjust_balance(
+    conn: &mut SqliteConnection,
+    token_key: &str,
+    delta_usd_micros: i64,
+) -> Result<TokenBalance, StoreError> {
+    sqlx::query(
+        "UPDATE token_balance \
+         SET balance_usd_micros = balance_usd_micros + ? \
+         WHERE token_key = ?",
+    )
+    .bind(delta_usd_micros)
+    .bind(token_key)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+
+    get_token_balance(conn, token_key)
+        .await?
+        .ok_or(StoreError::MissingToken(token_key.to_string()))
+}
+
+/// 请求日志查询过滤条件与分页。全部过滤维度可选，缺省即不限。
+#[derive(Debug, Clone, Default)]
+pub struct RequestLogQuery {
+    /// 按令牌精确过滤。
+    pub token_key: Option<String>,
+    /// 按模型精确过滤。
+    pub model: Option<String>,
+    /// 只返回 `created_at >= from_created_at`。
+    pub from_created_at: Option<i64>,
+    /// 只返回 `created_at <= to_created_at`。
+    pub to_created_at: Option<i64>,
+    /// 页码，从 1 起。
+    pub page: u64,
+    /// 每页条数。
+    pub page_size: u64,
+}
+
+impl RequestLogQuery {
+    /// 用必填的分页参数构造查询，过滤维度缺省为空。
+    pub fn new(page: u64, page_size: u64) -> Self {
+        Self {
+            page: page.max(1),
+            page_size: page_size.clamp(1, 200),
+            ..Self::default()
+        }
+    }
+}
+
+/// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目。
+pub async fn query_request_logs(
+    pool: &SqlitePool,
+    filter: &RequestLogQuery,
+) -> Result<Vec<RequestLog>, StoreError> {
+    let mut qb = sqlx::QueryBuilder::new(
+        "SELECT id, created_at, token_name, token_key, inbound_protocol, model, channel, \
+         status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+         request_body, response_body FROM request_log",
+    );
+    push_request_log_filters(&mut qb, filter);
+    qb.push(" ORDER BY id DESC");
+    // 分页参数在查询边界防御：`page`/`page_size` 可能为 0（`Default` 派生或
+    // 结构体字面量绕过构造器夹取），用 saturating 运算避免下溢。
+    let page_size = filter.page_size.max(1);
+    let offset = filter.page.saturating_sub(1).saturating_mul(page_size);
+    qb.push(" LIMIT ").push_bind(page_size as i64);
+    qb.push(" OFFSET ").push_bind(offset as i64);
+
+    let rows = qb
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+
+    let mut logs = Vec::with_capacity(rows.len());
+    for row in rows {
+        logs.push(map_request_log_row(&row)?);
+    }
+    Ok(logs)
+}
+
+/// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
+pub async fn count_request_logs(
+    pool: &SqlitePool,
+    filter: &RequestLogQuery,
+) -> Result<u64, StoreError> {
+    let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*) AS cnt FROM request_log");
+    push_request_log_filters(&mut qb, filter);
+
+    let row = qb
+        .build()
+        .fetch_one(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    let count: i64 = row.try_get("cnt").map_err(StoreError::Query)?;
+    Ok(count.max(0) as u64)
+}
+
+/// 把 `filter` 中非空条件以 AND 拼入 WHERE 子句。
+fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &RequestLogQuery) {
+    let mut first = true;
+    if let Some(token_key) = &filter.token_key {
+        push_where_cond(qb, &mut first, "token_key = ");
+        qb.push_bind(token_key);
+    }
+    if let Some(model) = &filter.model {
+        push_where_cond(qb, &mut first, "model = ");
+        qb.push_bind(model);
+    }
+    if let Some(from) = filter.from_created_at {
+        push_where_cond(qb, &mut first, "created_at >= ");
+        qb.push_bind(from);
+    }
+    if let Some(to) = filter.to_created_at {
+        push_where_cond(qb, &mut first, "created_at <= ");
+        qb.push_bind(to);
+    }
+}
+
+/// 向查询拼接一个条件：首个条件以 `WHERE` 开头，其余以 `AND` 连接。
+fn push_where_cond(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, first: &mut bool, condition: &str) {
+    qb.push(if *first { " WHERE " } else { " AND " });
+    *first = false;
+    qb.push(condition);
+}
+
+/// 把请求日志行映射为 `RequestLog`。
+fn map_request_log_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestLog, StoreError> {
+    let price = PriceSnapshot {
+        input_micros: row
+            .try_get("input_price_usd_micros")
+            .map_err(StoreError::Query)?,
+        output_micros: row
+            .try_get("output_price_usd_micros")
+            .map_err(StoreError::Query)?,
+        cache_read_micros: row
+            .try_get("cache_read_price_usd_micros")
+            .map_err(StoreError::Query)?,
+        cache_write_micros: row
+            .try_get("cache_write_price_usd_micros")
+            .map_err(StoreError::Query)?,
+    };
+    Ok(RequestLog {
+        created_at: row.try_get("created_at").map_err(StoreError::Query)?,
+        token_name: row.try_get("token_name").map_err(StoreError::Query)?,
+        token_key: row.try_get("token_key").map_err(StoreError::Query)?,
+        inbound_protocol: row.try_get("inbound_protocol").map_err(StoreError::Query)?,
+        model: row.try_get("model").map_err(StoreError::Query)?,
+        channel: row.try_get("channel").map_err(StoreError::Query)?,
+        status_code: row.try_get("status_code").map_err(StoreError::Query)?,
+        latency_ms: row.try_get("latency_ms").map_err(StoreError::Query)?,
+        input_tokens: row.try_get("input_tokens").map_err(StoreError::Query)?,
+        output_tokens: row.try_get("output_tokens").map_err(StoreError::Query)?,
+        cache_read_tokens: row
+            .try_get("cache_read_tokens")
+            .map_err(StoreError::Query)?,
+        cache_write_tokens: row
+            .try_get("cache_write_tokens")
+            .map_err(StoreError::Query)?,
+        price,
+        cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        request_body: row.try_get("request_body").map_err(StoreError::Query)?,
+        response_body: row.try_get("response_body").map_err(StoreError::Query)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::billing::PriceSnapshot;
+
+    /// 建一个临时 SQLite 连接池并跑完全部迁移。
+    async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let pool = open(&dir.path().join("test.db"))
+            .await
+            .expect("应能打开临时库");
+        (dir, pool)
+    }
+
+    /// 余额相对调整：充值/扣减同一原语，原子生效。
+    #[tokio::test]
+    async fn adjust_balance_recharges_and_deducts() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        ensure_token_balance(&mut conn, "sk-a", 10.0, 1)
+            .await
+            .expect("应能初始化余额");
+
+        let after_recharge = adjust_balance(&mut conn, "sk-a", 5_000_000)
+            .await
+            .expect("应能充值");
+        assert_eq!(after_recharge.balance_usd_micros, 15_000_000);
+        // 充值/扣减不动累计结算额。
+        assert_eq!(after_recharge.settled_usd_micros, 0);
+
+        let after_deduct = adjust_balance(&mut conn, "sk-a", -3_000_000)
+            .await
+            .expect("应能扣减");
+        assert_eq!(after_deduct.balance_usd_micros, 12_000_000);
+        assert_eq!(after_deduct.settled_usd_micros, 0);
+    }
+
+    /// 请求日志分页查询：时间倒序、LIMIT/OFFSET 生效、过滤维度生效。
+    #[tokio::test]
+    async fn request_log_query_paginates_and_filters() {
+        let (_dir, pool) = test_pool().await;
+        let price = PriceSnapshot {
+            input_micros: 2_500_000,
+            output_micros: 10_000_000,
+            cache_read_micros: 1_250_000,
+            cache_write_micros: 10_000_000,
+        };
+        for (i, model) in ["gpt-4o", "gpt-4o-mini", "gpt-4o", "gpt-4o-mini"]
+            .iter()
+            .enumerate()
+        {
+            insert_request_log(
+                &pool,
+                &RequestLog {
+                    created_at: 1000 + i as i64,
+                    token_name: format!("t{i}"),
+                    token_key: "sk-a".to_string(),
+                    inbound_protocol: "openai_chat".to_string(),
+                    model: model.to_string(),
+                    channel: "c1".to_string(),
+                    status_code: 200,
+                    latency_ms: 10,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    price,
+                    cost_usd_micros: 12,
+                    request_body: None,
+                    response_body: None,
+                },
+            )
+            .await
+            .expect("应能写请求日志");
+        }
+
+        // 分页：每页 2 条，第一页取最新两条（id 倒序）。
+        let page1 = RequestLogQuery::new(1, 2);
+        let rows = query_request_logs(&pool, &page1).await.expect("应能查询");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].created_at, 1003, "倒序：最新在前");
+        assert_eq!(rows[1].created_at, 1002);
+
+        // 页码 2：取剩余两条。
+        let page2 = RequestLogQuery::new(2, 2);
+        let rows = query_request_logs(&pool, &page2).await.expect("应能查询");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].created_at, 1001);
+        assert_eq!(rows[1].created_at, 1000);
+
+        // 按模型过滤 + 统计总数。
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.model = Some("gpt-4o".to_string());
+        let rows = query_request_logs(&pool, &filter).await.expect("应能过滤");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.model == "gpt-4o"));
+        assert_eq!(
+            count_request_logs(&pool, &filter).await.expect("应能统计"),
+            2
+        );
+
+        // 时间范围过滤。
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.from_created_at = Some(1002);
+        let rows = query_request_logs(&pool, &filter).await.expect("应能过滤");
+        assert_eq!(
+            count_request_logs(&pool, &filter).await.expect("应能统计"),
+            2
+        );
+        assert!(rows.iter().all(|r| r.created_at >= 1002));
+    }
+
+    /// 分页参数在查询边界防御：`Default` 派生的 page/page_size 为 0 时不 panic、
+    /// 不下溢，且行为等同于第一页。
+    #[tokio::test]
+    async fn request_log_query_defends_zero_pagination() {
+        let (_dir, pool) = test_pool().await;
+        let price = PriceSnapshot {
+            input_micros: 2_500_000,
+            output_micros: 10_000_000,
+            cache_read_micros: 1_250_000,
+            cache_write_micros: 10_000_000,
+        };
+        insert_request_log(
+            &pool,
+            &RequestLog {
+                created_at: 1000,
+                token_name: "t".to_string(),
+                token_key: "sk-a".to_string(),
+                inbound_protocol: "openai_chat".to_string(),
+                model: "gpt-4o".to_string(),
+                channel: "c1".to_string(),
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                price,
+                cost_usd_micros: 12,
+                request_body: None,
+                response_body: None,
+            },
+        )
+        .await
+        .expect("应能写请求日志");
+
+        // `RequestLogQuery::default()` 的 page/page_size 均为 0，不应引发下溢。
+        let rows = query_request_logs(&pool, &RequestLogQuery::default())
+            .await
+            .expect("page=0 不应 panic");
+        assert_eq!(rows.len(), 1, "page=0 视作第一页且 page_size 至少为 1");
+    }
 }
