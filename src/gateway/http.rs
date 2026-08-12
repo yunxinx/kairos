@@ -5,13 +5,17 @@
 //! 直通快路径（请求体仅目标性补丁、响应字节流直通、逐帧嗅探 usage 计费）；
 //! 跨协议或命中别名时经 IR 完整路径转换。协议转换由 `core` 各适配器承担，
 //! wire 类型不出适配器边界；本模块经 `protocol` 分派到对应适配器。
+//!
+//! v2 起运行时资源（渠道/令牌/价格/开关）来自 [`crate::runtime::RuntimeSnapshot`]：
+//! 请求在准入时刻抓取一个快照引用，整个请求生命周期只读该引用，不受后续原子
+//! 替换影响。入站请求体上限与 full_body 开关同样来自快照设置。
 
-use std::{collections::HashMap, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
@@ -24,12 +28,14 @@ use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::{
-    config::{Channel, Config, Price, Protocol, Token},
+    config::Protocol,
     core::billing,
     core::billing::PriceSnapshot,
     core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage},
     core::stream::{SseFrame, StreamAccumulator},
+    runtime::{RuntimeSnapshot, SnapshotHandle},
     store,
+    store::resources::{Channel, Token},
 };
 
 use super::failover::{Outbound, run_failover};
@@ -40,25 +46,17 @@ use super::sse::{
 
 use super::{protocol, routing};
 
-/// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 认证令牌表 + 渠道表 + 价格表。
+/// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 运行时资源快照句柄。
 #[derive(Clone)]
 pub struct Deps {
     pub(super) pool: SqlitePool,
     pub(super) client: reqwest::Client,
-    pub(super) tokens: HashMap<String, Token>,
-    pub(super) channels: Vec<Channel>,
-    pub(super) prices: HashMap<String, Price>,
-    pub(super) full_body: bool,
+    pub(super) snapshot: SnapshotHandle,
 }
 
-/// 组装网关路由。`cfg` 持有认证令牌、渠道与价格配置。
-pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
-    let tokens: HashMap<String, Token> = cfg
-        .tokens
-        .iter()
-        .map(|token| (token.key.clone(), token.clone()))
-        .collect();
-
+/// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
+/// 当前资源；管理 API 写库后可原子替换该快照使新资源即时生效。
+pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
     // 不设客户端级 timeout：reqwest 的 timeout 覆盖到响应体读完，会截断长流式
     // 响应；超时统一按渠道在请求级施加（非流式 `.timeout`，流式仅约束到响应头）。
     let client = reqwest::Client::builder()
@@ -68,17 +66,19 @@ pub fn router(cfg: &Config, pool: SqlitePool) -> Router {
     let deps = Deps {
         pool,
         client,
-        tokens,
-        channels: cfg.channels.clone(),
-        prices: cfg.prices.0.clone(),
-        full_body: cfg.logging.full_body,
+        snapshot,
     };
 
+    // 禁用 axum 默认的 2MB 请求体上限：入站请求体上限由运行时开关 `max_request_bytes`
+    // 在 `handle_request` 内统一施加（超限返回入站协议格式 413）。若不禁用，axum 会在
+    // `Bytes` 提取器内以 2MB 提前拒绝大请求，使运行时设置失效。`layer` 只作用于其之前
+    // 已添加的路由，故先注册路由再挂层。
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
         .fallback(not_found)
+        .layer(DefaultBodyLimit::disable())
         .with_state(deps)
 }
 
@@ -126,10 +126,34 @@ async fn handle_request(
     body: axum::body::Bytes,
 ) -> Response {
     let started = unix_millis();
-    let request_body_for_log = deps.full_body.then(|| body.to_vec());
+    // 准入时刻抓取快照引用：在途请求持有该引用直到结束，不受后续原子替换影响。
+    let snapshot = deps.snapshot.read().await.clone();
+    let full_body = snapshot.full_body;
+
+    // 0. 入站请求体上限：`Bytes` 提取器已把整个请求体缓冲进内存，此处按运行时开关
+    // `max_request_bytes` 的长度上限决定取舍，超限以入站协议错误格式拒绝（413）。
+    // 超限请求尚无令牌可归因，不落请求日志。
+    if body.len() as u64 > snapshot.max_request_bytes {
+        let message = format!("请求体超过上限 {} 字节", snapshot.max_request_bytes);
+        return error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &message,
+            &deps,
+            full_body,
+            None,
+            None,
+            started,
+            inbound_protocol,
+            None,
+        )
+        .await;
+    }
+
+    // 仅放行后的请求才为 full_body 预取请求字节，避免超限请求白分配一份待丢弃的拷贝。
+    let request_body_for_log = full_body.then(|| body.to_vec());
 
     // 1. 认证：Bearer 或 x-api-key 两种头都接受。认证先行，未认证不出站。
-    let token = match authenticate(&deps, &headers) {
+    let token = match authenticate(&snapshot, &headers) {
         Ok(token) => token,
         Err(err) => {
             let message = err.to_string();
@@ -137,6 +161,7 @@ async fn handle_request(
                 StatusCode::UNAUTHORIZED,
                 &message,
                 &deps,
+                full_body,
                 None,
                 None,
                 started,
@@ -156,6 +181,7 @@ async fn handle_request(
                 StatusCode::BAD_REQUEST,
                 &message,
                 &deps,
+                full_body,
                 Some(token),
                 None,
                 started,
@@ -173,6 +199,7 @@ async fn handle_request(
                 StatusCode::BAD_REQUEST,
                 &message,
                 &deps,
+                full_body,
                 Some(token),
                 None,
                 started,
@@ -184,7 +211,7 @@ async fn handle_request(
     };
 
     // 3. 准入：模型必须有候选渠道（按 failover 顺序排列）。
-    let route = match routing::route(&deps.channels, &request.model) {
+    let route = match routing::route(&snapshot.channels, &request.model) {
         Some(route) => route,
         None => {
             let message = format!("模型 {} 未配置任何可用渠道", request.model);
@@ -192,6 +219,7 @@ async fn handle_request(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &message,
                 &deps,
+                full_body,
                 Some(token),
                 Some(&request.model),
                 started,
@@ -203,14 +231,15 @@ async fn handle_request(
     };
 
     // 4. 计费准入：模型必须配置价格；令牌余额与累计上限须通过。
-    let price = match deps.prices.get(&request.model) {
-        Some(price) => billing::PriceSnapshot::from_price(price),
+    let price = match snapshot.prices.get(&request.model) {
+        Some(price) => PriceSnapshot::from_store_price(price),
         None => {
             let message = format!("模型 {} 未配置价格，无法计费", request.model);
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &message,
                 &deps,
+                full_body,
                 Some(token),
                 Some(&request.model),
                 started,
@@ -225,6 +254,7 @@ async fn handle_request(
         Err(err) => {
             return db_error_response(
                 &deps,
+                full_body,
                 token,
                 &request.model,
                 started,
@@ -235,18 +265,15 @@ async fn handle_request(
             .await;
         }
     };
-    let balance = match store::ensure_token_balance(
-        &mut conn,
-        &token.key,
-        token.balance_usd,
-        started,
-    )
-    .await
+    // 余额独立存 token_balance 表：令牌定义不含初始余额，首次出现按 0 建行，
+    // 运营经管理 API 充值后按实际余额准入。
+    let balance = match store::ensure_token_balance(&mut conn, &token.token_key, 0.0, started).await
     {
         Ok(balance) => balance,
         Err(err) => {
             return db_error_response(
                 &deps,
+                full_body,
                 token,
                 &request.model,
                 started,
@@ -267,6 +294,7 @@ async fn handle_request(
             StatusCode::PAYMENT_REQUIRED,
             &message,
             &deps,
+            full_body,
             Some(token),
             Some(&request.model),
             started,
@@ -275,25 +303,25 @@ async fn handle_request(
         )
         .await;
     }
-    if let Some(limit) = token.limit_usd {
-        let limit_micros = (limit * 1_000_000.0).round() as i64;
-        if balance.settled_usd_micros >= limit_micros {
-            let message = format!(
-                "令牌 {} 累计结算已超上限（limit_usd = {:.2}）",
-                token.name, limit
-            );
-            return error_response(
-                StatusCode::PAYMENT_REQUIRED,
-                &message,
-                &deps,
-                Some(token),
-                Some(&request.model),
-                started,
-                inbound_protocol,
-                request_body_for_log,
-            )
-            .await;
-        }
+    if let Some(limit) = token.limit_usd_micros
+        && balance.settled_usd_micros >= limit
+    {
+        let message = format!(
+            "令牌 {} 累计结算已超上限（limit_usd_micros = {limit}）",
+            token.name
+        );
+        return error_response(
+            StatusCode::PAYMENT_REQUIRED,
+            &message,
+            &deps,
+            full_body,
+            Some(token),
+            Some(&request.model),
+            started,
+            inbound_protocol,
+            request_body_for_log,
+        )
+        .await;
     }
 
     // 5. 出站：同协议且未命中别名时走直通快路径，否则经 IR 完整路径。
@@ -307,6 +335,7 @@ async fn handle_request(
     if passthrough {
         let passthrough_ctx = PassthroughCtx {
             deps: &deps,
+            snapshot: &snapshot,
             request: &request,
             token,
             price,
@@ -320,6 +349,7 @@ async fn handle_request(
 
     outbound_with_failover(
         &deps,
+        &snapshot,
         &request,
         &route,
         token,
@@ -335,6 +365,8 @@ async fn handle_request(
 /// 请求级信息。作为 `*_completion` 的参数打包，避免过长参数列表。
 struct CallCtx<'a> {
     deps: &'a Deps,
+    /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
+    snapshot: &'a Arc<RuntimeSnapshot>,
     request: &'a ChatRequest,
     route: &'a routing::Route,
     token: &'a Token,
@@ -353,6 +385,7 @@ struct CallCtx<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn outbound_with_failover(
     deps: &Deps,
+    snapshot: &Arc<RuntimeSnapshot>,
     request: &ChatRequest,
     route: &routing::Route,
     token: &Token,
@@ -369,6 +402,7 @@ async fn outbound_with_failover(
             Box::pin(async move {
                 let mut ctx = CallCtx {
                     deps,
+                    snapshot,
                     request,
                     route,
                     token,
@@ -387,7 +421,7 @@ async fn outbound_with_failover(
         |channel, status, _failover, body_wire| {
             let channel = channel.to_string();
             let request_body = request_body_for_log.clone();
-            let response_body = deps.full_body.then(|| body_wire.to_vec());
+            let response_body = snapshot.full_body.then(|| body_wire.to_vec());
             Box::pin(async move {
                 log_request(
                     deps,
@@ -417,6 +451,8 @@ async fn outbound_with_failover(
 /// 用于出站请求的目标性补丁。
 struct PassthroughCtx<'a> {
     deps: &'a Deps,
+    /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
+    snapshot: &'a Arc<RuntimeSnapshot>,
     request: &'a ChatRequest,
     token: &'a Token,
     price: PriceSnapshot,
@@ -448,7 +484,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
         |channel, status, _failover, body_wire| {
             let channel = channel.to_string();
             let request_body = ctx.request_body.clone();
-            let response_body = ctx.deps.full_body.then(|| body_wire.to_vec());
+            let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
             Box::pin(async move {
                 log_request(
                     ctx.deps,
@@ -532,6 +568,7 @@ async fn passthrough_stream_completion(ctx: &PassthroughCtx<'_>, channel: &Chann
     // 逐 SSE 帧嗅探 usage 计费，同时原样转发字节流到下游。
     let task = PassthroughStreamTask {
         deps: ctx.deps.clone(),
+        snapshot: ctx.snapshot.clone(),
         token: ctx.token.clone(),
         request: ctx.request.clone(),
         channel: channel.clone(),
@@ -608,7 +645,7 @@ async fn passthrough_non_stream_completion(
             match ctx.deps.pool.acquire().await {
                 Ok(mut settle_conn) => {
                     if let Err(err) =
-                        store::settle_charge(&mut settle_conn, &ctx.token.key, cost).await
+                        store::settle_charge(&mut settle_conn, &ctx.token.token_key, cost).await
                     {
                         eprintln!("直通非流式结算失败: {err}");
                     }
@@ -628,7 +665,7 @@ async fn passthrough_non_stream_completion(
                 price: ctx.price,
                 cost_usd_micros: cost,
                 request_body: ctx.request_body.clone(),
-                response_body: ctx.deps.full_body.then(|| upstream_body.to_vec()),
+                response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
             },
             ctx.inbound_protocol,
         )
@@ -688,6 +725,7 @@ fn passthrough_upstream_url(channel: &Channel) -> String {
 #[derive(Clone)]
 struct PassthroughStreamTask {
     deps: Deps,
+    snapshot: Arc<RuntimeSnapshot>,
     token: Token,
     request: ChatRequest,
     channel: Channel,
@@ -736,7 +774,7 @@ async fn pipe_passthrough_stream<S>(
             if downstream_open {
                 let data = String::from_utf8_lossy(&frame).into_owned();
                 // full_body：记录实际转发帧的 wire 字节（入站响应）。
-                if ctx.deps.full_body {
+                if ctx.snapshot.full_body {
                     let wire_frame = SseFrame {
                         event: event_name.clone(),
                         data: data.clone(),
@@ -764,7 +802,8 @@ async fn pipe_passthrough_stream<S>(
             Some(Err(_)) | None => {
                 // OpenAI 协议约定以 `data: [DONE]` 终止；哨兵也是入站响应的一部分，
                 // full_body 开启时在实际下发前记入（结算先于哨兵，日志此时能带全）。
-                if ctx.deps.full_body && downstream_open && ctx.protocol == Protocol::OpenAiChat {
+                if ctx.snapshot.full_body && downstream_open && ctx.protocol == Protocol::OpenAiChat
+                {
                     ctx.response_body
                         .extend_from_slice(&data_frame_to_wire("[DONE]"));
                 }
@@ -774,7 +813,8 @@ async fn pipe_passthrough_stream<S>(
                     match ctx.deps.pool.acquire().await {
                         Ok(mut settle_conn) => {
                             if let Err(err) =
-                                store::settle_charge(&mut settle_conn, &ctx.token.key, cost).await
+                                store::settle_charge(&mut settle_conn, &ctx.token.token_key, cost)
+                                    .await
                             {
                                 eprintln!("直通流式结算失败: {err}");
                             }
@@ -794,7 +834,7 @@ async fn pipe_passthrough_stream<S>(
                         price: ctx.price,
                         cost_usd_micros: cost,
                         request_body: ctx.request_body.clone(),
-                        response_body: ctx.deps.full_body.then(|| ctx.response_body.clone()),
+                        response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
                     },
                     ctx.protocol,
                 )
@@ -816,6 +856,7 @@ async fn pipe_passthrough_stream<S>(
 /// 成功且 usage 非零才结算；失败或零输出不扣费。
 async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
     let deps = ctx.deps;
+    let snapshot = ctx.snapshot;
     let request = ctx.request;
     let route = ctx.route;
     let token = ctx.token;
@@ -878,7 +919,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                     match deps.pool.acquire().await {
                         Ok(mut settle_conn) => {
                             if let Err(err) =
-                                store::settle_charge(&mut settle_conn, &token.key, cost).await
+                                store::settle_charge(&mut settle_conn, &token.token_key, cost).await
                             {
                                 eprintln!("结算失败: {err}");
                             }
@@ -889,7 +930,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                 let inbound = protocol::encode_response(&ir, inbound_protocol);
                 // full_body 记录实际返回下游的入站响应字节（重编码结果）；
                 // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
-                let inbound_wire = deps
+                let inbound_wire = snapshot
                     .full_body
                     .then(|| serde_json::to_vec(&inbound).unwrap_or_default());
                 log_request(
@@ -1026,6 +1067,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
     let byte_stream = resp.bytes_stream();
     let ctx = StreamTask {
         deps: deps.clone(),
+        snapshot: ctx.snapshot.clone(),
         token: token.clone(),
         request: request.clone(),
         channel: channel.clone(),
@@ -1050,6 +1092,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
 #[derive(Clone)]
 struct StreamTask {
     deps: Deps,
+    snapshot: Arc<RuntimeSnapshot>,
     token: Token,
     request: ChatRequest,
     channel: Channel,
@@ -1163,7 +1206,7 @@ async fn pipe_stream<S>(
                 // 终止哨兵也是入站响应的一部分，full_body 开启时先记入再结算，
                 // 保证日志带全实际下发的字节（结算仍先于哨兵下发）。
                 if downstream_open
-                    && ctx.deps.full_body
+                    && ctx.snapshot.full_body
                     && let Some(terminator) = terminator.as_ref()
                 {
                     ctx.response_body
@@ -1183,7 +1226,7 @@ async fn pipe_stream<S>(
 
 /// full_body 开启时把一个即将下发的入站协议帧记入响应字节；关闭时无操作。
 fn record_frame_wire(ctx: &mut StreamTask, frame: &SseFrame) {
-    if ctx.deps.full_body {
+    if ctx.snapshot.full_body {
         ctx.response_body.extend_from_slice(&frame_to_wire(frame));
     }
 }
@@ -1195,7 +1238,8 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
     if cost > 0 {
         match ctx.deps.pool.acquire().await {
             Ok(mut settle_conn) => {
-                if let Err(err) = store::settle_charge(&mut settle_conn, &ctx.token.key, cost).await
+                if let Err(err) =
+                    store::settle_charge(&mut settle_conn, &ctx.token.token_key, cost).await
                 {
                     eprintln!("流式结算失败: {err}");
                 }
@@ -1215,19 +1259,23 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
             price: ctx.price,
             cost_usd_micros: cost,
             request_body: ctx.request_body.clone(),
-            response_body: ctx.deps.full_body.then(|| ctx.response_body.clone()),
+            response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
         ctx.inbound_protocol,
     )
     .await;
 }
 
-/// 从请求头提取并校验令牌 key，返回匹配的令牌。
-fn authenticate<'a>(deps: &'a Deps, headers: &HeaderMap) -> anyhow::Result<&'a Token> {
+/// 从请求头提取并校验令牌 key，返回匹配的令牌定义。
+fn authenticate<'a>(
+    snapshot: &'a RuntimeSnapshot,
+    headers: &HeaderMap,
+) -> anyhow::Result<&'a Token> {
     let key = extract_key(headers).ok_or_else(|| {
         anyhow::anyhow!("缺少认证令牌：请提供 Authorization: Bearer <key> 或 x-api-key")
     })?;
-    deps.tokens
+    snapshot
+        .tokens
         .get(&key)
         .ok_or_else(|| anyhow::anyhow!("无效的认证令牌"))
 }
@@ -1290,6 +1338,7 @@ async fn error_response(
     status: StatusCode,
     message: &str,
     deps: &Deps,
+    full_body: bool,
     token: Option<&Token>,
     model: Option<&str>,
     started: i64,
@@ -1298,9 +1347,7 @@ async fn error_response(
 ) -> Response {
     let body = protocol::encode_error(status.as_u16(), message, inbound_protocol);
     if let (Some(token), Some(model)) = (token, model) {
-        let response_wire = deps
-            .full_body
-            .then(|| serde_json::to_vec(&body).unwrap_or_default());
+        let response_wire = full_body.then(|| serde_json::to_vec(&body).unwrap_or_default());
         log_request(
             deps,
             token,
@@ -1323,8 +1370,10 @@ async fn error_response(
 }
 
 /// 准入阶段数据库错误：500 + OpenAI 错误格式 + 落日志。
+#[allow(clippy::too_many_arguments)]
 async fn db_error_response(
     deps: &Deps,
+    full_body: bool,
     token: &Token,
     model: &str,
     started: i64,
@@ -1337,6 +1386,7 @@ async fn db_error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         &message,
         deps,
+        full_body,
         Some(token),
         Some(model),
         started,

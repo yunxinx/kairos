@@ -1,10 +1,10 @@
-//! 配置驱动的端到端测试：配置文件 → 建库 → 监听 → 未实现路径的确定响应。
+//! 配置驱动的端到端测试：配置文件 → 建库 → 加载快照 → 监听 → 未实现路径的确定响应。
 
 mod common;
 
 use std::{io::Write, net::TcpListener as StdListener};
 
-use kairos::{config, gateway, store};
+use kairos::{config, gateway, runtime, store};
 
 /// 用配置文件启动网关，验证监听配置生效、未实现路径返回 404。
 #[tokio::test]
@@ -22,12 +22,7 @@ async fn config_driven_listen_and_fallback() {
         r#"{{
             "listen": {{ "host": "127.0.0.1", "port": {port} }},
             "database": {{ "path": "./kairos.db" }},
-            "channels": [{{
-                "name": "c", "protocol": "openai_chat",
-                "base_url": "http://127.0.0.1:1", "api_key": "k",
-                "priority": 1, "weight": 1, "timeout_ms": 1000, "max_retries": 0
-            }}],
-            "prices": {{ "gpt-4o": {{ "input": 1.0, "output": 2.0 }} }}
+            "admin_key": "sk-admin"
         }}"#
     )
     .expect("应能写入配置");
@@ -35,7 +30,10 @@ async fn config_driven_listen_and_fallback() {
 
     let cfg = config::Config::load(&config_path).expect("配置应可解析");
     let pool = store::open(&cfg.database.path).await.expect("建库应成功");
-    let app = gateway::router(&cfg, pool);
+    // 空库加载出快照（无资源），网关可正常启动；本测试只验证监听与未实现路径。
+    let snapshot = runtime::load_snapshot(&pool).await.expect("应能加载快照");
+    let snapshot = runtime::snapshot_handle(snapshot);
+    let app = gateway::router(pool, snapshot).await;
 
     let listen = format!("{}:{}", cfg.listen.host, cfg.listen.port);
     let listener = tokio::net::TcpListener::bind(&listen)
@@ -72,8 +70,9 @@ fn example_config_file_is_valid() {
     let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.json"));
     let cfg = config::Config::load(path).expect("示例配置应可解析");
     assert_eq!(cfg.listen.port, 8787);
-    assert_eq!(cfg.channels.len(), 1);
-    assert_eq!(cfg.prices.0.len(), 1);
+    assert_eq!(cfg.admin_key, "sk-admin-secret");
+    let admin = cfg.admin_listen.expect("示例配置应含管理监听");
+    assert_eq!(admin.port, 8788);
     assert_eq!(
         cfg.database.path,
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("kairos.db"),

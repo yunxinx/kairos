@@ -5,7 +5,7 @@
 mod common;
 
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
-use kairos::config;
+use kairos::store::resources::Price;
 use serde_json::{Value, json};
 
 fn ok_response(usage: Value) -> Value {
@@ -130,21 +130,15 @@ async fn failed_request_is_not_charged() {
 #[tokio::test]
 async fn cache_tier_falls_back_to_input_price() {
     let mut gw = TestGateway::start_with(|base| {
-        let mut cfg = common::test_config(base);
-        cfg.prices = config::Prices(
-            [(
-                TEST_MODEL.to_string(),
-                config::Price {
-                    input: 2.5,
-                    output: 10.0,
-                    cache_read: None,
-                    cache_write: None,
-                },
-            )]
-            .into_iter()
-            .collect(),
-        );
-        cfg
+        let mut seed = common::test_seed(base);
+        seed.prices = vec![Price {
+            model: TEST_MODEL.to_string(),
+            input_micros: 2_500_000,
+            output_micros: 10_000_000,
+            cache_read_micros: None,
+            cache_write_micros: None,
+        }];
+        seed
     })
     .await;
     // 只计 cache_read：1M cache tokens × input 价 2.5 → 2.5M 微元。
@@ -168,9 +162,9 @@ async fn cache_tier_falls_back_to_input_price() {
 #[tokio::test]
 async fn zero_balance_request_is_402() {
     let gw = TestGateway::start_with(|base| {
-        let mut cfg = common::test_config(base);
-        cfg.tokens[0].balance_usd = 0.0;
-        cfg
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].balance_usd = 0.0;
+        seed
     })
     .await;
 
@@ -187,9 +181,9 @@ async fn zero_balance_request_is_402() {
 async fn overdraft_settles_and_blocks_next_request() {
     // 初始余额 0.000001 USD = 1 micro-USD，费用会透支。
     let mut gw = TestGateway::start_with(|base| {
-        let mut cfg = common::test_config(base);
-        cfg.tokens[0].balance_usd = 0.000001;
-        cfg
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].balance_usd = 0.000001;
+        seed
     })
     .await;
     // prompt=1250, cached=200, cache_write=50, completion=100 → input=1000, cache_read=200,
@@ -214,10 +208,10 @@ async fn overdraft_settles_and_blocks_next_request() {
 async fn settled_limit_exceeded_is_402() {
     // 初始余额充足，但 limit_usd 极小（0.01 USD = 10000 micro-USD）。
     let mut gw = TestGateway::start_with(|base| {
-        let mut cfg = common::test_config(base);
-        cfg.tokens[0].balance_usd = 5.0;
-        cfg.tokens[0].limit_usd = Some(0.01);
-        cfg
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].balance_usd = 5.0;
+        seed.tokens[0].limit_usd = Some(0.01);
+        seed
     })
     .await;
     // 每次结算 4250，settled 依次 4250/8500/12750。
@@ -259,9 +253,9 @@ async fn settled_limit_exceeded_is_402() {
 async fn missing_price_is_rejected() {
     // 渠道服务于 `no-price` 模型（有渠道），但价格表无该模型项。
     let gw = TestGateway::start_with(|base| {
-        let mut cfg = common::test_config(base);
-        cfg.channels[0].models.push("no-price".to_string());
-        cfg
+        let mut seed = common::test_seed(base);
+        seed.channels[0].models.push("no-price".to_string());
+        seed
     })
     .await;
 
@@ -321,13 +315,16 @@ async fn balance_persists_across_restart() {
     assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000 - 4250);
 
     // 用同一数据库文件重启网关（模拟重启），余额不应被重置回初始 5 USD。
+    // 资源也存库中，重启从库加载快照即可，无需再注入配置。
     let db_file = gw.db_path.to_path_buf();
-    let upstream2 = common::MockUpstream::start().await;
     let pool2 = kairos::store::open(&db_file)
         .await
         .expect("复用同一库文件应成功");
-    let cfg2 = common::test_config(&upstream2.base_url());
-    let app2 = kairos::gateway::router(&cfg2, pool2.clone());
+    let snapshot = kairos::runtime::load_snapshot(&pool2)
+        .await
+        .expect("重启应从库加载快照");
+    let snapshot = kairos::runtime::snapshot_handle(snapshot);
+    let app2 = kairos::gateway::router(pool2.clone(), snapshot).await;
     let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("网关应能绑定随机端口");

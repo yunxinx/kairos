@@ -8,7 +8,8 @@ use axum::{
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
-use crate::config::{Channel, Protocol};
+use crate::config::Protocol;
+use crate::store::resources::Channel;
 
 use super::{protocol, routing};
 

@@ -3,19 +3,25 @@
 //! 主接缝为端到端 HTTP 黑盒：这里只关心外部可观察行为（mock 收到的请求、
 //! 下游收到的响应、SQLite 中的持久化状态），不断言内部调用。
 //!
+//! v2 起运行时资源（渠道/令牌/价格/开关）移入 SQLite，夹具从「构造 Config 注入
+//! 资源」改为「DB 播种资源 + 极简静态配置」：`Seed` 持有资源清单，`start_with`
+//! 播种进库后加载快照启动网关。静态配置仅含监听/数据库路径/admin key。
+//!
 //! 该模块被多个测试二进制独立编译，各二进制只用到夹具的一个子集，
 //! 故整体允许 `dead_code`。
 
 #![allow(dead_code)]
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -24,7 +30,8 @@ use axum::{
     routing::post,
 };
 use futures_util::stream;
-use kairos::{config, gateway, store};
+use kairos::store::resources::{self, Channel, Price, Token};
+use kairos::{config, gateway, runtime, store};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
@@ -78,6 +85,8 @@ impl MockUpstream {
             .route("/chat/completions", post(handle))
             .route("/messages", post(handle))
             .route("/responses", post(handle))
+            // 禁用 axum 默认 2MB 上限：mock 上游需接收大请求体（模拟网关转发的多模态/base64）。
+            .layer(DefaultBodyLimit::disable())
             .with_state(MockDeps {
                 behavior: behavior.clone(),
                 received: received.clone(),
@@ -195,6 +204,122 @@ pub const TEST_TOKEN_KEY: &str = "sk-test-token";
 /// 测试用可用模型。
 pub const TEST_MODEL: &str = "gpt-4o";
 
+/// 测试 seed 中的令牌定义：定义 + 初始余额（USD，播种时换算为 micro-USD）。
+pub struct SeedToken {
+    pub token_key: String,
+    pub name: String,
+    /// 累计结算上限（USD）；`None` 表示无上限。
+    pub limit_usd: Option<f64>,
+    /// 初始余额（USD），缺省 0。
+    pub balance_usd: f64,
+}
+
+/// 测试资源清单：播种进 DB 后由网关加载进运行时快照。
+///
+/// 替代 v1 的 `config::Config` 资源段；渠道/价格复用 `store::resources` 行类型，
+/// 令牌因含初始余额而单独定义。
+pub struct Seed {
+    pub channels: Vec<Channel>,
+    pub tokens: Vec<SeedToken>,
+    pub prices: Vec<Price>,
+    /// 运行时开关（键为 `full_body`/`max_request_bytes`，值为 JSON）。
+    pub settings: HashMap<String, Value>,
+}
+
+/// 构造默认 seed：一个 openai_chat 渠道 + 一个测试令牌 + gpt-4o/fast 价格。
+pub fn test_seed(upstream_base: &str) -> Seed {
+    Seed {
+        channels: vec![Channel {
+            name: "test-channel".to_string(),
+            protocol: config::Protocol::OpenAiChat,
+            base_url: upstream_base.to_string(),
+            api_key: "sk-upstream".to_string(),
+            models: vec![TEST_MODEL.to_string()],
+            model_aliases: [("fast".to_string(), "gpt-4o-mini".to_string())]
+                .into_iter()
+                .collect(),
+            priority: 1,
+            weight: 1,
+            timeout_ms: 1000,
+            max_retries: 0,
+        }],
+        tokens: vec![SeedToken {
+            token_key: TEST_TOKEN_KEY.to_string(),
+            name: "dev".to_string(),
+            limit_usd: None,
+            balance_usd: 5.0,
+        }],
+        prices: vec![
+            Price {
+                model: TEST_MODEL.to_string(),
+                input_micros: 2_500_000,
+                output_micros: 10_000_000,
+                cache_read_micros: Some(1_250_000),
+                cache_write_micros: Some(10_000_000),
+            },
+            // 别名短名 `fast` 也是计费模型名（本票按 request.model 计价）。
+            Price {
+                model: "fast".to_string(),
+                input_micros: 150_000,
+                output_micros: 600_000,
+                cache_read_micros: None,
+                cache_write_micros: None,
+            },
+        ],
+        settings: HashMap::new(),
+    }
+}
+
+/// 把 seed 播种进数据库：渠道/价格直接 upsert，令牌则定义 + 初始余额。
+pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
+    let mut conn = pool.acquire().await.expect("应能获取连接");
+    for channel in &seed.channels {
+        resources::upsert_channel(&mut conn, channel)
+            .await
+            .expect("应能播种渠道");
+    }
+    for token in &seed.tokens {
+        resources::upsert_token(
+            &mut conn,
+            &Token {
+                token_key: token.token_key.clone(),
+                name: token.name.clone(),
+                limit_usd_micros: token
+                    .limit_usd
+                    .map(|usd| (usd * 1_000_000.0).round() as i64),
+            },
+        )
+        .await
+        .expect("应能播种令牌");
+        store::ensure_token_balance(
+            &mut conn,
+            &token.token_key,
+            token.balance_usd,
+            unix_millis(),
+        )
+        .await
+        .expect("应能播种令牌初始余额");
+    }
+    for price in &seed.prices {
+        resources::upsert_price(&mut conn, price)
+            .await
+            .expect("应能播种价格");
+    }
+    for (key, value) in &seed.settings {
+        resources::set_setting(&mut conn, key, value)
+            .await
+            .expect("应能播种开关");
+    }
+}
+
+/// 当前 unix 毫秒时间戳。
+pub fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// 一个已启动的网关 + mock 上游 + SQLite 组件的完整测试环境。
 pub struct TestGateway {
     pub addr: SocketAddr,
@@ -206,15 +331,15 @@ pub struct TestGateway {
 impl TestGateway {
     /// 启动完整测试环境：mock 上游 + SQLite 建库 + 网关监听随机端口。
     ///
-    /// 默认配置一个指向 mock 上游的 openai_chat 渠道（`TEST_MODEL`）与一个
-    /// `TEST_TOKEN_KEY` 令牌。
+    /// 默认播种一个指向 mock 上游的 openai_chat 渠道（`TEST_MODEL`）与一个
+    /// `TEST_TOKEN_KEY` 令牌（初始余额 5 USD）。
     pub async fn start() -> Self {
-        Self::start_with(test_config).await
+        Self::start_with(test_seed).await
     }
 
-    /// 用自定义配置启动完整测试环境。`make_cfg` 接收 mock 上游 base URL，
-    /// 返回完整的网关配置（计费/渠道可在其中定制）。
-    pub async fn start_with(make_cfg: impl Fn(&str) -> config::Config) -> Self {
+    /// 用自定义 seed 启动完整测试环境。`make_seed` 接收 mock 上游 base URL，
+    /// 返回要播种进数据库的资源（计费/渠道可在其中定制）。
+    pub async fn start_with(make_seed: impl Fn(&str) -> Seed) -> Self {
         let upstream = MockUpstream::start().await;
 
         let db = tempfile::NamedTempFile::new().expect("应能创建临时库文件");
@@ -223,8 +348,14 @@ impl TestGateway {
             .await
             .expect("SQLite 建库与迁移应成功");
 
-        let cfg = make_cfg(&upstream.base_url());
-        let app = gateway::router(&cfg, pool.clone());
+        let seed = make_seed(&upstream.base_url());
+        seed_into_db(&pool, &seed).await;
+
+        let snapshot = runtime::load_snapshot(&pool)
+            .await
+            .expect("应能加载运行时快照");
+        let snapshot = runtime::snapshot_handle(snapshot);
+        let app = gateway::router(pool.clone(), snapshot).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -243,11 +374,11 @@ impl TestGateway {
 
     /// 用多个 mock 上游启动完整测试环境（多渠道路由/failover）。
     ///
-    /// `make_cfg` 接收各 mock 上游的 base URL，返回使用多个渠道的完整配置；
+    /// `make_seed` 接收各 mock 上游的 base URL，返回使用多个渠道的 seed；
     /// 返回的 `Vec<MockUpstream>` 与传入顺序对应，便于分渠道注入行为。
     pub async fn start_with_multi(
         count: usize,
-        make_cfg: impl Fn(&[String]) -> config::Config,
+        make_seed: impl Fn(&[String]) -> Seed,
     ) -> (Self, Vec<MockUpstream>) {
         let mut upstreams = Vec::with_capacity(count);
         for _ in 0..count {
@@ -261,8 +392,14 @@ impl TestGateway {
             .await
             .expect("SQLite 建库与迁移应成功");
 
-        let cfg = make_cfg(&bases);
-        let app = gateway::router(&cfg, pool.clone());
+        let seed = make_seed(&bases);
+        seed_into_db(&pool, &seed).await;
+
+        let snapshot = runtime::load_snapshot(&pool)
+            .await
+            .expect("应能加载运行时快照");
+        let snapshot = runtime::snapshot_handle(snapshot);
+        let app = gateway::router(pool.clone(), snapshot).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -283,64 +420,5 @@ impl TestGateway {
     /// 网关 base URL。
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
-    }
-}
-
-/// 构造指向 mock 上游的测试配置：一个 openai_chat 渠道 + 一个测试令牌。
-pub fn test_config(upstream_base: &str) -> config::Config {
-    config::Config {
-        listen: config::Listen {
-            host: "127.0.0.1".to_string(),
-            port: 0,
-        },
-        database: config::Database {
-            path: "test.db".into(),
-        },
-        logging: config::Logging { full_body: false },
-        tokens: vec![config::Token {
-            key: TEST_TOKEN_KEY.to_string(),
-            name: "dev".to_string(),
-            limit_usd: None,
-            balance_usd: 5.0,
-        }],
-        channels: vec![config::Channel {
-            name: "test-channel".to_string(),
-            protocol: config::Protocol::OpenAiChat,
-            base_url: upstream_base.to_string(),
-            api_key: "sk-upstream".to_string(),
-            models: vec![TEST_MODEL.to_string()],
-            model_aliases: [("fast".to_string(), "gpt-4o-mini".to_string())]
-                .into_iter()
-                .collect(),
-            priority: 1,
-            weight: 1,
-            timeout_ms: 1000,
-            max_retries: 0,
-        }],
-        prices: config::Prices(
-            [
-                (
-                    TEST_MODEL.to_string(),
-                    config::Price {
-                        input: 2.5,
-                        output: 10.0,
-                        cache_read: Some(1.25),
-                        cache_write: Some(10.0),
-                    },
-                ),
-                // 别名短名 `fast` 也是计费模型名（本票按 request.model 计价）。
-                (
-                    "fast".to_string(),
-                    config::Price {
-                        input: 0.15,
-                        output: 0.6,
-                        cache_read: None,
-                        cache_write: None,
-                    },
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        ),
     }
 }

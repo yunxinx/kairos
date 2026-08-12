@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use rand::RngExt;
 
-use crate::config::Channel;
+use crate::store::resources::Channel;
 
 /// 一次路由的结果：按 failover 顺序排列的候选渠道 + 出站模型名。
 ///

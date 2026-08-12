@@ -10,6 +10,7 @@ mod common;
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use futures_util::StreamExt;
 use kairos::config;
+use kairos::store::resources::Channel;
 use serde_json::{Value, json};
 
 /// 解析下游 SSE 响应体，返回所有 `data:` 帧的原始 JSON 值列表。
@@ -204,9 +205,9 @@ async fn passthrough_requires_auth() {
 async fn passthrough_requires_balance_before_upstream() {
     // 用余额为 0 的令牌配置。
     let gw = TestGateway::start_with(|base| {
-        let mut cfg = common::test_config(base);
-        cfg.tokens[0].balance_usd = 0.0;
-        cfg
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].balance_usd = 0.0;
+        seed
     })
     .await;
 
@@ -259,9 +260,9 @@ async fn alias_hit_falls_back_to_ir_path() {
 async fn cross_protocol_falls_back_to_ir_path() {
     // 渠道协议为 anthropic_messages（≠ 入站 openai_chat），触发 IR 完整路径。
     let mut gw = TestGateway::start_with(|base| {
-        let mut cfg = common::test_config(base);
-        cfg.channels[0].protocol = config::Protocol::AnthropicMessages;
-        cfg
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = config::Protocol::AnthropicMessages;
+        seed
     })
     .await;
     // 上游以 Anthropic Messages 格式响应（stub 同协议，网关解码为 IR 再重编码为 openai）。
@@ -295,10 +296,10 @@ async fn cross_protocol_falls_back_to_ir_path() {
 #[tokio::test]
 async fn mixed_protocol_route_falls_back_to_ir_path() {
     let (_gw, mut upstreams) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = common::test_config(&bases[0]);
+        let mut seed = common::test_seed(&bases[0]);
         // 首渠道 openai_chat（同入站协议），failover 候选为 openai_responses（异协议）。
-        cfg.channels = vec![
-            config::Channel {
+        seed.channels = vec![
+            Channel {
                 name: "same-protocol".to_string(),
                 protocol: config::Protocol::OpenAiChat,
                 base_url: bases[0].clone(),
@@ -310,7 +311,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 timeout_ms: 1000,
                 max_retries: 0,
             },
-            config::Channel {
+            Channel {
                 name: "cross-protocol".to_string(),
                 protocol: config::Protocol::OpenAiResponses,
                 base_url: bases[1].clone(),
@@ -323,7 +324,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 max_retries: 0,
             },
         ];
-        cfg
+        seed
     })
     .await;
 
@@ -360,10 +361,10 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
 #[tokio::test]
 async fn passthrough_failover_happens_before_first_byte() {
     let (gw, mut upstreams) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = common::test_config(&bases[0]);
+        let mut seed = common::test_seed(&bases[0]);
         // 两个同协议渠道：首渠道 429（可重试），次渠道成功。
-        cfg.channels = vec![
-            config::Channel {
+        seed.channels = vec![
+            Channel {
                 name: "primary".to_string(),
                 protocol: config::Protocol::OpenAiChat,
                 base_url: bases[0].clone(),
@@ -375,7 +376,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 timeout_ms: 1000,
                 max_retries: 0,
             },
-            config::Channel {
+            Channel {
                 name: "backup".to_string(),
                 protocol: config::Protocol::OpenAiChat,
                 base_url: bases[1].clone(),
@@ -388,7 +389,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 max_retries: 0,
             },
         ];
-        cfg
+        seed
     })
     .await;
 

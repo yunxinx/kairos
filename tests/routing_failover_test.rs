@@ -10,6 +10,7 @@ mod common;
 
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use kairos::config;
+use kairos::store::resources::Channel;
 use serde_json::{Value, json};
 
 fn ok_response() -> Value {
@@ -36,12 +37,12 @@ async fn send_completion(base: &str, model: &str) -> reqwest::Response {
         .expect("应能请求网关")
 }
 
-/// 构造两个渠道的配置，分别指向两个 mock 上游。默认 ch-0 更高优先级（数值更小），
+/// 构造两个渠道的 seed，分别指向两个 mock 上游。默认 ch-0 更高优先级（数值更小），
 /// 使 failover 顺序确定：ch-0 先试、ch-1 兜底。
-fn two_channel_config(bases: &[String]) -> config::Config {
-    let mut cfg = common::test_config(&bases[0]);
-    cfg.channels = vec![
-        config::Channel {
+fn two_channel_seed(bases: &[String]) -> common::Seed {
+    let mut seed = common::test_seed(&bases[0]);
+    seed.channels = vec![
+        Channel {
             name: "ch-0".to_string(),
             protocol: config::Protocol::OpenAiChat,
             base_url: bases[0].clone(),
@@ -53,7 +54,7 @@ fn two_channel_config(bases: &[String]) -> config::Config {
             timeout_ms: 1000,
             max_retries: 0,
         },
-        config::Channel {
+        Channel {
             name: "ch-1".to_string(),
             protocol: config::Protocol::OpenAiChat,
             base_url: bases[1].clone(),
@@ -66,17 +67,17 @@ fn two_channel_config(bases: &[String]) -> config::Config {
             max_retries: 0,
         },
     ];
-    cfg
+    seed
 }
 
 /// 首渠道 429、次渠道成功：自动 failover 到下一渠道，下游收到成功响应。
 #[tokio::test]
 async fn retryable_429_fails_over_to_next_channel() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
-        cfg.channels[0].max_retries = 0;
-        cfg.channels[1].max_retries = 0;
-        cfg
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 0;
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     ups[0].set_behavior(UpstreamBehavior::Status429);
@@ -96,10 +97,10 @@ async fn retryable_429_fails_over_to_next_channel() {
 #[tokio::test]
 async fn retryable_5xx_fails_over_to_next_channel() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
-        cfg.channels[0].max_retries = 0;
-        cfg.channels[1].max_retries = 0;
-        cfg
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 0;
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     ups[0].set_behavior(UpstreamBehavior::Status5xx(500));
@@ -116,12 +117,12 @@ async fn retryable_5xx_fails_over_to_next_channel() {
 async fn network_error_fails_over_to_next_channel() {
     // 用一个不存在的端口模拟网络不可达。
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
+        let mut seed = two_channel_seed(bases);
         // 首渠道指向一个不会有服务的端口。
-        cfg.channels[0].base_url = "http://127.0.0.1:1".to_string();
-        cfg.channels[0].max_retries = 0;
-        cfg.channels[1].max_retries = 0;
-        cfg
+        seed.channels[0].base_url = "http://127.0.0.1:1".to_string();
+        seed.channels[0].max_retries = 0;
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     ups[1].set_behavior(UpstreamBehavior::Json(ok_response()));
@@ -139,10 +140,10 @@ async fn network_error_fails_over_to_next_channel() {
 #[tokio::test]
 async fn per_channel_max_retries_retries_same_channel_then_fails_over() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
-        cfg.channels[0].max_retries = 2; // 首渠道最多尝试 3 次
-        cfg.channels[1].max_retries = 0;
-        cfg
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 2; // 首渠道最多尝试 3 次
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     // 首渠道持续 429（重试预算内，最多尝试 3 次），次渠道成功。
@@ -162,10 +163,10 @@ async fn per_channel_max_retries_retries_same_channel_then_fails_over() {
 #[tokio::test]
 async fn all_channels_retryable_fail_returns_attributed_error() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
-        cfg.channels[0].max_retries = 0;
-        cfg.channels[1].max_retries = 0;
-        cfg
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 0;
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     ups[0].set_behavior(UpstreamBehavior::Status429);
@@ -188,10 +189,10 @@ async fn all_channels_retryable_fail_returns_attributed_error() {
 #[tokio::test]
 async fn non_retryable_4xx_returns_immediately() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
-        cfg.channels[0].max_retries = 2; // 即使可重试 budget 大，4xx 也不重试
-        cfg.channels[1].max_retries = 0;
-        cfg
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 2; // 即使可重试 budget 大，4xx 也不重试
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     ups[0].set_behavior(UpstreamBehavior::for_status(400));
@@ -214,11 +215,11 @@ async fn non_retryable_4xx_returns_immediately() {
 #[tokio::test]
 async fn alias_rewrites_outbound_and_response_model() {
     let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
-        let mut cfg = common::test_config(&bases[0]);
-        cfg.channels[0]
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels[0]
             .model_aliases
             .insert("fast".to_string(), "gpt-4o-mini".to_string());
-        cfg
+        seed
     })
     .await;
     // 上游返回真实模型名。
@@ -242,13 +243,13 @@ async fn alias_rewrites_outbound_and_response_model() {
 #[tokio::test]
 async fn alias_fails_over_across_channels() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
+        let mut seed = two_channel_seed(bases);
         // 两个渠道都服务短名 `fast`，都映射到真实名 gpt-4o-mini。
-        for ch in &mut cfg.channels {
+        for ch in &mut seed.channels {
             ch.model_aliases
                 .insert("fast".to_string(), "gpt-4o-mini".to_string());
         }
-        cfg
+        seed
     })
     .await;
     ups[0].set_behavior(UpstreamBehavior::Status429);
@@ -275,10 +276,10 @@ async fn alias_fails_over_across_channels() {
 #[tokio::test]
 async fn stream_fails_over_on_429() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
-        cfg.channels[0].max_retries = 0;
-        cfg.channels[1].max_retries = 0;
-        cfg
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 0;
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     ups[0].set_behavior(UpstreamBehavior::Status429);
@@ -318,10 +319,10 @@ async fn stream_fails_over_on_429() {
 #[tokio::test]
 async fn stream_disconnect_after_first_byte_does_not_failover() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
-        let mut cfg = two_channel_config(bases);
-        cfg.channels[0].max_retries = 3; // 即使可重试 budget 大，首字节后断连也不 failover
-        cfg.channels[1].max_retries = 0;
-        cfg
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 3; // 即使可重试 budget 大，首字节后断连也不 failover
+        seed.channels[1].max_retries = 0;
+        seed
     })
     .await;
     // 首渠道发一个帧后断连；次渠道本应能成功，但不应被调用。

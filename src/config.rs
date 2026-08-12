@@ -1,11 +1,13 @@
 //! 静态配置解析：单个 JSON 文件，无热重载，重启生效。
 //!
+//! v2 起配置文件退化为纯静态引导：只承载协议监听地址、数据库路径、admin key 与
+//! 可选的管理监听地址。运行时资源（渠道、令牌、价格、开关）全部移入 SQLite，
+//! 配置文件中的旧资源段（`tokens`/`channels`/`prices`/`logging`）整体移除；
+//! 检测到废弃字段直接报错，不做兼容迁移。
+//!
 //! 配置内的相对路径（如 `database.path`）相对配置文件所在目录解析。
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -13,20 +15,17 @@ use thiserror::Error;
 /// 默认配置文件路径，相对当前工作目录。
 pub const DEFAULT_CONFIG_PATH: &str = ".kairos/config.json";
 
-/// 网关静态配置，覆盖 spec 的 v1 schema 全部字段。
+/// 网关静态配置：仅引导字段，运行期资源从数据库加载。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: Listen,
     pub database: Database,
+    /// 管理 API 静态密钥（Bearer 认证）；未配置管理监听地址时虽不生效，仍为必填，避免形态漂移。
+    pub admin_key: String,
+    /// 可选的管理监听地址；配置了才启动管理面，否则管理 API 整体关闭。
     #[serde(default)]
-    pub logging: Logging,
-    #[serde(default)]
-    pub tokens: Vec<Token>,
-    #[serde(default)]
-    pub channels: Vec<Channel>,
-    #[serde(default)]
-    pub prices: Prices,
+    pub admin_listen: Option<Listen>,
 }
 
 /// HTTP 监听地址。
@@ -45,30 +44,7 @@ pub struct Database {
     pub path: PathBuf,
 }
 
-/// 日志开关。
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Logging {
-    /// 是否落完整请求/响应 body，默认关闭。
-    #[serde(default)]
-    pub full_body: bool,
-}
-
-/// 下游令牌：认证与计费的最小单位。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Token {
-    pub key: String,
-    pub name: String,
-    /// 累计结算上限（USD）；缺省表示无上限。单位在计费票据中换算为 micro-USD。
-    #[serde(default)]
-    pub limit_usd: Option<f64>,
-    /// 初始余额（USD），缺省 0。
-    #[serde(default)]
-    pub balance_usd: f64,
-}
-
-/// 出站 wire 协议。
+/// wire 协议：三种出站/入站协议共用同一枚举。
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub enum Protocol {
     #[serde(rename = "openai_chat")]
@@ -77,39 +53,6 @@ pub enum Protocol {
     OpenAiResponses,
     #[serde(rename = "anthropic_messages")]
     AnthropicMessages,
-}
-
-/// 渠道：指向一个上游端点的出站接入单元。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Channel {
-    pub name: String,
-    pub protocol: Protocol,
-    pub base_url: String,
-    pub api_key: String,
-    #[serde(default)]
-    pub models: Vec<String>,
-    #[serde(default)]
-    pub model_aliases: HashMap<String, String>,
-    pub priority: u32,
-    pub weight: u32,
-    pub timeout_ms: u64,
-    pub max_retries: u32,
-}
-
-/// 价格表：模型名 → 四档 USD/$1M tokens 单价。
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields, transparent)]
-pub struct Prices(pub HashMap<String, Price>);
-
-/// 单模型单价。缓存档缺省时回退 `input` 价（在计费票据中处理）。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Price {
-    pub input: f64,
-    pub output: f64,
-    pub cache_read: Option<f64>,
-    pub cache_write: Option<f64>,
 }
 
 /// 配置解析错误，向上抛给应用边界。
@@ -156,7 +99,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// 全字段配置可解析，相对路径相对配置文件目录解析。
+    /// 全字段（含可选管理监听）配置可解析，相对路径相对配置文件目录解析。
     #[test]
     fn load_full_config_and_resolve_relative_path() {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
@@ -167,15 +110,8 @@ mod tests {
             r#"{{
                 "listen": {{ "host": "127.0.0.1", "port": 8787 }},
                 "database": {{ "path": "./kairos.db" }},
-                "logging": {{ "full_body": true }},
-                "tokens": [{{ "key": "sk-x", "name": "dev", "limit_usd": 50.0, "balance_usd": 5.0 }}],
-                "channels": [{{
-                    "name": "c", "protocol": "openai_chat",
-                    "base_url": "https://api.openai.com/v1", "api_key": "k",
-                    "models": ["gpt-4o"], "model_aliases": {{ "fast": "gpt-4o-mini" }},
-                    "priority": 1, "weight": 1, "timeout_ms": 120000, "max_retries": 2
-                }}],
-                "prices": {{ "gpt-4o": {{ "input": 2.5, "output": 10.0, "cache_read": 1.25, "cache_write": 10.0 }} }}
+                "admin_key": "sk-admin",
+                "admin_listen": {{ "host": "127.0.0.1", "port": 8788 }}
             }}"#
         )
         .expect("应能写入配置");
@@ -185,32 +121,25 @@ mod tests {
 
         assert_eq!(cfg.listen.host, "127.0.0.1");
         assert_eq!(cfg.listen.port, 8787);
-        assert!(cfg.logging.full_body);
-        assert_eq!(cfg.tokens.len(), 1);
-        assert_eq!(cfg.channels.len(), 1);
-        assert_eq!(cfg.channels[0].protocol, Protocol::OpenAiChat);
-        assert_eq!(cfg.channels[0].model_aliases["fast"], "gpt-4o-mini");
-        assert_eq!(cfg.prices.0["gpt-4o"].input, 2.5);
+        assert_eq!(cfg.admin_key, "sk-admin");
+        let admin = cfg.admin_listen.expect("管理监听应可解析");
+        assert_eq!(admin.port, 8788);
         // 相对路径已相对配置文件目录解析。
         assert_eq!(cfg.database.path, dir.path().join("kairos.db"));
     }
 
-    /// 缺省字段（logging/tokens/channels/prices）有合理默认值。
+    /// 缺省的管理监听地址：未配置即管理面关闭（`None`）。
     #[test]
-    fn load_minimal_config_applies_defaults() {
+    fn admin_listen_omitted_is_off() {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
         let cfg_path = dir.path().join("config.json");
         std::fs::write(
             &cfg_path,
-            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"}}"#,
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_key":"k"}"#,
         )
         .expect("应能写配置");
         let cfg = Config::load(&cfg_path).expect("最小配置应可解析");
-
-        assert!(!cfg.logging.full_body);
-        assert!(cfg.tokens.is_empty());
-        assert!(cfg.channels.is_empty());
-        assert!(cfg.prices.0.is_empty());
+        assert!(cfg.admin_listen.is_none(), "缺管理监听应为关闭");
     }
 
     /// 未知字段报错，避免静默漏配。
@@ -220,19 +149,36 @@ mod tests {
         let cfg_path = dir.path().join("config.json");
         std::fs::write(
             &cfg_path,
-            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"bogus":1}"#,
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_key":"k","bogus":1}"#,
         )
         .expect("应能写配置");
         assert!(Config::load(&cfg_path).is_err(), "未知字段应报错");
     }
 
-    /// 缺失必需字段报错。
+    /// 已废弃的资源段（v1 的 `tokens`）出现在配置中直接报错，不做兼容迁移。
+    #[test]
+    fn deprecated_resource_segment_is_rejected() {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let cfg_path = dir.path().join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},
+                "admin_key":"k","tokens":[{"key":"sk-x","name":"dev"}]}"#,
+        )
+        .expect("应能写配置");
+        assert!(
+            Config::load(&cfg_path).is_err(),
+            "v1 废弃资源段应报错而非静默忽略"
+        );
+    }
+
+    /// 缺失必需字段（admin_key）报错。
     #[test]
     fn missing_field_is_rejected() {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
         let cfg_path = dir.path().join("config.json");
         std::fs::write(&cfg_path, r#"{"listen":{"host":"0.0.0.0","port":1}}"#).expect("应能写配置");
-        assert!(Config::load(&cfg_path).is_err(), "缺失必需字段应报错");
+        assert!(Config::load(&cfg_path).is_err(), "缺失 admin_key 应报错");
     }
 
     /// 配置文件的缺失报可读错误。
@@ -243,20 +189,5 @@ mod tests {
             ConfigError::Read { .. } => {}
             other => panic!("应报 Read 错误，实际 {other:?}"),
         }
-    }
-
-    /// 令牌的 limit_usd/balance_usd 可选：缺省分别为无上限与 0。
-    #[test]
-    fn token_limit_and_balance_are_optional() {
-        let dir = tempfile::tempdir().expect("应能创建临时目录");
-        let cfg_path = dir.path().join("config.json");
-        std::fs::write(
-            &cfg_path,
-            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"tokens":[{"key":"sk-x","name":"dev"}]}"#,
-        )
-        .expect("应能写配置");
-        let cfg = Config::load(&cfg_path).expect("缺可选字段的令牌应可解析");
-        assert_eq!(cfg.tokens[0].limit_usd, None, "缺 limit_usd 应为无上限");
-        assert_eq!(cfg.tokens[0].balance_usd, 0.0, "缺 balance_usd 应默认 0");
     }
 }

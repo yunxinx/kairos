@@ -10,14 +10,14 @@ use std::time::Duration;
 
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use futures_util::StreamExt;
-use kairos::config;
 use serde_json::{Value, json};
 
-/// full_body 开启的测试配置（其余沿用测试默认）。
-fn full_body_cfg(base: &str) -> config::Config {
-    let mut cfg = common::test_config(base);
-    cfg.logging.full_body = true;
-    cfg
+/// full_body 开启的测试 seed（其余沿用测试默认）。
+fn full_body_seed(base: &str) -> common::Seed {
+    let mut seed = common::test_seed(base);
+    seed.settings
+        .insert("full_body".to_string(), Value::Bool(true));
+    seed
 }
 
 /// 读最近一条日志的两份 body 列。
@@ -60,7 +60,7 @@ async fn full_body_disabled_stores_null_bodies() {
 /// 开启 + 同协议直通非流式：请求字节与下游收到的响应字节级一致。
 #[tokio::test]
 async fn full_body_passthrough_stores_inbound_request_and_response() {
-    let mut gw = TestGateway::start_with(full_body_cfg).await;
+    let mut gw = TestGateway::start_with(full_body_seed).await;
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "chatcmpl-2", "object": "chat.completion", "model": "gpt-4o",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "pong"},
@@ -103,7 +103,7 @@ async fn full_body_passthrough_stores_inbound_request_and_response() {
 /// 开启 + 跨协议非流式：入站响应是重编码后的入站协议格式，而非上游原始响应。
 #[tokio::test]
 async fn full_body_cross_protocol_stores_reencoded_response() {
-    let mut gw = TestGateway::start_with(full_body_cfg).await; // 默认 openai_chat 渠道。
+    let mut gw = TestGateway::start_with(full_body_seed).await; // 默认 openai_chat 渠道。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "chatcmpl-3", "object": "chat.completion", "model": "gpt-4o",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello!"},
@@ -142,7 +142,7 @@ async fn full_body_cross_protocol_stores_reencoded_response() {
 /// 开启 + 直通流式：入站响应为实际下发 SSE 帧文本（含 [DONE] 哨兵）。
 #[tokio::test]
 async fn full_body_streaming_records_forwarded_frames() {
-    let mut gw = TestGateway::start_with(full_body_cfg).await;
+    let mut gw = TestGateway::start_with(full_body_seed).await;
     gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
         json!({
             "id": "chatcmpl-4", "object": "chat.completion.chunk", "model": "gpt-4o",

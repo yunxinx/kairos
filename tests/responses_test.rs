@@ -45,17 +45,17 @@ async fn collect_sse_frames(resp: reqwest::Response) -> Vec<(Option<String>, Val
     frames
 }
 
-/// 构造指向 mock 上游的 Responses 渠道配置（其余沿用测试默认）。
-fn responses_channel_cfg(base: &str) -> config::Config {
-    let mut cfg = common::test_config(base);
-    cfg.channels[0].protocol = config::Protocol::OpenAiResponses;
-    cfg
+/// 构造指向 mock 上游的 Responses 渠道 seed（其余沿用测试默认）。
+fn responses_channel_seed(base: &str) -> common::Seed {
+    let mut seed = common::test_seed(base);
+    seed.channels[0].protocol = config::Protocol::OpenAiResponses;
+    seed
 }
 
 /// Responses 入站 → Responses 渠道（同协议直通）：非流式，字节直通 + usage 计费。
 #[tokio::test]
 async fn responses_passthrough_forwards_and_bills() {
-    let mut gw = TestGateway::start_with(responses_channel_cfg).await;
+    let mut gw = TestGateway::start_with(responses_channel_seed).await;
     // 同协议（responses ↔ responses）且未命中别名 → 直通快路径。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "resp_01p", "object": "response", "status": "completed", "model": TEST_MODEL,
@@ -154,7 +154,7 @@ async fn responses_inbound_to_openai_chat_channel() {
 /// Responses 入站 → Anthropic 渠道：非流式跨协议转换。
 #[tokio::test]
 async fn responses_inbound_to_anthropic_channel() {
-    let mut gw = TestGateway::start_with(anthropic_channel_cfg).await;
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "msg_01", "type": "message", "role": "assistant", "model": "claude-sonnet",
         "content": [{ "type": "text", "text": "Hello!" }],
@@ -190,7 +190,7 @@ async fn responses_inbound_to_anthropic_channel() {
 /// openai_chat 入站 → Responses 渠道：非流式反向转换。
 #[tokio::test]
 async fn openai_inbound_to_responses_channel() {
-    let mut gw = TestGateway::start_with(responses_channel_cfg).await;
+    let mut gw = TestGateway::start_with(responses_channel_seed).await;
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "resp_01", "object": "response", "status": "completed", "model": TEST_MODEL,
         "output": [
@@ -229,7 +229,7 @@ async fn openai_inbound_to_responses_channel() {
 /// openai_chat 入站 → Responses 渠道：上游 Responses 返回 reasoning，跨协议族丢弃并记 warning。
 #[tokio::test]
 async fn openai_inbound_drops_responses_reasoning_with_warning() {
-    let mut gw = TestGateway::start_with(responses_channel_cfg).await;
+    let mut gw = TestGateway::start_with(responses_channel_seed).await;
     // 上游 Responses 返回 reasoning + text；openai chat 无 reasoning 通道，丢弃记 warning。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "resp_01r", "object": "response", "status": "completed", "model": TEST_MODEL,
@@ -266,7 +266,7 @@ async fn openai_inbound_drops_responses_reasoning_with_warning() {
 /// Responses 入站 → Responses 渠道（命中别名走 IR 路径）：有状态特性 Out of Scope 显式 warning。
 #[tokio::test]
 async fn responses_stateful_features_warn_and_drop() {
-    let mut gw = TestGateway::start_with(responses_channel_cfg).await;
+    let mut gw = TestGateway::start_with(responses_channel_seed).await;
     // 请求别名短名 `fast`（命中别名 → IR 完整路径），携带有状态特性 store。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "resp_01s", "object": "response", "status": "completed", "model": "gpt-4o-mini",
@@ -307,7 +307,7 @@ async fn responses_stateful_features_warn_and_drop() {
 /// Responses 入站 → Responses 渠道：流式直通，usage 计费。
 #[tokio::test]
 async fn responses_passthrough_streaming_bills() {
-    let mut gw = TestGateway::start_with(responses_channel_cfg).await;
+    let mut gw = TestGateway::start_with(responses_channel_seed).await;
     // 同协议流式直通：上游 Responses SSE 流。
     gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
         serde_json::to_string(&json!({
@@ -565,9 +565,9 @@ async fn responses_inbound_error_uses_responses_shape() {
     assert!(gw.upstream.received().is_empty(), "未认证不应出站");
 }
 
-/// 构造指向 mock 上游的 Anthropic 渠道配置（其余沿用测试默认）。
-fn anthropic_channel_cfg(base: &str) -> config::Config {
-    let mut cfg = common::test_config(base);
-    cfg.channels[0].protocol = config::Protocol::AnthropicMessages;
-    cfg
+/// 构造指向 mock 上游的 Anthropic 渠道 seed（其余沿用测试默认）。
+fn anthropic_channel_seed(base: &str) -> common::Seed {
+    let mut seed = common::test_seed(base);
+    seed.channels[0].protocol = config::Protocol::AnthropicMessages;
+    seed
 }

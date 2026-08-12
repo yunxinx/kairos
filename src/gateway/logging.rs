@@ -3,9 +3,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    config::{Protocol, Token},
+    config::Protocol,
     core::{billing::PriceSnapshot, ir::Usage},
     store,
+    store::resources::Token,
 };
 
 use super::http::Deps;
@@ -36,7 +37,7 @@ pub(super) async fn log_request(
     let log = store::RequestLog {
         created_at: now,
         token_name: token.name.clone(),
-        token_key: token.key.clone(),
+        token_key: token.token_key.clone(),
         inbound_protocol: protocol_name(inbound_protocol).to_string(),
         model: model.to_string(),
         channel: channel.to_string(),

@@ -38,17 +38,17 @@ async fn collect_sse_frames(resp: reqwest::Response) -> Vec<Value> {
     frames
 }
 
-/// 构造指向 mock 上游的 Anthropic 渠道配置（其余沿用测试默认）。
-fn anthropic_channel_cfg(base: &str) -> config::Config {
-    let mut cfg = common::test_config(base);
-    cfg.channels[0].protocol = config::Protocol::AnthropicMessages;
-    cfg
+/// 构造指向 mock 上游的 Anthropic 渠道 seed（其余沿用测试默认）。
+fn anthropic_channel_seed(base: &str) -> common::Seed {
+    let mut seed = common::test_seed(base);
+    seed.channels[0].protocol = config::Protocol::AnthropicMessages;
+    seed
 }
 
 /// OpenAI chat 入站 → Anthropic 渠道：非流式跨协议转换。
 #[tokio::test]
 async fn openai_inbound_to_anthropic_channel_non_stream() {
-    let mut gw = TestGateway::start_with(anthropic_channel_cfg).await;
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
     // 上游以 Anthropic Messages 响应（含 tool_use），网关解码为 IR 再重编码为 openai chat。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "msg_01x", "type": "message", "role": "assistant", "model": "claude-sonnet",
@@ -117,7 +117,7 @@ async fn openai_inbound_to_anthropic_channel_non_stream() {
 /// OpenAI chat 入站 → Anthropic 渠道：thinking 响应跨协议族丢弃并记 warning。
 #[tokio::test]
 async fn openai_inbound_drops_anthropic_reasoning_with_warning() {
-    let mut gw = TestGateway::start_with(anthropic_channel_cfg).await;
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
     // 上游 Anthropic 返回 thinking + text；openai chat 无 reasoning 通道，丢弃记 warning。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "msg_01r", "type": "message", "role": "assistant", "model": "claude-sonnet",
@@ -200,7 +200,7 @@ async fn anthropic_inbound_to_openai_channel() {
 /// Anthropic 入站 → Anthropic 渠道（同协议直通）：字节流直通，usage 计费。
 #[tokio::test]
 async fn anthropic_passthrough_forwards_and_bills() {
-    let mut gw = TestGateway::start_with(anthropic_channel_cfg).await;
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
     // 同协议（anthropic ↔ anthropic）且未命中别名 → 直通快路径。
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "msg_01p", "type": "message", "role": "assistant", "model": TEST_MODEL,
@@ -250,7 +250,7 @@ async fn anthropic_passthrough_forwards_and_bills() {
 /// OpenAI chat 入站 → Anthropic 渠道：流式跨协议，下游收到 openai chunk 帧。
 #[tokio::test]
 async fn openai_inbound_to_anthropic_channel_streaming() {
-    let mut gw = TestGateway::start_with(anthropic_channel_cfg).await;
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
     // 上游以 Anthropic SSE 流响应。
     gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
         serde_json::to_string(&json!({
@@ -326,7 +326,7 @@ async fn openai_inbound_to_anthropic_channel_streaming() {
 ///（最终 output），直通快路径逐帧嗅探后按分量取 max，账单完整。
 #[tokio::test]
 async fn anthropic_passthrough_streaming_bills_split_usage() {
-    let mut gw = TestGateway::start_with(anthropic_channel_cfg).await;
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
     // 同协议（anthropic ↔ anthropic）流式直通。
     gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
         serde_json::to_string(&json!({
