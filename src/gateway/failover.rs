@@ -31,6 +31,10 @@ pub(super) enum Outbound {
 }
 
 /// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
+///
+/// `log_failure` 接收（渠道名、状态码、是否已 failover、返回下游的错误响应体
+/// wire 字节）：wire 字节先于日志构造，保证 full_body 开启时失败日志也能记录
+/// 实际返回下游的入站响应。
 pub(super) async fn run_failover<'a, A, L>(
     route: &'a routing::Route,
     mut attempt: A,
@@ -39,7 +43,7 @@ pub(super) async fn run_failover<'a, A, L>(
 ) -> Response
 where
     A: FnMut(&Channel) -> BoxFuture<'a, Outbound>,
-    L: Fn(&str, u16, bool) -> BoxFuture<'a, ()>,
+    L: Fn(&str, u16, bool, &[u8]) -> BoxFuture<'a, ()>,
 {
     let mut last_retryable: Option<(String, Option<u16>, String)> = None;
 
@@ -53,9 +57,10 @@ where
                     status,
                     message,
                 } => {
-                    log_failure(&channel, status, false).await;
                     let body =
                         upstream_error_body(status, &message, &channel, false, inbound_protocol);
+                    let wire = serde_json::to_vec(&body).unwrap_or_default();
+                    log_failure(&channel, status, false, &wire).await;
                     return (
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                         Json(body),
@@ -80,8 +85,9 @@ where
     let (channel, status, message) = last_retryable
         .unwrap_or_else(|| ("unknown".to_string(), None, "所有渠道均不可用".to_string()));
     let status_code = status.unwrap_or(502);
-    log_failure(&channel, status_code, true).await;
     let body = upstream_error_body(status_code, &message, &channel, true, inbound_protocol);
+    let wire = serde_json::to_vec(&body).unwrap_or_default();
+    log_failure(&channel, status_code, true, &wire).await;
     (
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
         Json(body),

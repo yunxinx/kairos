@@ -28,13 +28,15 @@ use crate::{
     core::billing,
     core::billing::PriceSnapshot,
     core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage},
-    core::stream::StreamAccumulator,
+    core::stream::{SseFrame, StreamAccumulator},
     store,
 };
 
 use super::failover::{Outbound, run_failover};
 use super::logging::{Billing, log_request, unix_millis};
-use super::sse::{event_from_frame, receiver_stream, take_frame};
+use super::sse::{
+    data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream, take_frame,
+};
 
 use super::{protocol, routing};
 
@@ -139,6 +141,7 @@ async fn handle_request(
                 None,
                 started,
                 inbound_protocol,
+                request_body_for_log,
             )
             .await;
         }
@@ -157,6 +160,7 @@ async fn handle_request(
                 None,
                 started,
                 inbound_protocol,
+                request_body_for_log,
             )
             .await;
         }
@@ -173,6 +177,7 @@ async fn handle_request(
                 None,
                 started,
                 inbound_protocol,
+                request_body_for_log,
             )
             .await;
         }
@@ -191,6 +196,7 @@ async fn handle_request(
                 Some(&request.model),
                 started,
                 inbound_protocol,
+                request_body_for_log,
             )
             .await;
         }
@@ -209,6 +215,7 @@ async fn handle_request(
                 Some(&request.model),
                 started,
                 inbound_protocol,
+                request_body_for_log,
             )
             .await;
         }
@@ -216,8 +223,16 @@ async fn handle_request(
     let mut conn = match deps.pool.acquire().await {
         Ok(conn) => conn,
         Err(err) => {
-            return db_error_response(&deps, token, &request.model, started, err, inbound_protocol)
-                .await;
+            return db_error_response(
+                &deps,
+                token,
+                &request.model,
+                started,
+                err,
+                inbound_protocol,
+                request_body_for_log,
+            )
+            .await;
         }
     };
     let balance = match store::ensure_token_balance(
@@ -230,8 +245,16 @@ async fn handle_request(
     {
         Ok(balance) => balance,
         Err(err) => {
-            return db_error_response(&deps, token, &request.model, started, err, inbound_protocol)
-                .await;
+            return db_error_response(
+                &deps,
+                token,
+                &request.model,
+                started,
+                err,
+                inbound_protocol,
+                request_body_for_log,
+            )
+            .await;
         }
     };
     if balance.balance_usd_micros <= 0 {
@@ -248,6 +271,7 @@ async fn handle_request(
             Some(&request.model),
             started,
             inbound_protocol,
+            request_body_for_log,
         )
         .await;
     }
@@ -266,6 +290,7 @@ async fn handle_request(
                 Some(&request.model),
                 started,
                 inbound_protocol,
+                request_body_for_log,
             )
             .await;
         }
@@ -359,8 +384,10 @@ async fn outbound_with_failover(
                 }
             })
         },
-        |channel, status, _failover| {
+        |channel, status, _failover, body_wire| {
             let channel = channel.to_string();
+            let request_body = request_body_for_log.clone();
+            let response_body = deps.full_body.then(|| body_wire.to_vec());
             Box::pin(async move {
                 log_request(
                     deps,
@@ -369,7 +396,11 @@ async fn outbound_with_failover(
                     &channel,
                     status,
                     started,
-                    Billing::default(),
+                    Billing {
+                        request_body,
+                        response_body,
+                        ..Default::default()
+                    },
                     inbound_protocol,
                 )
                 .await;
@@ -414,8 +445,10 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                 }
             })
         },
-        |channel, status, _failover| {
+        |channel, status, _failover, body_wire| {
             let channel = channel.to_string();
+            let request_body = ctx.request_body.clone();
+            let response_body = ctx.deps.full_body.then(|| body_wire.to_vec());
             Box::pin(async move {
                 log_request(
                     ctx.deps,
@@ -424,7 +457,11 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                     &channel,
                     status,
                     ctx.started,
-                    Billing::default(),
+                    Billing {
+                        request_body,
+                        response_body,
+                        ..Default::default()
+                    },
                     ctx.inbound_protocol,
                 )
                 .await;
@@ -698,6 +735,15 @@ async fn pipe_passthrough_stream<S>(
             }
             if downstream_open {
                 let data = String::from_utf8_lossy(&frame).into_owned();
+                // full_body：记录实际转发帧的 wire 字节（入站响应）。
+                if ctx.deps.full_body {
+                    let wire_frame = SseFrame {
+                        event: event_name.clone(),
+                        data: data.clone(),
+                    };
+                    ctx.response_body
+                        .extend_from_slice(&frame_to_wire(&wire_frame));
+                }
                 let mut event = SseEvent::default().data(data);
                 if let Some(name) = event_name {
                     event = event.event(name);
@@ -713,12 +759,15 @@ async fn pipe_passthrough_stream<S>(
         // 缓冲不足一帧：从上游读取更多字节。
         match byte_stream.next().await {
             Some(Ok(bytes)) => {
-                if ctx.deps.full_body {
-                    ctx.response_body.extend_from_slice(&bytes);
-                }
                 sse_buffer.extend_from_slice(&bytes);
             }
             Some(Err(_)) | None => {
+                // OpenAI 协议约定以 `data: [DONE]` 终止；哨兵也是入站响应的一部分，
+                // full_body 开启时在实际下发前记入（结算先于哨兵，日志此时能带全）。
+                if ctx.deps.full_body && downstream_open && ctx.protocol == Protocol::OpenAiChat {
+                    ctx.response_body
+                        .extend_from_slice(&data_frame_to_wire("[DONE]"));
+                }
                 // 流结束：按嗅探累积的 usage 结算并落日志。
                 let cost = billing::cost_micros(&usage, &ctx.price);
                 if cost > 0 {
@@ -761,7 +810,6 @@ async fn pipe_passthrough_stream<S>(
     }
 }
 
-/// 把适配器产出的 SSE 帧转为 axum SSE 事件：有事件名时写 `event:` 字段。
 /// 非流式出站调用单个渠道，返回可重试判定。
 ///
 /// 按渠道协议编码出站请求、调用上游、解码响应为 IR，再重编码为入站协议返回。
@@ -839,6 +887,11 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                     }
                 }
                 let inbound = protocol::encode_response(&ir, inbound_protocol);
+                // full_body 记录实际返回下游的入站响应字节（重编码结果）；
+                // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
+                let inbound_wire = deps
+                    .full_body
+                    .then(|| serde_json::to_vec(&inbound).unwrap_or_default());
                 log_request(
                     deps,
                     token,
@@ -851,7 +904,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                         price,
                         cost_usd_micros: cost,
                         request_body: ctx.request_body.clone(),
-                        response_body: deps.full_body.then(|| upstream_body.as_bytes().to_vec()),
+                        response_body: inbound_wire,
                     },
                     inbound_protocol,
                 )
@@ -1017,8 +1070,11 @@ struct StreamTask {
 ///
 /// 每收到一个完整 SSE 数据帧，解码为 IR 流事件并累积（供计费），同时重编码为
 /// 入站协议 chunk 帧推给下游。上游流结束时按累积 usage 结算并落日志。
-async fn pipe_stream<S>(byte_stream: S, tx: tokio::sync::mpsc::Sender<SseEvent>, ctx: StreamTask)
-where
+async fn pipe_stream<S>(
+    byte_stream: S,
+    tx: tokio::sync::mpsc::Sender<SseEvent>,
+    mut ctx: StreamTask,
+) where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 {
     use futures_util::StreamExt as _;
@@ -1036,16 +1092,20 @@ where
 
     // 流首先下发 message_start（Anthropic 需要；OpenAI 无）与 stream-start 的
     // warnings，让下游在任何内容之前就感知信息损失（跨协议族丢弃的 reasoning 等）。
-    if let Some(frame) = encoder.message_start()
-        && tx.send(event_from_frame(&frame)).await.is_err()
-    {
-        downstream_open = false;
+    if let Some(frame) = encoder.message_start() {
+        record_frame_wire(&mut ctx, &frame);
+        if tx.send(event_from_frame(&frame)).await.is_err() {
+            downstream_open = false;
+        }
     }
     let start_event = StreamEvent::StreamStart {
         warnings: ctx.request_warnings.clone(),
     };
     accumulator.push(start_event.clone());
     for frame in encoder.encode(&start_event) {
+        if downstream_open {
+            record_frame_wire(&mut ctx, &frame);
+        }
         if tx.send(event_from_frame(&frame)).await.is_err() {
             downstream_open = false;
             break;
@@ -1069,6 +1129,7 @@ where
                 accumulator.push(event.clone());
                 if downstream_open {
                     for frame in encoder.encode(event) {
+                        record_frame_wire(&mut ctx, &frame);
                         if tx.send(event_from_frame(&frame)).await.is_err() {
                             // 下游断开：停止发送，但继续消费上游直至结算。
                             downstream_open = false;
@@ -1093,10 +1154,20 @@ where
                         provider_metadata: response.provider_metadata.clone(),
                     };
                     for frame in encoder.encode(&finish_event) {
+                        record_frame_wire(&mut ctx, &frame);
                         if tx.send(event_from_frame(&frame)).await.is_err() {
                             break;
                         }
                     }
+                }
+                // 终止哨兵也是入站响应的一部分，full_body 开启时先记入再结算，
+                // 保证日志带全实际下发的字节（结算仍先于哨兵下发）。
+                if downstream_open
+                    && ctx.deps.full_body
+                    && let Some(terminator) = terminator.as_ref()
+                {
+                    ctx.response_body
+                        .extend_from_slice(&data_frame_to_wire(terminator));
                 }
                 // 先结算再发终止哨兵：下游读到终止时计费必定已落库。
                 settle_and_log(&ctx, response).await;
@@ -1110,10 +1181,13 @@ where
     }
 }
 
-/// 把 tokio mpsc 接收端适配为 axum SSE 可消费的流。
-///
-/// axum 的 `Sse` 需要 `Stream<Item = Result<Event, E>>`；这里把 `Receiver` 的一
-/// 个个事件包成 `Ok`。通道关闭（发送端 drop）即流结束。
+/// full_body 开启时把一个即将下发的入站协议帧记入响应字节；关闭时无操作。
+fn record_frame_wire(ctx: &mut StreamTask, frame: &SseFrame) {
+    if ctx.deps.full_body {
+        ctx.response_body.extend_from_slice(&frame_to_wire(frame));
+    }
+}
+
 /// 结算流式请求费用并落日志。
 async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
     let usage = &response.usage;
@@ -1208,6 +1282,10 @@ fn upstream_error_message(parsed: &Value, status: u16) -> String {
 }
 
 /// 构造入站协议错误格式的响应，并落一条请求日志（无计费数据）。
+///
+/// full_body 开启时错误日志同样带全 body：入站请求字节与实际返回下游的错误
+/// JSON 字节，便于排障时重放失败请求。
+#[allow(clippy::too_many_arguments)]
 async fn error_response(
     status: StatusCode,
     message: &str,
@@ -1216,9 +1294,13 @@ async fn error_response(
     model: Option<&str>,
     started: i64,
     inbound_protocol: Protocol,
+    request_body: Option<Vec<u8>>,
 ) -> Response {
     let body = protocol::encode_error(status.as_u16(), message, inbound_protocol);
     if let (Some(token), Some(model)) = (token, model) {
+        let response_wire = deps
+            .full_body
+            .then(|| serde_json::to_vec(&body).unwrap_or_default());
         log_request(
             deps,
             token,
@@ -1230,8 +1312,8 @@ async fn error_response(
                 usage: Usage::default(),
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
-                request_body: None,
-                response_body: None,
+                request_body,
+                response_body: response_wire,
             },
             inbound_protocol,
         )
@@ -1248,6 +1330,7 @@ async fn db_error_response(
     started: i64,
     err: impl std::fmt::Display,
     inbound_protocol: Protocol,
+    request_body: Option<Vec<u8>>,
 ) -> Response {
     let message = format!("计费状态读取失败: {err}");
     error_response(
@@ -1258,6 +1341,7 @@ async fn db_error_response(
         Some(model),
         started,
         inbound_protocol,
+        request_body,
     )
     .await
 }
