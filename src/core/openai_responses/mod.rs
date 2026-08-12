@@ -414,10 +414,14 @@ fn decode_content_parts(content: &Value, index: usize) -> Result<Vec<ContentPart
                             provider_options: HashMap::new(),
                         });
                     }
-                    // 多模态 part v1 仅声明：以 File 占位，跨协议族丢弃时记 warning。
+                    // 多模态 part v1 仅声明：以 Media 占位，跨协议族丢弃时记 warning。
+                    // 06 票把占位做实（携带真实数据源）。
                     "input_image" | "image" | "input_file" | "file" | "input_audio" | "audio" => {
-                        out.push(ContentPart::File {
+                        out.push(ContentPart::Media {
                             media_type: part_type.to_string(),
+                            data: crate::core::ir::MediaSource::Data {
+                                base64: String::new(),
+                            },
                             provider_options: HashMap::new(),
                         });
                     }
@@ -578,10 +582,10 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     for message in request.messages.iter().filter(|m| m.role == Role::System) {
         for part in &message.content {
             match part {
-                ContentPart::File { media_type, .. } => {
+                ContentPart::Media { media_type, .. } => {
                     warnings.push(Warning::unsupported(
-                        "file",
-                        format!("网关尚未实现多模态文件内容（{media_type}），已丢弃"),
+                        "media",
+                        format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
                     ));
                 }
                 ContentPart::Custom { kind, .. } => {
@@ -689,10 +693,10 @@ fn encode_user_item(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Value
             ContentPart::Text { text, .. } => {
                 parts.push(json!({ "type": "input_text", "text": text }));
             }
-            ContentPart::File { media_type, .. } => {
+            ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "file",
-                    format!("网关尚未实现多模态文件内容（{media_type}），已丢弃"),
+                    "media",
+                    format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
@@ -768,10 +772,10 @@ fn encode_assistant_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec
                 );
                 items.push(Value::Object(item));
             }
-            ContentPart::File { media_type, .. } => {
+            ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "file",
-                    format!("网关尚未实现多模态文件内容（{media_type}），已丢弃"),
+                    "media",
+                    format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
@@ -1202,10 +1206,10 @@ pub fn encode_response(response: &ChatResponse) -> Value {
                 }));
             }
             ContentPart::ToolResult { .. } => {}
-            ContentPart::File { media_type, .. } => {
+            ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "file",
-                    format!("网关尚未实现多模态文件内容（{media_type}），已丢弃"),
+                    "media",
+                    format!("网关尚未实现多模态媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {

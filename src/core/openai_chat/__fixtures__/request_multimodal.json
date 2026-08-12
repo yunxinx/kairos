@@ -1,0 +1,20 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What's in this image?" },
+        {
+          "type": "image_url",
+          "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+        },
+        { "type": "text", "text": "And this one?" },
+        {
+          "type": "image_url",
+          "image_url": { "url": "https://example.com/image.png" }
+        }
+      ]
+    }
+  ]
+}

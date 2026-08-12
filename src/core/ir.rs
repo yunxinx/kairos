@@ -68,10 +68,24 @@ pub enum Role {
     Tool,
 }
 
+/// 媒体 part 的数据源：原始字节（base64）或 URL 二选一。
+///
+/// 形状对齐 AI SDK `FilePart` 的 `data` 判别联合（`{type:'data'}`/`{type:'url'}`）；
+/// 网关只承载两种载体，`reference` 等 provider 托管形态经 `provider_options`
+/// 逃生舱表达。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum MediaSource {
+    /// 原始字节，base64 编码。
+    Data { base64: String },
+    /// 指向媒体资源的 URL。
+    Url { url: String },
+}
+
 /// 消息内容 part 枚举。`type` 为 serde tag，序列化为 `snake_case`。
 ///
-/// `file`/`custom`/`reasoning` 为 ADR-0001 预留的 part 类型：v1 仅声明不实现
-/// 多模态，跨协议族转换有损时记 warning 而非静默吞掉。
+/// `media` 由 ADR-0001 预留的占位演进为携带真实载荷的媒体 part（形状演进
+/// 见 ADR-0003）；跨协议族转换有损时记 warning 而非静默吞掉。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -87,9 +101,12 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 文件内容。v1 仅声明，不实现多模态。
-    File {
+    /// 媒体内容（多模态）。`media_type` 为 IANA 媒体类型（如 `image/png`），
+    /// 携带数据源（base64 字节或 URL）+ provider_options 逃生舱。v1 的 `File`
+    /// 占位演进为此形状，wire 类型不出适配器边界。
+    Media {
         media_type: String,
+        data: MediaSource,
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },

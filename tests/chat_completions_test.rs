@@ -339,3 +339,47 @@ async fn alias_key_matches_but_alias_target_does_not() {
         "上游真实名不应绕过别名命中渠道"
     );
 }
+
+/// 入站多模态（image_url data URL + 远程 URL + 文本混排）：同协议直通字节级原样
+/// 送达上游，媒体内容零转换损耗。
+#[tokio::test]
+async fn multimodal_inbound_passthrough_preserves_bytes() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-mm", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "two images"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+    })));
+
+    let body = json!({
+        "model": TEST_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "What's in these images?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" } },
+                { "type": "text", "text": "and" },
+                { "type": "image_url", "image_url": { "url": "https://example.com/image.png" } }
+            ]
+        }]
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "多模态请求应 200");
+
+    // 直通快路径：mock 上游收到的出站请求体与下游请求字节级一致（媒体原样）。
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1, "mock 上游应收一条请求");
+    assert_eq!(
+        received[0], body,
+        "同协议直通应字节级原样送达上游（含 base64 与混排顺序）"
+    );
+}

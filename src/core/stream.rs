@@ -386,7 +386,7 @@ pub fn chat_response_to_stream_events(response: &ChatResponse) -> Vec<StreamEven
             }
             // 响应侧不携带请求侧 part；此处不产出流事件。
             ContentPart::ToolResult { .. }
-            | ContentPart::File { .. }
+            | ContentPart::Media { .. }
             | ContentPart::Custom { .. } => {}
         }
     }

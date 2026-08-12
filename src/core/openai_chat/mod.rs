@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
-    StreamEvent, Tool, Usage, Warning,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
+    Message, Role, StreamEvent, Tool, Usage, Warning,
 };
 use crate::core::stream::SseFrame;
 
@@ -129,6 +129,18 @@ struct WireContentPart {
     part_type: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    image_url: Option<WireImageUrl>,
+}
+
+/// `image_url` part 的载体：`url` 为远程 URL 或 base64 data URL；
+/// `detail` 为 OpenAI 图片清晰度档位，可选。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireImageUrl {
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -335,15 +347,7 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Message, DecodeErr
                 }],
                 WireContent::Parts(parts) => parts
                     .iter()
-                    .map(|part| {
-                        if part.part_type != "text" || part.text.is_none() {
-                            return Err(DecodeError::UnknownUserContentPart { index });
-                        }
-                        Ok(ContentPart::Text {
-                            text: part.text.clone().unwrap_or_default(),
-                            provider_options: HashMap::new(),
-                        })
-                    })
+                    .map(|part| decode_user_part(part, index))
                     .collect::<Result<Vec<_>, _>>()?,
             }
         }
@@ -426,6 +430,74 @@ impl WireContent {
             WireContent::Parts(_) => Err(()),
         }
     }
+}
+
+/// 解码单个 user content part：`text` 与 `image_url`（远程 URL 或 base64 data URL）。
+///
+/// `image_url` part 映射为 IR 媒体 part：data URL 解析出 media_type + base64 字节
+/// 为 `MediaSource::Data`，远程 URL 为 `MediaSource::Url`。其余 part 类型拒绝
+/// （未知 user part），与 v1 一致。
+fn decode_user_part(part: &WireContentPart, index: usize) -> Result<ContentPart, DecodeError> {
+    match part.part_type.as_str() {
+        "text" => {
+            let text = part
+                .text
+                .clone()
+                .ok_or(DecodeError::UnknownUserContentPart { index })?;
+            Ok(ContentPart::Text {
+                text,
+                provider_options: HashMap::new(),
+            })
+        }
+        "image_url" => {
+            let image = part
+                .image_url
+                .as_ref()
+                .ok_or(DecodeError::UnknownUserContentPart { index })?;
+            let (media_type, data) = split_data_url(&image.url);
+            // `detail` 是 OpenAI 特有的图片档位，经逃生舱保留，跨协议转换不静默丢失。
+            let mut provider_options = HashMap::new();
+            if let Some(detail) = &image.detail {
+                provider_options.insert("openai".to_string(), json!({ "detail": detail }));
+            }
+            Ok(ContentPart::Media {
+                media_type,
+                data,
+                provider_options,
+            })
+        }
+        _ => Err(DecodeError::UnknownUserContentPart { index }),
+    }
+}
+
+/// 拆分 media 数据源：data URL → `MediaSource::Data`（base64），否则 → `MediaSource::Url`。
+///
+/// data URL 形如 `data:<media_type>;base64,<base64 字节>`；`media_type` 缺省时
+/// 以空串占位（出站编码时按目标协议兜底）。远程 URL 原样保留。
+fn split_data_url(url: &str) -> (String, MediaSource) {
+    if let Some(rest) = url.strip_prefix("data:")
+        && let Some((meta, base64)) = rest.split_once(',')
+    {
+        let media_type = meta.strip_suffix(";base64").unwrap_or_default().to_string();
+        return (
+            media_type,
+            MediaSource::Data {
+                base64: base64.to_string(),
+            },
+        );
+    }
+    // 非 data URL 的 `image_url` 隐含图片：以顶层 `image` 兜底（出站按顶层段判定）。
+    (
+        "image".to_string(),
+        MediaSource::Url {
+            url: url.to_string(),
+        },
+    )
+}
+
+/// 顶层媒体段是否为图片（对齐 AI SDK `getTopLevelMediaType`）。
+fn is_image_media(media_type: &str) -> bool {
+    media_type.split('/').next().unwrap_or(media_type) == "image"
 }
 
 // ---- 出站编码：IR → wire 请求 ----
@@ -537,14 +609,23 @@ fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
             json!({ "role": "system", "content": text })
         }
         Role::User => {
-            let content: String = message
-                .content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
+            // 单一纯文本 user 消息编码为字符串（OpenAI 惯例，保持既有往返形状）；
+            // 否则按 content 顺序编码为数组，保持文本与媒体混排顺序。
+            let single_text = match message.content.as_slice() {
+                [ContentPart::Text { text, .. }] => Some(text),
+                _ => None,
+            };
+            let content: Value = if let Some(text) = single_text {
+                Value::String(text.clone())
+            } else {
+                Value::Array(
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|p| encode_user_part(p, warnings))
+                        .collect(),
+                )
+            };
             json!({ "role": "user", "content": content })
         }
         Role::Assistant => {
@@ -606,6 +687,45 @@ fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
             };
             json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content })
         }
+    }
+}
+
+/// 编码单个 IR user part 为 wire content part。
+///
+/// 文本 → `text` part；媒体 part → `image_url`（base64 数据拼接为 data URL，
+/// URL 原样，逃生舱 `provider_options["openai"]["detail"]` 存在时写回）。
+/// 目标协议无法表达的媒体类型（非 image）丢弃并记 warning——Chat
+/// Completions 的 `image_url` 仅承载图片，其他媒体（audio/file）不支持。
+fn encode_user_part(part: &ContentPart, warnings: &mut Vec<Warning>) -> Option<Value> {
+    match part {
+        ContentPart::Text { text, .. } => Some(json!({ "type": "text", "text": text })),
+        ContentPart::Media {
+            media_type,
+            data,
+            provider_options,
+        } => {
+            // OpenAI Chat Completions：仅 `image_url` 承载媒体，且数据源可为
+            // 远程 URL 或 base64 data URL。非图片媒体类型丢弃并记 warning。
+            if !is_image_media(media_type) {
+                warnings.push(Warning::unsupported(
+                    "media",
+                    format!("OpenAI Chat Completions 仅支持图片媒体，{media_type} 已丢弃"),
+                ));
+                return None;
+            }
+            let url = match data {
+                MediaSource::Data { base64 } => {
+                    format!("data:{media_type};base64,{base64}")
+                }
+                MediaSource::Url { url } => url.clone(),
+            };
+            let mut image_url = json!({ "url": url });
+            if let Some(detail) = provider_options.get("openai").and_then(|o| o.get("detail")) {
+                image_url["detail"] = detail.clone();
+            }
+            Some(json!({ "type": "image_url", "image_url": image_url }))
+        }
+        _ => None,
     }
 }
 
@@ -1252,14 +1372,74 @@ mod tests {
         assert_eq!(reencoded, wire, "往返应还原 wire 响应");
     }
 
-    /// 非文本 user content part 报错。
+    /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与图片混排顺序不丢。
+    #[test]
+    fn multimodal_fixture_roundtrip() {
+        let raw = include_str!("__fixtures__/request_multimodal.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let ir = decode_request(&wire).expect("fixture 应可解码为 IR");
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "往返应还原 wire 请求（含混排顺序）");
+        assert!(warnings.is_empty(), "同协议图片往返不应产出 warning");
+
+        // 混排顺序：text → 图片(data URL) → text → 图片(远程 URL)。
+        let parts = &ir.messages[0].content;
+        assert_eq!(parts.len(), 4, "应保留 4 个 part");
+        assert!(matches!(parts[0], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::Media {
+                media_type,
+                data: MediaSource::Data { base64 },
+                ..
+            } if media_type == "image/png" && base64 == "iVBORw0KGgoAAAANSUhEUg=="
+        ));
+        assert!(matches!(parts[2], ContentPart::Text { .. }));
+        assert!(matches!(
+            &parts[3],
+            ContentPart::Media {
+                data: MediaSource::Url { url },
+                ..
+            } if url == "https://example.com/image.png"
+        ));
+    }
+
+    /// `image_url.detail` 档位经逃生舱往返：入站存 `provider_options["openai"]`，
+    /// 出站写回，跨协议/跨渠道转换不静默丢失。
+    #[test]
+    fn image_detail_roundtrips_via_provider_options() {
+        let wire = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image_url",
+                    "image_url": { "url": "https://example.com/image.png", "detail": "low" }
+                }]
+            }]
+        });
+        let ir = decode_request(&wire).expect("带 detail 的 image_url 应可解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Media { provider_options, .. }
+                if provider_options.get("openai").and_then(|o| o.get("detail"))
+                    == Some(&Value::String("low".to_string()))
+        ));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "往返应还原 detail");
+        assert!(warnings.is_empty());
+    }
+
+    /// 非文本/非 image_url 的 user content part 报错。
     #[test]
     fn unknown_user_content_is_rejected() {
         let wire = json!({
             "model": "gpt-4o",
             "messages": [{
                 "role": "user",
-                "content": [{ "type": "image_url", "image_url": { "url": "x" } }]
+                "content": [{ "type": "audio_url", "audio_url": { "url": "x" } }]
             }]
         });
         assert!(matches!(
@@ -1522,6 +1702,53 @@ mod tests {
         assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
         assert_eq!(chunk["usage"]["completion_tokens"], 2);
         assert_eq!(chunk["usage"]["prompt_tokens"], 3);
+    }
+
+    /// 目标协议不支持的媒体类型（非图片）出站时丢弃并记 warning。
+    #[test]
+    fn non_image_media_is_dropped_with_warning() {
+        use crate::core::ir::Message;
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentPart::Media {
+                    media_type: "audio/mp3".to_string(),
+                    data: MediaSource::Url {
+                        url: "https://example.com/a.mp3".to_string(),
+                    },
+                    provider_options: HashMap::new(),
+                }],
+                provider_options: HashMap::new(),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            provider_options: HashMap::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        // 非图片媒体被丢弃：user content 为空数组。
+        assert_eq!(
+            encoded["messages"][0]["content"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, Warning::Unsupported { feature, .. } if feature == "media")),
+            "媒体丢弃应记 warning"
+        );
     }
 
     /// 无 warning 时响应体不含 `gateway` 字段（与官方形状一致）；有 warning 时

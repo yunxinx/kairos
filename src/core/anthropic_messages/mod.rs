@@ -628,10 +628,12 @@ fn encode_messages(
             Role::User => {
                 for part in &message.content {
                     match part {
-                        ContentPart::File { media_type, .. } => {
+                        ContentPart::Media { media_type, .. } => {
                             warnings.push(Warning::unsupported(
-                                "file",
-                                format!("网关尚未实现多模态文件内容（{media_type}），已丢弃"),
+                                "media",
+                                format!(
+                                    "网关尚未实现 Anthropic 多模态媒体内容（{media_type}），已丢弃"
+                                ),
                             ));
                         }
                         ContentPart::Custom { kind, .. } => {
@@ -765,10 +767,10 @@ fn encode_assistant_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -
                     "input": input,
                 }));
             }
-            ContentPart::File { media_type, .. } => {
+            ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "file",
-                    format!("网关尚未实现多模态文件内容（{media_type}），已丢弃"),
+                    "media",
+                    format!("网关尚未实现 Anthropic 多模态媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
@@ -1066,7 +1068,7 @@ fn encode_response_block(part: &ContentPart) -> Option<Value> {
             "input": input,
         })),
         // 响应 content 不携带请求侧 part。
-        ContentPart::ToolResult { .. } | ContentPart::File { .. } | ContentPart::Custom { .. } => {
+        ContentPart::ToolResult { .. } | ContentPart::Media { .. } | ContentPart::Custom { .. } => {
             None
         }
     }
