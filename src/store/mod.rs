@@ -76,6 +76,10 @@ pub struct RequestLog {
     pub price: PriceSnapshot,
     /// 本次费用（micro-USD）。
     pub cost_usd_micros: i64,
+    /// 可选的入站请求原始字节（仅 `logging.full_body` 开启时保存）。
+    pub request_body: Option<Vec<u8>>,
+    /// 可选的入站响应原始字节（仅 `logging.full_body` 开启时保存）。
+    pub response_body: Option<Vec<u8>>,
 }
 
 /// 落一条请求日志，返回插入的自增 id。
@@ -84,9 +88,9 @@ pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i
         "INSERT INTO request_log \
          (created_at, token_name, token_key, inbound_protocol, model, channel, status_code, \
           latency_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
-          input_price_usd_micros, output_price_usd_micros, cache_read_price_usd_micros, \
-          cache_write_price_usd_micros, cost_usd_micros) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         input_price_usd_micros, output_price_usd_micros, cache_read_price_usd_micros, \
+         cache_write_price_usd_micros, cost_usd_micros, request_body, response_body) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.created_at)
     .bind(&log.token_name)
@@ -105,6 +109,8 @@ pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i
     .bind(log.price.cache_read_micros)
     .bind(log.price.cache_write_micros)
     .bind(log.cost_usd_micros)
+    .bind(&log.request_body)
+    .bind(&log.response_body)
     .execute(pool)
     .await
     .map_err(StoreError::Query)?;
