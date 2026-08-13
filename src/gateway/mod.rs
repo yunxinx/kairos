@@ -10,6 +10,8 @@ mod logging;
 mod protocol;
 mod routing;
 mod sse;
+mod webui;
 
 pub use admin::router as admin_router;
 pub use http::{Deps, router};
+pub use webui::is_available as webui_available;

@@ -21,3 +21,10 @@
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# Web UI
+/webui/node_modules/
+/webui/dist/
+/webui/playwright-report/
+/webui/test-results/
+/webui/.tmp/

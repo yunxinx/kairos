@@ -1,8 +1,9 @@
-//! 管理 API：独立管理监听 + 静态 admin key 认证 + 资源 CRUD。
+//! 管理 API：独立管理监听 + 静态 admin key 认证 + 资源 CRUD + 嵌入式 Web UI。
 //!
 //! 管理面与协议面物理隔离：配置文件中可选的管理监听地址（`admin_listen`）配置了
-//! 才启动，未配置即管理面整体关闭，协议监听不注册任何管理路由。所有端点以静态
-//! `admin_key`（Bearer）认证。
+//! 才启动，未配置即管理面整体关闭，协议监听不注册任何管理路由。所有资源 API
+//! 以静态 `admin_key`（Bearer）认证；`webui/dist` 静态资源与 SPA 回退挂在 fallback
+//! 上、免认证。产物缺失时管理面退化为纯 API。
 //!
 //! 资源 CRUD（令牌/渠道/价格）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
@@ -44,10 +45,11 @@ struct AdminDeps {
     client: reqwest::Client,
 }
 
-/// 组装管理面路由：三组资源 CRUD，全部挂在 admin key 认证中间件之后。
+/// 组装管理面路由：资源 CRUD 挂在 admin key 认证中间件之后；静态 UI 为 fallback。
 ///
 /// 路由以领域词直出（`/tokens`、`/channels`、`/prices`），集合端点 GET 列出、
-/// POST 新建；单资源端点 PUT 整体替换、DELETE 删除。
+/// POST 新建；单资源端点 PUT 整体替换、DELETE 删除。UI 静态资源与未匹配的 GET
+/// 深链不经认证中间件。
 pub fn router(
     pool: SqlitePool,
     snapshot: crate::runtime::SnapshotHandle,
@@ -82,6 +84,8 @@ pub fn router(
         .route("/logs", get(query_logs))
         .route("/stats", get(get_stats))
         .route_layer(middleware::from_fn_with_state(admin_key, admin_auth))
+        // fallback 不走 route_layer：静态资源与 SPA 回退免认证；API 路由仍受中间件保护。
+        .fallback(super::webui::serve)
         .with_state(deps)
 }
 

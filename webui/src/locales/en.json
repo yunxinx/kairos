@@ -1,0 +1,62 @@
+{
+  "app": {
+    "title": "Kairos",
+    "localeToggle": "中 / EN",
+    "themeLight": "Light",
+    "themeDark": "Dark"
+  },
+  "nav": {
+    "overview": "Overview",
+    "tokens": "Tokens",
+    "channel": "Channels",
+    "pricing": "Pricing",
+    "settings": "Settings",
+    "logs": "Request logs",
+    "logout": "Sign out"
+  },
+  "auth": {
+    "loginTitle": "Kairos",
+    "adminKey": "Admin key",
+    "adminKeyPlaceholder": "sk-...",
+    "login": "Sign in",
+    "loggingIn": "Signing in...",
+    "invalidKey": "Invalid admin key."
+  },
+  "overview": {
+    "title": "Overview"
+  },
+  "placeholder": {
+    "comingTitle": "Still in progress",
+    "body": "This page will connect to the management API in a later ticket."
+  },
+  "common": {
+    "loading": "Loading...",
+    "retry": "Try again",
+    "close": "Close",
+    "navMenu": "Menu"
+  },
+  "a11y": {
+    "skipToContent": "Skip to main content",
+    "fieldGuide": "Format and requirements",
+    "showPassword": "Show password",
+    "hidePassword": "Hide password"
+  },
+  "fieldGuides": {
+    "auth": {
+      "adminKey": "Enter the static admin key from the config file. It is stored only in this browser."
+    }
+  },
+  "validation": {
+    "required": "This field is required",
+    "minLength": "At least {min} characters required",
+    "uint": "Enter a whole number",
+    "uintMin": "Enter a whole number of {min} or greater"
+  },
+  "errors": {
+    "notFoundTitle": "Page not found",
+    "notFoundDescription": "This address does not exist or may have been removed.",
+    "routeErrorTitle": "Something went wrong",
+    "routeErrorDescription": "This page could not be loaded. You can retry or return to a safe route.",
+    "goHome": "Back to overview"
+  }
+}

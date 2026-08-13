@@ -1,0 +1,80 @@
+@import './globals.css';
+
+@theme inline {
+  --spacing-page-x: 1.5rem;
+  --spacing-page-y: 2.5rem;
+  --spacing-stack: 1rem;
+  --spacing-page: 2rem;
+  --width-content: 80rem;
+  --height-topnav: 2.75rem;
+  --z-topnav: 50;
+  --z-overlay-backdrop: 99;
+  --z-overlay: 100;
+  --z-floating: 110;
+  --spacing-touch: 2.75rem;
+  --height-chart: 20rem;
+}
+
+.max-w-content {
+  max-width: var(--width-content);
+}
+
+.px-page-x {
+  padding-left: var(--spacing-page-x);
+  padding-right: var(--spacing-page-x);
+}
+
+.py-page-y {
+  padding-top: var(--spacing-page-y);
+  padding-bottom: var(--spacing-page-y);
+}
+
+.gap-stack {
+  gap: var(--spacing-stack);
+}
+
+.gap-page {
+  gap: var(--spacing-page);
+}
+
+.not-found-stage {
+  display: flex;
+  width: 100%;
+  min-height: calc(100dvh - 2 * var(--spacing-page-y));
+  align-items: center;
+  justify-content: center;
+}
+
+@media (min-width: 768px) {
+  .not-found-stage {
+    min-height: calc(100dvh - var(--height-topnav) - 2 * var(--spacing-page-y));
+  }
+}
+
+.h-topnav {
+  height: var(--height-topnav);
+}
+
+.z-topnav {
+  z-index: var(--z-topnav);
+}
+
+.z-overlay-backdrop {
+  z-index: var(--z-overlay-backdrop);
+}
+
+.z-overlay {
+  z-index: var(--z-overlay);
+}
+
+.z-floating {
+  z-index: var(--z-floating);
+}
+
+.min-h-touch {
+  min-height: var(--spacing-touch);
+}
+
+.h-chart {
+  height: var(--height-chart);
+}

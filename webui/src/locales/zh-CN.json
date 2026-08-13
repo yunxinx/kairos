@@ -1,0 +1,62 @@
+{
+  "app": {
+    "title": "Kairos",
+    "localeToggle": "中 / EN",
+    "themeLight": "浅色",
+    "themeDark": "深色"
+  },
+  "nav": {
+    "overview": "概览",
+    "tokens": "令牌",
+    "channel": "渠道",
+    "pricing": "价格",
+    "settings": "设置",
+    "logs": "请求日志",
+    "logout": "退出"
+  },
+  "auth": {
+    "loginTitle": "Kairos",
+    "adminKey": "Admin key",
+    "adminKeyPlaceholder": "sk-...",
+    "login": "登录",
+    "loggingIn": "登录中...",
+    "invalidKey": "admin key 无效。"
+  },
+  "overview": {
+    "title": "概览"
+  },
+  "placeholder": {
+    "comingTitle": "功能开发中",
+    "body": "此页面将在后续票中接入管理 API。"
+  },
+  "common": {
+    "loading": "加载中...",
+    "retry": "重试",
+    "close": "关闭",
+    "navMenu": "导航菜单"
+  },
+  "a11y": {
+    "skipToContent": "跳到主内容",
+    "fieldGuide": "格式与填写说明",
+    "showPassword": "显示密码",
+    "hidePassword": "隐藏密码"
+  },
+  "fieldGuides": {
+    "auth": {
+      "adminKey": "输入配置文件中的静态 admin key，浏览器仅保存在本地。"
+    }
+  },
+  "validation": {
+    "required": "请填写此项",
+    "minLength": "至少需要 {min} 个字符",
+    "uint": "请输入一个整数",
+    "uintMin": "请输入不小于 {min} 的整数"
+  },
+  "errors": {
+    "notFoundTitle": "页面不存在",
+    "notFoundDescription": "你访问的地址不存在或已被移除。",
+    "routeErrorTitle": "页面加载失败",
+    "routeErrorDescription": "当前页面未能完成加载。你可以重试，或返回安全页面。",
+    "goHome": "返回概览"
+  }
+}

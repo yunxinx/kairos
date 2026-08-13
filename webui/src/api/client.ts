@@ -1,0 +1,152 @@
+import { invalidateAdminKey, getAdminKey } from '@/lib/session';
+import { ApiClientError, type ApiErrorBody } from '@/api/types';
+import type {
+  BalanceAdjustment,
+  BalanceView,
+  Channel,
+  ChannelProbeResult,
+  LogQuery,
+  Page,
+  LogEntry,
+  Price,
+  Settings,
+  StatsView,
+  Token,
+} from '@/api/types';
+
+function buildQuery(params: object): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === '') continue;
+    if (typeof value !== 'string' && typeof value !== 'number') continue;
+    search.set(key, String(value));
+  }
+  const query = search.toString();
+  return query ? `?${query}` : '';
+}
+
+/**
+ * 调用管理 API。路径无 `/api` 前缀；认证为 `Authorization: Bearer <admin key>`。
+ *
+ * `keyOverride` 用于登录试探：失败时不清除已持有的凭据。
+ */
+async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: string): Promise<T> {
+  const key = keyOverride ?? getAdminKey();
+  const headers = new Headers(init?.headers);
+  if (init?.body !== undefined && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
+  if (key) {
+    headers.set('Authorization', `Bearer ${key}`);
+  }
+
+  const response = await fetch(path, { ...init, headers });
+  if (!response.ok) {
+    if (response.status === 401 && key && keyOverride === undefined) {
+      invalidateAdminKey();
+    }
+    const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
+    const message = body.error?.message ?? response.statusText;
+    throw new ApiClientError(message, body.error?.code);
+  }
+  if (response.status === 204) {
+    return undefined as T;
+  }
+  return (await response.json()) as T;
+}
+
+export const apiClient = {
+  listTokens(keyOverride?: string): Promise<Token[]> {
+    return apiFetch('/tokens', { method: 'GET' }, keyOverride);
+  },
+
+  createToken(body: Token): Promise<Token> {
+    return apiFetch('/tokens', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  updateToken(tokenKey: string, body: Token): Promise<Token> {
+    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  deleteToken(tokenKey: string): Promise<Token> {
+    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}`, { method: 'DELETE' });
+  },
+
+  adjustTokenBalance(tokenKey: string, body: BalanceAdjustment): Promise<BalanceView> {
+    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}/balance`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+
+  listChannels(): Promise<Channel[]> {
+    return apiFetch('/channels');
+  },
+
+  createChannel(body: Channel): Promise<Channel> {
+    return apiFetch('/channels', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  updateChannel(name: string, body: Channel): Promise<Channel> {
+    return apiFetch(`/channels/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  deleteChannel(name: string): Promise<Channel> {
+    return apiFetch(`/channels/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  },
+
+  testChannel(name: string): Promise<ChannelProbeResult> {
+    return apiFetch(`/channels/${encodeURIComponent(name)}/test`, { method: 'POST' });
+  },
+
+  listPrices(): Promise<Price[]> {
+    return apiFetch('/prices');
+  },
+
+  createPrice(body: Price): Promise<Price> {
+    return apiFetch('/prices', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  updatePrice(model: string, body: Price): Promise<Price> {
+    return apiFetch(`/prices/${encodeURIComponent(model)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  deletePrice(model: string): Promise<Price> {
+    return apiFetch(`/prices/${encodeURIComponent(model)}`, { method: 'DELETE' });
+  },
+
+  getSettings(): Promise<Settings> {
+    return apiFetch('/settings');
+  },
+
+  updateSettings(body: Settings): Promise<Settings> {
+    return apiFetch('/settings', { method: 'PUT', body: JSON.stringify(body) });
+  },
+
+  queryLogs(query: LogQuery = {}): Promise<Page<LogEntry>> {
+    return apiFetch(`/logs${buildQuery(query)}`);
+  },
+
+  getStats(days?: number): Promise<StatsView> {
+    return apiFetch(`/stats${buildQuery({ days })}`);
+  },
+};
+
+export function extractApiError(err: unknown): { message: string; code?: string } {
+  if (err instanceof ApiClientError) {
+    return err.code === undefined
+      ? { message: err.message }
+      : { message: err.message, code: err.code };
+  }
+  if (err instanceof Error) return { message: err.message };
+  return { message: 'Unknown error' };
+}

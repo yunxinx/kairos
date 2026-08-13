@@ -32,7 +32,11 @@ async fn main() -> anyhow::Result<()> {
             gateway::admin_router(pool.clone(), snapshot.clone(), cfg.admin_key.clone());
         let admin_addr = format!("{}:{}", admin_listen.host, admin_listen.port);
         let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
-        println!("kairos 管理面监听 {admin_addr}");
+        if gateway::webui_available() {
+            println!("kairos 管理面监听 {admin_addr}");
+        } else {
+            println!("kairos 管理面监听 {admin_addr}（未嵌入 Web UI，仅提供 API）");
+        }
         tokio::spawn(async move {
             axum::serve(admin_listener, admin_app)
                 .await
