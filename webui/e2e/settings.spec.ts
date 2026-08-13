@@ -1,5 +1,5 @@
 import { authedTest as test, expect } from './fixtures';
-import { E2E_PROTOCOL_PORT } from './helpers/gateway';
+import { E2E_ADMIN_KEY, E2E_PROTOCOL_PORT } from './helpers/gateway';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -32,5 +32,28 @@ test.describe('settings page', () => {
     await expect(page.getByTestId('settings-save-error')).toContainText(
       /max_request_bytes 必须大于 0/,
     );
+  });
+
+  test('saves the full_body switch and keeps it after refresh', async ({ page, request }) => {
+    await page.goto('/config');
+    const checkbox = page.getByTestId('settings-full-body');
+    await expect(checkbox).toBeVisible();
+    if (await checkbox.isChecked()) {
+      await checkbox.uncheck();
+      await page.getByTestId('settings-save').click();
+      await expect(page.getByTestId('settings-save-success')).toBeVisible();
+    }
+    await checkbox.check();
+    await page.getByTestId('settings-save').click();
+    await expect(page.getByTestId('settings-save-success')).toBeVisible();
+
+    const resp = await request.get('/settings', {
+      headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+    });
+    expect(resp.ok()).toBeTruthy();
+    expect((await resp.json()).full_body).toBe(true);
+
+    await page.reload();
+    await expect(page.getByTestId('settings-full-body')).toBeChecked();
   });
 });

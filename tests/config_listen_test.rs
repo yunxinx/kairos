@@ -52,6 +52,7 @@ async fn config_driven_listen_and_fallback() {
         "/v1/audio/speech",
         "/v1/batches",
         "/v1/realtime",
+        "/metrics",
     ] {
         for method in [reqwest::Method::GET, reqwest::Method::POST] {
             let resp = client

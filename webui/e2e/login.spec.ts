@@ -6,6 +6,12 @@ const ADMIN_KEY_STORAGE = 'kairos-admin-key';
 test.describe.configure({ mode: 'serial' });
 
 test.describe('admin key login', () => {
+  test('redirects the admin root to the login page', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForURL('**/login');
+    await expect(page.locator('#login-admin-key')).toBeVisible();
+  });
+
   test('accepts a valid admin key and reaches overview', async ({ page }) => {
     await page.goto('/login');
     await page.locator('#login-admin-key').fill(E2E_ADMIN_KEY);

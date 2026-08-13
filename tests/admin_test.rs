@@ -94,24 +94,33 @@ async fn admin_put(gw: &TestGateway, path: &str, body: Value) -> reqwest::Respon
         .expect("管理请求应可达")
 }
 
+/// 协议监听上不应出现的管理 API 与 UI 路径（含 SPA 路由）。
+const PROTOCOL_FORBIDDEN_ADMIN_GETS: &[&str] = &[
+    "/",
+    "/overview",
+    "/login",
+    "/tokens",
+    "/channels",
+    "/prices",
+    "/settings",
+    "/logs",
+    "/stats",
+    "/token",
+    "/channel",
+    "/pricing",
+    "/config",
+    "/requests",
+    "/metrics",
+];
+
 /// 未配置管理监听时管理面整体关闭：协议监听上没有任何管理路由。
 #[tokio::test]
 async fn admin_not_configured_means_no_admin_routes() {
     let gw = TestGateway::start().await;
     let client = reqwest::Client::new();
 
-    // 协议监听不应有管理路由；落到 fallback（404）。覆盖读/写与各资源路径。
-    for path in [
-        "/",
-        "/overview",
-        "/login",
-        "/tokens",
-        "/channels",
-        "/prices",
-        "/settings",
-        "/logs",
-        "/stats",
-    ] {
+    // 协议监听不应有管理路由或 UI；落到 fallback（404）。覆盖读/写、探测与 SPA 路径。
+    for path in PROTOCOL_FORBIDDEN_ADMIN_GETS {
         let resp = client
             .get(format!("{}{path}", gw.base_url()))
             .send()
@@ -133,6 +142,16 @@ async fn admin_not_configured_means_no_admin_routes() {
         resp.status(),
         reqwest::StatusCode::NOT_FOUND,
         "协议监听不应接受管理写入"
+    );
+    let resp = client
+        .post(format!("{}/channels/test-channel/test", gw.base_url()))
+        .send()
+        .await
+        .expect("协议监听应可请求");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "协议监听不应接受渠道探测"
     );
 }
 
@@ -435,7 +454,7 @@ async fn unknown_field_is_rejected() {
     assert_eq!(body["error"]["code"], "invalid_body");
 }
 
-/// 已配置管理面时协议监听仍不注册管理路由；管理监听不提供协议端点。
+/// 已配置管理面时协议监听仍不注册管理路由或 UI；管理监听不提供协议端点。
 ///
 /// admin key 与下游令牌体系隔离：下游令牌调管理面 401，admin key 当下游令牌 401。
 #[tokio::test]
@@ -443,9 +462,22 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let client = reqwest::Client::new();
 
-    // 协议监听无管理路由（即使管理面已启动）。
+    // 协议监听无管理路由、无 UI（即使管理面已启动）。
+    for path in PROTOCOL_FORBIDDEN_ADMIN_GETS {
+        let resp = client
+            .get(format!("{}{path}", gw.base_url()))
+            .bearer_auth(TEST_ADMIN_KEY)
+            .send()
+            .await
+            .expect("协议监听应可请求");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "协议监听即使已配置管理面也不应注册 {path}"
+        );
+    }
     let resp = client
-        .get(format!("{}/tokens", gw.base_url()))
+        .post(format!("{}/channels/test-channel/test", gw.base_url()))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await
@@ -453,7 +485,7 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::NOT_FOUND,
-        "协议监听即使已配置管理面也不应注册管理路由"
+        "协议监听不应接受渠道探测"
     );
 
     // 管理监听无协议端点。
