@@ -1,14 +1,20 @@
 import { queryClient } from '@/app/providers/query';
 import { apiClient } from '@/api/client';
 import { loadTokenRows } from '@/api/token-rows';
+import {
+  LOGS_INITIAL_PAGE,
+  LOGS_INITIAL_PAGE_SIZE,
+  LOGS_INITIAL_QUERY_KEY,
+  OVERVIEW_DEFAULT_DAYS,
+} from '@/lib/admin-query-defaults';
 
 /** 导航悬停时预取对应页数据，进入时尽量已有缓存、不再拆布局。 */
 export function prefetchAdminRoute(to: string): void {
   switch (to) {
     case '/overview':
       void queryClient.prefetchQuery({
-        queryKey: ['stats', '7'],
-        queryFn: () => apiClient.getStats(7),
+        queryKey: ['stats', String(OVERVIEW_DEFAULT_DAYS)],
+        queryFn: () => apiClient.getStats(OVERVIEW_DEFAULT_DAYS),
       });
       void queryClient.prefetchQuery({
         queryKey: ['stats', 'lifetime'],
@@ -41,8 +47,9 @@ export function prefetchAdminRoute(to: string): void {
       return;
     case '/requests':
       void queryClient.prefetchQuery({
-        queryKey: ['logs', 1, 20, '', '', '', ''],
-        queryFn: () => apiClient.queryLogs({ page: 1, page_size: 20 }),
+        queryKey: LOGS_INITIAL_QUERY_KEY,
+        queryFn: () =>
+          apiClient.queryLogs({ page: LOGS_INITIAL_PAGE, page_size: LOGS_INITIAL_PAGE_SIZE }),
       });
       return;
     default:

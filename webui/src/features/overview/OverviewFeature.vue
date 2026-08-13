@@ -12,10 +12,11 @@ import OverviewShareList from '@/features/overview/OverviewShareList.vue';
 import OverviewHeatmap from '@/features/overview/OverviewHeatmap.vue';
 import ChartPanelSkeleton from '@/features/overview/ChartPanelSkeleton.vue';
 import { OverviewTrendChart } from '@/features/overview/overview-charts.async';
+import { OVERVIEW_DEFAULT_DAYS } from '@/lib/admin-query-defaults';
 
 const { t } = useI18n();
 
-const days = ref('7');
+const days = ref(String(OVERVIEW_DEFAULT_DAYS));
 
 const dayOptions = computed(() =>
   ['1', '7', '30', '90'].map((value) => ({

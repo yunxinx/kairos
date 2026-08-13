@@ -19,6 +19,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow from '@/features/logs/LogTableRow.vue';
+import { LOGS_INITIAL_PAGE, LOGS_INITIAL_PAGE_SIZE } from '@/lib/admin-query-defaults';
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const;
 
@@ -32,8 +33,8 @@ const appliedTokenKey = ref('');
 const appliedModel = ref('');
 const appliedFrom = ref('');
 const appliedTo = ref('');
-const page = ref(1);
-const pageSize = ref(20);
+const page = ref(LOGS_INITIAL_PAGE);
+const pageSize = ref(LOGS_INITIAL_PAGE_SIZE);
 const expandedIds = ref<Set<number>>(new Set());
 
 const pageSizeModel = computed({
