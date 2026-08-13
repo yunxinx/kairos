@@ -198,18 +198,7 @@ function formatLimit(limit: number | null): string {
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-    <PageHeader :title="t('nav.tokens')" :subtitle="t('tokens.subtitle')">
-      <template #actions>
-        <button
-          type="button"
-          class="btn btn-primary"
-          data-testid="create-token"
-          @click="openCreate"
-        >
-          {{ t('tokens.create') }}
-        </button>
-      </template>
-    </PageHeader>
+    <PageHeader :title="t('nav.tokens')" />
 
     <InlineError
       v-if="tokensQuery.isError.value && !tokensQuery.data.value"
@@ -232,6 +221,16 @@ function formatLimit(limit: number | null): string {
               :placeholder="t('tokens.search')"
               :aria-label="t('tokens.search')"
             />
+            <template #actions>
+              <button
+                type="button"
+                class="btn btn-primary"
+                data-testid="create-token"
+                @click="openCreate"
+              >
+                {{ t('tokens.create') }}
+              </button>
+            </template>
           </DataTableToolbar>
         </template>
         <TableHeader>

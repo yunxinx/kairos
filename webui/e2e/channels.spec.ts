@@ -42,7 +42,7 @@ test.describe('channel resource page', () => {
       await page.getByTestId('channel-save').click();
       await expect(okRow).toContainText('gpt-4o');
 
-      await okRow.getByTestId('channel-test').click();
+      await clickRowAction(okRow, page, 'channel-test');
       await expect(okRow.getByTestId('channel-probe-result')).toHaveText(/Success · 200 · \d+ ms/);
 
       await page.getByTestId('create-channel').click();
@@ -54,7 +54,7 @@ test.describe('channel resource page', () => {
 
       const failRow = page.locator('[data-testid="channel-row"][data-channel-name="fail-channel"]');
       await expect(failRow).toBeVisible();
-      await failRow.getByTestId('channel-test').click();
+      await clickRowAction(failRow, page, 'channel-test');
       await expect(failRow.getByTestId('channel-probe-result')).toHaveText(/Failed · 500 · \d+ ms/);
 
       await clickRowAction(okRow, page, 'channel-edit');

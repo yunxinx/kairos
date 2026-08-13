@@ -288,18 +288,7 @@ function probeClass(result: ChannelProbeResult): string {
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-    <PageHeader :title="t('nav.channel')" :subtitle="t('channel.subtitle')">
-      <template #actions>
-        <button
-          type="button"
-          class="btn btn-primary"
-          data-testid="create-channel"
-          @click="openCreate"
-        >
-          {{ t('channel.create') }}
-        </button>
-      </template>
-    </PageHeader>
+    <PageHeader :title="t('nav.channel')" />
 
     <InlineError
       v-if="channelsQuery.isError.value && !channelsQuery.data.value"
@@ -322,6 +311,16 @@ function probeClass(result: ChannelProbeResult): string {
               :placeholder="t('channel.search')"
               :aria-label="t('channel.search')"
             />
+            <template #actions>
+              <button
+                type="button"
+                class="btn btn-primary"
+                data-testid="create-channel"
+                @click="openCreate"
+              >
+                {{ t('channel.create') }}
+              </button>
+            </template>
           </DataTableToolbar>
         </template>
         <TableHeader>
@@ -330,13 +329,12 @@ function probeClass(result: ChannelProbeResult): string {
             <TableHead>{{ t('channel.protocol') }}</TableHead>
             <TableHead>{{ t('channel.baseUrl') }}</TableHead>
             <TableHead>{{ t('channel.models') }}</TableHead>
-            <TableHead>{{ t('channel.priority') }}</TableHead>
-            <TableHead>{{ t('channel.test') }}</TableHead>
+            <TableHead align="center">{{ t('channel.priority') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="7" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="6" />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"
@@ -350,18 +348,9 @@ function probeClass(result: ChannelProbeResult): string {
               <TableCell class="font-mono text-sm">
                 {{ channel.models.join(', ') }}
               </TableCell>
-              <TableCell class="font-mono">{{ channel.priority }}</TableCell>
-              <TableCell>
-                <span class="flex flex-col gap-1">
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-subtle"
-                    data-testid="channel-test"
-                    :disabled="testingName === channel.name"
-                    @click="handleTest(channel.name)"
-                  >
-                    {{ testingName === channel.name ? t('channel.testing') : t('channel.test') }}
-                  </button>
+              <TableCell align="center" class="font-mono">{{ channel.priority }}</TableCell>
+              <TableCell align="center">
+                <span class="inline-flex items-center justify-center gap-1">
                   <span
                     v-if="probeByName[channel.name]"
                     class="badge"
@@ -370,46 +359,52 @@ function probeClass(result: ChannelProbeResult): string {
                   >
                     {{ probeText(probeByName[channel.name]!) }}
                   </span>
+                  <span
+                    v-if="confirmingDeleteName === channel.name"
+                    class="inline-flex items-center justify-center gap-1"
+                  >
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-danger-filled"
+                      data-testid="channel-delete-confirm"
+                      @click="handleDelete(channel.name)"
+                    >
+                      {{ t('common.confirmDelete') }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-ghost"
+                      @click="confirmingDeleteName = null"
+                    >
+                      {{ t('common.cancel') }}
+                    </button>
+                  </span>
+                  <DataTableRowActions v-else>
+                    <DataTableMenuItem
+                      data-testid="channel-test"
+                      :disabled="testingName === channel.name"
+                      @select="handleTest(channel.name)"
+                    >
+                      {{ testingName === channel.name ? t('channel.testing') : t('channel.test') }}
+                    </DataTableMenuItem>
+                    <DataTableMenuSeparator />
+                    <DataTableMenuItem data-testid="channel-edit" @select="openEdit(channel)">
+                      {{ t('common.edit') }}
+                    </DataTableMenuItem>
+                    <DataTableMenuSeparator />
+                    <DataTableMenuItem
+                      danger
+                      data-testid="channel-delete"
+                      @select="handleDelete(channel.name)"
+                    >
+                      {{ t('common.delete') }}
+                    </DataTableMenuItem>
+                  </DataTableRowActions>
                 </span>
-              </TableCell>
-              <TableCell align="center">
-                <span
-                  v-if="confirmingDeleteName === channel.name"
-                  class="inline-flex items-center justify-center gap-1"
-                >
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-danger-filled"
-                    data-testid="channel-delete-confirm"
-                    @click="handleDelete(channel.name)"
-                  >
-                    {{ t('common.confirmDelete') }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                    @click="confirmingDeleteName = null"
-                  >
-                    {{ t('common.cancel') }}
-                  </button>
-                </span>
-                <DataTableRowActions v-else>
-                  <DataTableMenuItem data-testid="channel-edit" @select="openEdit(channel)">
-                    {{ t('common.edit') }}
-                  </DataTableMenuItem>
-                  <DataTableMenuSeparator />
-                  <DataTableMenuItem
-                    danger
-                    data-testid="channel-delete"
-                    @select="handleDelete(channel.name)"
-                  >
-                    {{ t('common.delete') }}
-                  </DataTableMenuItem>
-                </DataTableRowActions>
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="7" class="h-24 whitespace-normal">
+              <TableCell :colspan="6" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}

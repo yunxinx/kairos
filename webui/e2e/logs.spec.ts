@@ -66,7 +66,7 @@ test.describe('request logs page', () => {
     await applyLogFilters(page);
 
     await page.locator('#logs-page-size').click();
-    await page.getByRole('option', { name: '10' }).click();
+    await page.getByRole('option', { name: '10', exact: true }).click();
 
     await expect(page.getByTestId('log-row')).toHaveCount(10);
     await expect(page.getByTestId('logs-pagination-summary')).toContainText('12');

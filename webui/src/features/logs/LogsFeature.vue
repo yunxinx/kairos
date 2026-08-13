@@ -20,7 +20,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow from '@/features/logs/LogTableRow.vue';
 
-const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
+const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const;
 
 const { t } = useI18n();
 
@@ -147,7 +147,7 @@ function isExpanded(id: number): boolean {
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-    <PageHeader :title="t('nav.logs')" :subtitle="t('logs.subtitle')" />
+    <PageHeader :title="t('nav.logs')" />
 
     <InlineError
       v-if="logsQuery.isError.value && !logsQuery.data.value"

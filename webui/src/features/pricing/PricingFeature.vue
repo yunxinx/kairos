@@ -167,18 +167,7 @@ function formatOptionalMicros(value: number | null): string {
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-    <PageHeader :title="t('nav.pricing')" :subtitle="t('pricing.subtitle')">
-      <template #actions>
-        <button
-          type="button"
-          class="btn btn-primary"
-          data-testid="pricing-create-entry"
-          @click="openCreate"
-        >
-          {{ t('pricing.createEntry') }}
-        </button>
-      </template>
-    </PageHeader>
+    <PageHeader :title="t('nav.pricing')" />
 
     <InlineError
       v-if="pricesQuery.isError.value && !pricesQuery.data.value"
@@ -201,6 +190,16 @@ function formatOptionalMicros(value: number | null): string {
               :placeholder="t('pricing.model')"
               :aria-label="t('pricing.model')"
             />
+            <template #actions>
+              <button
+                type="button"
+                class="btn btn-primary"
+                data-testid="pricing-create-entry"
+                @click="openCreate"
+              >
+                {{ t('pricing.createEntry') }}
+              </button>
+            </template>
           </DataTableToolbar>
         </template>
         <TableHeader>
