@@ -1347,7 +1347,7 @@ fn is_retryable_status(status: u16) -> bool {
 ///
 /// OpenAI 用 `Authorization: Bearer`；Anthropic 用 `x-api-key` 并带
 /// `anthropic-version`（官方 SDK 默认头）。
-trait OutboundAuth {
+pub(super) trait OutboundAuth {
     fn apply_outbound_auth(self, channel: &Channel) -> Self;
 }
 
@@ -1364,7 +1364,7 @@ impl OutboundAuth for reqwest::RequestBuilder {
 
 /// 从上游错误 body 提取可读消息（OpenAI/Anthropic 均为 `error.message`），
 /// 避免把整个 JSON 串塞进下游 message。
-fn upstream_error_message(parsed: &Value, status: u16) -> String {
+pub(super) fn upstream_error_message(parsed: &Value, status: u16) -> String {
     parsed
         .get("error")
         .and_then(|e| e.get("message"))

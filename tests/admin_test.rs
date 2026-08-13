@@ -101,7 +101,14 @@ async fn admin_not_configured_means_no_admin_routes() {
     let client = reqwest::Client::new();
 
     // 协议监听不应有管理路由；落到 fallback（404）。覆盖读/写与各资源路径。
-    for path in ["/tokens", "/channels", "/prices", "/settings", "/logs"] {
+    for path in [
+        "/tokens",
+        "/channels",
+        "/prices",
+        "/settings",
+        "/logs",
+        "/stats",
+    ] {
         let resp = client
             .get(format!("{}{path}", gw.base_url()))
             .send()
@@ -1129,4 +1136,441 @@ async fn new_endpoints_structured_errors() {
         .await
         .expect("应可查日志");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+// --- 01 票：stats 聚合与渠道连通性探测 ---
+
+const MS_PER_DAY: i64 = 86_400_000;
+
+/// 播种日志时需要变化的字段；其余列用固定测试缺省。
+struct SeededLog {
+    created_at: i64,
+    model: &'static str,
+    channel: &'static str,
+    status_code: i64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd_micros: i64,
+}
+
+/// 播种一条请求日志，字段按断言需要的口径填写。
+async fn seed_log(pool: &sqlx::SqlitePool, log: SeededLog) {
+    store::insert_request_log(
+        pool,
+        &store::RequestLog {
+            id: 0,
+            created_at: log.created_at,
+            token_name: "dev".to_string(),
+            token_key: TEST_TOKEN_KEY.to_string(),
+            inbound_protocol: "openai_chat".to_string(),
+            model: log.model.to_string(),
+            channel: log.channel.to_string(),
+            status_code: log.status_code,
+            latency_ms: 10,
+            input_tokens: log.input_tokens,
+            output_tokens: log.output_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            price: kairos::core::billing::PriceSnapshot::default(),
+            cost_usd_micros: log.cost_usd_micros,
+            request_body: None,
+            response_body: None,
+        },
+    )
+    .await
+    .expect("应能播种请求日志");
+}
+
+/// 把 unix 毫秒格式化为 UTC 日历日（YYYY-MM-DD），与 SQLite `unixepoch` 口径一致。
+async fn utc_date(pool: &sqlx::SqlitePool, millis: i64) -> String {
+    sqlx::query_scalar("SELECT date(? / 1000, 'unixepoch')")
+        .bind(millis)
+        .fetch_one(pool)
+        .await
+        .expect("应能格式化 UTC 日期")
+}
+
+/// 播种一组跨日、含失败结算的日志，覆盖默认 7 天窗与超窗条目。
+async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
+    let today_start = now.div_euclid(MS_PER_DAY) * MS_PER_DAY;
+    let yesterday = today_start - MS_PER_DAY;
+    let eight_days_ago = today_start - 8 * MS_PER_DAY;
+
+    // 今日两条成功：gpt-4o / test-channel。
+    seed_log(
+        pool,
+        SeededLog {
+            created_at: today_start + 1,
+            model: TEST_MODEL,
+            channel: "test-channel",
+            status_code: 200,
+            input_tokens: 10,
+            output_tokens: 4,
+            cost_usd_micros: 1_000,
+        },
+    )
+    .await;
+    seed_log(
+        pool,
+        SeededLog {
+            created_at: today_start + 2,
+            model: TEST_MODEL,
+            channel: "test-channel",
+            status_code: 200,
+            input_tokens: 20,
+            output_tokens: 8,
+            cost_usd_micros: 2_000,
+        },
+    )
+    .await;
+    // 今日一条失败：费用不应计入（仅成功结算）。
+    seed_log(
+        pool,
+        SeededLog {
+            created_at: today_start + 3,
+            model: TEST_MODEL,
+            channel: "test-channel",
+            status_code: 500,
+            input_tokens: 0,
+            output_tokens: 0,
+            cost_usd_micros: 999_999,
+        },
+    )
+    .await;
+    // 昨日一条成功：另一模型/渠道，用于分布。
+    seed_log(
+        pool,
+        SeededLog {
+            created_at: yesterday + 1,
+            model: "gpt-4o-mini",
+            channel: "other-channel",
+            status_code: 200,
+            input_tokens: 5,
+            output_tokens: 1,
+            cost_usd_micros: 500,
+        },
+    )
+    .await;
+    // 8 天前一条成功：默认 7 天窗应排除，夹取到 90 天后应纳入。
+    seed_log(
+        pool,
+        SeededLog {
+            created_at: eight_days_ago + 1,
+            model: TEST_MODEL,
+            channel: "test-channel",
+            status_code: 200,
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_usd_micros: 100,
+        },
+    )
+    .await;
+
+    (today_start, yesterday, eight_days_ago)
+}
+
+/// `/stats` 汇总与逐日序列与播种数据精确一致；失败行费用不计入。
+#[tokio::test]
+async fn stats_aggregates_seeded_logs_with_success_only_cost() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let now = common::unix_millis();
+    let (today_start, yesterday, _) = seed_stats_logs(&gw.pool, now).await;
+    let today = utc_date(&gw.pool, today_start).await;
+    let yesterday_date = utc_date(&gw.pool, yesterday).await;
+
+    let resp = admin_get(&gw, "/stats").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("stats 应可解析");
+
+    let summary = &body["summary"];
+    assert_eq!(
+        summary["request_count"], 4,
+        "默认 7 天窗应含今日 3 + 昨日 1"
+    );
+    assert_eq!(summary["success_count"], 3);
+    assert_eq!(summary["input_tokens"], 35);
+    assert_eq!(summary["output_tokens"], 13);
+    assert_eq!(
+        summary["cost_usd_micros"], 3500,
+        "失败行 999999 微元不应计入费用"
+    );
+    assert_eq!(summary["token_count"], 1, "资源表令牌数");
+    assert_eq!(summary["channel_count"], 1, "资源表渠道数");
+
+    let daily = body["daily"].as_array().expect("应有逐日序列");
+    assert_eq!(daily.len(), 7, "缺省 days=7");
+    let today_point = daily.iter().find(|p| p["date"] == today).expect("应含今日");
+    assert_eq!(today_point["request_count"], 3);
+    assert_eq!(today_point["input_tokens"], 30);
+    assert_eq!(today_point["output_tokens"], 12);
+    assert_eq!(today_point["cost_usd_micros"], 3000);
+    let yesterday_point = daily
+        .iter()
+        .find(|p| p["date"] == yesterday_date)
+        .expect("应含昨日");
+    assert_eq!(yesterday_point["request_count"], 1);
+    assert_eq!(yesterday_point["input_tokens"], 5);
+    assert_eq!(yesterday_point["output_tokens"], 1);
+    assert_eq!(yesterday_point["cost_usd_micros"], 500);
+    let zero_days = daily.iter().filter(|p| p["request_count"] == 0).count();
+    assert_eq!(zero_days, 5, "无流量的日历日应补零");
+
+    let by_model = body["by_model"].as_array().expect("应有模型分布");
+    let gpt4o = by_model
+        .iter()
+        .find(|p| p["model"] == TEST_MODEL)
+        .expect("应有 gpt-4o");
+    assert_eq!(gpt4o["request_count"], 3);
+    assert_eq!(gpt4o["cost_usd_micros"], 3000);
+    let mini = by_model
+        .iter()
+        .find(|p| p["model"] == "gpt-4o-mini")
+        .expect("应有 gpt-4o-mini");
+    assert_eq!(mini["request_count"], 1);
+    assert_eq!(mini["cost_usd_micros"], 500);
+
+    let by_channel = body["by_channel"].as_array().expect("应有渠道分布");
+    let test_ch = by_channel
+        .iter()
+        .find(|p| p["channel"] == "test-channel")
+        .expect("应有 test-channel");
+    assert_eq!(test_ch["request_count"], 3);
+    assert_eq!(test_ch["cost_usd_micros"], 3000);
+    let other = by_channel
+        .iter()
+        .find(|p| p["channel"] == "other-channel")
+        .expect("应有 other-channel");
+    assert_eq!(other["request_count"], 1);
+    assert_eq!(other["cost_usd_micros"], 500);
+}
+
+/// `days` 非法非数字 → 400；0 与超大值夹取；未知查询参数拒绝。
+#[tokio::test]
+async fn stats_clamps_days_and_rejects_invalid_query() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let now = common::unix_millis();
+    let _ = seed_stats_logs(&gw.pool, now).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 非数字 → 400 结构化错误。
+    let resp = client
+        .get(format!("{admin}/stats?days=abc"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可请求 stats");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "invalid_body");
+
+    // 未知查询参数 → 400。
+    let resp = client
+        .get(format!("{admin}/stats?dayz=7"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可请求 stats");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // days=0 夹取为 1：只有今日。
+    let resp = admin_get(&gw, "/stats?days=0").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("stats 应可解析");
+    assert_eq!(body["daily"].as_array().unwrap().len(), 1);
+    assert_eq!(body["summary"]["request_count"], 3, "1 天窗只有今日 3 条");
+    assert_eq!(body["summary"]["cost_usd_micros"], 3000);
+
+    // 超大值夹取为 90：8 天前那条进入窗口。
+    let resp = admin_get(&gw, "/stats?days=99999").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("stats 应可解析");
+    assert_eq!(body["daily"].as_array().unwrap().len(), 90);
+    assert_eq!(body["summary"]["request_count"], 5);
+    assert_eq!(body["summary"]["cost_usd_micros"], 3600);
+}
+
+/// 渠道探测成功：可达、200、有延迟；出站为非流式极小请求；不经计费、不落日志。
+#[tokio::test]
+async fn channel_probe_success_skips_billing_and_logging() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+
+    let balance_before: (i64,) =
+        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+            .bind(TEST_TOKEN_KEY)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应有余额");
+    let logs_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_log")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计日志");
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/channels/test-channel/test",
+            gw.admin_base_url()
+        ))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可探测渠道");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("探测结果应可解析");
+    assert_eq!(body["reachable"], true);
+    assert_eq!(body["status_code"], 200);
+    assert!(
+        body["latency_ms"].as_u64().unwrap() < 5_000,
+        "成功探测延迟应在合理范围"
+    );
+    assert!(body["error"].is_null() || body.get("error").is_none());
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1, "探测应向渠道发一条出站请求");
+    assert_eq!(received[0]["model"], TEST_MODEL, "应使用 models 首个模型");
+    assert_eq!(received[0]["max_tokens"], 1, "应为极小 max_tokens");
+    assert!(
+        received[0].get("stream").is_none() || received[0]["stream"] == false,
+        "探测应为非流式"
+    );
+
+    let balance_after: (i64,) =
+        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+            .bind(TEST_TOKEN_KEY)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应有余额");
+    assert_eq!(balance_before, balance_after, "探测不应扣减令牌余额");
+    let logs_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_log")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计日志");
+    assert_eq!(logs_before, logs_after, "探测不应落 request_log");
+}
+
+/// 渠道探测失败（上游 4xx）：可达但带状态码与错误摘要；仍不落日志。
+#[tokio::test]
+async fn channel_probe_upstream_error_is_reachable_with_status() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Status(401));
+
+    let logs_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_log")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计日志");
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/channels/test-channel/test",
+            gw.admin_base_url()
+        ))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可探测渠道");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("探测结果应可解析");
+    assert_eq!(body["reachable"], true, "拿到 HTTP 响应即可达");
+    assert_eq!(body["status_code"], 401);
+    assert!(
+        body["error"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        "失败应带错误摘要"
+    );
+
+    let logs_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_log")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计日志");
+    assert_eq!(logs_before, logs_after, "失败探测也不落 request_log");
+}
+
+/// 渠道探测超时：不可达、无状态码、错误摘要标识超时；沿用渠道 timeout_ms。
+#[tokio::test]
+async fn channel_probe_timeout_is_unreachable() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        json!({
+            "name": "timeout-channel",
+            "protocol": "openai_chat",
+            "base_url": gw.upstream.base_url(),
+            "api_key": "sk-upstream",
+            "models": [TEST_MODEL],
+            "model_aliases": {},
+            "priority": 1,
+            "weight": 1,
+            "timeout_ms": 200,
+            "max_retries": 0
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    gw.upstream.set_behavior(UpstreamBehavior::Hang);
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/channels/timeout-channel/test",
+            gw.admin_base_url()
+        ))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可探测渠道");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("探测结果应可解析");
+    assert_eq!(body["reachable"], false);
+    assert!(body["status_code"].is_null());
+    let error = body["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("超时") || error.to_ascii_lowercase().contains("timeout"),
+        "超时摘要应可识别，实际: {error}"
+    );
+    let latency = body["latency_ms"].as_u64().unwrap_or(0);
+    assert!(
+        (100..3_000).contains(&latency),
+        "延迟应贴近渠道 timeout_ms=200，实际 {latency}"
+    );
+}
+
+/// 探测未知渠道 404；两端点未认证 401。
+#[tokio::test]
+async fn stats_and_probe_auth_and_unknown_channel() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    let resp = client
+        .get(format!("{admin}/stats"))
+        .send()
+        .await
+        .expect("应可请求管理面");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "unauthorized");
+
+    let resp = client
+        .post(format!("{admin}/channels/test-channel/test"))
+        .send()
+        .await
+        .expect("应可请求管理面");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp = client
+        .post(format!("{admin}/channels/does-not-exist/test"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可探测渠道");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "not_found");
 }

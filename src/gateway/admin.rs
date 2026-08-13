@@ -6,8 +6,12 @@
 //!
 //! 资源 CRUD（令牌/渠道/价格）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
-//! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）与
-//! 请求日志分页查询（`/logs`）。
+//! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）、
+//! 请求日志分页查询（`/logs`）、只读聚合（`/stats`）与渠道连通性探测
+//! （`/channels/{name}/test`）。
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -19,20 +23,25 @@ use axum::{
 };
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::{
+    core::ir::{ChatRequest, ContentPart, Message, Role},
     runtime, store,
     store::StoreError,
     store::resources::{Channel, Price, Settings, Token},
 };
 
-/// 管理面依赖：存储连接池 + 运行时快照句柄（写后原子替换）。
+use super::http::OutboundAuth;
+use super::protocol;
+
+/// 管理面依赖：存储连接池 + 运行时快照句柄（写后原子替换）+ 出站 HTTP 客户端。
 #[derive(Clone)]
 struct AdminDeps {
     pool: SqlitePool,
     snapshot: crate::runtime::SnapshotHandle,
+    client: reqwest::Client,
 }
 
 /// 组装管理面路由：三组资源 CRUD，全部挂在 admin key 认证中间件之后。
@@ -44,7 +53,16 @@ pub fn router(
     snapshot: crate::runtime::SnapshotHandle,
     admin_key: String,
 ) -> Router {
-    let deps = AdminDeps { pool, snapshot };
+    // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
+    // builder 事先记下错误时失败；本路径未设置会失败的选项。
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("未配置会失败的 ClientBuilder 选项，rustls 客户端应能构建");
+    let deps = AdminDeps {
+        pool,
+        snapshot,
+        client,
+    };
     Router::new()
         .route("/tokens", get(list_tokens).post(create_token))
         .route(
@@ -57,10 +75,12 @@ pub fn router(
             "/channels/{name}",
             put(update_channel).delete(delete_channel),
         )
+        .route("/channels/{name}/test", post(test_channel))
         .route("/prices", get(list_prices).post(create_price))
         .route("/prices/{model}", put(update_price).delete(delete_price))
         .route("/settings", get(get_settings).put(update_settings))
         .route("/logs", get(query_logs))
+        .route("/stats", get(get_stats))
         .route_layer(middleware::from_fn_with_state(admin_key, admin_auth))
         .with_state(deps)
 }
@@ -518,6 +538,241 @@ async fn query_logs(
         page_size: filter.page_size,
         total,
     }))
+}
+
+// --- stats 聚合 ---
+
+/// `/stats` 查询参数：`days` 缺省 7，由存储层夹取上限。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatsQueryParams {
+    days: Option<u64>,
+}
+
+/// 汇总卡片 wire 契约。
+#[derive(Debug, Serialize)]
+struct StatsSummaryView {
+    request_count: u64,
+    success_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd_micros: i64,
+    token_count: u64,
+    channel_count: u64,
+}
+
+/// 逐日序列点 wire 契约。
+#[derive(Debug, Serialize)]
+struct DailyPointView {
+    date: String,
+    request_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd_micros: i64,
+}
+
+/// 按模型的费用/请求分布。
+#[derive(Debug, Serialize)]
+struct ModelShareView {
+    model: String,
+    request_count: u64,
+    cost_usd_micros: i64,
+}
+
+/// 按渠道的费用/请求分布。
+#[derive(Debug, Serialize)]
+struct ChannelShareView {
+    channel: String,
+    request_count: u64,
+    cost_usd_micros: i64,
+}
+
+/// `/stats` 响应：汇总 + 逐日序列 + 模型/渠道分布。
+#[derive(Debug, Serialize)]
+struct StatsView {
+    summary: StatsSummaryView,
+    daily: Vec<DailyPointView>,
+    by_model: Vec<ModelShareView>,
+    by_channel: Vec<ChannelShareView>,
+}
+
+/// 只读聚合：时间窗内请求量/token/费用与分布。非法 `days`（非数字）返回 400。
+async fn get_stats(
+    State(deps): State<AdminDeps>,
+    query: Result<Query<StatsQueryParams>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<StatsView>, AdminError> {
+    let params = query
+        .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
+        .0;
+    let days = store::clamp_stats_days(params.days);
+    let stats = store::query_stats(&deps.pool, days)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(StatsView {
+        summary: StatsSummaryView {
+            request_count: stats.summary.request_count,
+            success_count: stats.summary.success_count,
+            input_tokens: stats.summary.input_tokens,
+            output_tokens: stats.summary.output_tokens,
+            cost_usd_micros: stats.summary.cost_usd_micros,
+            token_count: stats.summary.token_count,
+            channel_count: stats.summary.channel_count,
+        },
+        daily: stats
+            .daily
+            .into_iter()
+            .map(|bucket| DailyPointView {
+                date: bucket.date,
+                request_count: bucket.request_count,
+                input_tokens: bucket.input_tokens,
+                output_tokens: bucket.output_tokens,
+                cost_usd_micros: bucket.cost_usd_micros,
+            })
+            .collect(),
+        by_model: stats
+            .by_model
+            .into_iter()
+            .map(|share| ModelShareView {
+                model: share.name,
+                request_count: share.request_count,
+                cost_usd_micros: share.cost_usd_micros,
+            })
+            .collect(),
+        by_channel: stats
+            .by_channel
+            .into_iter()
+            .map(|share| ChannelShareView {
+                channel: share.name,
+                request_count: share.request_count,
+                cost_usd_micros: share.cost_usd_micros,
+            })
+            .collect(),
+    }))
+}
+
+// --- 渠道连通性探测 ---
+
+/// 渠道探测结果：可达性、状态码、延迟、失败时的错误摘要。
+///
+/// 探测不经令牌认证/计费、不落 `request_log`。超时沿用渠道 `timeout_ms`。
+#[derive(Debug, Serialize)]
+struct ChannelProbeResult {
+    reachable: bool,
+    status_code: Option<u16>,
+    latency_ms: u64,
+    error: Option<String>,
+}
+
+/// 向渠道 `base_url` 发一条最小非流式请求，按渠道协议编码，回报可达性。
+async fn test_channel(
+    State(deps): State<AdminDeps>,
+    Path(name): Path<String>,
+) -> Result<Json<ChannelProbeResult>, AdminError> {
+    let channel = read_channel(&deps, &name).await?;
+    let model = channel
+        .models
+        .first()
+        .ok_or_else(|| AdminError::InvalidBody(format!("渠道 {name} 未配置模型，无法探测")))?;
+    let request = minimal_probe_request(model);
+    let mut warnings = Vec::new();
+    let outbound = protocol::encode_request(&request, channel.protocol, &mut warnings);
+    let upstream_url = format!(
+        "{}{}",
+        channel.base_url.trim_end_matches('/'),
+        protocol::upstream_path(channel.protocol)
+    );
+
+    let started = Instant::now();
+    let send = deps
+        .client
+        .post(&upstream_url)
+        .timeout(Duration::from_millis(channel.timeout_ms))
+        .apply_outbound_auth(&channel)
+        .json(&outbound)
+        .send()
+        .await;
+
+    let result = match send {
+        Ok(resp) => {
+            let status_code = resp.status().as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+            let error = if (200..300).contains(&status_code) {
+                None
+            } else {
+                Some(probe_error_summary(&body_text, status_code))
+            };
+            ChannelProbeResult {
+                reachable: true,
+                status_code: Some(status_code),
+                latency_ms: elapsed_ms(started),
+                error,
+            }
+        }
+        Err(err) => {
+            let error = if err.is_timeout() {
+                "请求超时".to_string()
+            } else {
+                format!("上游不可达: {err}")
+            };
+            ChannelProbeResult {
+                reachable: false,
+                status_code: None,
+                latency_ms: elapsed_ms(started),
+                error: Some(truncate_error(error)),
+            }
+        }
+    };
+    Ok(Json(result))
+}
+
+/// 探测用最小非流式请求：单条 user 文本 + `max_tokens = 1`。
+fn minimal_probe_request(model: &str) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentPart::Text {
+                text: "ping".to_string(),
+                provider_options: HashMap::new(),
+            }],
+            provider_options: HashMap::new(),
+        }],
+        stream: false,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        max_tokens: Some(1),
+        n: None,
+        stop: Vec::new(),
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        response_format: None,
+        tools: Vec::new(),
+        tool_choice: None,
+        provider_options: HashMap::new(),
+    }
+}
+
+/// 从上游错误 body 提取可读摘要；非 JSON 时回退状态码描述。
+fn probe_error_summary(body: &str, status: u16) -> String {
+    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    truncate_error(super::http::upstream_error_message(&parsed, status))
+}
+
+/// 错误摘要截到 512 字节（按 UTF-8 字符边界），避免把整段上游 body 回给管理面。
+fn truncate_error(mut message: String) -> String {
+    const MAX: usize = 512;
+    if message.len() > MAX {
+        let end = message.floor_char_boundary(MAX);
+        message.truncate(end);
+    }
+    message
+}
+
+/// `Instant` 经过的毫秒，夹到 `u64`。
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 // --- 写库 + 换快照公共原语 ---

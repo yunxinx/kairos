@@ -1,11 +1,13 @@
 //! SQLite 存储层：版本化迁移 + 请求日志落库 + 令牌余额结算。
 //!
 //! 本模块承载请求日志（`request_log`）、冒烟记录（`smoke_probe`）与令牌计费
-//! 余额（`token_balance`）。金额一律整数 micro-USD（ADR-0002）。
+//! 余额（`token_balance`）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats`
+//! 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
 pub mod resources;
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions};
 use thiserror::Error;
@@ -330,6 +332,237 @@ pub async fn count_request_logs(
         .map_err(StoreError::Query)?;
     let count: i64 = row.try_get("cnt").map_err(StoreError::Query)?;
     Ok(count.max(0) as u64)
+}
+
+/// `/stats` 缺省时间窗（天）。
+const DEFAULT_STATS_DAYS: u64 = 7;
+/// `/stats` 时间窗上限（天）；外部传入的 `days` 夹取到 `[1, MAX]`。
+const MAX_STATS_DAYS: u64 = 90;
+
+const MS_PER_DAY: i64 = 86_400_000;
+
+/// 把外部传入的 `days` 夹取到合法时间窗：缺省 7，下限 1，上限 90。
+pub fn clamp_stats_days(days: Option<u64>) -> u64 {
+    days.unwrap_or(DEFAULT_STATS_DAYS).clamp(1, MAX_STATS_DAYS)
+}
+
+/// `/stats` 只读聚合：时间窗内请求量、token、费用与分布。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stats {
+    pub summary: StatsSummary,
+    pub daily: Vec<DailyBucket>,
+    pub by_model: Vec<CostShare>,
+    pub by_channel: Vec<CostShare>,
+}
+
+/// 时间窗汇总。令牌数/渠道数来自资源表（当前存量），其余来自 `request_log`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsSummary {
+    pub request_count: u64,
+    pub success_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd_micros: i64,
+    pub token_count: u64,
+    pub channel_count: u64,
+}
+
+/// 逐日桶：无流量的日历日补零，长度为夹取后的 `days`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DailyBucket {
+    pub date: String,
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd_micros: i64,
+}
+
+/// 按模型或按渠道的费用/请求分布。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostShare {
+    pub name: String,
+    pub request_count: u64,
+    pub cost_usd_micros: i64,
+}
+
+/// 聚合 `days` 天（已夹取）内的 stats。费用只计 HTTP 2xx（与计费「仅成功结算」一致）。
+pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreError> {
+    let days = clamp_stats_days(Some(days));
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let today = now_millis.div_euclid(MS_PER_DAY);
+    let start_day = today.saturating_sub(days as i64 - 1);
+    let from_created_at = start_day.saturating_mul(MS_PER_DAY);
+
+    let summary_row = sqlx::query(
+        "SELECT COUNT(*) AS request_count, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS success_count, \
+         COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+         COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+           AS cost_usd_micros \
+         FROM request_log WHERE created_at >= ?",
+    )
+    .bind(from_created_at)
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    let token_count = count_rows(pool, "SELECT COUNT(*) AS cnt FROM tokens").await?;
+    let channel_count = count_rows(pool, "SELECT COUNT(*) AS cnt FROM channels").await?;
+
+    let summary = StatsSummary {
+        request_count: as_count(
+            summary_row
+                .try_get("request_count")
+                .map_err(StoreError::Query)?,
+        ),
+        success_count: as_count(
+            summary_row
+                .try_get("success_count")
+                .map_err(StoreError::Query)?,
+        ),
+        input_tokens: as_count(
+            summary_row
+                .try_get("input_tokens")
+                .map_err(StoreError::Query)?,
+        ),
+        output_tokens: as_count(
+            summary_row
+                .try_get("output_tokens")
+                .map_err(StoreError::Query)?,
+        ),
+        cost_usd_micros: summary_row
+            .try_get("cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        token_count,
+        channel_count,
+    };
+
+    let daily = query_daily_buckets(pool, from_created_at, days).await?;
+    let by_model = query_cost_share(pool, from_created_at, CostDimension::Model).await?;
+    let by_channel = query_cost_share(pool, from_created_at, CostDimension::Channel).await?;
+
+    Ok(Stats {
+        summary,
+        daily,
+        by_model,
+        by_channel,
+    })
+}
+
+/// 逐日序列：用 SQLite 日历补齐无流量日，日期为 UTC `YYYY-MM-DD`。
+async fn query_daily_buckets(
+    pool: &SqlitePool,
+    from_created_at: i64,
+    days: u64,
+) -> Result<Vec<DailyBucket>, StoreError> {
+    let rows = sqlx::query(
+        "WITH RECURSIVE calendar(day, n) AS ( \
+            SELECT date(? / 1000, 'unixepoch') AS day, 1 AS n \
+            UNION ALL \
+            SELECT date(day, '+1 day'), n + 1 FROM calendar WHERE n < ? \
+         ) \
+         SELECT calendar.day AS date, \
+                COALESCE(agg.request_count, 0) AS request_count, \
+                COALESCE(agg.input_tokens, 0) AS input_tokens, \
+                COALESCE(agg.output_tokens, 0) AS output_tokens, \
+                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros \
+         FROM calendar \
+         LEFT JOIN ( \
+            SELECT date(created_at / 1000, 'unixepoch') AS day, \
+                   COUNT(*) AS request_count, \
+                   COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 \
+                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
+            FROM request_log WHERE created_at >= ? \
+            GROUP BY day \
+         ) agg ON agg.day = calendar.day \
+         ORDER BY calendar.day",
+    )
+    .bind(from_created_at)
+    .bind(days as i64)
+    .bind(from_created_at)
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    let mut daily = Vec::with_capacity(rows.len());
+    for row in rows {
+        daily.push(DailyBucket {
+            date: row.try_get("date").map_err(StoreError::Query)?,
+            request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
+            input_tokens: as_count(row.try_get("input_tokens").map_err(StoreError::Query)?),
+            output_tokens: as_count(row.try_get("output_tokens").map_err(StoreError::Query)?),
+            cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        });
+    }
+    Ok(daily)
+}
+
+/// 分布聚合的分组列。
+enum CostDimension {
+    Model,
+    Channel,
+}
+
+/// 按模型或按渠道聚合费用/请求；费用仅计 2xx。
+async fn query_cost_share(
+    pool: &SqlitePool,
+    from_created_at: i64,
+    dimension: CostDimension,
+) -> Result<Vec<CostShare>, StoreError> {
+    let sql = match dimension {
+        CostDimension::Model => {
+            "SELECT model AS name, COUNT(*) AS request_count, \
+             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+               AS cost_usd_micros \
+             FROM request_log WHERE created_at >= ? \
+             GROUP BY model \
+             ORDER BY cost_usd_micros DESC, name ASC"
+        }
+        CostDimension::Channel => {
+            "SELECT channel AS name, COUNT(*) AS request_count, \
+             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+               AS cost_usd_micros \
+             FROM request_log WHERE created_at >= ? \
+             GROUP BY channel \
+             ORDER BY cost_usd_micros DESC, name ASC"
+        }
+    };
+    let rows = sqlx::query(sql)
+        .bind(from_created_at)
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+
+    let mut shares = Vec::with_capacity(rows.len());
+    for row in rows {
+        shares.push(CostShare {
+            name: row.try_get("name").map_err(StoreError::Query)?,
+            request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
+            cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        });
+    }
+    Ok(shares)
+}
+
+/// 执行 `SELECT COUNT(*) AS cnt ...`，把结果夹到非负 u64。
+async fn count_rows(pool: &SqlitePool, sql: &'static str) -> Result<u64, StoreError> {
+    let row = sqlx::query(sql)
+        .fetch_one(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    let count: i64 = row.try_get("cnt").map_err(StoreError::Query)?;
+    Ok(as_count(count))
+}
+
+/// SQLite 聚合整数转计数；负值视为 0。
+fn as_count(value: i64) -> u64 {
+    value.max(0) as u64
 }
 
 /// 把 `filter` 中非空条件以 AND 拼入 WHERE 子句。

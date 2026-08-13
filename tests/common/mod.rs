@@ -55,6 +55,8 @@ pub enum UpstreamBehavior {
     Status(u16),
     /// 发送部分字节后突然断开连接。
     Disconnect,
+    /// 接收请求后永不响应，供渠道探测超时。
+    Hang,
 }
 
 impl UpstreamBehavior {
@@ -163,6 +165,9 @@ async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Respon
         .expect("behavior 锁不应被污染")
         .pop_front()
         .unwrap_or(UpstreamBehavior::Sse(vec![]));
+    if matches!(behavior, UpstreamBehavior::Hang) {
+        std::future::pending::<()>().await;
+    }
     behavior.into_response()
 }
 
@@ -217,6 +222,9 @@ impl IntoResponse for UpstreamBehavior {
                     Ok::<_, std::convert::Infallible>(Event::default().data("partial"))
                 });
                 Sse::new(events).into_response()
+            }
+            UpstreamBehavior::Hang => {
+                unreachable!("Hang 应在 handle 内 pending，不应进入 IntoResponse")
             }
         }
     }
