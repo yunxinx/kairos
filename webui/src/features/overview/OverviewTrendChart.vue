@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { LineChart } from 'echarts/charts';
@@ -7,7 +7,7 @@ import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/compon
 import VChart from 'vue-echarts';
 import { useI18n } from 'vue-i18n';
 import type { DailyPoint } from '@/api/types';
-import { buildTrendChartOption } from '@/lib/chart-theme';
+import { buildTrendChartOption, formatTrendLabel } from '@/lib/chart-theme';
 
 use([CanvasRenderer, LineChart, GridComponent, LegendComponent, TooltipComponent]);
 
@@ -17,21 +17,32 @@ const props = defineProps<{
 
 const { t } = useI18n();
 
-const chartOption = computed(() =>
-  buildTrendChartOption(
-    props.daily.map((point) => point.date),
+/** html.dark 切换时重读 CSS 变量，让浮窗/轴线跟主题。 */
+const themeTick = ref(0);
+let themeObserver: MutationObserver | undefined;
+
+onMounted(() => {
+  themeObserver = new MutationObserver(() => {
+    themeTick.value += 1;
+  });
+  themeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['class'],
+  });
+});
+
+onUnmounted(() => {
+  themeObserver?.disconnect();
+});
+
+const chartOption = computed(() => {
+  void themeTick.value;
+  return buildTrendChartOption(
+    props.daily.map((point) => formatTrendLabel(point.date)),
     [
       {
         name: t('overview.requests'),
         data: props.daily.map((point) => point.request_count),
-      },
-      {
-        name: t('overview.inputTokens'),
-        data: props.daily.map((point) => point.input_tokens),
-      },
-      {
-        name: t('overview.outputTokens'),
-        data: props.daily.map((point) => point.output_tokens),
       },
       {
         name: t('overview.cost'),
@@ -39,10 +50,15 @@ const chartOption = computed(() =>
         yAxisIndex: 1,
       },
     ],
-  ),
-);
+  );
+});
 </script>
 
 <template>
-  <VChart class="h-full w-full" :option="chartOption" autoresize />
+  <VChart
+    class="h-full w-full"
+    :option="chartOption"
+    :update-options="{ notMerge: true }"
+    autoresize
+  />
 </template>

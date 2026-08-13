@@ -591,7 +591,7 @@ struct ChannelShareView {
     cost_usd_micros: i64,
 }
 
-/// `/stats` 响应：汇总 + 逐日序列 + 模型/渠道分布。
+/// `/stats` 响应：汇总 + 趋势序列 + 模型/渠道分布。
 #[derive(Debug, Serialize)]
 struct StatsView {
     summary: StatsSummaryView,

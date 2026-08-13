@@ -4,6 +4,8 @@ import { E2E_ADMIN_KEY } from './helpers/gateway';
 import { MS_PER_DAY, seedRequestLogs, utcDayStart } from './helpers/seed-logs';
 import { usdLabel } from './helpers/usd';
 import type { StatsView } from '../src/api/types';
+import { HEATMAP_WEEK_COUNT } from '../src/features/overview/heatmap';
+import { formatCount } from '../src/lib/format';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -77,25 +79,25 @@ function seedOverviewLogs(now: number): { today: string; yesterday: string; eigh
 
 async function expectCardsMatchStats(page: Page, stats: StatsView): Promise<void> {
   await expect(page.getByTestId('overview-request-count')).toHaveText(
-    String(stats.summary.request_count),
+    formatCount(stats.summary.request_count, 'en'),
   );
   await expect(page.getByTestId('overview-success-count')).toHaveText(
-    String(stats.summary.success_count),
+    formatCount(stats.summary.success_count, 'en'),
   );
   await expect(page.getByTestId('overview-input-tokens')).toHaveText(
-    String(stats.summary.input_tokens),
+    formatCount(stats.summary.input_tokens, 'en'),
   );
   await expect(page.getByTestId('overview-output-tokens')).toHaveText(
-    String(stats.summary.output_tokens),
+    formatCount(stats.summary.output_tokens, 'en'),
   );
   await expect(page.getByTestId('overview-cost')).toHaveText(
     usdLabel(stats.summary.cost_usd_micros),
   );
   await expect(page.getByTestId('overview-token-count')).toHaveText(
-    String(stats.summary.token_count),
+    formatCount(stats.summary.token_count, 'en'),
   );
   await expect(page.getByTestId('overview-channel-count')).toHaveText(
-    String(stats.summary.channel_count),
+    formatCount(stats.summary.channel_count, 'en'),
   );
 }
 
@@ -158,13 +160,44 @@ test.describe('overview page', () => {
       page.locator('[data-testid="overview-model-share"][data-model="e2e-ov-mini"]'),
     ).toBeVisible();
 
+    await page.getByTestId('overview-share-tab-channel').click();
     const expectedPrimary = stats.by_channel.find((share) => share.channel === 'e2e-ov-primary');
     expect(expectedPrimary).toBeDefined();
     await expect(
       page.locator('[data-testid="overview-channel-share"][data-channel="e2e-ov-primary"]'),
     ).toHaveAttribute('data-request-count', String(expectedPrimary?.request_count));
-    await expect(page.getByTestId('overview-model-chart').locator('canvas')).toBeVisible();
-    await expect(page.getByTestId('overview-channel-chart').locator('canvas')).toBeVisible();
+    await expect(
+      page.locator('[data-testid="overview-channel-share"][data-channel="e2e-ov-primary"]'),
+    ).toBeVisible();
+
+    await expect(page.getByTestId('overview-heatmap-cell')).toHaveCount(HEATMAP_WEEK_COUNT * 7);
+    const todayHeat = page.locator(`[data-testid="overview-heatmap-cell"][data-date="${today}"]`);
+    await expect(todayHeat).toHaveAttribute(
+      'data-request-count',
+      String(expectedToday?.request_count),
+    );
+    await page.getByTestId('overview-heatmap').scrollIntoViewIfNeeded();
+    await todayHeat.hover();
+    const heatTip = page.getByTestId('overview-heatmap-tooltip');
+    await expect(heatTip).toBeVisible();
+    await expect(heatTip).toContainText(String(expectedToday?.request_count));
+    await expect(heatTip).toContainText(usdLabel(expectedToday?.cost_usd_micros ?? 0));
+  });
+
+  test('lets the overview page scroll when content exceeds the viewport', async ({ page }) => {
+    seedOverviewLogs(Date.now());
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto('/overview');
+    await expect(page.getByRole('heading', { name: /overview/i })).toBeVisible();
+
+    const main = page.locator('#main-content');
+    const overflow = await main.evaluate((el) => el.scrollHeight - el.clientHeight);
+    expect(overflow).toBeGreaterThan(0);
+
+    await main.evaluate((el) => {
+      el.scrollTop = 160;
+    });
+    expect(await main.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
   });
 
   test('switches the days window and updates cards to match /stats', async ({ page, request }) => {
@@ -176,6 +209,10 @@ test.describe('overview page', () => {
     await expect(
       page.locator(`[data-testid="overview-daily-point"][data-date="${eightDaysAgo}"]`),
     ).toHaveCount(0);
+    await expect(page.getByTestId('overview-heatmap-cell')).toHaveCount(HEATMAP_WEEK_COUNT * 7);
+    await expect(
+      page.locator(`[data-testid="overview-heatmap-cell"][data-date="${eightDaysAgo}"]`),
+    ).toHaveAttribute('data-request-count', '0');
 
     await page.locator('#overview-days').click();
     await page.getByRole('option', { name: /90 days/i }).click();
@@ -188,10 +225,16 @@ test.describe('overview page', () => {
     await expect(
       page.locator(`[data-testid="overview-daily-point"][data-date="${eightDaysAgo}"]`),
     ).toHaveAttribute('data-request-count', String(expectedOld?.request_count));
+    await expect(
+      page.locator(`[data-testid="overview-heatmap-cell"][data-date="${eightDaysAgo}"]`),
+    ).toHaveAttribute('data-request-count', String(expectedOld?.request_count));
 
     await page.locator('#overview-days').click();
     await page.getByRole('option', { name: /1 day/i }).click();
     const stats1 = await fetchStats(request, 1);
+    expect(stats1.daily).toHaveLength(24);
     await expectCardsMatchStats(page, stats1);
+    await expect(page.getByTestId('overview-daily-point')).toHaveCount(24);
+    await expect(page.getByTestId('overview-heatmap-cell')).toHaveCount(HEATMAP_WEEK_COUNT * 7);
   });
 });

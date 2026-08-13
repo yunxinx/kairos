@@ -6,6 +6,7 @@ defineProps<{
   hideNav?: boolean;
   showPublicFooter?: boolean;
   suppressContent?: boolean;
+  fillViewport?: boolean;
 }>();
 
 const { t } = useI18n();
@@ -27,14 +28,16 @@ const { t } = useI18n();
       id="main-content"
       data-component="PageContent"
       tabindex="-1"
-      class="flex min-h-0 flex-1 flex-col"
-      :class="[{ 'dotted-bg': !hideNav }, hideNav ? '' : 'overflow-hidden']"
+      class="seed-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-y-contain"
+      :class="{ 'dotted-bg': !hideNav }"
     >
       <div
         :class="[
           hideNav
             ? 'flex min-h-0 flex-1 flex-col'
-            : 'max-w-content px-page-x py-page-y mx-auto flex min-h-0 w-full flex-1 flex-col',
+            : fillViewport
+              ? 'max-w-content px-page-x py-page-y mx-auto flex h-full min-h-0 w-full flex-1 flex-col overflow-hidden'
+              : 'max-w-content px-page-x py-page-y mx-auto w-full',
           suppressContent ? 'pointer-events-none opacity-0 transition-opacity duration-150' : '',
         ]"
       >

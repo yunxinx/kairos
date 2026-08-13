@@ -1408,11 +1408,18 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
         .expect("应可请求 stats");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    // days=0 夹取为 1：只有今日。
+    // days=0 夹取为 1：今日按 UTC 小时共 24 点。
     let resp = admin_get(&gw, "/stats?days=0").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.expect("stats 应可解析");
-    assert_eq!(body["daily"].as_array().unwrap().len(), 1);
+    let daily = body["daily"].as_array().expect("应有趋势序列");
+    assert_eq!(daily.len(), 24, "1 天窗应为 24 个小时桶");
+    let first = daily[0]["date"].as_str().expect("应有小时标签");
+    assert!(
+        first.ends_with("T00:00:00Z"),
+        "首个小时桶应为 UTC 0 点，实际 {first}"
+    );
+    assert_eq!(daily[0]["request_count"], 3, "今日 3 条都落在 0 点桶");
     assert_eq!(body["summary"]["request_count"], 3, "1 天窗只有今日 3 条");
     assert_eq!(body["summary"]["cost_usd_micros"], 3000);
 

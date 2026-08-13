@@ -5,8 +5,3 @@ export const OverviewTrendChart = defineAsyncComponent(async (): Promise<Compone
   const module = (await import('./OverviewTrendChart.vue')) as { default: Component };
   return module.default;
 });
-
-export const OverviewShareChart = defineAsyncComponent(async (): Promise<Component> => {
-  const module = (await import('./OverviewShareChart.vue')) as { default: Component };
-  return module.default;
-});

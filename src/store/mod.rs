@@ -340,6 +340,8 @@ const DEFAULT_STATS_DAYS: u64 = 7;
 const MAX_STATS_DAYS: u64 = 90;
 
 const MS_PER_DAY: i64 = 86_400_000;
+/// `days=1` 时趋势按 UTC 小时补齐，长度为 24。
+const HOURS_PER_DAY: i64 = 24;
 
 /// 把外部传入的 `days` 夹取到合法时间窗：缺省 7，下限 1，上限 90。
 pub fn clamp_stats_days(days: Option<u64>) -> u64 {
@@ -367,7 +369,7 @@ pub struct StatsSummary {
     pub channel_count: u64,
 }
 
-/// 逐日桶：无流量的日历日补零，长度为夹取后的 `days`。
+/// 趋势桶：`days=1` 为 UTC 小时（24 点），否则为日历日；无流量的桶补零。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DailyBucket {
     pub date: String,
@@ -441,7 +443,11 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
         channel_count,
     };
 
-    let daily = query_daily_buckets(pool, from_created_at, days).await?;
+    let daily = if days == 1 {
+        query_hourly_buckets(pool, from_created_at).await?
+    } else {
+        query_daily_buckets(pool, from_created_at, days).await?
+    };
     let by_model = query_cost_share(pool, from_created_at, CostDimension::Model).await?;
     let by_channel = query_cost_share(pool, from_created_at, CostDimension::Channel).await?;
 
@@ -451,6 +457,56 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
         by_model,
         by_channel,
     })
+}
+
+/// 把趋势查询行映射为桶；`date` 列已是展示用标签。
+fn trend_bucket(row: &sqlx::sqlite::SqliteRow) -> Result<DailyBucket, StoreError> {
+    Ok(DailyBucket {
+        date: row.try_get("date").map_err(StoreError::Query)?,
+        request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
+        input_tokens: as_count(row.try_get("input_tokens").map_err(StoreError::Query)?),
+        output_tokens: as_count(row.try_get("output_tokens").map_err(StoreError::Query)?),
+        cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+    })
+}
+
+/// `days=1`：当日 UTC 0–23 时补齐，标签为 `YYYY-MM-DDTHH:00:00Z`。
+async fn query_hourly_buckets(
+    pool: &SqlitePool,
+    from_created_at: i64,
+) -> Result<Vec<DailyBucket>, StoreError> {
+    let rows = sqlx::query(
+        "WITH RECURSIVE calendar(ts, n) AS ( \
+            SELECT datetime(? / 1000, 'unixepoch') AS ts, 1 AS n \
+            UNION ALL \
+            SELECT datetime(ts, '+1 hour'), n + 1 FROM calendar WHERE n < ? \
+         ) \
+         SELECT strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) AS date, \
+                COALESCE(agg.request_count, 0) AS request_count, \
+                COALESCE(agg.input_tokens, 0) AS input_tokens, \
+                COALESCE(agg.output_tokens, 0) AS output_tokens, \
+                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros \
+         FROM calendar \
+         LEFT JOIN ( \
+            SELECT strftime('%Y-%m-%dT%H:00:00Z', created_at / 1000, 'unixepoch') AS hour, \
+                   COUNT(*) AS request_count, \
+                   COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 \
+                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
+            FROM request_log WHERE created_at >= ? \
+            GROUP BY hour \
+         ) agg ON agg.hour = strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) \
+         ORDER BY calendar.ts",
+    )
+    .bind(from_created_at)
+    .bind(HOURS_PER_DAY)
+    .bind(from_created_at)
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    rows.iter().map(trend_bucket).collect()
 }
 
 /// 逐日序列：用 SQLite 日历补齐无流量日，日期为 UTC `YYYY-MM-DD`。
@@ -490,17 +546,7 @@ async fn query_daily_buckets(
     .await
     .map_err(StoreError::Query)?;
 
-    let mut daily = Vec::with_capacity(rows.len());
-    for row in rows {
-        daily.push(DailyBucket {
-            date: row.try_get("date").map_err(StoreError::Query)?,
-            request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
-            input_tokens: as_count(row.try_get("input_tokens").map_err(StoreError::Query)?),
-            output_tokens: as_count(row.try_get("output_tokens").map_err(StoreError::Query)?),
-            cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
-        });
-    }
-    Ok(daily)
+    rows.iter().map(trend_bucket).collect()
 }
 
 /// 分布聚合的分组列。

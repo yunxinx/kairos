@@ -1,6 +1,12 @@
 const MICROS_PER_USD = 1_000_000;
 const USD_PATTERN = /^(-?)(\d+)(?:\.(\d{1,6}))?$/;
 
+function resolveNumberLocale(locale?: string): string | undefined {
+  if (locale === 'zh-CN') return 'zh-CN';
+  if (locale === 'en') return 'en-US';
+  return undefined;
+}
+
 /** micro-USD 整数 → 不含 `$` 的美元字符串，六位小数对应全部微元，去尾零不丢精度。 */
 export function formatUsdAmount(micros: number): string {
   const negative = micros < 0;
@@ -50,6 +56,18 @@ export function parseUsdToMicros(input: string): number | null {
 
 /** unix 毫秒 → 本地化日期时间。 */
 export function formatUnixMillis(millis: number, locale?: string): string {
-  const resolved = locale === 'zh-CN' ? 'zh-CN' : locale === 'en' ? 'en-US' : undefined;
-  return new Date(millis).toLocaleString(resolved);
+  return new Date(millis).toLocaleString(resolveNumberLocale(locale));
+}
+
+/** 整数计数 → 本地化千分位，展示层用。 */
+export function formatCount(value: number, locale?: string): string {
+  return new Intl.NumberFormat(resolveNumberLocale(locale)).format(value);
+}
+
+/** 0–1 比例 → 百分比字符串（最多一位小数）。 */
+export function formatPercent(ratio: number, locale?: string): string {
+  return new Intl.NumberFormat(resolveNumberLocale(locale), {
+    style: 'percent',
+    maximumFractionDigits: 1,
+  }).format(ratio);
 }

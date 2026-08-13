@@ -102,7 +102,7 @@ export interface StatsSummary {
   channel_count: number;
 }
 
-/** `/stats` 逐日点。 */
+/** `/stats` 趋势点。`date` 在 `days=1` 时为 UTC 小时 `YYYY-MM-DDTHH:00:00Z`，否则为日历日 `YYYY-MM-DD`。 */
 export interface DailyPoint {
   date: string;
   request_count: number;
