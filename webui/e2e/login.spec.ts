@@ -6,8 +6,12 @@ const ADMIN_KEY_STORAGE = 'kairos-admin-key';
 test.describe.configure({ mode: 'serial' });
 
 test.describe('admin key login', () => {
-  test('redirects the admin root to the login page', async ({ page }) => {
+  test('renders the marketing home at the admin root', async ({ page }) => {
     await page.goto('/');
+    await expect(
+      page.getByRole('heading', { name: /provider-agnostic ai gateway/i }),
+    ).toBeVisible();
+    await page.getByRole('link', { name: /get started/i }).click();
     await page.waitForURL('**/login');
     await expect(page.locator('#login-admin-key')).toBeVisible();
   });
@@ -18,6 +22,9 @@ test.describe('admin key login', () => {
     await page.getByRole('button', { name: /sign in|登录/i }).click();
     await page.waitForURL('**/overview');
     await expect(page.getByRole('navigation')).toBeVisible();
+    await page.goto('/');
+    await page.waitForURL('**/overview');
+    await expect(page.getByRole('heading', { name: /overview/i })).toBeVisible();
   });
 
   test('rejects an invalid admin key', async ({ page }) => {

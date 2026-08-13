@@ -1,14 +1,13 @@
 <script setup lang="ts">
-import { computed } from 'vue';
 import { Link } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
 import MarketingSiteHeader from '@/app/shell/MarketingSiteHeader.vue';
+import { useSafeHomeTarget } from '@/composables/useSafeHomeTarget';
 import { useShellMode } from '@/composables/useShellMode';
-import { hasAdminKey } from '@/lib/session';
 
 const { t } = useI18n();
 const { showMarketingChrome } = useShellMode();
-const homeTarget = computed(() => (hasAdminKey() ? '/overview' : '/login'));
+const homeTarget = useSafeHomeTarget();
 </script>
 
 <template>

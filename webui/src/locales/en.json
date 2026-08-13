@@ -5,6 +5,15 @@
     "themeLight": "Light",
     "themeDark": "Dark"
   },
+  "home": {
+    "kicker": "Provider-agnostic gateway",
+    "headline": "A provider-agnostic AI gateway",
+    "lead": "Transparent same-protocol relay. Governance, metering, and observability on the gateway side.",
+    "startCta": "Get started",
+    "anchorRun": "Run",
+    "anchorRelay": "Relay",
+    "anchorObserve": "Observe"
+  },
   "nav": {
     "overview": "Overview",
     "tokens": "Tokens",
@@ -183,6 +192,6 @@
     "notFoundDescription": "This address does not exist or may have been removed.",
     "routeErrorTitle": "Something went wrong",
     "routeErrorDescription": "This page could not be loaded. You can retry or return to a safe route.",
-    "goHome": "Back to overview"
+    "goHome": "Back to home"
   }
 }
