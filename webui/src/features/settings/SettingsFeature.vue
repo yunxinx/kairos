@@ -1,24 +1,30 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { Settings } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
-import FormCheckbox from '@/components/ui/FormCheckbox.vue';
 import FormField from '@/components/ui/FormField.vue';
+import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
-import { parseOptionalUint } from '@/lib/uint-parse';
+import { formatBytesAsMb, parseMbToBytes } from '@/lib/format';
+
+type SettingsSection = 'logging';
 
 const { t } = useI18n();
+const section = ref<SettingsSection>('logging');
+const sections = computed(() => [{ id: 'logging' as const, labelKey: 'settings.section.logging' }]);
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, clearErrors, validate } = useFormValidation();
 
 const fullBody = ref(false);
-const maxRequestBytes = ref('');
+const maxRequestMb = ref('');
+/** 上次从接口载入的字节值；未改 MB 文案时原样回写，避免 0.00 显示把小字节上限抹掉。 */
+const loadedMaxRequestBytes = ref<number | null>(null);
 const saveError = ref('');
 const saveSuccess = ref(false);
 
@@ -38,7 +44,8 @@ watch(
 
 function applySettings(settings: Settings) {
   fullBody.value = settings.full_body;
-  maxRequestBytes.value = String(settings.max_request_bytes);
+  loadedMaxRequestBytes.value = settings.max_request_bytes;
+  maxRequestMb.value = formatBytesAsMb(settings.max_request_bytes);
 }
 
 const saveMutation = useMutation({
@@ -60,22 +67,27 @@ const saveMutation = useMutation({
 function handleSave() {
   saveError.value = '';
   saveSuccess.value = false;
-  const isValid = validate(
-    [
-      {
-        name: 'maxRequestBytes',
-        value: maxRequestBytes.value,
-        rules: [{ kind: 'required' }, { kind: 'uint' }],
-      },
-    ],
-    t,
-  );
-  if (!isValid) return;
-  const parsed = parseOptionalUint(maxRequestBytes.value);
-  if (parsed === null) return;
+  const loadedBytes = loadedMaxRequestBytes.value;
+  const mbUnchanged =
+    loadedBytes !== null && maxRequestMb.value.trim() === formatBytesAsMb(loadedBytes);
+  if (!mbUnchanged) {
+    const isValid = validate(
+      [
+        {
+          name: 'maxRequestBytes',
+          value: maxRequestMb.value,
+          rules: [{ kind: 'required' }, { kind: 'mb', min: 1 }],
+        },
+      ],
+      t,
+    );
+    if (!isValid) return;
+  }
+  const maxRequestBytes = mbUnchanged ? loadedBytes : parseMbToBytes(maxRequestMb.value);
+  if (maxRequestBytes === null) return;
   saveMutation.mutate({
     full_body: fullBody.value,
-    max_request_bytes: parsed,
+    max_request_bytes: maxRequestBytes,
   });
 }
 
@@ -91,7 +103,7 @@ function resetForm() {
 
 <template>
   <div>
-    <PageHeader :title="t('nav.settings')" :subtitle="t('settings.subtitle')" />
+    <PageHeader :title="t('nav.settings')" />
 
     <InlineError
       v-if="settingsQuery.isError.value && !settingsQuery.data.value"
@@ -99,79 +111,108 @@ function resetForm() {
       @retry="() => settingsQuery.refetch()"
     />
 
-    <form v-else novalidate class="space-y-4" @submit.prevent="handleSave">
-      <div class="card">
-        <div
-          v-if="settingsQuery.isPending.value && !settingsQuery.data.value"
-          class="card-body space-y-4"
-        >
-          <SkeletonBlock height="h-4" width="w-40" />
-          <SkeletonBlock height="h-10" width="w-full" />
-          <SkeletonBlock height="h-4" width="w-48" />
-          <SkeletonBlock height="h-10" width="w-full" />
-        </div>
-        <div v-else class="card-body space-y-4">
-          <FormField
-            field-name="fullBody"
-            :label="t('settings.fullBody')"
-            input-id="settings-full-body"
-            :guide="t('settings.fullBodyGuide')"
+    <form v-else novalidate @submit.prevent="handleSave">
+      <div class="settings-layout">
+        <nav class="card settings-nav" :aria-label="t('settings.sections')">
+          <button
+            v-for="item in sections"
+            :key="item.id"
+            type="button"
+            class="settings-nav-item"
+            :data-testid="'settings-section-' + item.id"
+            :aria-current="section === item.id ? 'page' : undefined"
+            @click="section = item.id"
           >
-            <template #default>
-              <FormCheckbox
-                id="settings-full-body"
-                v-model="fullBody"
-                data-testid="settings-full-body"
-              />
-            </template>
-          </FormField>
-
-          <FormField
-            field-name="maxRequestBytes"
-            :label="t('settings.maxRequestBytes')"
-            input-id="settings-max-request-bytes"
-            :error="fieldError('maxRequestBytes')"
-            :guide="t('settings.maxRequestBytesGuide')"
+            {{ t(item.labelKey) }}
+          </button>
+        </nav>
+        <div class="card settings-panel">
+          <div
+            v-if="settingsQuery.isPending.value && !settingsQuery.data.value"
+            class="card-body space-y-4"
           >
-            <template #default="{ hintId, invalid }">
-              <FormTextInput
-                id="settings-max-request-bytes"
-                v-model="maxRequestBytes"
-                type="text"
-                inputmode="numeric"
-                data-testid="settings-max-request-bytes"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('maxRequestBytes')"
-              />
-            </template>
-          </FormField>
-        </div>
-      </div>
+            <SkeletonBlock height="h-4" width="w-40" />
+            <SkeletonBlock height="h-10" width="w-full" />
+            <SkeletonBlock height="h-4" width="w-48" />
+            <SkeletonBlock height="h-10" width="w-full" />
+          </div>
+          <template v-else>
+            <div v-if="section === 'logging'" class="card-body">
+              <div class="settings-fields-row">
+                <FormField
+                  field-name="fullBody"
+                  layout="inline"
+                  :label="t('settings.fullBody')"
+                  input-id="settings-full-body"
+                  :guide="t('settings.fullBodyGuide')"
+                >
+                  <template #default>
+                    <FormSwitch
+                      id="settings-full-body"
+                      v-model="fullBody"
+                      data-testid="settings-full-body"
+                    />
+                  </template>
+                </FormField>
 
-      <p v-if="saveError" class="text-danger text-sm" data-testid="settings-save-error">
-        {{ saveError }}
-      </p>
-      <p v-if="saveSuccess" class="text-success text-sm" data-testid="settings-save-success">
-        {{ t('settings.saveSuccess') }}
-      </p>
-      <div class="flex flex-wrap gap-2">
-        <button
-          type="submit"
-          class="btn btn-primary"
-          data-testid="settings-save"
-          :disabled="saveMutation.isPending.value || !settingsQuery.data.value"
-        >
-          {{ t('settings.save') }}
-        </button>
-        <button
-          type="button"
-          class="btn btn-subtle"
-          data-testid="settings-reset"
-          @click="resetForm"
-        >
-          {{ t('settings.reset') }}
-        </button>
+                <FormField
+                  field-name="maxRequestBytes"
+                  layout="inline"
+                  :label="t('settings.maxRequestBytes')"
+                  input-id="settings-max-request-bytes"
+                  :error="fieldError('maxRequestBytes')"
+                  :guide="t('settings.maxRequestBytesGuide')"
+                >
+                  <template #default="{ hintId, invalid }">
+                    <FormTextInput
+                      id="settings-max-request-bytes"
+                      v-model="maxRequestMb"
+                      type="text"
+                      inputmode="decimal"
+                      class="font-mono"
+                      data-testid="settings-max-request-bytes"
+                      :invalid="invalid"
+                      :hint-id="hintId"
+                      v-on="fieldInputHandlers('maxRequestBytes')"
+                    />
+                  </template>
+                </FormField>
+              </div>
+            </div>
+            <div class="card-footer card-body flex flex-wrap items-center justify-end gap-2">
+              <p
+                v-if="saveError"
+                class="text-danger mr-auto text-sm"
+                data-testid="settings-save-error"
+              >
+                {{ saveError }}
+              </p>
+              <p
+                v-if="saveSuccess"
+                class="text-success mr-auto text-sm"
+                data-testid="settings-save-success"
+              >
+                {{ t('settings.saveSuccess') }}
+              </p>
+              <button
+                type="button"
+                class="btn btn-subtle"
+                data-testid="settings-reset"
+                @click="resetForm"
+              >
+                {{ t('settings.reset') }}
+              </button>
+              <button
+                type="submit"
+                class="btn btn-primary"
+                data-testid="settings-save"
+                :disabled="saveMutation.isPending.value || !settingsQuery.data.value"
+              >
+                {{ t('settings.save') }}
+              </button>
+            </div>
+          </template>
+        </div>
       </div>
     </form>
   </div>

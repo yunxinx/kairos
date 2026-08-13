@@ -71,3 +71,45 @@ export function formatPercent(ratio: number, locale?: string): string {
     maximumFractionDigits: 1,
   }).format(ratio);
 }
+
+const TOKENS_PER_MILLION = 1_000_000;
+/** 与网关 `DEFAULT_MAX_REQUEST_BYTES = 100 * 1024 * 1024` 同一档（1 MB = 1 MiB）。 */
+const BYTES_PER_MB = 1024 * 1024;
+const MB_PATTERN = /^(\d+)(?:\.(\d{1,2}))?$/;
+
+/** 总 token 数 → 百万单位，固定四位小数，后缀 ` M`。 */
+export function formatTokensMillions(tokens: number): string {
+  return `${(tokens / TOKENS_PER_MILLION).toFixed(4)} M`;
+}
+
+/** 字节 → MB 字符串，固定两位小数。 */
+export function formatBytesAsMb(bytes: number): string {
+  return (bytes / BYTES_PER_MB).toFixed(2);
+}
+
+/**
+ * MB 可读字符串 → 字节整数。
+ *
+ * 接受最多两位小数；`0.01` 档不是整字节，四舍五入。空串或非法格式返回 `null`。
+ */
+export function parseMbToBytes(input: string): number | null {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const match = MB_PATTERN.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  const whole = Number(match[1]);
+  const fraction = (match[2] ?? '').padEnd(2, '0');
+  if (!Number.isSafeInteger(whole)) {
+    return null;
+  }
+  const hundredths = whole * 100 + Number(fraction);
+  const bytes = Math.round((hundredths * BYTES_PER_MB) / 100);
+  if (!Number.isSafeInteger(bytes)) {
+    return null;
+  }
+  return bytes;
+}

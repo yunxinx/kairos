@@ -12,11 +12,14 @@ const props = withDefaults(
     labelsControl?: boolean;
     /** 标题右侧格式说明；与 #guide 插槽二选一，插槽优先。 */
     guide?: string | undefined;
+    /** `inline`：标签左、控件右，同一行。 */
+    layout?: 'stack' | 'inline';
   }>(),
   {
     labelsControl: true,
     error: undefined,
     guide: undefined,
+    layout: 'stack',
   },
 );
 
@@ -29,7 +32,11 @@ const hasGuide = computed(() => Boolean(props.guide) || Boolean(slots.guide));
 </script>
 
 <template>
-  <div class="form-field" :data-form-field="fieldName">
+  <div
+    class="form-field"
+    :class="{ 'form-field-inline': props.layout === 'inline' }"
+    :data-form-field="fieldName"
+  >
     <div class="form-field-label-row">
       <label v-if="labelsControl" :for="inputId" class="form-field-label">{{ label }}</label>
       <span v-else :id="labelId" class="form-field-label">{{ label }}</span>

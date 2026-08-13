@@ -9,6 +9,6 @@ export const NAV_TABS: NavTab[] = [
   { to: '/token', labelKey: 'nav.tokens' },
   { to: '/channel', labelKey: 'nav.channel' },
   { to: '/pricing', labelKey: 'nav.pricing' },
-  { to: '/config', labelKey: 'nav.settings' },
   { to: '/requests', labelKey: 'nav.logs' },
+  { to: '/config', labelKey: 'nav.settings' },
 ];
