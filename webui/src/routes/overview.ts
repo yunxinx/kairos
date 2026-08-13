@@ -1,9 +1,9 @@
 import { createFileRoute } from '@tanstack/vue-router';
-import PlaceholderFeature from '@/features/placeholders/PlaceholderFeature.vue';
+import OverviewFeature from '@/features/overview/OverviewFeature.vue';
 import { requireAuth } from '@/lib/router-guards';
 
 export const Route = createFileRoute('/overview')({
   beforeLoad: requireAuth,
-  component: PlaceholderFeature,
+  component: OverviewFeature,
   staticData: { titleKey: 'overview.title' },
 });

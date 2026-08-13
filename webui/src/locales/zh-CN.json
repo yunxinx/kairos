@@ -23,11 +23,25 @@
     "invalidKey": "admin key 无效。"
   },
   "overview": {
-    "title": "概览"
-  },
-  "placeholder": {
-    "comingTitle": "功能开发中",
-    "body": "此页面将在后续票中接入管理 API。"
+    "title": "概览",
+    "subtitle": "请求量、token、费用，以及模型和渠道上的分布。",
+    "days": "时间窗",
+    "daysOption": {
+      "1": "1 天",
+      "7": "7 天",
+      "30": "30 天",
+      "90": "90 天"
+    },
+    "requests": "请求总数",
+    "success": "成功数",
+    "inputTokens": "输入 token",
+    "outputTokens": "输出 token",
+    "cost": "费用合计",
+    "tokenCount": "令牌数",
+    "channelCount": "渠道数",
+    "trend": "逐日趋势",
+    "byModel": "按模型",
+    "byChannel": "按渠道"
   },
   "common": {
     "loading": "加载中...",
@@ -42,7 +56,11 @@
     "emptyList": "暂无数据",
     "actions": "操作",
     "unlimited": "无上限",
-    "navMenu": "导航菜单"
+    "navMenu": "导航菜单",
+    "copy": "复制",
+    "copied": "已复制",
+    "previousPage": "上一页",
+    "nextPage": "下一页"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -114,6 +132,32 @@
     "save": "保存设置",
     "saveSuccess": "设置已保存，对新的入站请求立即生效。",
     "reset": "重置"
+  },
+  "logs": {
+    "subtitle": "按令牌、模型和时间范围过滤请求日志。展开一行可查看完整 body。",
+    "tokenKey": "令牌 key",
+    "tokenKeyPlaceholder": "精确匹配令牌 key",
+    "model": "模型",
+    "modelPlaceholder": "精确匹配模型 id",
+    "from": "起始时间",
+    "to": "结束时间",
+    "applyFilters": "应用",
+    "clearFilters": "清除",
+    "created": "时间",
+    "token": "令牌",
+    "channel": "渠道",
+    "status": "状态码",
+    "latency": "耗时",
+    "cost": "费用",
+    "expand": "详情",
+    "expandDetails": "查看请求与响应 body",
+    "collapseDetails": "收起请求与响应 body",
+    "requestBody": "请求",
+    "responseBody": "响应",
+    "bodyEmpty": "未记录 body。",
+    "bodyBinary": "二进制内容（{bytes} 字节）已隐藏，避免不安全展示。",
+    "pageSize": "每页",
+    "paginationSummary": "第 {page} / {totalPages} 页 · 共 {total} 条"
   },
   "a11y": {
     "skipToContent": "跳到主内容",

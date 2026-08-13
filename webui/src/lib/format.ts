@@ -47,3 +47,9 @@ export function parseUsdToMicros(input: string): number | null {
   }
   return negative ? -micros : micros;
 }
+
+/** unix 毫秒 → 本地化日期时间。 */
+export function formatUnixMillis(millis: number, locale?: string): string {
+  const resolved = locale === 'zh-CN' ? 'zh-CN' : locale === 'en' ? 'en-US' : undefined;
+  return new Date(millis).toLocaleString(resolved);
+}

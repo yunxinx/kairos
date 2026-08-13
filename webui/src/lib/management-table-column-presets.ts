@@ -27,4 +27,14 @@ export const managementTableColumnPresets = {
     { id: 'cacheWrite', width: '9rem', minWidth: '9rem' },
     { id: 'actions', width: '1%', minWidth: '10rem' },
   ] satisfies VirtualDataTableColumn[],
+  logs: [
+    { id: 'created', width: '12rem', minWidth: '12rem' },
+    { id: 'token', width: '14%' },
+    { id: 'model', width: '14%' },
+    { id: 'channel', width: '14%' },
+    { id: 'status', width: '5rem', minWidth: '5rem' },
+    { id: 'latency', width: '6rem', minWidth: '6rem' },
+    { id: 'cost', width: '8rem', minWidth: '8rem' },
+    { id: 'expand', width: '3rem', minWidth: '3rem' },
+  ] satisfies VirtualDataTableColumn[],
 } as const;

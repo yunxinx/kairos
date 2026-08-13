@@ -1,28 +1,15 @@
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from '@playwright/test';
-import { E2E_ADMIN_PORT, E2E_PROTOCOL_PORT, E2E_ADMIN_KEY } from './e2e/helpers/gateway';
+import {
+  E2E_ADMIN_PORT,
+  E2E_CONFIG_PATH,
+  E2E_DB_PATH,
+  writeE2eConfig,
+} from './e2e/helpers/gateway';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-
-function writeE2eConfig(): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kairos-e2e-'));
-  const configPath = path.join(dir, 'config.json');
-  fs.writeFileSync(
-    configPath,
-    JSON.stringify({
-      listen: { host: '127.0.0.1', port: E2E_PROTOCOL_PORT },
-      database: { path: path.join(dir, 'kairos.db') },
-      admin_key: E2E_ADMIN_KEY,
-      admin_listen: { host: '127.0.0.1', port: E2E_ADMIN_PORT },
-    }),
-  );
-  return configPath;
-}
-
-const e2eConfigPath = writeE2eConfig();
+writeE2eConfig();
 
 export default defineConfig({
   testDir: './e2e',
@@ -34,9 +21,10 @@ export default defineConfig({
   use: {
     baseURL: `http://127.0.0.1:${E2E_ADMIN_PORT}`,
     locale: 'en-US',
+    permissions: ['clipboard-read', 'clipboard-write'],
   },
   webServer: {
-    command: `cargo run -q --bin kairos -- --config ${e2eConfigPath}`,
+    command: `pnpm --dir webui build && rm -f ${E2E_DB_PATH} ${E2E_DB_PATH}-wal ${E2E_DB_PATH}-shm && cargo run -q --bin kairos -- --config ${E2E_CONFIG_PATH}`,
     cwd: repoRoot,
     url: `http://127.0.0.1:${E2E_ADMIN_PORT}/`,
     reuseExistingServer: false,

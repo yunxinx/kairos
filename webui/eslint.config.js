@@ -45,6 +45,7 @@ export default tseslint.config(
             'FormCheckbox',
             'FormTextarea',
             'UiSelect',
+            'FilterField',
           ],
           required: { every: ['id'] },
         },
@@ -65,7 +66,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['src/components/ui/FormField.vue'],
+    files: ['src/components/ui/FormField.vue', 'src/components/ui/FilterField.vue'],
     rules: {
       // 控件在 slot 内且带与 inputId 一致的 id；规则无法跨 slot 静态关联 label[for]。
       'vuejs-accessibility/label-has-for': 'off',

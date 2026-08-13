@@ -1,9 +1,9 @@
 import { createFileRoute } from '@tanstack/vue-router';
-import PlaceholderFeature from '@/features/placeholders/PlaceholderFeature.vue';
+import LogsFeature from '@/features/logs/LogsFeature.vue';
 import { requireAuth } from '@/lib/router-guards';
 
 export const Route = createFileRoute('/requests')({
   beforeLoad: requireAuth,
-  component: PlaceholderFeature,
+  component: LogsFeature,
   staticData: { titleKey: 'nav.logs' },
 });
