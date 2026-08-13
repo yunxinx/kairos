@@ -10,8 +10,8 @@ test.describe('token resource page', () => {
     await expect(page.getByRole('heading', { name: /tokens/i })).toBeVisible();
 
     await page.getByTestId('create-token').click();
-    await page.locator('#token-editor-key').fill('sk-e2e-alpha');
-    await page.locator('#token-editor-name').fill('Alpha token');
+    await page.locator('[id^="token-editor-key"]').fill('sk-e2e-alpha');
+    await page.locator('[id^="token-editor-name"]').fill('Alpha token');
     await page.getByTestId('token-save').click();
 
     const row = page.locator('[data-testid="token-row"][data-token-key="sk-e2e-alpha"]');
@@ -27,13 +27,13 @@ test.describe('token resource page', () => {
     await expect(row).toBeVisible();
 
     await clickRowAction(row, page, 'token-recharge');
-    await page.locator('#token-balance-amount').fill('1.5');
+    await page.locator('[id^="token-balance-amount"]').fill('1.5');
     await page.getByTestId('token-balance-save').click();
     await expect(row.getByTestId('token-balance')).toHaveText('$1.5');
     await expect(row.getByTestId('token-settled')).toHaveText('$0');
 
     await clickRowAction(row, page, 'token-deduct');
-    await page.locator('#token-balance-amount').fill('0.25');
+    await page.locator('[id^="token-balance-amount"]').fill('0.25');
     await page.getByTestId('token-balance-save').click();
     await expect(row.getByTestId('token-balance')).toHaveText('$1.25');
 
@@ -50,29 +50,29 @@ test.describe('token resource page', () => {
     expect(balance.settled_usd_micros).toBe(0);
 
     await clickRowAction(row, page, 'token-edit');
-    await page.locator('#token-editor-name').fill('Alpha renamed');
+    await page.locator('[id^="token-editor-name"]').fill('Alpha renamed');
     await page.getByTestId('token-save').click();
     await expect(row.getByText('Alpha renamed')).toBeVisible();
     await expect(row.getByTestId('token-balance')).toHaveText('$1.25');
 
     await clickRowAction(row, page, 'token-delete');
-    await row.getByTestId('token-delete-confirm').click();
+    await page.getByRole('dialog').getByTestId('token-delete-confirm').click();
     await expect(row).toHaveCount(0);
   });
 
   test('shows a readable conflict when creating a duplicate token key', async ({ page }) => {
     await page.goto('/token');
     await page.getByTestId('create-token').click();
-    await page.locator('#token-editor-key').fill('sk-e2e-dup');
-    await page.locator('#token-editor-name').fill('First');
+    await page.locator('[id^="token-editor-key"]').fill('sk-e2e-dup');
+    await page.locator('[id^="token-editor-name"]').fill('First');
     await page.getByTestId('token-save').click();
     await expect(
       page.locator('[data-testid="token-row"][data-token-key="sk-e2e-dup"]'),
     ).toBeVisible();
 
     await page.getByTestId('create-token').click();
-    await page.locator('#token-editor-key').fill('sk-e2e-dup');
-    await page.locator('#token-editor-name').fill('Second');
+    await page.locator('[id^="token-editor-key"]').fill('sk-e2e-dup');
+    await page.locator('[id^="token-editor-name"]').fill('Second');
     await page.getByTestId('token-save').click();
     await expect(page.getByTestId('token-editor-error')).toContainText(/sk-e2e-dup/);
   });
@@ -80,8 +80,8 @@ test.describe('token resource page', () => {
   test('shows a readable not_found when adjusting a deleted token', async ({ page }) => {
     await page.goto('/token');
     await page.getByTestId('create-token').click();
-    await page.locator('#token-editor-key').fill('sk-e2e-gone');
-    await page.locator('#token-editor-name').fill('Gone');
+    await page.locator('[id^="token-editor-key"]').fill('sk-e2e-gone');
+    await page.locator('[id^="token-editor-name"]').fill('Gone');
     await page.getByTestId('token-save').click();
     const row = page.locator('[data-testid="token-row"][data-token-key="sk-e2e-gone"]');
     await expect(row).toBeVisible();
@@ -92,7 +92,7 @@ test.describe('token resource page', () => {
     expect(deleted.ok()).toBeTruthy();
 
     await clickRowAction(row, page, 'token-recharge');
-    await page.locator('#token-balance-amount').fill('1');
+    await page.locator('[id^="token-balance-amount"]').fill('1');
     await page.getByTestId('token-balance-save').click();
     await expect(page.getByTestId('token-balance-error')).toContainText(/sk-e2e-gone/);
   });

@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, useId } from 'vue';
+import { computed, ref } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { Price } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
-import AppModal from '@/components/ui/AppModal.vue';
+import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
-import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
@@ -21,26 +20,36 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
-import { useFormValidation } from '@/composables/useFormValidation';
-import { formatUsdAmount, formatUsdMicros, parseUsdToMicros } from '@/lib/format';
-import type { FieldValidationSpec } from '@/lib/form-validation';
+import { useWindowStack } from '@/composables/useWindowStack';
+import PriceEditorWindow from '@/features/pricing/PriceEditorWindow.vue';
+import { formatUsdMicros } from '@/lib/format';
+import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+
+type PriceWindowPayload =
+  { kind: 'editor'; price: Price | null } | { kind: 'delete'; price: Price };
 
 const { t } = useI18n();
 const queryClient = useQueryClient();
-const { fieldError, fieldInputHandlers, clearErrors, validate } = useFormValidation();
 
 const searchText = ref('');
-const showEditor = ref(false);
-const editingModel = ref<string | null>(null);
-const editorModel = ref('');
-const editorInput = ref('');
-const editorOutput = ref('');
-const editorCacheRead = ref('');
-const editorCacheWrite = ref('');
-const editorError = ref('');
-const editorTitleId = useId();
-const confirmingDeleteModel = ref<string | null>(null);
-const actionError = ref('');
+const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
+
+function takePendingAnchor(): FloatingWindowAnchor | null {
+  const anchor = pendingAnchor.value;
+  pendingAnchor.value = null;
+  return anchor;
+}
+
+const {
+  windows,
+  topmostId,
+  open: openWindow,
+  close: closeWindow,
+  setDirty,
+  bringToFront,
+} = useWindowStack<PriceWindowPayload>();
+
+const deleteErrors = ref<Record<number, string>>({});
 
 const pricesQuery = useQuery({
   queryKey: ['prices'],
@@ -56,108 +65,52 @@ const filteredPrices = computed(() => {
   return prices.value.filter((price) => price.model.toLowerCase().includes(q));
 });
 
-function invalidatePrices() {
-  return queryClient.invalidateQueries({ queryKey: ['prices'] });
-}
-
-const saveMutation = useMutation({
-  mutationFn: (body: Price) =>
-    editingModel.value === null
-      ? apiClient.createPrice(body)
-      : apiClient.updatePrice(editingModel.value, body),
-  onSuccess: async () => {
-    editorError.value = '';
-    showEditor.value = false;
-    await invalidatePrices();
-  },
-  onError: (err) => {
-    editorError.value = extractApiError(err).message;
-  },
-});
-
 const deleteMutation = useMutation({
   mutationFn: (model: string) => apiClient.deletePrice(model),
-  onSuccess: async () => {
-    confirmingDeleteModel.value = null;
-    actionError.value = '';
-    await invalidatePrices();
+  onSuccess: async (_data, model) => {
+    const entry = windows.value.find(
+      (item) => item.payload.kind === 'delete' && item.payload.price.model === model,
+    );
+    if (entry) closeWindow(entry.id);
+    await queryClient.invalidateQueries({ queryKey: ['prices'] });
   },
-  onError: (err) => {
-    actionError.value = extractApiError(err).message;
+  onError: (err, model) => {
+    const entry = windows.value.find(
+      (item) => item.payload.kind === 'delete' && item.payload.price.model === model,
+    );
+    if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
   },
 });
 
-function openCreate() {
-  editingModel.value = null;
-  editorModel.value = '';
-  editorInput.value = '';
-  editorOutput.value = '';
-  editorCacheRead.value = '';
-  editorCacheWrite.value = '';
-  editorError.value = '';
-  clearErrors();
-  showEditor.value = true;
+const deletingModel = computed(() =>
+  deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
+);
+
+function openCreate(event: Event) {
+  openWindow(anchorFromEvent(event), { kind: 'editor', price: null });
 }
 
 function openEdit(price: Price) {
-  editingModel.value = price.model;
-  editorModel.value = price.model;
-  editorInput.value = formatUsdAmount(price.input_micros);
-  editorOutput.value = formatUsdAmount(price.output_micros);
-  editorCacheRead.value =
-    price.cache_read_micros === null ? '' : formatUsdAmount(price.cache_read_micros);
-  editorCacheWrite.value =
-    price.cache_write_micros === null ? '' : formatUsdAmount(price.cache_write_micros);
-  editorError.value = '';
-  clearErrors();
-  showEditor.value = true;
-}
-
-function optionalMicros(value: string): number | null {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  return parseUsdToMicros(trimmed);
-}
-
-function handleSave() {
-  editorError.value = '';
-  const specs: FieldValidationSpec[] = [
-    { name: 'model', value: editorModel.value, rules: [{ kind: 'required' }] },
-    {
-      name: 'input',
-      value: editorInput.value,
-      rules: [{ kind: 'required' }, { kind: 'usd', min: 0 }],
-    },
-    {
-      name: 'output',
-      value: editorOutput.value,
-      rules: [{ kind: 'required' }, { kind: 'usd', min: 0 }],
-    },
-    { name: 'cacheRead', value: editorCacheRead.value, rules: [{ kind: 'usd', min: 0 }] },
-    { name: 'cacheWrite', value: editorCacheWrite.value, rules: [{ kind: 'usd', min: 0 }] },
-  ];
-  if (!validate(specs, t)) return;
-  const inputMicros = parseUsdToMicros(editorInput.value);
-  const outputMicros = parseUsdToMicros(editorOutput.value);
-  if (inputMicros === null || outputMicros === null) {
+  const existing = windows.value.find(
+    (entry) => entry.payload.kind === 'editor' && entry.payload.price?.model === price.model,
+  );
+  if (existing) {
+    bringToFront(existing.id);
     return;
   }
-  saveMutation.mutate({
-    model: editorModel.value.trim(),
-    input_micros: inputMicros,
-    output_micros: outputMicros,
-    cache_read_micros: optionalMicros(editorCacheRead.value),
-    cache_write_micros: optionalMicros(editorCacheWrite.value),
-  });
+  openWindow(takePendingAnchor(), { kind: 'editor', price });
 }
 
-function handleDelete(model: string) {
-  if (confirmingDeleteModel.value !== model) {
-    confirmingDeleteModel.value = model;
+function openDelete(price: Price) {
+  const existing = windows.value.find(
+    (entry) => entry.payload.kind === 'delete' && entry.payload.price.model === price.model,
+  );
+  if (existing) {
+    bringToFront(existing.id);
     return;
   }
-  actionError.value = '';
-  deleteMutation.mutate(model);
+  const entry = openWindow(takePendingAnchor(), { kind: 'delete', price });
+  if (entry) deleteErrors.value[entry.id] = '';
 }
 
 function formatOptionalMicros(value: number | null): string {
@@ -176,8 +129,6 @@ function formatOptionalMicros(value: number | null): string {
     />
 
     <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <p v-if="actionError" class="text-danger mb-4 shrink-0">{{ actionError }}</p>
-
       <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
@@ -187,8 +138,8 @@ function formatOptionalMicros(value: number | null): string {
               type="text"
               class="h-8 max-w-xs"
               data-testid="pricing-search"
-              :placeholder="t('pricing.model')"
-              :aria-label="t('pricing.model')"
+              :placeholder="t('pricing.search')"
+              :aria-label="t('pricing.search')"
             />
             <template #actions>
               <button
@@ -235,35 +186,20 @@ function formatOptionalMicros(value: number | null): string {
                 {{ formatOptionalMicros(price.cache_write_micros) }}
               </TableCell>
               <TableCell align="center">
-                <span
-                  v-if="confirmingDeleteModel === price.model"
-                  class="inline-flex items-center justify-center gap-1"
-                >
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-danger-filled"
-                    data-testid="pricing-delete-confirm"
-                    @click="handleDelete(price.model)"
+                <DataTableRowActions>
+                  <DataTableMenuItem
+                    data-testid="pricing-edit-entry"
+                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                    @select="openEdit(price)"
                   >
-                    {{ t('common.confirmDelete') }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                    @click="confirmingDeleteModel = null"
-                  >
-                    {{ t('common.cancel') }}
-                  </button>
-                </span>
-                <DataTableRowActions v-else>
-                  <DataTableMenuItem data-testid="pricing-edit-entry" @select="openEdit(price)">
                     {{ t('common.edit') }}
                   </DataTableMenuItem>
                   <DataTableMenuSeparator />
                   <DataTableMenuItem
                     danger
                     data-testid="pricing-delete-entry"
-                    @select="handleDelete(price.model)"
+                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                    @select="openDelete(price)"
                   >
                     {{ t('common.delete') }}
                   </DataTableMenuItem>
@@ -284,132 +220,36 @@ function formatOptionalMicros(value: number | null): string {
       </DataTable>
     </div>
 
-    <AppModal v-if="showEditor" :labelled-by="editorTitleId" @close="showEditor = false">
-      <div class="card w-full">
-        <form novalidate @submit.prevent="handleSave">
-          <div class="card-header">
-            <h2 :id="editorTitleId" class="font-serif text-base font-semibold">
-              {{ editingModel === null ? t('pricing.editorCreate') : t('pricing.editorEdit') }}
-            </h2>
-          </div>
-          <div class="card-body space-y-3">
-            <FormField
-              field-name="model"
-              :label="t('pricing.model')"
-              input-id="pricing-editor-model"
-              :error="fieldError('model')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="pricing-editor-model"
-                  v-model="editorModel"
-                  type="text"
-                  :disabled="editingModel !== null"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('model')"
-                />
-              </template>
-            </FormField>
-            <FormField
-              field-name="input"
-              :label="t('pricing.input')"
-              input-id="pricing-editor-input"
-              :error="fieldError('input')"
-              :guide="t('pricing.usdGuide')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="pricing-editor-input"
-                  v-model="editorInput"
-                  type="text"
-                  inputmode="decimal"
-                  class="font-mono"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('input')"
-                />
-              </template>
-            </FormField>
-            <FormField
-              field-name="output"
-              :label="t('pricing.output')"
-              input-id="pricing-editor-output"
-              :error="fieldError('output')"
-              :guide="t('pricing.usdGuide')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="pricing-editor-output"
-                  v-model="editorOutput"
-                  type="text"
-                  inputmode="decimal"
-                  class="font-mono"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('output')"
-                />
-              </template>
-            </FormField>
-            <FormField
-              field-name="cacheRead"
-              :label="t('pricing.cacheRead')"
-              input-id="pricing-editor-cache-read"
-              :error="fieldError('cacheRead')"
-              :guide="t('pricing.optionalUsdGuide')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="pricing-editor-cache-read"
-                  v-model="editorCacheRead"
-                  type="text"
-                  inputmode="decimal"
-                  class="font-mono"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('cacheRead')"
-                />
-              </template>
-            </FormField>
-            <FormField
-              field-name="cacheWrite"
-              :label="t('pricing.cacheWrite')"
-              input-id="pricing-editor-cache-write"
-              :error="fieldError('cacheWrite')"
-              :guide="t('pricing.optionalUsdGuide')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="pricing-editor-cache-write"
-                  v-model="editorCacheWrite"
-                  type="text"
-                  inputmode="decimal"
-                  class="font-mono"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('cacheWrite')"
-                />
-              </template>
-            </FormField>
-            <p v-if="editorError" class="text-danger text-sm" data-testid="pricing-editor-error">
-              {{ editorError }}
-            </p>
-          </div>
-          <div class="card-footer card-body flex justify-end gap-2">
-            <button type="button" class="btn" @click="showEditor = false">
-              {{ t('common.close') }}
-            </button>
-            <button
-              type="submit"
-              class="btn btn-primary"
-              data-testid="pricing-save-entry"
-              :disabled="saveMutation.isPending.value"
-            >
-              {{ t('common.save') }}
-            </button>
-          </div>
-        </form>
-      </div>
-    </AppModal>
+    <template v-for="(win, index) in windows" :key="win.id">
+      <PriceEditorWindow
+        v-if="win.payload.kind === 'editor'"
+        :initial="win.payload.price"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+      />
+      <ConfirmWindow
+        v-else
+        :title="t('pricing.deleteTitle')"
+        :message="t('pricing.deleteMessage', { name: win.payload.price.model })"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        :error="deleteErrors[win.id] ?? ''"
+        :busy="deletingModel === win.payload.price.model"
+        confirm-test-id="pricing-delete-confirm"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @confirm="deleteMutation.mutate(win.payload.price.model)"
+      />
+    </template>
   </div>
 </template>

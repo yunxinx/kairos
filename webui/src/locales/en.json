@@ -113,7 +113,9 @@
     "rechargeTitle": "Recharge balance",
     "deductTitle": "Deduct balance",
     "amount": "Amount (USD)",
-    "amountGuide": "Relative amount in dollars, up to six decimal places."
+    "amountGuide": "Relative amount in dollars, up to six decimal places.",
+    "deleteTitle": "Delete token",
+    "deleteMessage": "Delete token \"{name}\"? This cannot be undone."
   },
   "channel": {
     "create": "Create channel",
@@ -136,10 +138,13 @@
     "testing": "Testing...",
     "probeSuccess": "Success · {status} · {latency} ms",
     "probeFailure": "Failed · {status} · {latency} ms",
-    "probeUnreachable": "Unreachable · {latency} ms"
+    "probeUnreachable": "Unreachable · {latency} ms",
+    "deleteTitle": "Delete channel",
+    "deleteMessage": "Delete channel \"{name}\"? This cannot be undone."
   },
   "pricing": {
     "createEntry": "Add price",
+    "search": "Search by model",
     "editorCreate": "New price",
     "editorEdit": "Edit price",
     "model": "Model",
@@ -148,7 +153,9 @@
     "cacheRead": "Cache read",
     "cacheWrite": "Cache write",
     "usdGuide": "Dollars per 1M tokens, up to six decimal places.",
-    "optionalUsdGuide": "Optional. Leave empty to fall back to the input price."
+    "optionalUsdGuide": "Optional. Leave empty to fall back to the input price.",
+    "deleteTitle": "Delete price",
+    "deleteMessage": "Delete the price for \"{name}\"? This cannot be undone."
   },
   "settings": {
     "sections": "Settings sections",

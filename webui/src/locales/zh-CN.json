@@ -113,7 +113,9 @@
     "rechargeTitle": "充值余额",
     "deductTitle": "扣减余额",
     "amount": "金额（美元）",
-    "amountGuide": "相对量，美元最多六位小数。"
+    "amountGuide": "相对量，美元最多六位小数。",
+    "deleteTitle": "删除令牌",
+    "deleteMessage": "确定删除令牌「{name}」？删除后不可恢复。"
   },
   "channel": {
     "create": "创建渠道",
@@ -136,10 +138,13 @@
     "testing": "测试中...",
     "probeSuccess": "成功 · {status} · {latency} ms",
     "probeFailure": "失败 · {status} · {latency} ms",
-    "probeUnreachable": "不可达 · {latency} ms"
+    "probeUnreachable": "不可达 · {latency} ms",
+    "deleteTitle": "删除渠道",
+    "deleteMessage": "确定删除渠道「{name}」？删除后不可恢复。"
   },
   "pricing": {
     "createEntry": "添加价格",
+    "search": "按模型搜索",
     "editorCreate": "新建价格",
     "editorEdit": "编辑价格",
     "model": "模型",
@@ -148,7 +153,9 @@
     "cacheRead": "缓存读",
     "cacheWrite": "缓存写",
     "usdGuide": "每 1M tokens 的美元单价，最多六位小数。",
-    "optionalUsdGuide": "可选。留空则回退到输入单价。"
+    "optionalUsdGuide": "可选。留空则回退到输入单价。",
+    "deleteTitle": "删除价格",
+    "deleteMessage": "确定删除「{name}」的价格？删除后不可恢复。"
   },
   "settings": {
     "sections": "设置分类",

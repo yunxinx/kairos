@@ -1,14 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, useId } from 'vue';
+import { computed, ref } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { Token } from '@/api/types';
 import { loadTokenRows, type TokenRow } from '@/api/token-rows';
 import PageHeader from '@/app/layout/PageHeader.vue';
-import AppModal from '@/components/ui/AppModal.vue';
+import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
-import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
@@ -22,34 +20,38 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
-import { useFormValidation } from '@/composables/useFormValidation';
-import { formatUsdAmount, formatUsdMicros, parseUsdToMicros } from '@/lib/format';
-import type { FieldValidationSpec } from '@/lib/form-validation';
+import { useWindowStack } from '@/composables/useWindowStack';
+import type { BalanceMode } from '@/features/tokens/balance-mode';
+import TokenBalanceWindow from '@/features/tokens/TokenBalanceWindow.vue';
+import TokenEditorWindow from '@/features/tokens/TokenEditorWindow.vue';
+import { formatUsdMicros } from '@/lib/format';
+import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
-type BalanceMode = 'recharge' | 'deduct';
+type TokenWindowPayload =
+  | { kind: 'editor'; token: TokenRow | null }
+  | { kind: 'balance'; token: TokenRow; mode: BalanceMode }
+  | { kind: 'delete'; token: TokenRow };
 
 const { t } = useI18n();
 const queryClient = useQueryClient();
-const { fieldError, fieldInputHandlers, clearErrors, validate } = useFormValidation();
 
 const searchText = ref('');
-const showEditor = ref(false);
-const editingKey = ref<string | null>(null);
-const editorKey = ref('');
-const editorName = ref('');
-const editorLimit = ref('');
-const editorError = ref('');
-const editorTitleId = useId();
+const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
-const confirmingDeleteKey = ref<string | null>(null);
-const actionError = ref('');
+function takePendingAnchor(): FloatingWindowAnchor | null {
+  const anchor = pendingAnchor.value;
+  pendingAnchor.value = null;
+  return anchor;
+}
 
-const showBalance = ref(false);
-const balanceMode = ref<BalanceMode>('recharge');
-const balanceTokenKey = ref('');
-const balanceAmount = ref('');
-const balanceError = ref('');
-const balanceTitleId = useId();
+const {
+  windows,
+  topmostId,
+  open: openWindow,
+  close: closeWindow,
+  setDirty,
+  bringToFront,
+} = useWindowStack<TokenWindowPayload>();
 
 const tokensQuery = useQuery({
   queryKey: ['tokens'],
@@ -67,128 +69,69 @@ const filteredTokens = computed(() => {
   );
 });
 
-function invalidateTokens() {
-  return queryClient.invalidateQueries({ queryKey: ['tokens'] });
-}
-
-const saveMutation = useMutation({
-  mutationFn: (body: Token) =>
-    editingKey.value === null
-      ? apiClient.createToken(body)
-      : apiClient.updateToken(editingKey.value, body),
-  onSuccess: async () => {
-    editorError.value = '';
-    showEditor.value = false;
-    await invalidateTokens();
-  },
-  onError: (err) => {
-    editorError.value = extractApiError(err).message;
-  },
-});
+const deleteErrors = ref<Record<number, string>>({});
 
 const deleteMutation = useMutation({
   mutationFn: (tokenKey: string) => apiClient.deleteToken(tokenKey),
-  onSuccess: async () => {
-    confirmingDeleteKey.value = null;
-    actionError.value = '';
-    await invalidateTokens();
+  onSuccess: async (_data, tokenKey) => {
+    const entry = windows.value.find(
+      (item) => item.payload.kind === 'delete' && item.payload.token.token_key === tokenKey,
+    );
+    if (entry) closeWindow(entry.id);
+    await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
-  onError: (err) => {
-    actionError.value = extractApiError(err).message;
-  },
-});
-
-const balanceMutation = useMutation({
-  mutationFn: ({ tokenKey, delta }: { tokenKey: string; delta: number }) =>
-    apiClient.adjustTokenBalance(tokenKey, { delta_usd_micros: delta }),
-  onSuccess: async () => {
-    balanceError.value = '';
-    showBalance.value = false;
-    await invalidateTokens();
-  },
-  onError: (err) => {
-    balanceError.value = extractApiError(err).message;
+  onError: (err, tokenKey) => {
+    const entry = windows.value.find(
+      (item) => item.payload.kind === 'delete' && item.payload.token.token_key === tokenKey,
+    );
+    if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
   },
 });
 
-function openCreate() {
-  editingKey.value = null;
-  editorKey.value = '';
-  editorName.value = '';
-  editorLimit.value = '';
-  editorError.value = '';
-  clearErrors();
-  showEditor.value = true;
+const deletingKey = computed(() =>
+  deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
+);
+
+function openCreate(event: Event) {
+  openWindow(anchorFromEvent(event), { kind: 'editor', token: null });
 }
 
 function openEdit(token: TokenRow) {
-  editingKey.value = token.token_key;
-  editorKey.value = token.token_key;
-  editorName.value = token.name;
-  editorLimit.value =
-    token.limit_usd_micros === null ? '' : formatUsdAmount(token.limit_usd_micros);
-  editorError.value = '';
-  clearErrors();
-  showEditor.value = true;
+  const existing = windows.value.find(
+    (entry) =>
+      entry.payload.kind === 'editor' && entry.payload.token?.token_key === token.token_key,
+  );
+  if (existing) {
+    bringToFront(existing.id);
+    return;
+  }
+  openWindow(takePendingAnchor(), { kind: 'editor', token });
 }
 
 function openBalance(token: TokenRow, mode: BalanceMode) {
-  balanceMode.value = mode;
-  balanceTokenKey.value = token.token_key;
-  balanceAmount.value = '';
-  balanceError.value = '';
-  clearErrors();
-  showBalance.value = true;
-}
-
-function handleSave() {
-  editorError.value = '';
-  const specs: FieldValidationSpec[] = [
-    { name: 'tokenKey', value: editorKey.value, rules: [{ kind: 'required' }] },
-    { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
-    { name: 'limit', value: editorLimit.value, rules: [{ kind: 'usd', min: 0 }] },
-  ];
-  if (!validate(specs, t)) return;
-  const limit = parseUsdToMicros(editorLimit.value);
-  saveMutation.mutate({
-    token_key: editorKey.value.trim(),
-    name: editorName.value.trim(),
-    limit_usd_micros: limit,
-  });
-}
-
-function handleBalance() {
-  balanceError.value = '';
-  if (
-    !validate(
-      [
-        {
-          name: 'amount',
-          value: balanceAmount.value,
-          rules: [{ kind: 'required' }, { kind: 'usd', min: 0 }],
-        },
-      ],
-      t,
-    )
-  ) {
+  const existing = windows.value.find(
+    (entry) =>
+      entry.payload.kind === 'balance' &&
+      entry.payload.token.token_key === token.token_key &&
+      entry.payload.mode === mode,
+  );
+  if (existing) {
+    bringToFront(existing.id);
     return;
   }
-  const micros = parseUsdToMicros(balanceAmount.value);
-  if (micros === null || micros === 0) {
-    balanceError.value = t('validation.usd');
-    return;
-  }
-  const delta = balanceMode.value === 'deduct' ? -micros : micros;
-  balanceMutation.mutate({ tokenKey: balanceTokenKey.value, delta });
+  openWindow(takePendingAnchor(), { kind: 'balance', token, mode });
 }
 
-function handleDelete(tokenKey: string) {
-  if (confirmingDeleteKey.value !== tokenKey) {
-    confirmingDeleteKey.value = tokenKey;
+function openDelete(token: TokenRow) {
+  const existing = windows.value.find(
+    (entry) => entry.payload.kind === 'delete' && entry.payload.token.token_key === token.token_key,
+  );
+  if (existing) {
+    bringToFront(existing.id);
     return;
   }
-  actionError.value = '';
-  deleteMutation.mutate(tokenKey);
+  const entry = openWindow(takePendingAnchor(), { kind: 'delete', token });
+  if (entry) deleteErrors.value[entry.id] = '';
 }
 
 function formatLimit(limit: number | null): string {
@@ -207,8 +150,6 @@ function formatLimit(limit: number | null): string {
     />
 
     <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <p v-if="actionError" class="text-danger mb-4 shrink-0">{{ actionError }}</p>
-
       <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
@@ -268,47 +209,34 @@ function formatLimit(limit: number | null): string {
                 {{ formatLimit(token.limit_usd_micros) }}
               </TableCell>
               <TableCell align="center">
-                <span
-                  v-if="confirmingDeleteKey === token.token_key"
-                  class="inline-flex items-center justify-center gap-1"
-                >
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-danger-filled"
-                    data-testid="token-delete-confirm"
-                    @click="handleDelete(token.token_key)"
-                  >
-                    {{ t('common.confirmDelete') }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                    @click="confirmingDeleteKey = null"
-                  >
-                    {{ t('common.cancel') }}
-                  </button>
-                </span>
-                <DataTableRowActions v-else>
+                <DataTableRowActions>
                   <DataTableMenuItem
                     data-testid="token-recharge"
+                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
                     @select="openBalance(token, 'recharge')"
                   >
                     {{ t('tokens.recharge') }}
                   </DataTableMenuItem>
                   <DataTableMenuItem
                     data-testid="token-deduct"
+                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
                     @select="openBalance(token, 'deduct')"
                   >
                     {{ t('tokens.deduct') }}
                   </DataTableMenuItem>
-                  <DataTableMenuItem data-testid="token-edit" @select="openEdit(token)">
+                  <DataTableMenuItem
+                    data-testid="token-edit"
+                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                    @select="openEdit(token)"
+                  >
                     {{ t('common.edit') }}
                   </DataTableMenuItem>
                   <DataTableMenuSeparator />
                   <DataTableMenuItem
                     danger
                     data-testid="token-delete"
-                    @select="handleDelete(token.token_key)"
+                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                    @select="openDelete(token)"
                   >
                     {{ t('common.delete') }}
                   </DataTableMenuItem>
@@ -329,141 +257,49 @@ function formatLimit(limit: number | null): string {
       </DataTable>
     </div>
 
-    <AppModal v-if="showEditor" :labelled-by="editorTitleId" @close="showEditor = false">
-      <div class="card w-full">
-        <form novalidate @submit.prevent="handleSave">
-          <div class="card-header">
-            <h2 :id="editorTitleId" class="font-serif text-base font-semibold">
-              {{ editingKey === null ? t('tokens.editorCreate') : t('tokens.editorEdit') }}
-            </h2>
-          </div>
-          <div class="card-body space-y-3">
-            <FormField
-              field-name="tokenKey"
-              :label="t('tokens.key')"
-              input-id="token-editor-key"
-              :error="fieldError('tokenKey')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="token-editor-key"
-                  v-model="editorKey"
-                  type="text"
-                  class="font-mono"
-                  :disabled="editingKey !== null"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('tokenKey')"
-                />
-              </template>
-            </FormField>
-            <FormField
-              field-name="name"
-              :label="t('tokens.name')"
-              input-id="token-editor-name"
-              :error="fieldError('name')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="token-editor-name"
-                  v-model="editorName"
-                  type="text"
-                  :placeholder="t('tokens.namePlaceholder')"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('name')"
-                />
-              </template>
-            </FormField>
-            <FormField
-              field-name="limit"
-              :label="t('tokens.limit')"
-              input-id="token-editor-limit"
-              :error="fieldError('limit')"
-              :guide="t('tokens.limitGuide')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="token-editor-limit"
-                  v-model="editorLimit"
-                  type="text"
-                  inputmode="decimal"
-                  class="font-mono"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('limit')"
-                />
-              </template>
-            </FormField>
-            <p v-if="editorError" class="text-danger text-sm" data-testid="token-editor-error">
-              {{ editorError }}
-            </p>
-          </div>
-          <div class="card-footer card-body flex justify-end gap-2">
-            <button type="button" class="btn" @click="showEditor = false">
-              {{ t('common.cancel') }}
-            </button>
-            <button
-              type="submit"
-              class="btn btn-primary"
-              data-testid="token-save"
-              :disabled="saveMutation.isPending.value"
-            >
-              {{ t('common.save') }}
-            </button>
-          </div>
-        </form>
-      </div>
-    </AppModal>
-
-    <AppModal v-if="showBalance" :labelled-by="balanceTitleId" @close="showBalance = false">
-      <div class="card w-full">
-        <form novalidate @submit.prevent="handleBalance">
-          <div class="card-header">
-            <h2 :id="balanceTitleId" class="font-serif text-base font-semibold">
-              {{ balanceMode === 'recharge' ? t('tokens.rechargeTitle') : t('tokens.deductTitle') }}
-            </h2>
-          </div>
-          <div class="card-body space-y-3">
-            <FormField
-              field-name="amount"
-              :label="t('tokens.amount')"
-              input-id="token-balance-amount"
-              :error="fieldError('amount')"
-              :guide="t('tokens.amountGuide')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  id="token-balance-amount"
-                  v-model="balanceAmount"
-                  type="text"
-                  inputmode="decimal"
-                  class="font-mono"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('amount')"
-                />
-              </template>
-            </FormField>
-            <p v-if="balanceError" class="text-danger text-sm" data-testid="token-balance-error">
-              {{ balanceError }}
-            </p>
-          </div>
-          <div class="card-footer card-body flex justify-end gap-2">
-            <button type="button" class="btn" @click="showBalance = false">
-              {{ t('common.cancel') }}
-            </button>
-            <button
-              type="submit"
-              class="btn btn-primary"
-              data-testid="token-balance-save"
-              :disabled="balanceMutation.isPending.value"
-            >
-              {{ t('common.save') }}
-            </button>
-          </div>
-        </form>
-      </div>
-    </AppModal>
+    <template v-for="(win, index) in windows" :key="win.id">
+      <TokenEditorWindow
+        v-if="win.payload.kind === 'editor'"
+        :initial="win.payload.token"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+      />
+      <TokenBalanceWindow
+        v-else-if="win.payload.kind === 'balance'"
+        :token="win.payload.token"
+        :mode="win.payload.mode"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+      />
+      <ConfirmWindow
+        v-else
+        :title="t('tokens.deleteTitle')"
+        :message="t('tokens.deleteMessage', { name: win.payload.token.name })"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        :error="deleteErrors[win.id] ?? ''"
+        :busy="deletingKey === win.payload.token.token_key"
+        confirm-test-id="token-delete-confirm"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @confirm="deleteMutation.mutate(win.payload.token.token_key)"
+      />
+    </template>
   </div>
 </template>

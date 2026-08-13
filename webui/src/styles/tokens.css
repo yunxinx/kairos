@@ -11,6 +11,8 @@
   --z-overlay-backdrop: 99;
   --z-overlay: 100;
   --z-floating: 110;
+  --z-window: 120;
+  --z-popover: 130;
   --spacing-touch: 2.75rem;
   --height-chart: 20rem;
   --height-overview-panel: 28rem;
