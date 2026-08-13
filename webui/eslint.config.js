@@ -39,7 +39,13 @@ export default tseslint.config(
       'vuejs-accessibility/label-has-for': [
         'error',
         {
-          controlComponents: ['FormTextInput', 'FormPasswordInput', 'FormCheckbox'],
+          controlComponents: [
+            'FormTextInput',
+            'FormPasswordInput',
+            'FormCheckbox',
+            'FormTextarea',
+            'UiSelect',
+          ],
           required: { every: ['id'] },
         },
       ],

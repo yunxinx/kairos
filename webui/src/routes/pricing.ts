@@ -1,9 +1,9 @@
 import { createFileRoute } from '@tanstack/vue-router';
-import PlaceholderFeature from '@/features/placeholders/PlaceholderFeature.vue';
+import PricingFeature from '@/features/pricing/PricingFeature.vue';
 import { requireAuth } from '@/lib/router-guards';
 
 export const Route = createFileRoute('/pricing')({
   beforeLoad: requireAuth,
-  component: PlaceholderFeature,
+  component: PricingFeature,
   staticData: { titleKey: 'nav.pricing' },
 });

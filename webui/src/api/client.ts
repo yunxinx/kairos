@@ -82,6 +82,16 @@ export const apiClient = {
     });
   },
 
+  /**
+   * 读令牌余额：管理 API 无独立 GET，相对调整 `delta = 0` 返回当前余额且不改账。
+   */
+  readTokenBalance(tokenKey: string): Promise<BalanceView> {
+    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}/balance`, {
+      method: 'POST',
+      body: JSON.stringify({ delta_usd_micros: 0 }),
+    });
+  },
+
   listChannels(): Promise<Channel[]> {
     return apiFetch('/channels');
   },

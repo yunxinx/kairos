@@ -1,9 +1,9 @@
 import { createFileRoute } from '@tanstack/vue-router';
-import PlaceholderFeature from '@/features/placeholders/PlaceholderFeature.vue';
+import ChannelFeature from '@/features/channel/ChannelFeature.vue';
 import { requireAuth } from '@/lib/router-guards';
 
 export const Route = createFileRoute('/channel')({
   beforeLoad: requireAuth,
-  component: PlaceholderFeature,
+  component: ChannelFeature,
   staticData: { titleKey: 'nav.channel' },
 });

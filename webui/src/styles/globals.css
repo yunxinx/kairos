@@ -281,6 +281,9 @@ html[lang='zh-CN'] {
   max-width: 28rem;
   margin: 0 1rem;
 }
+.app-modal-panel-wide {
+  max-width: 40rem;
+}
 
 .btn-danger-filled {
   background: var(--danger);
