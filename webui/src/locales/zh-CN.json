@@ -33,7 +33,6 @@
   },
   "overview": {
     "title": "概览",
-    "subtitle": "请求量、token、费用，以及模型和渠道上的分布。",
     "days": "时间窗",
     "daysOption": {
       "1": "1 天",
@@ -62,7 +61,11 @@
     "heatmap": "请求活动",
     "heatmapLess": "少",
     "heatmapMore": "多",
-    "heatmapCell": "{date}：{count} 次请求 · {cost}"
+    "heatmapCell": "{date}：{count} 次请求 · {tokens} Token · {cost}",
+    "lifetimeRequests": "请求计数",
+    "lifetimeCost": "历史消耗",
+    "lifetimeTokens": "总 Token 数",
+    "tokenSpend": "Token 消耗"
   },
   "common": {
     "loading": "加载中...",
@@ -94,7 +97,6 @@
     "anthropic_messages": "Anthropic Messages"
   },
   "tokens": {
-    "subtitle": "发放下游 API key，查看余额，并以相对量充值或扣减。",
     "create": "创建令牌",
     "search": "按名称或 key 搜索",
     "editorCreate": "新建令牌",
@@ -114,7 +116,6 @@
     "amountGuide": "相对量，美元最多六位小数。"
   },
   "channel": {
-    "subtitle": "配置上游端点，并在承接流量前探测连通性。",
     "create": "创建渠道",
     "search": "按名称、URL 或模型搜索",
     "editorCreate": "新建渠道",
@@ -138,7 +139,6 @@
     "probeUnreachable": "不可达 · {latency} ms"
   },
   "pricing": {
-    "subtitle": "按模型维护四档单价（美元 / 1M tokens），往返为整数 micro-USD。",
     "createEntry": "添加价格",
     "editorCreate": "新建价格",
     "editorEdit": "编辑价格",
@@ -151,17 +151,19 @@
     "optionalUsdGuide": "可选。留空则回退到输入单价。"
   },
   "settings": {
-    "subtitle": "运行时开关对后续入站请求立即生效，无需重启。",
+    "sections": "设置分类",
+    "section": {
+      "logging": "日志记录"
+    },
     "fullBody": "记录完整请求与响应 body",
     "fullBodyGuide": "开启后，后续请求会把完整 body 写入请求日志。",
-    "maxRequestBytes": "入站请求体上限（字节）",
-    "maxRequestBytesGuide": "超过该上限的请求会立即以 413 拒绝。",
+    "maxRequestBytes": "入站请求体上限（MB）",
+    "maxRequestBytesGuide": "超过该上限的请求会立即以 413 拒绝。最多两位小数。",
     "save": "保存设置",
     "saveSuccess": "设置已保存，对新的入站请求立即生效。",
     "reset": "重置"
   },
   "logs": {
-    "subtitle": "按令牌、模型和时间范围过滤请求日志。展开一行可查看完整 body。",
     "tokenKey": "令牌 key",
     "tokenKeyPlaceholder": "精确匹配令牌 key",
     "model": "模型",
@@ -203,7 +205,9 @@
     "uint": "请输入一个整数",
     "uintMin": "请输入不小于 {min} 的整数",
     "usd": "请输入最多六位小数的美元金额",
-    "usdMin": "请输入不小于 {min} 的美元金额"
+    "usdMin": "请输入不小于 {min} 的美元金额",
+    "mb": "请输入最多两位小数的 MB 数值",
+    "mbMin": "请输入大于 0 的 MB 数值"
   },
   "errors": {
     "notFoundTitle": "页面不存在",

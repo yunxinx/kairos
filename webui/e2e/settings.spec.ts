@@ -11,11 +11,11 @@ test.describe('settings page', () => {
     await page.goto('/config');
     await expect(page.getByRole('heading', { name: /settings/i })).toBeVisible();
 
-    await page.locator('#settings-max-request-bytes').fill('100');
+    await page.locator('#settings-max-request-bytes').fill('0.01');
     await page.getByTestId('settings-save').click();
     await expect(page.getByTestId('settings-save-success')).toBeVisible();
 
-    const oversized = 'x'.repeat(2000);
+    const oversized = 'x'.repeat(20_000);
     const resp = await request.post(`http://127.0.0.1:${E2E_PROTOCOL_PORT}/v1/chat/completions`, {
       data: {
         model: 'gpt-4o',
@@ -29,8 +29,8 @@ test.describe('settings page', () => {
     await page.goto('/config');
     await page.locator('#settings-max-request-bytes').fill('0');
     await page.getByTestId('settings-save').click();
-    await expect(page.getByTestId('settings-save-error')).toContainText(
-      /max_request_bytes 必须大于 0/,
+    await expect(page.locator('[data-form-field="maxRequestBytes"]')).toContainText(
+      /greater than 0|大于 0/,
     );
   });
 

@@ -33,7 +33,6 @@
   },
   "overview": {
     "title": "Overview",
-    "subtitle": "Request volume, tokens, cost, and how traffic splits across models and channels.",
     "days": "Time window",
     "daysOption": {
       "1": "1 day",
@@ -62,7 +61,11 @@
     "heatmap": "Request activity",
     "heatmapLess": "Less",
     "heatmapMore": "More",
-    "heatmapCell": "{date}: {count} requests · {cost}"
+    "heatmapCell": "{date}: {count} requests · {tokens} tokens · {cost}",
+    "lifetimeRequests": "Request count",
+    "lifetimeCost": "Lifetime spend",
+    "lifetimeTokens": "Total tokens",
+    "tokenSpend": "Token usage"
   },
   "common": {
     "loading": "Loading...",
@@ -94,7 +97,6 @@
     "anthropic_messages": "Anthropic Messages"
   },
   "tokens": {
-    "subtitle": "Issue downstream API keys, inspect balances, and adjust them by relative amounts.",
     "create": "Create token",
     "search": "Search by name or key",
     "editorCreate": "New token",
@@ -114,7 +116,6 @@
     "amountGuide": "Relative amount in dollars, up to six decimal places."
   },
   "channel": {
-    "subtitle": "Configure upstream endpoints and probe them before they take traffic.",
     "create": "Create channel",
     "search": "Search by name, URL, or model",
     "editorCreate": "New channel",
@@ -138,7 +139,6 @@
     "probeUnreachable": "Unreachable · {latency} ms"
   },
   "pricing": {
-    "subtitle": "Four-tier USD prices per 1M tokens. Values round-trip as integer micro-USD.",
     "createEntry": "Add price",
     "editorCreate": "New price",
     "editorEdit": "Edit price",
@@ -151,17 +151,19 @@
     "optionalUsdGuide": "Optional. Leave empty to fall back to the input price."
   },
   "settings": {
-    "subtitle": "Runtime switches take effect on the next inbound request, without a restart.",
+    "sections": "Settings sections",
+    "section": {
+      "logging": "Logging"
+    },
     "fullBody": "Log full request and response bodies",
     "fullBodyGuide": "When on, subsequent requests store complete bodies on the request log.",
-    "maxRequestBytes": "Inbound body limit (bytes)",
-    "maxRequestBytesGuide": "Requests larger than this are rejected with 413 immediately.",
+    "maxRequestBytes": "Inbound body limit (MB)",
+    "maxRequestBytesGuide": "Requests larger than this are rejected with 413 immediately. Up to two decimal places.",
     "save": "Save settings",
     "saveSuccess": "Settings saved. Changes apply to new inbound requests immediately.",
     "reset": "Reset"
   },
   "logs": {
-    "subtitle": "Filter request logs by token, model, and time range. Expand a row to read the recorded bodies.",
     "tokenKey": "Token key",
     "tokenKeyPlaceholder": "Exact token key",
     "model": "Model",
@@ -203,7 +205,9 @@
     "uint": "Enter a whole number",
     "uintMin": "Enter a whole number of {min} or greater",
     "usd": "Enter a dollar amount with up to six decimal places",
-    "usdMin": "Enter a dollar amount of {min} or greater"
+    "usdMin": "Enter a dollar amount of {min} or greater",
+    "mb": "Enter an MB amount with up to two decimal places",
+    "mbMin": "Enter an MB amount greater than 0"
   },
   "errors": {
     "notFoundTitle": "Page not found",
