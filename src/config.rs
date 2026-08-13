@@ -155,21 +155,26 @@ mod tests {
         assert!(Config::load(&cfg_path).is_err(), "未知字段应报错");
     }
 
-    /// 已废弃的资源段（v1 的 `tokens`）出现在配置中直接报错，不做兼容迁移。
+    /// 已废弃的资源段（v1 的 tokens/channels/prices/logging）出现在配置中直接报错，
+    /// 不做兼容迁移。
     #[test]
-    fn deprecated_resource_segment_is_rejected() {
+    fn deprecated_resource_segments_are_rejected() {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
-        let cfg_path = dir.path().join("config.json");
-        std::fs::write(
-            &cfg_path,
-            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},
-                "admin_key":"k","tokens":[{"key":"sk-x","name":"dev"}]}"#,
-        )
-        .expect("应能写配置");
-        assert!(
-            Config::load(&cfg_path).is_err(),
-            "v1 废弃资源段应报错而非静默忽略"
-        );
+        let base =
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_key":"k""#;
+        for (name, extra) in [
+            ("tokens", r#","tokens":[]}"#),
+            ("channels", r#","channels":[]}"#),
+            ("prices", r#","prices":[]}"#),
+            ("logging", r#","logging":{"full_body":false}}"#),
+        ] {
+            let cfg_path = dir.path().join(format!("{name}.json"));
+            std::fs::write(&cfg_path, format!("{base}{extra}")).expect("应能写配置");
+            assert!(
+                Config::load(&cfg_path).is_err(),
+                "v1 废弃资源段 {name} 应报错而非静默忽略"
+            );
+        }
     }
 
     /// 缺失必需字段（admin_key）报错。

@@ -20,8 +20,8 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&cli.config)?;
 
     let pool = store::open(&cfg.database.path).await?;
-    // 启动时从库加载全部运行时资源进内存快照；请求路径读快照，管理 API 后续可
-    // 原子替换（v2 管理面落地前快照在启动时固定）。
+    // 启动时从库加载全部运行时资源进内存快照；请求路径读快照，管理 API 写库后
+    // 原子替换，使新资源即时生效。
     let snapshot = runtime::load_snapshot(&pool).await?;
     let snapshot = runtime::snapshot_handle(snapshot);
 

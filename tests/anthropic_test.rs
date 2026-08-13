@@ -557,3 +557,55 @@ async fn anthropic_inbound_multimodal_to_openai_chat_streaming() {
     assert_eq!(warning_frame["warnings"][0]["type"], "unsupported");
     assert_eq!(warning_frame["warnings"][0]["feature"], "media");
 }
+
+/// OpenAI chat 入站 → Anthropic 渠道：多模态跨协议映射（data URL ↔ base64 source）。
+///
+/// 入站 `image_url`（data URL + 远程 URL）与文本混排，出站编码为 Anthropic
+/// `image` content block（base64 source / URL source），顺序与语义保持。
+#[tokio::test]
+async fn openai_inbound_multimodal_to_anthropic() {
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_mm", "type": "message", "role": "assistant", "model": TEST_MODEL,
+        "content": [{ "type": "text", "text": "two images" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": { "input_tokens": 10, "output_tokens": 2 }
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "What's in these images?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" } },
+                    { "type": "text", "text": "and" },
+                    { "type": "image_url", "image_url": { "url": "https://example.com/image.png" } }
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    let content = received[0]["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 4, "混排顺序应保留 4 个 block");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "What's in these images?");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "iVBORw0KGgoAAAANSUhEUg==");
+    assert_eq!(content[2]["type"], "text");
+    assert_eq!(content[2]["text"], "and");
+    assert_eq!(content[3]["type"], "image");
+    assert_eq!(content[3]["source"]["type"], "url");
+    assert_eq!(content[3]["source"]["url"], "https://example.com/image.png");
+}

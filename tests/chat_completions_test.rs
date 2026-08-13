@@ -383,3 +383,73 @@ async fn multimodal_inbound_passthrough_preserves_bytes() {
         "同协议直通应字节级原样送达上游（含 base64 与混排顺序）"
     );
 }
+
+/// 多模态流式与纯文本流式行为一致：直通透传媒体字节，usage 照常计费。
+#[tokio::test]
+async fn multimodal_inbound_passthrough_streaming_bills() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-mm", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "ok" } }]
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-mm", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+        }))
+        .unwrap(),
+    ]));
+
+    let body = json!({
+        "model": TEST_MODEL,
+        "stream": true,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "What's in this?" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" } }
+            ]
+        }]
+    });
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "多模态流式应 200");
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0]["messages"], body["messages"],
+        "流式直通应原样送达媒体 content"
+    );
+    assert_eq!(
+        received[0]["stream_options"]["include_usage"], true,
+        "流式直通应注入 stream_options.include_usage（既有目标性补丁）"
+    );
+
+    // 消费完流，等待结算落库。
+    let _ = resp.bytes().await.expect("流应可读");
+    let mut billed = None;
+    for _ in 0..100 {
+        billed = sqlx::query_as::<_, (i64, i64)>(
+            "SELECT input_tokens, output_tokens FROM request_log LIMIT 1",
+        )
+        .fetch_optional(&gw.pool)
+        .await
+        .expect("应能查询请求日志");
+        if billed.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let (input, output) = billed.expect("多模态流式应落计费日志");
+    assert_eq!(input, 10);
+    assert_eq!(output, 2);
+}

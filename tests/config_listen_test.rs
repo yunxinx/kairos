@@ -44,20 +44,30 @@ async fn config_driven_listen_and_fallback() {
     });
 
     // 配置的端口上，未实现路径返回确定 404。
-    // （embeddings 属 spec Out of Scope，任何方法都不应命中已实现端点。）
+    // embeddings / image generation / audio / batch 均属 spec Out of Scope。
     let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("http://127.0.0.1:{port}/v1/embeddings"))
-        .send()
-        .await
-        .expect("应能请求网关未实现路径");
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::NOT_FOUND,
-        "未实现路径应 404"
-    );
-    let body = resp.text().await.expect("响应应可读");
-    assert!(body.contains("未实现"), "响应应含可读提示，实际 {body:?}");
+    for path in [
+        "/v1/embeddings",
+        "/v1/images/generations",
+        "/v1/audio/speech",
+        "/v1/batches",
+        "/v1/realtime",
+    ] {
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let resp = client
+                .request(method.clone(), format!("http://127.0.0.1:{port}{path}"))
+                .send()
+                .await
+                .expect("应能请求网关未实现路径");
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "Out of Scope 路径 {method} {path} 应 404"
+            );
+            let body = resp.text().await.expect("响应应可读");
+            assert!(body.contains("未实现"), "响应应含可读提示，实际 {body:?}");
+        }
+    }
 
     // 数据库按配置路径建出（相对路径已相对配置文件目录解析）。
     let db_exists = dir.path().join("kairos.db").exists();

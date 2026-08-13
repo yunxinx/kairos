@@ -1,8 +1,8 @@
 //! 计费：四档价格快照与费用计算，全程整数 micro-USD（ADR-0002）。
 //!
-//! 配置价格以「USD / 1M tokens」浮点给出；换算为「每 1M tokens 的 micro-USD
-//! 单价」后，费用计算只做整数乘除，抑制浮点误差。缓存档缺省时回退 `input` 价；
-//! reasoning tokens 不单独计价（计入 output，已在 usage 折算）。
+//! 价格表经管理 API 维护，库内以「每 1M tokens 的 micro-USD」整数存储；费用
+//! 计算只做整数乘除。缓存档缺省时回退 `input` 价；reasoning tokens 不单独计价
+//! （计入 output，已在 usage 折算）。不为媒体内容引入新计价维度。
 
 use crate::core::ir::Usage;
 use crate::store::resources::Price;

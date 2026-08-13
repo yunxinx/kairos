@@ -299,7 +299,7 @@ async fn log_records_price_snapshot() {
     assert_eq!(row.3, 10_000_000);
 }
 
-/// 令牌首次出现按配置 balance_usd 落库；重启不重置已存在的余额。
+/// 令牌余额存库；重启从库加载快照，不重置已存在的余额，请求路径仍可用。
 #[tokio::test]
 async fn balance_persists_across_restart() {
     let mut gw = TestGateway::start().await;
@@ -316,28 +316,22 @@ async fn balance_persists_across_restart() {
 
     // 用同一数据库文件重启网关（模拟重启），余额不应被重置回初始 5 USD。
     // 资源也存库中，重启从库加载快照即可，无需再注入配置。
-    let db_file = gw.db_path.to_path_buf();
-    let pool2 = kairos::store::open(&db_file)
-        .await
-        .expect("复用同一库文件应成功");
-    let snapshot = kairos::runtime::load_snapshot(&pool2)
-        .await
-        .expect("重启应从库加载快照");
-    let snapshot = kairos::runtime::snapshot_handle(snapshot);
-    let app2 = kairos::gateway::router(pool2.clone(), snapshot).await;
-    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("网关应能绑定随机端口");
-    tokio::spawn(async move {
-        axum::serve(listener2, app2).await.expect("网关服务应运行");
-    });
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000 - 4250);
+    let base2 = gw.spawn_reloaded_protocol().await;
 
-    // 重启后余额保持 5_000_000 - 4250，而不是重置为 5_000_000。
-    let row: (i64,) =
-        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
-            .fetch_one(&pool2)
-            .await
-            .expect("重启后余额应存在");
-    assert_eq!(row.0, 5_000_000 - 4250);
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(json!({
+            "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11
+        }))));
+    let resp = send_completion(&base2, TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "重启后应从库加载令牌与渠道，请求路径仍可用"
+    );
+    let after_reload = balance_micros(&gw, TEST_TOKEN_KEY).await;
+    assert!(
+        after_reload < 5_000_000 - 4250,
+        "重启后继续结算，余额不应被重置，实际 {after_reload}"
+    );
 }

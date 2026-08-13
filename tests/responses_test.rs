@@ -226,6 +226,56 @@ async fn openai_inbound_to_responses_channel() {
     assert_eq!(received[0]["input"][0]["content"][0]["text"], "hi");
 }
 
+/// openai_chat 入站 → Responses 渠道：多模态跨协议映射（image_url → input_image）。
+#[tokio::test]
+async fn openai_inbound_multimodal_to_responses() {
+    let mut gw = TestGateway::start_with(responses_channel_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "resp_mm", "object": "response", "status": "completed", "model": TEST_MODEL,
+        "output": [
+            { "id": "msg_1", "type": "message", "role": "assistant",
+              "content": [ { "type": "output_text", "text": "two images", "annotations": [] } ] }
+        ],
+        "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "What's in these images?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" } },
+                    { "type": "text", "text": "and" },
+                    { "type": "image_url", "image_url": { "url": "https://example.com/image.png" } }
+                ]
+            }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 1);
+    let content = received[0]["input"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 4, "混排顺序应保留 4 个 part");
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[0]["text"], "What's in these images?");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(
+        content[1]["image_url"],
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    );
+    assert_eq!(content[2]["type"], "input_text");
+    assert_eq!(content[3]["type"], "input_image");
+    assert_eq!(content[3]["image_url"], "https://example.com/image.png");
+}
+
 /// openai_chat 入站 → Responses 渠道：上游 Responses 返回 reasoning，跨协议族丢弃并记 warning。
 #[tokio::test]
 async fn openai_inbound_drops_responses_reasoning_with_warning() {
@@ -592,7 +642,9 @@ async fn responses_inbound_multimodal_to_openai_chat() {
                   "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" },
                 { "type": "input_file",
                   "filename": "doc.pdf",
-                  "file_data": "data:application/pdf;base64,JVBERi0xLjQK" }
+                  "file_data": "data:application/pdf;base64,JVBERi0xLjQK" },
+                { "type": "input_audio",
+                  "input_audio": { "data": "UklGRg==", "format": "mp3" } }
             ] }]
         }))
         .send()
@@ -610,12 +662,23 @@ async fn responses_inbound_multimodal_to_openai_chat() {
         content[1]["image_url"]["url"],
         "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
     );
-    assert_eq!(content.len(), 2, "文档媒体应在 chat 出站丢弃");
+    assert_eq!(content.len(), 2, "文档与音频媒体应在 chat 出站丢弃");
 
-    // 下游响应显式 warning：文档媒体丢弃。
+    // 下游响应显式 warning：非图片媒体丢弃。
     let body: Value = resp.json().await.expect("响应应可解析");
-    assert_eq!(body["gateway"]["warnings"][0]["type"], "unsupported");
-    assert_eq!(body["gateway"]["warnings"][0]["feature"], "media");
+    let warnings = body["gateway"]["warnings"]
+        .as_array()
+        .expect("应有 warnings");
+    assert!(
+        warnings.len() >= 2,
+        "input_file 与 input_audio 均应记 warning，实际 {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w["type"] == "unsupported" && w["feature"] == "media"),
+        "丢弃的媒体应记 media warning"
+    );
 }
 
 /// Responses 入站 → Responses 渠道（同协议直通）：多模态字节级原样送达上游。
@@ -637,7 +700,9 @@ async fn responses_multimodal_passthrough_preserves_bytes() {
         "input": [{ "type": "message", "role": "user", "content": [
             { "type": "input_text", "text": "What's in this?" },
             { "type": "input_image",
-              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" },
+            { "type": "input_audio",
+              "input_audio": { "data": "UklGRg==", "format": "mp3" } }
         ] }]
     });
     let resp = client

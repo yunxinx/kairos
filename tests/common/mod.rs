@@ -303,6 +303,16 @@ pub fn test_seed(upstream_base: &str) -> Seed {
     }
 }
 
+/// 空资源清单：模拟首次部署的空库，供管理 API 初始化路径使用。
+pub fn empty_seed(_upstream_base: &str) -> Seed {
+    Seed {
+        channels: vec![],
+        tokens: vec![],
+        prices: vec![],
+        settings: HashMap::new(),
+    }
+}
+
 /// 把 seed 播种进数据库：渠道/价格直接 upsert，令牌则定义 + 初始余额。
 pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
     let mut conn = pool.acquire().await.expect("应能获取连接");
@@ -500,6 +510,29 @@ impl TestGateway {
         let addr = self
             .admin_addr
             .expect("管理面未启用：请用 start_with_admin 启动");
+        format!("http://{addr}")
+    }
+
+    /// 从当前实例的数据库再启一个协议监听（模拟进程重启：从库加载快照，不重新播种）。
+    ///
+    /// 原实例保持存活以持有临时库文件；新实例复用同一 mock 上游（渠道 `base_url`
+    /// 仍指向它）。返回新协议面的 base URL。
+    pub async fn spawn_reloaded_protocol(&self) -> String {
+        let pool = store::open(&self.db_path)
+            .await
+            .expect("复用同一库文件应成功");
+        let snapshot = runtime::load_snapshot(&pool)
+            .await
+            .expect("重启应从库加载快照");
+        let snapshot = runtime::snapshot_handle(snapshot);
+        let app = gateway::router(pool, snapshot).await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("网关应能绑定随机端口");
+        let addr = listener.local_addr().expect("应能取端口");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("网关服务应运行");
+        });
         format!("http://{addr}")
     }
 }

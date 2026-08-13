@@ -20,7 +20,7 @@ pub type ProviderOptions = HashMap<String, Value>;
 /// 转换过程中无法表达的内容或设置，随响应显式回传给下游。
 ///
 /// 形状对齐 AI SDK `SharedV4Warning`。跨协议族转换是有损的（ADR-0001）：丢失的
-/// reasoning、目标协议不支持的采样参数等一律记 warning，不静默吞掉。
+/// reasoning、目标协议不支持的媒体类型或采样参数等一律记 warning，不静默吞掉。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Warning {
