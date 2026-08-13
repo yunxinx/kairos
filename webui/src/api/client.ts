@@ -11,6 +11,7 @@ import type {
   Price,
   Settings,
   StatsView,
+  LifetimeStats,
   Token,
 } from '@/api/types';
 
@@ -148,6 +149,10 @@ export const apiClient = {
 
   getStats(days?: number): Promise<StatsView> {
     return apiFetch(`/stats${buildQuery({ days })}`);
+  },
+
+  getLifetimeStats(): Promise<LifetimeStats> {
+    return apiFetch('/stats/lifetime');
   },
 };
 

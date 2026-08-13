@@ -133,6 +133,13 @@ export interface StatsView {
   by_channel: ChannelShare[];
 }
 
+/** `/stats/lifetime` 全量累计，不受时间窗影响。 */
+export interface LifetimeStats {
+  request_count: number;
+  cost_usd_micros: number;
+  total_tokens: number;
+}
+
 /** 渠道连通性探测结果。 */
 export interface ChannelProbeResult {
   reachable: boolean;

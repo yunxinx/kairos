@@ -10,6 +10,10 @@ export function prefetchAdminRoute(to: string): void {
         queryKey: ['stats', '7'],
         queryFn: () => apiClient.getStats(7),
       });
+      void queryClient.prefetchQuery({
+        queryKey: ['stats', 'lifetime'],
+        queryFn: () => apiClient.getLifetimeStats(),
+      });
       return;
     case '/token':
       void queryClient.prefetchQuery({

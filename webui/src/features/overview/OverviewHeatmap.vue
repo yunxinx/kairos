@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
-import type { DailyPoint } from '@/api/types';
-import { formatCount, formatUsdMicros } from '@/lib/format';
+import type { DailyPoint, LifetimeStats } from '@/api/types';
+import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
+import { formatCount, formatTokensMillions, formatUsdMicros } from '@/lib/format';
 import {
   buildHeatmap,
   formatHeatmapMonth,
@@ -14,12 +15,22 @@ import {
 const props = withDefaults(
   defineProps<{
     daily: DailyPoint[];
+    lifetime?: LifetimeStats | null;
+    lifetimeLoading?: boolean;
+    lifetimeError?: string;
     loading?: boolean;
   }>(),
   {
+    lifetime: null,
+    lifetimeLoading: false,
+    lifetimeError: '',
     loading: false,
   },
 );
+
+const emit = defineEmits<{
+  retryLifetime: [];
+}>();
 
 const { t, locale } = useI18n();
 
@@ -52,6 +63,7 @@ function cellAriaLabel(cell: HeatmapCell): string {
   return t('overview.heatmapCell', {
     date: cell.date,
     count: cell.requestCount,
+    tokens: formatTokensMillions(cell.tokenCount),
     cost: formatUsdMicros(cell.costUsdMicros),
   });
 }
@@ -64,7 +76,7 @@ function monthCaption(date: string | null): string {
 function placeTip(event: PointerEvent): void {
   const offset = 12;
   const tipWidth = 176;
-  const tipHeight = 88;
+  const tipHeight = 110;
   let x = event.clientX + offset;
   let y = event.clientY + offset;
   if (x + tipWidth > window.innerWidth) {
@@ -103,94 +115,145 @@ function clearTip(): void {
       <h2 class="font-serif text-base font-semibold">{{ t('overview.heatmap') }}</h2>
     </div>
     <div class="card-body overview-panel-body overview-heatmap-body">
-      <div
-        v-if="loading"
-        class="heatmap"
-        role="status"
-        :aria-label="t('common.loading')"
-        :style="{ '--heatmap-weeks': HEATMAP_WEEK_COUNT }"
-      >
-        <div class="heatmap-calendar">
-          <div class="heatmap-month-gutter" aria-hidden="true" />
-          <div class="heatmap-months">
-            <span
-              v-for="week in HEATMAP_WEEK_COUNT"
-              :key="'sk-month-' + week"
-              class="heatmap-month"
-            />
-          </div>
-          <div class="heatmap-weekdays" aria-hidden="true">
-            <span
-              v-for="item in weekdayLabels"
-              :key="'sk-wd-' + item.weekday"
-              class="heatmap-weekday"
-            >
-              {{ item.label }}
-            </span>
-          </div>
-          <div class="heatmap-grid">
-            <span
-              v-for="index in HEATMAP_WEEK_COUNT * 7"
-              :key="'cell-skeleton-' + index"
-              class="heatmap-cell heatmap-level-0 skeleton-stagger"
-              :style="{ '--skeleton-index': Math.floor((index - 1) / 7) }"
-            />
-          </div>
-        </div>
-      </div>
-
-      <div
-        v-else
-        class="heatmap"
-        data-testid="overview-heatmap"
-        data-heatmap-kind="calendar"
-        :style="{ '--heatmap-weeks': heatmap.weeks.length }"
-        @pointermove="handleBoardPointer"
-        @pointerleave="clearTip"
-      >
-        <div class="heatmap-calendar">
-          <div class="heatmap-month-gutter" aria-hidden="true" />
-          <div class="heatmap-months">
-            <span
-              v-for="(date, weekIndex) in heatmap.monthLabels"
-              :key="'month-' + weekIndex"
-              class="heatmap-month"
-            >
-              {{ monthCaption(date) }}
-            </span>
-          </div>
-          <div class="heatmap-weekdays" aria-hidden="true">
-            <span v-for="item in weekdayLabels" :key="'wd-' + item.weekday" class="heatmap-weekday">
-              {{ item.label }}
-            </span>
-          </div>
-          <div class="heatmap-grid">
-            <template v-for="(week, weekIndex) in heatmap.weeks" :key="'week-' + weekIndex">
+      <div class="heatmap-upper">
+        <div
+          v-if="loading"
+          class="heatmap"
+          role="status"
+          :aria-label="t('common.loading')"
+          :style="{ '--heatmap-weeks': HEATMAP_WEEK_COUNT }"
+        >
+          <div class="heatmap-calendar">
+            <div class="heatmap-month-gutter" aria-hidden="true" />
+            <div class="heatmap-months">
               <span
-                v-for="cell in week"
-                :key="cell.date"
-                class="heatmap-cell"
-                :class="'heatmap-level-' + cell.level"
-                data-testid="overview-heatmap-cell"
-                :data-date="cell.date"
-                :data-request-count="String(cell.requestCount)"
-                :data-cost-usd-micros="String(cell.costUsdMicros)"
-                :aria-label="cellAriaLabel(cell)"
+                v-for="week in HEATMAP_WEEK_COUNT"
+                :key="'sk-month-' + week"
+                class="heatmap-month"
               />
-            </template>
+            </div>
+            <div class="heatmap-weekdays" aria-hidden="true">
+              <span
+                v-for="item in weekdayLabels"
+                :key="'sk-wd-' + item.weekday"
+                class="heatmap-weekday"
+              >
+                {{ item.label }}
+              </span>
+            </div>
+            <div class="heatmap-grid">
+              <span
+                v-for="index in HEATMAP_WEEK_COUNT * 7"
+                :key="'cell-skeleton-' + index"
+                class="heatmap-cell heatmap-level-0 skeleton-stagger"
+                :style="{ '--skeleton-index': Math.floor((index - 1) / 7) }"
+              />
+            </div>
           </div>
         </div>
+
+        <div
+          v-else
+          class="heatmap"
+          data-testid="overview-heatmap"
+          data-heatmap-kind="calendar"
+          :style="{ '--heatmap-weeks': heatmap.weeks.length }"
+          @pointermove="handleBoardPointer"
+          @pointerleave="clearTip"
+        >
+          <div class="heatmap-calendar">
+            <div class="heatmap-month-gutter" aria-hidden="true" />
+            <div class="heatmap-months">
+              <span
+                v-for="(date, weekIndex) in heatmap.monthLabels"
+                :key="'month-' + weekIndex"
+                class="heatmap-month"
+              >
+                {{ monthCaption(date) }}
+              </span>
+            </div>
+            <div class="heatmap-weekdays" aria-hidden="true">
+              <span
+                v-for="item in weekdayLabels"
+                :key="'wd-' + item.weekday"
+                class="heatmap-weekday"
+              >
+                {{ item.label }}
+              </span>
+            </div>
+            <div class="heatmap-grid">
+              <template v-for="(week, weekIndex) in heatmap.weeks" :key="'week-' + weekIndex">
+                <span
+                  v-for="cell in week"
+                  :key="cell.date"
+                  class="heatmap-cell"
+                  :class="'heatmap-level-' + cell.level"
+                  data-testid="overview-heatmap-cell"
+                  :data-date="cell.date"
+                  :data-request-count="String(cell.requestCount)"
+                  :data-token-count="String(cell.tokenCount)"
+                  :data-cost-usd-micros="String(cell.costUsdMicros)"
+                  :aria-label="cellAriaLabel(cell)"
+                />
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <p v-if="!loading" class="heatmap-legend">
+          <span>{{ t('overview.heatmapLess') }}</span>
+          <span class="heatmap-cell heatmap-level-0 heatmap-legend-swatch" />
+          <span class="heatmap-cell heatmap-level-1 heatmap-legend-swatch" />
+          <span class="heatmap-cell heatmap-level-2 heatmap-legend-swatch" />
+          <span class="heatmap-cell heatmap-level-3 heatmap-legend-swatch" />
+          <span class="heatmap-cell heatmap-level-4 heatmap-legend-swatch" />
+          <span>{{ t('overview.heatmapMore') }}</span>
+        </p>
       </div>
 
-      <p v-if="!loading" class="heatmap-legend">
-        <span>{{ t('overview.heatmapLess') }}</span>
-        <span class="heatmap-cell heatmap-level-0 heatmap-legend-swatch" />
-        <span class="heatmap-cell heatmap-level-1 heatmap-legend-swatch" />
-        <span class="heatmap-cell heatmap-level-2 heatmap-legend-swatch" />
-        <span class="heatmap-cell heatmap-level-3 heatmap-legend-swatch" />
-        <span class="heatmap-cell heatmap-level-4 heatmap-legend-swatch" />
-        <span>{{ t('overview.heatmapMore') }}</span>
-      </p>
+      <div class="heatmap-lifetime" data-testid="overview-lifetime">
+        <div v-if="lifetimeError" class="heatmap-lifetime-error">
+          <p class="text-danger text-sm">{{ lifetimeError }}</p>
+          <button type="button" class="btn btn-sm" @click="emit('retryLifetime')">
+            {{ t('common.retry') }}
+          </button>
+        </div>
+        <template v-else>
+          <div>
+            <div class="heatmap-lifetime-label">{{ t('overview.lifetimeRequests') }}</div>
+            <div
+              v-if="lifetime"
+              class="heatmap-lifetime-value"
+              data-testid="overview-lifetime-requests"
+            >
+              {{ formatCount(lifetime.request_count, locale) }}
+            </div>
+            <SkeletonBlock v-else-if="lifetimeLoading" height="h-6" width="w-16" class="mt-1" />
+          </div>
+          <div>
+            <div class="heatmap-lifetime-label">{{ t('overview.lifetimeCost') }}</div>
+            <div
+              v-if="lifetime"
+              class="heatmap-lifetime-value"
+              data-testid="overview-lifetime-cost"
+            >
+              {{ formatUsdMicros(lifetime.cost_usd_micros) }}
+            </div>
+            <SkeletonBlock v-else-if="lifetimeLoading" height="h-6" width="w-20" class="mt-1" />
+          </div>
+          <div>
+            <div class="heatmap-lifetime-label">{{ t('overview.lifetimeTokens') }}</div>
+            <div
+              v-if="lifetime"
+              class="heatmap-lifetime-value"
+              data-testid="overview-lifetime-tokens"
+            >
+              {{ formatTokensMillions(lifetime.total_tokens) }}
+            </div>
+            <SkeletonBlock v-else-if="lifetimeLoading" height="h-6" width="w-20" class="mt-1" />
+          </div>
+        </template>
+      </div>
     </div>
 
     <div
@@ -203,6 +266,10 @@ function clearTip(): void {
       <p class="heatmap-tooltip-row">
         <span>{{ t('overview.requests') }}</span>
         <span class="heatmap-tooltip-value">{{ formatCount(hovered.requestCount, locale) }}</span>
+      </p>
+      <p class="heatmap-tooltip-row">
+        <span>{{ t('overview.tokenSpend') }}</span>
+        <span class="heatmap-tooltip-value">{{ formatTokensMillions(hovered.tokenCount) }}</span>
       </p>
       <p class="heatmap-tooltip-row">
         <span>{{ t('overview.cost') }}</span>

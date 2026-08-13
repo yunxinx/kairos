@@ -3,9 +3,9 @@ import { authedTest as test, expect } from './fixtures';
 import { E2E_ADMIN_KEY } from './helpers/gateway';
 import { MS_PER_DAY, seedRequestLogs, utcDayStart } from './helpers/seed-logs';
 import { usdLabel } from './helpers/usd';
-import type { StatsView } from '../src/api/types';
+import type { LifetimeStats, StatsView } from '../src/api/types';
 import { HEATMAP_WEEK_COUNT } from '../src/features/overview/heatmap';
-import { formatCount } from '../src/lib/format';
+import { formatCount, formatTokensMillions } from '../src/lib/format';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -15,6 +15,14 @@ async function fetchStats(request: APIRequestContext, days: number): Promise<Sta
   });
   expect(resp.ok()).toBeTruthy();
   return (await resp.json()) as StatsView;
+}
+
+async function fetchLifetimeStats(request: APIRequestContext): Promise<LifetimeStats> {
+  const resp = await request.get('/stats/lifetime', {
+    headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+  });
+  expect(resp.ok()).toBeTruthy();
+  return (await resp.json()) as LifetimeStats;
 }
 
 function seedOverviewLogs(now: number): { today: string; yesterday: string; eightDaysAgo: string } {
@@ -77,6 +85,18 @@ function seedOverviewLogs(now: number): { today: string; yesterday: string; eigh
   return { today: iso(todayStart), yesterday: iso(yesterday), eightDaysAgo: iso(eightDaysAgo) };
 }
 
+async function expectLifetimeMatch(page: Page, lifetime: LifetimeStats): Promise<void> {
+  await expect(page.getByTestId('overview-lifetime-requests')).toHaveText(
+    formatCount(lifetime.request_count, 'en'),
+  );
+  await expect(page.getByTestId('overview-lifetime-cost')).toHaveText(
+    usdLabel(lifetime.cost_usd_micros),
+  );
+  await expect(page.getByTestId('overview-lifetime-tokens')).toHaveText(
+    formatTokensMillions(lifetime.total_tokens),
+  );
+}
+
 async function expectCardsMatchStats(page: Page, stats: StatsView): Promise<void> {
   await expect(page.getByTestId('overview-request-count')).toHaveText(
     formatCount(stats.summary.request_count, 'en'),
@@ -111,7 +131,9 @@ test.describe('overview page', () => {
     await expect(page.getByRole('heading', { name: /overview/i })).toBeVisible();
 
     const stats = await fetchStats(request, 7);
+    const lifetime = await fetchLifetimeStats(request);
     await expectCardsMatchStats(page, stats);
+    await expectLifetimeMatch(page, lifetime);
 
     const expectedToday = stats.daily.find((point) => point.date === today);
     expect(expectedToday).toBeDefined();
@@ -181,6 +203,11 @@ test.describe('overview page', () => {
     const heatTip = page.getByTestId('overview-heatmap-tooltip');
     await expect(heatTip).toBeVisible();
     await expect(heatTip).toContainText(String(expectedToday?.request_count));
+    await expect(heatTip).toContainText(
+      formatTokensMillions(
+        (expectedToday?.input_tokens ?? 0) + (expectedToday?.output_tokens ?? 0),
+      ),
+    );
     await expect(heatTip).toContainText(usdLabel(expectedToday?.cost_usd_micros ?? 0));
   });
 
@@ -205,7 +232,9 @@ test.describe('overview page', () => {
     await page.goto('/overview');
 
     const stats7 = await fetchStats(request, 7);
+    const lifetime = await fetchLifetimeStats(request);
     await expectCardsMatchStats(page, stats7);
+    await expectLifetimeMatch(page, lifetime);
     await expect(
       page.locator(`[data-testid="overview-daily-point"][data-date="${eightDaysAgo}"]`),
     ).toHaveCount(0);
@@ -220,6 +249,7 @@ test.describe('overview page', () => {
     const stats90 = await fetchStats(request, 90);
     expect(stats90.summary.request_count).toBeGreaterThan(stats7.summary.request_count);
     await expectCardsMatchStats(page, stats90);
+    await expectLifetimeMatch(page, lifetime);
     const expectedOld = stats90.daily.find((point) => point.date === eightDaysAgo);
     expect(expectedOld).toBeDefined();
     await expect(
@@ -234,6 +264,7 @@ test.describe('overview page', () => {
     const stats1 = await fetchStats(request, 1);
     expect(stats1.daily).toHaveLength(24);
     await expectCardsMatchStats(page, stats1);
+    await expectLifetimeMatch(page, lifetime);
     await expect(page.getByTestId('overview-daily-point')).toHaveCount(24);
     await expect(page.getByTestId('overview-heatmap-cell')).toHaveCount(HEATMAP_WEEK_COUNT * 7);
   });

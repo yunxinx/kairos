@@ -29,6 +29,11 @@ const statsQuery = useQuery({
   queryFn: () => apiClient.getStats(Number(days.value)),
 });
 
+const lifetimeQuery = useQuery({
+  queryKey: ['stats', 'lifetime'],
+  queryFn: () => apiClient.getLifetimeStats(),
+});
+
 const summary = computed(() => statsQuery.data.value?.summary);
 const daily = computed(() => statsQuery.data.value?.daily ?? []);
 const byModel = computed(() =>
@@ -50,13 +55,19 @@ const trendTitle = computed(() =>
   days.value === '1' ? t('overview.trendHourly') : t('overview.trend'),
 );
 
+const lifetime = computed(() => lifetimeQuery.data.value ?? null);
+const lifetimeLoading = computed(() => lifetimeQuery.isPending.value && !lifetimeQuery.data.value);
+const lifetimeError = computed(() => {
+  if (!lifetimeQuery.isError.value || lifetimeQuery.data.value) return '';
+  return extractApiError(lifetimeQuery.error.value).message;
+});
 const showSkeleton = computed(() => statsQuery.isPending.value && !statsQuery.data.value);
 const showError = computed(() => statsQuery.isError.value && !statsQuery.data.value);
 </script>
 
 <template>
   <div>
-    <PageHeader :title="t('overview.title')" :subtitle="t('overview.subtitle')">
+    <PageHeader :title="t('overview.title')">
       <template #actions>
         <FilterField :label="t('overview.days')" input-id="overview-days" class="min-w-[10rem]">
           <UiSelect
@@ -117,7 +128,14 @@ const showError = computed(() => statsQuery.isError.value && !statsQuery.data.va
           :channel-items="byChannel"
           :loading="showSkeleton"
         />
-        <OverviewHeatmap :daily="daily" :loading="showSkeleton" />
+        <OverviewHeatmap
+          :daily="daily"
+          :lifetime="lifetime"
+          :lifetime-loading="lifetimeLoading"
+          :lifetime-error="lifetimeError"
+          :loading="showSkeleton"
+          @retry-lifetime="() => lifetimeQuery.refetch()"
+        />
       </section>
     </template>
   </div>

@@ -8,7 +8,7 @@
 //! 资源 CRUD（令牌/渠道/价格）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
 //! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）、
-//! 请求日志分页查询（`/logs`）、只读聚合（`/stats`）与渠道连通性探测
+//! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）与渠道连通性探测
 //! （`/channels/{name}/test`）。
 
 use std::collections::HashMap;
@@ -83,6 +83,7 @@ pub fn router(
         .route("/settings", get(get_settings).put(update_settings))
         .route("/logs", get(query_logs))
         .route("/stats", get(get_stats))
+        .route("/stats/lifetime", get(get_lifetime_stats))
         .route_layer(middleware::from_fn_with_state(admin_key, admin_auth))
         // fallback 不走 route_layer：静态资源与 SPA 回退免认证；API 路由仍受中间件保护。
         .fallback(super::webui::serve)
@@ -651,6 +652,28 @@ async fn get_stats(
                 cost_usd_micros: share.cost_usd_micros,
             })
             .collect(),
+    }))
+}
+
+/// `/stats/lifetime` 响应：全量累计，不受时间窗影响。
+#[derive(Debug, Serialize)]
+struct LifetimeStatsView {
+    request_count: u64,
+    cost_usd_micros: i64,
+    total_tokens: u64,
+}
+
+/// 只读全量累计：请求数 / 成功结算费用 / 四分量 token 合计。
+async fn get_lifetime_stats(
+    State(deps): State<AdminDeps>,
+) -> Result<Json<LifetimeStatsView>, AdminError> {
+    let stats = store::query_lifetime_stats(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(LifetimeStatsView {
+        request_count: stats.request_count,
+        cost_usd_micros: stats.cost_usd_micros,
+        total_tokens: stats.total_tokens,
     }))
 }
 

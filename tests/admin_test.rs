@@ -105,6 +105,7 @@ const PROTOCOL_FORBIDDEN_ADMIN_GETS: &[&str] = &[
     "/settings",
     "/logs",
     "/stats",
+    "/stats/lifetime",
     "/token",
     "/channel",
     "/pricing",
@@ -1430,6 +1431,30 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
     assert_eq!(body["daily"].as_array().unwrap().len(), 90);
     assert_eq!(body["summary"]["request_count"], 5);
     assert_eq!(body["summary"]["cost_usd_micros"], 3600);
+}
+
+/// `/stats/lifetime` 为全量累计，含默认 7 天窗外的条目；失败行费用不计入。
+#[tokio::test]
+async fn stats_lifetime_aggregates_all_seeded_logs() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let now = common::unix_millis();
+    let _ = seed_stats_logs(&gw.pool, now).await;
+
+    let resp = admin_get(&gw, "/stats/lifetime").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("lifetime stats 应可解析");
+    assert_eq!(body["request_count"], 5, "全量应含 8 天前那条");
+    assert_eq!(
+        body["cost_usd_micros"], 3600,
+        "失败行 999999 微元不应计入费用"
+    );
+    assert_eq!(body["total_tokens"], 50);
+
+    let windowed = admin_get(&gw, "/stats?days=7").await;
+    assert_eq!(windowed.status(), reqwest::StatusCode::OK);
+    let windowed_body: Value = windowed.json().await.expect("stats 应可解析");
+    assert_eq!(windowed_body["summary"]["request_count"], 4);
+    assert_eq!(body["request_count"], 5);
 }
 
 /// 渠道探测成功：可达、200、有延迟；出站为非流式极小请求；不经计费、不落日志。

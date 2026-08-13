@@ -13,6 +13,8 @@ interface OverviewShareItem {
 
 type ShareTab = 'model' | 'channel';
 
+const SHARE_LIST_LIMIT = 5;
+
 const props = withDefaults(
   defineProps<{
     modelItems: OverviewShareItem[];
@@ -27,7 +29,7 @@ const props = withDefaults(
 const { t, locale } = useI18n();
 const shareTab = ref<ShareTab>('model');
 
-const ranked = computed(() => {
+const rankedAll = computed(() => {
   const items = shareTab.value === 'model' ? props.modelItems : props.channelItems;
   return [...items].sort(
     (left, right) =>
@@ -35,16 +37,20 @@ const ranked = computed(() => {
   );
 });
 
+const ranked = computed(() => rankedAll.value.slice(0, SHARE_LIST_LIMIT));
+
 const itemTestId = computed(() =>
   shareTab.value === 'model' ? 'overview-model-share' : 'overview-channel-share',
 );
 
 const nameAttr = computed(() => (shareTab.value === 'model' ? 'data-model' : 'data-channel'));
 
-const totalCost = computed(() => ranked.value.reduce((sum, item) => sum + item.costUsdMicros, 0));
+const totalCost = computed(() =>
+  rankedAll.value.reduce((sum, item) => sum + item.costUsdMicros, 0),
+);
 
 const totalRequests = computed(() =>
-  ranked.value.reduce((sum, item) => sum + item.requestCount, 0),
+  rankedAll.value.reduce((sum, item) => sum + item.requestCount, 0),
 );
 
 function shareRatio(item: OverviewShareItem): number {
@@ -97,7 +103,7 @@ function nameBinding(name: string): Record<string, string> {
     <div class="card-body overview-panel-body seed-scrollbar">
       <ul v-if="loading" class="space-y-4" role="status" :aria-label="t('common.loading')">
         <li
-          v-for="row in 4"
+          v-for="row in SHARE_LIST_LIMIT"
           :key="'share-skeleton-' + row"
           class="skeleton-stagger space-y-1.5"
           :style="{ '--skeleton-index': row - 1 }"

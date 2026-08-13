@@ -2,7 +2,7 @@
 //!
 //! 本模块承载请求日志（`request_log`）、冒烟记录（`smoke_probe`）与令牌计费
 //! 余额（`token_balance`）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats`
-//! 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
+//! 与 `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
 pub mod resources;
 
@@ -387,6 +387,14 @@ pub struct CostShare {
     pub cost_usd_micros: i64,
 }
 
+/// 全量累计：不受 `/stats` 时间窗影响。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifetimeStats {
+    pub request_count: u64,
+    pub cost_usd_micros: i64,
+    pub total_tokens: u64,
+}
+
 /// 聚合 `days` 天（已夹取）内的 stats。费用只计 HTTP 2xx（与计费「仅成功结算」一致）。
 pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreError> {
     let days = clamp_stats_days(Some(days));
@@ -456,6 +464,27 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
         daily,
         by_model,
         by_channel,
+    })
+}
+
+/// 全量累计：请求数、成功结算费用、四分量 token 合计。
+pub async fn query_lifetime_stats(pool: &SqlitePool) -> Result<LifetimeStats, StoreError> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS request_count, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+           AS cost_usd_micros, \
+         COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
+           AS total_tokens \
+         FROM request_log",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    Ok(LifetimeStats {
+        request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
+        cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        total_tokens: as_count(row.try_get("total_tokens").map_err(StoreError::Query)?),
     })
 }
 

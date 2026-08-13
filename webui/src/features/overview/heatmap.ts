@@ -5,6 +5,7 @@ export type HeatmapLevel = 0 | 1 | 2 | 3 | 4;
 export interface HeatmapCell {
   date: string;
   requestCount: number;
+  tokenCount: number;
   costUsdMicros: number;
   level: HeatmapLevel;
 }
@@ -70,17 +71,23 @@ export function formatHeatmapWeekday(weekday: number, locale: string): string {
 /** 小时点折成日历日；无流量日不进表，由网格补空格。 */
 function rollupByDay(
   points: DailyPoint[],
-): Map<string, { requestCount: number; costUsdMicros: number }> {
-  const byDay = new Map<string, { requestCount: number; costUsdMicros: number }>();
+): Map<string, { requestCount: number; tokenCount: number; costUsdMicros: number }> {
+  const byDay = new Map<
+    string,
+    { requestCount: number; tokenCount: number; costUsdMicros: number }
+  >();
   for (const point of points) {
     const day = point.date.slice(0, 10);
+    const tokenCount = point.input_tokens + point.output_tokens;
     const prev = byDay.get(day);
     if (prev) {
       prev.requestCount += point.request_count;
+      prev.tokenCount += tokenCount;
       prev.costUsdMicros += point.cost_usd_micros;
     } else {
       byDay.set(day, {
         requestCount: point.request_count,
+        tokenCount,
         costUsdMicros: point.cost_usd_micros,
       });
     }
@@ -113,6 +120,7 @@ export function buildHeatmap(daily: DailyPoint[], nowMillis: number = Date.now()
     week.push({
       date,
       requestCount,
+      tokenCount: rolled?.tokenCount ?? 0,
       costUsdMicros: rolled?.costUsdMicros ?? 0,
       level: levelForCount(requestCount, max),
     });
