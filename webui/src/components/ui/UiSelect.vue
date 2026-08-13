@@ -25,16 +25,22 @@ export interface UiSelectOption {
   label: string;
 }
 
-withDefaults(
+const props = withDefaults(
   defineProps<{
     id: string;
     options: UiSelectOption[];
     invalid?: boolean;
     disabled?: boolean;
+    /** `popper` 按触发器展开全部选项；`item-aligned` 对齐当前项（可能出现滚动条）。 */
+    position?: 'item-aligned' | 'popper';
+    /** 仅 `popper` 生效；分页在页面底部时用 `top` 向上展开。 */
+    side?: 'top' | 'bottom';
   }>(),
   {
     invalid: false,
     disabled: false,
+    position: 'item-aligned',
+    side: 'bottom',
   },
 );
 
@@ -92,7 +98,9 @@ onScopeDispose(() => {
       <SelectPortal>
         <SelectContent
           class="ui-select-content"
-          position="item-aligned"
+          :class="{ 'ui-select-content-expanded': props.position === 'popper' }"
+          :position="props.position"
+          :side="props.side"
           :body-lock="false"
           @close-auto-focus="handleCloseAutoFocus"
         >

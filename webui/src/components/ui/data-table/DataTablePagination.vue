@@ -40,24 +40,32 @@ function goToPage(nextPage: number | '...') {
 <template>
   <div
     data-slot="data-table-pagination"
-    class="flex flex-wrap items-center justify-between gap-3 overflow-hidden px-2"
+    class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-2"
   >
-    <div class="flex flex-wrap items-center gap-3">
-      <label class="text-fg-muted inline-flex items-center gap-2 text-sm" :for="pageSizeId">
-        <span>{{ t('common.rowsPerPage') }}</span>
-        <UiSelect
-          :id="pageSizeId"
-          v-model="pageSize"
-          class="min-w-[4.5rem]"
-          :options="pageSizeOptions"
-        />
+    <div class="flex min-w-0 flex-1 items-center gap-3">
+      <label
+        class="text-fg-muted inline-flex shrink-0 items-center gap-2 text-sm whitespace-nowrap"
+        :for="pageSizeId"
+      >
+        <span class="shrink-0">{{ t('common.rowsPerPage') }}</span>
+        <span class="page-size-select inline-block shrink-0">
+          <UiSelect
+            :id="pageSizeId"
+            v-model="pageSize"
+            position="popper"
+            side="top"
+            :options="pageSizeOptions"
+          />
+        </span>
       </label>
-      <span class="text-fg-muted text-sm" :data-testid="summaryTestId">{{ summary }}</span>
+      <span
+        class="text-fg-muted min-w-0 truncate text-sm"
+        :data-testid="summaryTestId"
+        :title="summary"
+        >{{ summary }}</span
+      >
     </div>
-    <div class="flex items-center gap-2">
-      <span class="text-fg-muted hidden text-sm font-medium sm:inline">
-        {{ t('common.pageStatus', { page, totalPages }) }}
-      </span>
+    <div class="flex shrink-0 items-center gap-2">
       <div class="inline-flex items-center gap-1">
         <button
           type="button"
