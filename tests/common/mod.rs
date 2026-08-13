@@ -21,8 +21,9 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -40,6 +41,10 @@ use tokio::net::TcpListener;
 pub enum UpstreamBehavior {
     /// 返回 SSE 流，逐帧下发给定文本。
     Sse(Vec<String>),
+    /// 返回预先切分的原始 SSE 字节块，用于验证跨块与字节级直通。
+    RawSse(Vec<Vec<u8>>),
+    /// 返回有固定块间隔的原始 SSE 字节块，用于构造下游中途断开。
+    DelayedRawSse { chunks: Vec<Vec<u8>>, delay_ms: u64 },
     /// 返回普通 JSON 响应。
     Json(Value),
     /// 返回 429（可重试）。
@@ -171,6 +176,25 @@ impl IntoResponse for UpstreamBehavior {
                     }));
                 Sse::new(events).into_response()
             }
+            UpstreamBehavior::RawSse(chunks) => {
+                let stream = stream::iter(
+                    chunks
+                        .into_iter()
+                        .map(|chunk| Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk))),
+                );
+                raw_sse_response(Body::from_stream(stream))
+            }
+            UpstreamBehavior::DelayedRawSse { chunks, delay_ms } => {
+                let stream = async_stream::stream! {
+                    for (index, chunk) in chunks.into_iter().enumerate() {
+                        if index > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                        yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk));
+                    }
+                };
+                raw_sse_response(Body::from_stream(stream))
+            }
             UpstreamBehavior::Json(value) => Json(value).into_response(),
             UpstreamBehavior::Status429 => {
                 (axum::http::StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
@@ -196,6 +220,15 @@ impl IntoResponse for UpstreamBehavior {
             }
         }
     }
+}
+
+fn raw_sse_response(body: Body) -> Response {
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("text/event-stream"),
+    );
+    response
 }
 
 /// 测试用下游令牌 key。

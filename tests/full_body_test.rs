@@ -208,3 +208,41 @@ async fn full_body_streaming_records_forwarded_frames() {
         &response_text[response_text.len().saturating_sub(32)..]
     );
 }
+
+/// raw chunk 直搬开启 full_body 时，日志保存成功下发的原始响应字节。
+#[tokio::test]
+async fn full_body_streaming_records_raw_cross_chunk_bytes() {
+    let mut gw = TestGateway::start_with(full_body_seed).await;
+    let upstream = b": keep-alive\r\nevent: custom\r\ndata:{\"type\":\"chunk\"}\r\n\r\ndata: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n";
+    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        upstream[..13].to_vec(),
+        upstream[13..57].to_vec(),
+        upstream[57..].to_vec(),
+    ]));
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let downstream = resp.bytes().await.expect("响应流应可读");
+    let expected = [upstream.as_slice(), b"data: [DONE]\n\n"].concat();
+    assert_eq!(downstream.as_ref(), expected);
+
+    let mut response_body = None;
+    for _ in 0..100 {
+        response_body = fetch_bodies(&gw.pool).await.1;
+        if response_body.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(response_body.as_deref(), Some(expected.as_slice()));
+}

@@ -327,29 +327,21 @@ async fn openai_inbound_to_anthropic_channel_streaming() {
 #[tokio::test]
 async fn anthropic_passthrough_streaming_bills_split_usage() {
     let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
-    // 同协议（anthropic ↔ anthropic）流式直通。
-    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
-        serde_json::to_string(&json!({
-            "type": "message_start",
-            "message": { "id": "msg_01", "model": "claude-sonnet", "usage": { "input_tokens": 50, "output_tokens": 0 } }
-        }))
-        .unwrap(),
-        serde_json::to_string(&json!({
-            "type": "content_block_start", "index": 0,
-            "content_block": { "type": "text", "text": "" }
-        }))
-        .unwrap(),
-        serde_json::to_string(&json!({
-            "type": "content_block_delta", "index": 0,
-            "delta": { "type": "text_delta", "text": "直通" }
-        }))
-        .unwrap(),
-        serde_json::to_string(&json!({
-            "type": "message_delta",
-            "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-            "usage": { "input_tokens": 50, "output_tokens": 5 }
-        }))
-        .unwrap(),
+    // 同协议流式直通；两处 usage 都跨原始块边界，验证旁路缓冲独立组帧。
+    let raw = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{",
+        "\"id\":\"msg_01\",\"usage\":{\"input_tokens\":50,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,",
+        "\"delta\":{\"type\":\"text_delta\",\"text\":\"直通\"}}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",",
+        "\"delta\":{\"stop_reason\":\"end_turn\"},",
+        "\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}\n\n"
+    )
+    .as_bytes();
+    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        raw[..73].to_vec(),
+        raw[73..raw.len() - 37].to_vec(),
+        raw[raw.len() - 37..].to_vec(),
     ]));
 
     let client = reqwest::Client::new();

@@ -2,7 +2,7 @@
 //!
 //! 本模块承载完整链路：下游以 OpenAI Chat Completions 或 Anthropic Messages 协议
 //! 带令牌发请求，网关认证与计费准入后出站到目标渠道。同协议且未命中别名时走
-//! 直通快路径（请求体仅目标性补丁、响应字节流直通、逐帧嗅探 usage 计费）；
+//! 直通快路径（请求体仅目标性补丁、响应原始字节块直搬、旁路嗅探 usage 计费）；
 //! 跨协议或命中别名时经 IR 完整路径转换。协议转换由 `core` 各适配器承担，
 //! wire 类型不出适配器边界；本模块经 `protocol` 分派到对应适配器。
 //!
@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, Sse},
@@ -41,7 +41,8 @@ use crate::{
 use super::failover::{Outbound, run_failover};
 use super::logging::{Billing, log_request, unix_millis};
 use super::sse::{
-    data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream, take_frame,
+    OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
+    take_frame,
 };
 
 use super::{protocol, routing};
@@ -508,7 +509,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
     .await
 }
 
-/// 直通快路径的流式出站：字节流直通转发，逐 SSE 帧嗅探 usage 计费。
+/// 直通快路径的流式出站：原始字节块直搬，旁路逐 SSE 帧嗅探 usage 计费。
 ///
 /// 请求体仅做目标性补丁（OpenAI 流式注入 `stream_options.include_usage` 供计费，
 /// Anthropic 无需补丁），响应以字节流直通到下游，不做完整解码。流结束后按嗅探
@@ -580,13 +581,21 @@ async fn passthrough_stream_completion(ctx: &PassthroughCtx<'_>, channel: &Chann
         response_body: Vec::new(),
     };
     let byte_stream = resp.bytes_stream();
-    let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
     tokio::spawn(async move {
         pipe_passthrough_stream(byte_stream, tx, task).await;
     });
 
     let stream = receiver_stream(rx);
-    Outbound::Success(Sse::new(stream).into_response())
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Outbound::Success(response)
 }
 
 /// 直通快路径的非流式出站：响应体整体透传，从响应 JSON 嗅探 usage 计费。
@@ -738,15 +747,15 @@ struct PassthroughStreamTask {
     response_body: Vec<u8>,
 }
 
-/// 把上游 SSE 字节流逐帧转发到下游，同时逐帧嗅探 usage 计费。
+/// 把上游 SSE 原始字节块直搬到下游，并在旁路缓冲中逐帧嗅探 usage。
 ///
-/// 每收到一个完整 SSE 数据帧，原样转发给下游（含 `event:` 名，不改装帧），并按
-/// 协议嗅探帧内 usage 逐分量取 max 累积计费（Anthropic 的 usage 分散在
-/// message_start/message_delta）。上游流结束时按累积 usage 结算并落日志；
-/// OpenAI 追加 `[DONE]` 终止哨兵，Anthropic 以上游 message_stop 收尾。
+/// 转发不等待分帧：每个成功读取的块直接送入响应体。旁路缓冲仅负责提取完整 SSE
+/// 数据事件，并按协议把 usage 逐分量取 max（Anthropic 的 usage 分散在
+/// message_start/message_delta）；它不决定普通块的转发。上游流结束时按累积 usage
+/// 结算并落日志；OpenAI 追加 `[DONE]`，Anthropic 以上游 message_stop 收尾。
 async fn pipe_passthrough_stream<S>(
     byte_stream: S,
-    tx: tokio::sync::mpsc::Sender<SseEvent>,
+    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     mut ctx: PassthroughStreamTask,
 ) where
     S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
@@ -756,50 +765,64 @@ async fn pipe_passthrough_stream<S>(
     let mut usage = Usage::default();
     let mut sse_buffer: Vec<u8> = Vec::new();
     let mut downstream_open = true;
+    let mut done_filter = OpenAiDoneFilter::default();
     let mut byte_stream = Box::pin(byte_stream);
 
     loop {
-        // 尝试从已缓冲字节提取完整 SSE 数据帧。
-        if let Some((event_name, frame, rest)) = take_frame(&sse_buffer) {
-            sse_buffer = rest;
-            if frame.is_empty() {
-                continue;
-            }
-            // 逐帧嗅探 usage 计费（不完整解码），多帧逐分量取 max。
-            if let Ok(chunk) = serde_json::from_slice::<Value>(&frame)
-                && let Some(sniffed) = protocol::sniff_usage(&chunk, ctx.protocol)
-            {
-                usage.union_max(sniffed);
-            }
-            if downstream_open {
-                let data = String::from_utf8_lossy(&frame).into_owned();
-                // full_body：记录实际转发帧的 wire 字节（入站响应）。
-                if ctx.snapshot.full_body {
-                    let wire_frame = SseFrame {
-                        event: event_name.clone(),
-                        data: data.clone(),
-                    };
-                    ctx.response_body
-                        .extend_from_slice(&frame_to_wire(&wire_frame));
-                }
-                let mut event = SseEvent::default().data(data);
-                if let Some(name) = event_name {
-                    event = event.event(name);
-                }
-                if tx.send(event).await.is_err() {
-                    // 下游断开：停止发送，但继续消费上游直至结算。
-                    downstream_open = false;
-                }
-            }
-            continue;
-        }
-
-        // 缓冲不足一帧：从上游读取更多字节。
         match byte_stream.next().await {
-            Some(Ok(bytes)) => {
-                sse_buffer.extend_from_slice(&bytes);
+            Some(Ok(chunk)) => {
+                sse_buffer.extend_from_slice(&chunk);
+                // 传输快路径只处理原始块；旁路解析的结果不影响这个块是否转发。
+                if downstream_open {
+                    let chunks = if ctx.protocol == Protocol::OpenAiChat {
+                        done_filter.push(chunk)
+                    } else {
+                        vec![chunk]
+                    };
+                    for forwarded in chunks {
+                        if !send_passthrough_chunk(
+                            &tx,
+                            forwarded,
+                            ctx.snapshot.full_body,
+                            &mut ctx.response_body,
+                        )
+                        .await
+                        {
+                            // 下游断开：停止发送，但继续消费上游直至结算。
+                            downstream_open = false;
+                            break;
+                        }
+                    }
+                }
+
+                while let Some((_event_name, frame, rest)) = take_frame(&sse_buffer) {
+                    sse_buffer = rest;
+                    if frame.is_empty() {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_slice::<Value>(&frame)
+                        && let Some(sniffed) = protocol::sniff_usage(&value, ctx.protocol)
+                    {
+                        usage.union_max(sniffed);
+                    }
+                }
             }
             Some(Err(_)) | None => {
+                if downstream_open && ctx.protocol == Protocol::OpenAiChat {
+                    for trailing in done_filter.finish() {
+                        if !send_passthrough_chunk(
+                            &tx,
+                            trailing,
+                            ctx.snapshot.full_body,
+                            &mut ctx.response_body,
+                        )
+                        .await
+                        {
+                            downstream_open = false;
+                            break;
+                        }
+                    }
+                }
                 // OpenAI 协议约定以 `data: [DONE]` 终止；哨兵也是入站响应的一部分，
                 // full_body 开启时在实际下发前记入（结算先于哨兵，日志此时能带全）。
                 if ctx.snapshot.full_body && downstream_open && ctx.protocol == Protocol::OpenAiChat
@@ -842,11 +865,32 @@ async fn pipe_passthrough_stream<S>(
                 // OpenAI 协议约定以 `data: [DONE]` 终止；Anthropic 以上游
                 // message_stop 收尾，无需哨兵。
                 if downstream_open && ctx.protocol == Protocol::OpenAiChat {
-                    let _ = tx.send(SseEvent::default().data("[DONE]")).await;
+                    let _ = tx
+                        .send(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+                        .await;
                 }
                 return;
             }
         }
+    }
+}
+
+/// 下发一个直通块；full_body 仅保留已被响应通道接受的字节。
+async fn send_passthrough_chunk(
+    tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
+    chunk: bytes::Bytes,
+    full_body: bool,
+    response_body: &mut Vec<u8>,
+) -> bool {
+    let response_body_len = response_body.len();
+    if full_body {
+        response_body.extend_from_slice(&chunk);
+    }
+    if tx.send(chunk).await.is_ok() {
+        true
+    } else {
+        response_body.truncate(response_body_len);
+        false
     }
 }
 

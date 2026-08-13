@@ -7,6 +7,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use futures_util::StreamExt;
 use kairos::config;
@@ -178,6 +180,163 @@ async fn stream_passthrough_forwards_and_bills_usage() {
     assert_eq!(row.2, 1000, "日志应记录 input=1000");
     assert_eq!(row.3, 100, "日志应记录 output=100");
     assert_eq!(row.4, 4250, "日志应记录费用 4250");
+}
+
+/// raw chunk 直搬：跨块的大帧不参与转发决策，拼接后的下游字节与上游一致。
+///
+/// usage 帧也刻意跨块切分，验证旁路解析仍能完成计费；SSE 注释、CRLF 与字段
+/// 空格用于区分原始字节直搬和逐帧重组。
+#[tokio::test]
+async fn stream_passthrough_copies_large_cross_chunk_body_and_sniffs_usage() {
+    let mut gw = TestGateway::start().await;
+    let large_text = "x".repeat(128 * 1024);
+    let first_frame = format!(
+        ": upstream-comment\r\nid: original-id\r\ndata: {{\"id\":\"chatcmpl-raw\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{large_text}\"}}}}]}}\r\n\r\n"
+    );
+    let usage_frame = concat!(
+        "data:{\"id\":\"chatcmpl-raw\",\"object\":\"chat.completion.chunk\",",
+        "\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,",
+        "\"total_tokens\":12}}\n\n"
+    );
+    let upstream = [first_frame.as_bytes(), usage_frame.as_bytes()].concat();
+    let split_points = [17, 64 * 1024, first_frame.len() + 43];
+    let chunks = upstream.split_at(split_points[0]);
+    let (second, tail) = chunks.1.split_at(split_points[1] - split_points[0]);
+    let (third, fourth) = tail.split_at(split_points[2] - split_points[1]);
+    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        chunks.0.to_vec(),
+        second.to_vec(),
+        third.to_vec(),
+        fourth.to_vec(),
+    ]));
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let downstream = resp.bytes().await.expect("响应流应可读");
+    let expected = [upstream.as_slice(), b"data: [DONE]\n\n"].concat();
+    assert_eq!(downstream.as_ref(), expected, "直通响应应原样拼接上游块");
+
+    let mut billed = None;
+    for _ in 0..100 {
+        billed = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT input_tokens, output_tokens, cost_usd_micros FROM request_log LIMIT 1",
+        )
+        .fetch_optional(&gw.pool)
+        .await
+        .expect("应能查询请求日志");
+        if billed.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(billed, Some((10, 2, 45)), "跨块 usage 应完成结算");
+}
+
+/// 上游自带的 OpenAI `[DONE]` 不直搬，网关仍在结算完成后仅下发一个哨兵。
+#[tokio::test]
+async fn stream_passthrough_replaces_upstream_done_after_settlement() {
+    let mut gw = TestGateway::start().await;
+    let usage = b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n";
+    let mixed = b"event: custom\ndata: hello\ndata:\t[DONE]\n\n";
+    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        usage.to_vec(),
+        mixed[..19].to_vec(),
+        mixed[19..].to_vec(),
+        b"event: terminal\r\ndata: [DO".to_vec(),
+        b"NE]\r\n\r\n".to_vec(),
+    ]));
+
+    let resp = send_stream(&gw.base_url()).await;
+    let downstream = resp.bytes().await.expect("响应流应可读");
+    let expected = [
+        usage.as_slice(),
+        b"event: custom\ndata: hello\n\n",
+        b"data: [DONE]\n\n",
+    ]
+    .concat();
+    assert_eq!(downstream.as_ref(), expected, "终止哨兵只能出现一次");
+
+    let settled: i64 =
+        sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
+            .bind(TEST_TOKEN_KEY)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("读到哨兵时结算应已落库");
+    assert_eq!(settled, 45);
+}
+
+/// 未闭合的普通上游事件仍按已接收字节直搬，并与网关终止哨兵分隔。
+#[tokio::test]
+async fn stream_passthrough_separates_done_after_unclosed_event() {
+    let mut gw = TestGateway::start().await;
+    let upstream = b"event: custom\r\ndata: partial";
+    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        upstream[..12].to_vec(),
+        upstream[12..].to_vec(),
+    ]));
+
+    let resp = send_stream(&gw.base_url()).await;
+    let downstream = resp.bytes().await.expect("响应流应可读");
+    let expected = [upstream.as_slice(), b"\n\ndata: [DONE]\n\n"].concat();
+    assert_eq!(downstream.as_ref(), expected);
+}
+
+/// 混合事件中的上游哨兵行被移除时，EOF 前其余字段不得丢失。
+#[tokio::test]
+async fn stream_passthrough_preserves_unclosed_mixed_event_tail() {
+    let mut gw = TestGateway::start().await;
+    let upstream = b"event: custom\ndata: hello\ndata: [DONE]\nid: retained";
+    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        upstream[..7].to_vec(),
+        upstream[7..35].to_vec(),
+        upstream[35..].to_vec(),
+    ]));
+
+    let resp = send_stream(&gw.base_url()).await;
+    let downstream = resp.bytes().await.expect("响应流应可读");
+    let expected = b"event: custom\ndata: hello\nid: retained\n\ndata: [DONE]\n\n";
+    assert_eq!(downstream.as_ref(), expected);
+}
+
+/// 下游读到首块后断开，直通任务仍继续消费上游尾部 usage 并完成结算。
+#[tokio::test]
+async fn stream_passthrough_settles_after_downstream_disconnect() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream.set_behavior(UpstreamBehavior::DelayedRawSse {
+        chunks: vec![
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
+            b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n".to_vec(),
+        ],
+        delay_ms: 100,
+    });
+
+    let resp = send_stream(&gw.base_url()).await;
+    let mut downstream = resp.bytes_stream();
+    let mut prefix = Vec::new();
+    while !prefix.windows(5).any(|window| window == b"first") {
+        let chunk = downstream
+            .next()
+            .await
+            .expect("正文前响应流不应结束")
+            .expect("响应块应可读");
+        prefix.extend_from_slice(&chunk);
+    }
+    drop(downstream);
+
+    let mut settled = 0;
+    for _ in 0..100 {
+        settled =
+            sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
+                .bind(TEST_TOKEN_KEY)
+                .fetch_one(&gw.pool)
+                .await
+                .expect("应能查询余额");
+        if settled > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(settled, 45, "断连后仍应消费尾部 usage 并结算");
 }
 
 /// 快路径不免认证：未认证请求不触发直通出站，返回 401。
