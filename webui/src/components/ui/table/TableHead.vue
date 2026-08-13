@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import { cn } from '@/lib/cn';
+import { tableAlignClass, type TableAlign } from '@/components/ui/table/table-align';
 
 defineOptions({ inheritAttrs: false });
 
-const props = defineProps<{
-  class?: string;
-}>();
+const props = withDefaults(
+  defineProps<{
+    class?: string;
+    align?: TableAlign;
+  }>(),
+  {
+    class: '',
+    align: 'left',
+  },
+);
 </script>
 
 <template>
@@ -14,7 +22,8 @@ const props = defineProps<{
     v-bind="$attrs"
     :class="
       cn(
-        'h-10 px-2 text-left align-middle text-sm font-medium whitespace-nowrap text-[var(--seed-fg)] [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]',
+        'sticky top-0 z-10 h-10 bg-[var(--seed-surface)] px-2 align-middle text-sm font-medium whitespace-nowrap text-[var(--seed-fg)] [&:has([role=checkbox])]:pr-0 [&>[role=checkbox]]:translate-y-[2px]',
+        tableAlignClass[props.align],
         props.class,
       )
     "

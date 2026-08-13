@@ -10,16 +10,19 @@ import EmptyState from '@/components/ui/EmptyState.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
-import DataTablePanel from '@/components/ui/DataTablePanel.vue';
-import TableSkeleton from '@/components/ui/TableSkeleton.vue';
-import VirtualDataTable from '@/components/ui/VirtualDataTable.vue';
+import DataTable from '@/components/ui/data-table/DataTable.vue';
+import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
+import DataTableMenuSeparator from '@/components/ui/data-table/DataTableMenuSeparator.vue';
+import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
+import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
+import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
+import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { formatUsdAmount, formatUsdMicros, parseUsdToMicros } from '@/lib/format';
-import { managementTableColumnPresets } from '@/lib/management-table-column-presets';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 
 const { t } = useI18n();
@@ -45,6 +48,7 @@ const pricesQuery = useQuery({
 });
 
 const prices = computed(() => pricesQuery.data.value ?? []);
+const showTableSkeleton = computed(() => pricesQuery.isPending.value && !pricesQuery.data.value);
 
 const filteredPrices = computed(() => {
   const q = searchText.value.trim().toLowerCase();
@@ -176,29 +180,8 @@ function formatOptionalMicros(value: number | null): string {
       </template>
     </PageHeader>
 
-    <div class="card mb-4 shrink-0">
-      <div class="card-body">
-        <FormTextInput
-          id="pricing-search"
-          v-model="searchText"
-          type="text"
-          class="max-w-md"
-          data-testid="pricing-search"
-          :placeholder="t('pricing.model')"
-          :aria-label="t('pricing.model')"
-        />
-      </div>
-    </div>
-
-    <TableSkeleton
-      v-if="pricesQuery.isPending.value"
-      fill-viewport
-      class="min-h-0 flex-1"
-      :columns="6"
-    />
-
     <InlineError
-      v-else-if="pricesQuery.isError.value"
+      v-if="pricesQuery.isError.value && !pricesQuery.data.value"
       :message="extractApiError(pricesQuery.error.value).message"
       @retry="() => pricesQuery.refetch()"
     />
@@ -206,93 +189,100 @@ function formatOptionalMicros(value: number | null): string {
     <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
       <p v-if="actionError" class="text-danger mb-4 shrink-0">{{ actionError }}</p>
 
-      <DataTablePanel fill-viewport class="min-h-0 flex-1">
-        <VirtualDataTable
-          :row-count="filteredPrices.length"
-          :columns="managementTableColumnPresets.pricing"
-          :estimate-row-height="52"
-        >
-          <template #header>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{{ t('pricing.model') }}</TableHead>
-                <TableHead>{{ t('pricing.input') }}</TableHead>
-                <TableHead>{{ t('pricing.output') }}</TableHead>
-                <TableHead>{{ t('pricing.cacheRead') }}</TableHead>
-                <TableHead>{{ t('pricing.cacheWrite') }}</TableHead>
-                <TableHead>{{ t('common.actions') }}</TableHead>
-              </TableRow>
-            </TableHeader>
-          </template>
-          <template #row="{ index }">
+      <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
+        <template #toolbar>
+          <DataTableToolbar>
+            <FormTextInput
+              id="pricing-search"
+              v-model="searchText"
+              type="text"
+              class="h-8 max-w-xs"
+              data-testid="pricing-search"
+              :placeholder="t('pricing.model')"
+              :aria-label="t('pricing.model')"
+            />
+          </DataTableToolbar>
+        </template>
+        <TableHeader>
+          <TableRow>
+            <TableHead>{{ t('pricing.model') }}</TableHead>
+            <TableHead>{{ t('pricing.input') }}</TableHead>
+            <TableHead>{{ t('pricing.output') }}</TableHead>
+            <TableHead>{{ t('pricing.cacheRead') }}</TableHead>
+            <TableHead>{{ t('pricing.cacheWrite') }}</TableHead>
+            <TableHead align="center">{{ t('common.actions') }}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="6" />
+          <template v-else>
             <TableRow
-              v-if="filteredPrices[index]"
-              :key="filteredPrices[index].model"
+              v-for="price in filteredPrices"
+              :key="price.model"
               data-testid="price-row"
-              :data-price-model="filteredPrices[index].model"
+              :data-price-model="price.model"
             >
-              <TableCell class="font-medium">{{ filteredPrices[index].model }}</TableCell>
+              <TableCell class="font-medium">{{ price.model }}</TableCell>
               <TableCell class="font-mono" data-testid="price-input">
-                {{ formatUsdMicros(filteredPrices[index].input_micros) }}
+                {{ formatUsdMicros(price.input_micros) }}
               </TableCell>
               <TableCell class="font-mono" data-testid="price-output">
-                {{ formatUsdMicros(filteredPrices[index].output_micros) }}
+                {{ formatUsdMicros(price.output_micros) }}
               </TableCell>
               <TableCell class="font-mono" data-testid="price-cache-read">
-                {{ formatOptionalMicros(filteredPrices[index].cache_read_micros) }}
+                {{ formatOptionalMicros(price.cache_read_micros) }}
               </TableCell>
               <TableCell class="font-mono" data-testid="price-cache-write">
-                {{ formatOptionalMicros(filteredPrices[index].cache_write_micros) }}
+                {{ formatOptionalMicros(price.cache_write_micros) }}
               </TableCell>
-              <TableCell>
-                <span class="inline-flex flex-wrap items-center gap-1">
+              <TableCell align="center">
+                <span
+                  v-if="confirmingDeleteModel === price.model"
+                  class="inline-flex items-center justify-center gap-1"
+                >
                   <button
                     type="button"
-                    class="btn btn-sm btn-subtle"
-                    data-testid="pricing-edit-entry"
-                    @click="openEdit(filteredPrices[index])"
+                    class="btn btn-sm btn-danger-filled"
+                    data-testid="pricing-delete-confirm"
+                    @click="handleDelete(price.model)"
                   >
-                    {{ t('common.edit') }}
+                    {{ t('common.confirmDelete') }}
                   </button>
                   <button
-                    v-if="confirmingDeleteModel !== filteredPrices[index].model"
                     type="button"
-                    class="btn btn-sm btn-subtle text-danger"
+                    class="btn btn-sm btn-ghost"
+                    @click="confirmingDeleteModel = null"
+                  >
+                    {{ t('common.cancel') }}
+                  </button>
+                </span>
+                <DataTableRowActions v-else>
+                  <DataTableMenuItem data-testid="pricing-edit-entry" @select="openEdit(price)">
+                    {{ t('common.edit') }}
+                  </DataTableMenuItem>
+                  <DataTableMenuSeparator />
+                  <DataTableMenuItem
+                    danger
                     data-testid="pricing-delete-entry"
-                    @click="handleDelete(filteredPrices[index].model)"
+                    @select="handleDelete(price.model)"
                   >
                     {{ t('common.delete') }}
+                  </DataTableMenuItem>
+                </DataTableRowActions>
+              </TableCell>
+            </TableRow>
+            <TableRow v-if="filteredPrices.length === 0">
+              <TableCell :colspan="6" class="h-24 whitespace-normal">
+                <EmptyState :title="t('common.emptyList')">
+                  <button type="button" class="btn btn-primary" @click="openCreate">
+                    {{ t('pricing.createEntry') }}
                   </button>
-                  <template v-else>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-danger-filled"
-                      data-testid="pricing-delete-confirm"
-                      @click="handleDelete(filteredPrices[index].model)"
-                    >
-                      {{ t('common.confirmDelete') }}
-                    </button>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-ghost"
-                      @click="confirmingDeleteModel = null"
-                    >
-                      {{ t('common.cancel') }}
-                    </button>
-                  </template>
-                </span>
+                </EmptyState>
               </TableCell>
             </TableRow>
           </template>
-          <template v-if="filteredPrices.length === 0" #empty>
-            <EmptyState :title="t('common.emptyList')">
-              <button type="button" class="btn btn-primary" @click="openCreate">
-                {{ t('pricing.createEntry') }}
-              </button>
-            </EmptyState>
-          </template>
-        </VirtualDataTable>
-      </DataTablePanel>
+        </TableBody>
+      </DataTable>
     </div>
 
     <AppModal v-if="showEditor" :labelled-by="editorTitleId" @close="showEditor = false">

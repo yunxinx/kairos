@@ -3,29 +3,28 @@ import { computed, ref, useId } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { BalanceView, Token } from '@/api/types';
+import type { Token } from '@/api/types';
+import { loadTokenRows, type TokenRow } from '@/api/token-rows';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import AppModal from '@/components/ui/AppModal.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
-import DataTablePanel from '@/components/ui/DataTablePanel.vue';
-import TableSkeleton from '@/components/ui/TableSkeleton.vue';
-import VirtualDataTable from '@/components/ui/VirtualDataTable.vue';
+import DataTable from '@/components/ui/data-table/DataTable.vue';
+import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
+import DataTableMenuSeparator from '@/components/ui/data-table/DataTableMenuSeparator.vue';
+import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
+import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
+import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
+import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { formatUsdAmount, formatUsdMicros, parseUsdToMicros } from '@/lib/format';
-import { managementTableColumnPresets } from '@/lib/management-table-column-presets';
 import type { FieldValidationSpec } from '@/lib/form-validation';
-
-type TokenRow = Token & {
-  balance_usd_micros: number;
-  settled_usd_micros: number;
-};
 
 type BalanceMode = 'recharge' | 'deduct';
 
@@ -58,6 +57,7 @@ const tokensQuery = useQuery({
 });
 
 const tokens = computed(() => tokensQuery.data.value ?? []);
+const showTableSkeleton = computed(() => tokensQuery.isPending.value && !tokensQuery.data.value);
 
 const filteredTokens = computed(() => {
   const q = searchText.value.trim().toLowerCase();
@@ -66,24 +66,6 @@ const filteredTokens = computed(() => {
     (token) => token.name.toLowerCase().includes(q) || token.token_key.toLowerCase().includes(q),
   );
 });
-
-async function loadTokenRows(): Promise<TokenRow[]> {
-  const listed = await apiClient.listTokens();
-  // 余额读是 `POST .../balance` 且 delta=0，仍占 SQLite 写锁；必须串行，避免 Promise.all 并发写触发 database is locked。
-  const balances: BalanceView[] = [];
-  for (const token of listed) {
-    balances.push(await apiClient.readTokenBalance(token.token_key));
-  }
-  const byKey = new Map(balances.map((item) => [item.token_key, item]));
-  return listed.map((token) => {
-    const balance = byKey.get(token.token_key);
-    return {
-      ...token,
-      balance_usd_micros: balance?.balance_usd_micros ?? 0,
-      settled_usd_micros: balance?.settled_usd_micros ?? 0,
-    };
-  });
-}
 
 function invalidateTokens() {
   return queryClient.invalidateQueries({ queryKey: ['tokens'] });
@@ -229,29 +211,8 @@ function formatLimit(limit: number | null): string {
       </template>
     </PageHeader>
 
-    <div class="card mb-4 shrink-0">
-      <div class="card-body">
-        <FormTextInput
-          id="tokens-search"
-          v-model="searchText"
-          type="text"
-          class="max-w-md"
-          data-testid="tokens-search"
-          :placeholder="t('tokens.search')"
-          :aria-label="t('tokens.search')"
-        />
-      </div>
-    </div>
-
-    <TableSkeleton
-      v-if="tokensQuery.isPending.value"
-      fill-viewport
-      class="min-h-0 flex-1"
-      :columns="6"
-    />
-
     <InlineError
-      v-else-if="tokensQuery.isError.value"
+      v-if="tokensQuery.isError.value && !tokensQuery.data.value"
       :message="extractApiError(tokensQuery.error.value).message"
       @retry="() => tokensQuery.refetch()"
     />
@@ -259,111 +220,114 @@ function formatLimit(limit: number | null): string {
     <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
       <p v-if="actionError" class="text-danger mb-4 shrink-0">{{ actionError }}</p>
 
-      <DataTablePanel fill-viewport class="min-h-0 flex-1">
-        <VirtualDataTable
-          :row-count="filteredTokens.length"
-          :columns="managementTableColumnPresets.tokens"
-          :estimate-row-height="56"
-        >
-          <template #header>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{{ t('tokens.name') }}</TableHead>
-                <TableHead>{{ t('tokens.key') }}</TableHead>
-                <TableHead>{{ t('tokens.balance') }}</TableHead>
-                <TableHead>{{ t('tokens.settled') }}</TableHead>
-                <TableHead>{{ t('tokens.limit') }}</TableHead>
-                <TableHead>{{ t('common.actions') }}</TableHead>
-              </TableRow>
-            </TableHeader>
-          </template>
-          <template #row="{ index }">
+      <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
+        <template #toolbar>
+          <DataTableToolbar>
+            <FormTextInput
+              id="tokens-search"
+              v-model="searchText"
+              type="text"
+              class="h-8 max-w-xs"
+              data-testid="tokens-search"
+              :placeholder="t('tokens.search')"
+              :aria-label="t('tokens.search')"
+            />
+          </DataTableToolbar>
+        </template>
+        <TableHeader>
+          <TableRow>
+            <TableHead>{{ t('tokens.name') }}</TableHead>
+            <TableHead align="center">{{ t('tokens.key') }}</TableHead>
+            <TableHead>{{ t('tokens.balance') }}</TableHead>
+            <TableHead>{{ t('tokens.settled') }}</TableHead>
+            <TableHead align="center">{{ t('tokens.limit') }}</TableHead>
+            <TableHead align="center">{{ t('common.actions') }}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="6" />
+          <template v-else>
             <TableRow
-              v-if="filteredTokens[index]"
-              :key="filteredTokens[index].token_key"
+              v-for="token in filteredTokens"
+              :key="token.token_key"
               data-testid="token-row"
-              :data-token-key="filteredTokens[index].token_key"
+              :data-token-key="token.token_key"
             >
-              <TableCell class="font-medium">{{ filteredTokens[index].name }}</TableCell>
-              <TableCell>
+              <TableCell class="font-medium">{{ token.name }}</TableCell>
+              <TableCell align="center">
                 <code class="code-chip rounded px-2 py-0.5 font-mono text-xs">
-                  {{ filteredTokens[index].token_key }}
+                  {{ token.token_key }}
                 </code>
               </TableCell>
               <TableCell class="font-mono" data-testid="token-balance">
-                {{ formatUsdMicros(filteredTokens[index].balance_usd_micros) }}
+                {{ formatUsdMicros(token.balance_usd_micros) }}
               </TableCell>
               <TableCell class="font-mono" data-testid="token-settled">
-                {{ formatUsdMicros(filteredTokens[index].settled_usd_micros) }}
+                {{ formatUsdMicros(token.settled_usd_micros) }}
               </TableCell>
-              <TableCell class="font-mono">
-                {{ formatLimit(filteredTokens[index].limit_usd_micros) }}
+              <TableCell align="center" class="font-mono">
+                {{ formatLimit(token.limit_usd_micros) }}
               </TableCell>
-              <TableCell>
-                <span class="inline-flex flex-wrap items-center gap-1">
+              <TableCell align="center">
+                <span
+                  v-if="confirmingDeleteKey === token.token_key"
+                  class="inline-flex items-center justify-center gap-1"
+                >
                   <button
                     type="button"
-                    class="btn btn-sm btn-subtle"
+                    class="btn btn-sm btn-danger-filled"
+                    data-testid="token-delete-confirm"
+                    @click="handleDelete(token.token_key)"
+                  >
+                    {{ t('common.confirmDelete') }}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    @click="confirmingDeleteKey = null"
+                  >
+                    {{ t('common.cancel') }}
+                  </button>
+                </span>
+                <DataTableRowActions v-else>
+                  <DataTableMenuItem
                     data-testid="token-recharge"
-                    @click="openBalance(filteredTokens[index], 'recharge')"
+                    @select="openBalance(token, 'recharge')"
                   >
                     {{ t('tokens.recharge') }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-subtle"
+                  </DataTableMenuItem>
+                  <DataTableMenuItem
                     data-testid="token-deduct"
-                    @click="openBalance(filteredTokens[index], 'deduct')"
+                    @select="openBalance(token, 'deduct')"
                   >
                     {{ t('tokens.deduct') }}
-                  </button>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-subtle"
-                    data-testid="token-edit"
-                    @click="openEdit(filteredTokens[index])"
-                  >
+                  </DataTableMenuItem>
+                  <DataTableMenuItem data-testid="token-edit" @select="openEdit(token)">
                     {{ t('common.edit') }}
-                  </button>
-                  <button
-                    v-if="confirmingDeleteKey !== filteredTokens[index].token_key"
-                    type="button"
-                    class="btn btn-sm btn-subtle text-danger"
+                  </DataTableMenuItem>
+                  <DataTableMenuSeparator />
+                  <DataTableMenuItem
+                    danger
                     data-testid="token-delete"
-                    @click="handleDelete(filteredTokens[index].token_key)"
+                    @select="handleDelete(token.token_key)"
                   >
                     {{ t('common.delete') }}
+                  </DataTableMenuItem>
+                </DataTableRowActions>
+              </TableCell>
+            </TableRow>
+            <TableRow v-if="filteredTokens.length === 0">
+              <TableCell :colspan="6" class="h-24 whitespace-normal">
+                <EmptyState :title="t('common.emptyList')">
+                  <button type="button" class="btn btn-primary" @click="openCreate">
+                    {{ t('tokens.create') }}
                   </button>
-                  <template v-else>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-danger-filled"
-                      data-testid="token-delete-confirm"
-                      @click="handleDelete(filteredTokens[index].token_key)"
-                    >
-                      {{ t('common.confirmDelete') }}
-                    </button>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-ghost"
-                      @click="confirmingDeleteKey = null"
-                    >
-                      {{ t('common.cancel') }}
-                    </button>
-                  </template>
-                </span>
+                </EmptyState>
               </TableCell>
             </TableRow>
           </template>
-          <template v-if="filteredTokens.length === 0" #empty>
-            <EmptyState :title="t('common.emptyList')">
-              <button type="button" class="btn btn-primary" @click="openCreate">
-                {{ t('tokens.create') }}
-              </button>
-            </EmptyState>
-          </template>
-        </VirtualDataTable>
-      </DataTablePanel>
+        </TableBody>
+      </DataTable>
     </div>
 
     <AppModal v-if="showEditor" :labelled-by="editorTitleId" @close="showEditor = false">

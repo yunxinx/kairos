@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
@@ -9,20 +9,18 @@ import EmptyState from '@/components/ui/EmptyState.vue';
 import FilterField from '@/components/ui/FilterField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
-import DataTablePanel from '@/components/ui/DataTablePanel.vue';
-import TableSkeleton from '@/components/ui/TableSkeleton.vue';
-import UiSelect from '@/components/ui/UiSelect.vue';
-import VirtualDataTable from '@/components/ui/VirtualDataTable.vue';
+import DataTable from '@/components/ui/data-table/DataTable.vue';
+import DataTablePagination from '@/components/ui/data-table/DataTablePagination.vue';
+import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
+import TableBody from '@/components/ui/table/TableBody.vue';
+import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
+import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow from '@/features/logs/LogTableRow.vue';
-import type { FlatLogRow } from '@/features/logs/flat-log-row';
-import { managementTableColumnPresets } from '@/lib/management-table-column-presets';
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
-const MAIN_ROW_HEIGHT = 52;
-const DETAIL_ROW_HEIGHT = 280;
 
 const { t } = useI18n();
 
@@ -57,6 +55,10 @@ const pageSizeOptions = computed(() =>
     label: String(size),
   })),
 );
+
+watch(page, () => {
+  expandedIds.value = new Set();
+});
 
 function datetimeLocalToMillis(value: string): number | undefined {
   const trimmed = value.trim();
@@ -97,26 +99,19 @@ const logsQuery = useQuery({
 });
 
 const items = computed(() => logsQuery.data.value?.items ?? []);
+const showTableSkeleton = computed(() => logsQuery.isPending.value && !logsQuery.data.value);
 const total = computed(() => logsQuery.data.value?.total ?? 0);
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
 const canGoPrevious = computed(() => page.value > 1);
 const canGoNext = computed(() => page.value < totalPages.value && total.value > 0);
 
-const flatRows = computed((): FlatLogRow[] => {
-  const rows: FlatLogRow[] = [];
-  for (let itemIndex = 0; itemIndex < items.value.length; itemIndex += 1) {
-    rows.push({ kind: 'main', itemIndex });
-    const item = items.value[itemIndex];
-    if (item && expandedIds.value.has(item.id)) {
-      rows.push({ kind: 'detail', itemIndex });
-    }
-  }
-  return rows;
-});
-
-function rowHeight(index: number): number {
-  return flatRows.value[index]?.kind === 'detail' ? DETAIL_ROW_HEIGHT : MAIN_ROW_HEIGHT;
-}
+const paginationSummary = computed(() =>
+  t('logs.paginationSummary', {
+    page: page.value,
+    totalPages: totalPages.value,
+    total: total.value,
+  }),
+);
 
 function applyFilters() {
   appliedTokenKey.value = draftTokenKey.value;
@@ -135,22 +130,6 @@ function clearFilters() {
   applyFilters();
 }
 
-function goToPrevious() {
-  if (!canGoPrevious.value) {
-    return;
-  }
-  page.value -= 1;
-  expandedIds.value = new Set();
-}
-
-function goToNext() {
-  if (!canGoNext.value) {
-    return;
-  }
-  page.value += 1;
-  expandedIds.value = new Set();
-}
-
 function toggleExpand(id: number) {
   const next = new Set(expandedIds.value);
   if (next.has(id)) {
@@ -164,167 +143,120 @@ function toggleExpand(id: number) {
 function isExpanded(id: number): boolean {
   return expandedIds.value.has(id);
 }
-
-function resolvedRow(index: number) {
-  const flatRow = flatRows.value[index];
-  if (!flatRow) {
-    return undefined;
-  }
-  const entry = items.value[flatRow.itemIndex];
-  if (!entry) {
-    return undefined;
-  }
-  return { flatRow, entry };
-}
 </script>
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
     <PageHeader :title="t('nav.logs')" :subtitle="t('logs.subtitle')" />
 
-    <div class="card mb-4 shrink-0">
-      <div class="card-body flex flex-wrap items-end gap-3">
-        <FilterField
-          :label="t('logs.tokenKey')"
-          input-id="logs-token-key"
-          class="min-w-[12rem] flex-1"
-        >
-          <FormTextInput
-            id="logs-token-key"
-            v-model="draftTokenKey"
-            type="text"
-            :placeholder="t('logs.tokenKeyPlaceholder')"
-          />
-        </FilterField>
-        <FilterField :label="t('logs.model')" input-id="logs-model" class="min-w-[10rem] flex-1">
-          <FormTextInput
-            id="logs-model"
-            v-model="draftModel"
-            type="text"
-            :placeholder="t('logs.modelPlaceholder')"
-          />
-        </FilterField>
-        <FilterField :label="t('logs.from')" input-id="logs-from" class="min-w-[12rem]">
-          <FormTextInput id="logs-from" v-model="draftFrom" type="datetime-local" />
-        </FilterField>
-        <FilterField :label="t('logs.to')" input-id="logs-to" class="min-w-[12rem]">
-          <FormTextInput id="logs-to" v-model="draftTo" type="datetime-local" />
-        </FilterField>
-        <button
-          type="button"
-          class="btn btn-primary"
-          data-testid="logs-apply-filters"
-          @click="applyFilters"
-        >
-          {{ t('logs.applyFilters') }}
-        </button>
-        <button
-          type="button"
-          class="btn btn-subtle"
-          data-testid="logs-clear-filters"
-          @click="clearFilters"
-        >
-          {{ t('logs.clearFilters') }}
-        </button>
-      </div>
-    </div>
-
-    <TableSkeleton
-      v-if="logsQuery.isPending.value"
-      fill-viewport
-      class="min-h-0 flex-1"
-      :columns="8"
-    />
-
     <InlineError
-      v-else-if="logsQuery.isError.value"
+      v-if="logsQuery.isError.value && !logsQuery.data.value"
       :message="extractApiError(logsQuery.error.value).message"
       @retry="() => logsQuery.refetch()"
     />
 
-    <div v-else class="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden">
-      <DataTablePanel fill-viewport class="min-h-0 flex-1">
-        <VirtualDataTable
-          :row-count="flatRows.length"
-          :columns="managementTableColumnPresets.logs"
-          :estimate-row-height="MAIN_ROW_HEIGHT"
-          :get-row-height="rowHeight"
-        >
-          <template #header>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{{ t('logs.created') }}</TableHead>
-                <TableHead>{{ t('logs.token') }}</TableHead>
-                <TableHead>{{ t('logs.model') }}</TableHead>
-                <TableHead>{{ t('logs.channel') }}</TableHead>
-                <TableHead>{{ t('logs.status') }}</TableHead>
-                <TableHead>{{ t('logs.latency') }}</TableHead>
-                <TableHead>{{ t('logs.cost') }}</TableHead>
-                <TableHead class="w-10"
-                  ><span class="sr-only">{{ t('logs.expand') }}</span></TableHead
-                >
-              </TableRow>
-            </TableHeader>
-          </template>
-          <template #row="{ index, measureRow }">
+    <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
+        <template #toolbar>
+          <DataTableToolbar class="items-end">
+            <FilterField
+              :label="t('logs.tokenKey')"
+              input-id="logs-token-key"
+              class="min-w-[12rem] flex-1"
+            >
+              <FormTextInput
+                id="logs-token-key"
+                v-model="draftTokenKey"
+                type="text"
+                class="h-8"
+                :placeholder="t('logs.tokenKeyPlaceholder')"
+              />
+            </FilterField>
+            <FilterField
+              :label="t('logs.model')"
+              input-id="logs-model"
+              class="min-w-[10rem] flex-1"
+            >
+              <FormTextInput
+                id="logs-model"
+                v-model="draftModel"
+                type="text"
+                class="h-8"
+                :placeholder="t('logs.modelPlaceholder')"
+              />
+            </FilterField>
+            <FilterField :label="t('logs.from')" input-id="logs-from" class="min-w-[12rem]">
+              <FormTextInput id="logs-from" v-model="draftFrom" type="datetime-local" class="h-8" />
+            </FilterField>
+            <FilterField :label="t('logs.to')" input-id="logs-to" class="min-w-[12rem]">
+              <FormTextInput id="logs-to" v-model="draftTo" type="datetime-local" class="h-8" />
+            </FilterField>
+            <button
+              type="button"
+              class="btn btn-primary"
+              data-testid="logs-apply-filters"
+              @click="applyFilters"
+            >
+              {{ t('logs.applyFilters') }}
+            </button>
+            <button
+              type="button"
+              class="btn btn-subtle"
+              data-testid="logs-clear-filters"
+              @click="clearFilters"
+            >
+              {{ t('logs.clearFilters') }}
+            </button>
+          </DataTableToolbar>
+        </template>
+        <TableHeader>
+          <TableRow>
+            <TableHead>{{ t('logs.created') }}</TableHead>
+            <TableHead>{{ t('logs.token') }}</TableHead>
+            <TableHead>{{ t('logs.model') }}</TableHead>
+            <TableHead>{{ t('logs.channel') }}</TableHead>
+            <TableHead>{{ t('logs.status') }}</TableHead>
+            <TableHead>{{ t('logs.latency') }}</TableHead>
+            <TableHead>{{ t('logs.cost') }}</TableHead>
+            <TableHead class="w-10">
+              <span class="sr-only">{{ t('logs.expand') }}</span>
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
+          <template v-else>
             <LogTableRow
-              v-if="resolvedRow(index)"
-              :flat-row="resolvedRow(index)!.flatRow"
-              :entry="resolvedRow(index)!.entry"
-              :expanded="isExpanded(resolvedRow(index)!.entry.id)"
+              v-for="entry in items"
+              :key="entry.id"
+              :entry="entry"
+              :expanded="isExpanded(entry.id)"
               :detail-col-span="8"
-              :measure-row="measureRow"
-              @toggle-expand="toggleExpand(resolvedRow(index)!.entry.id)"
+              @toggle-expand="toggleExpand(entry.id)"
             />
+            <TableRow v-if="items.length === 0">
+              <TableCell :colspan="8" class="h-24 whitespace-normal">
+                <EmptyState data-testid="logs-empty" :title="t('common.emptyList')" />
+              </TableCell>
+            </TableRow>
           </template>
-          <template v-if="items.length === 0" #empty>
-            <EmptyState data-testid="logs-empty" :title="t('common.emptyList')" />
-          </template>
-        </VirtualDataTable>
-      </DataTablePanel>
-
-      <div v-if="total > 0" class="flex shrink-0 flex-wrap items-center justify-between gap-3">
-        <div class="flex flex-wrap items-center gap-3">
-          <label class="text-fg-muted inline-flex items-center gap-2 text-sm" for="logs-page-size">
-            <span>{{ t('logs.pageSize') }}</span>
-            <UiSelect
-              id="logs-page-size"
-              v-model="pageSizeModel"
-              class="min-w-[6rem]"
-              :options="pageSizeOptions"
-            />
-          </label>
-          <span class="text-fg-muted text-sm" data-testid="logs-pagination-summary">
-            {{
-              t('logs.paginationSummary', {
-                page: page,
-                totalPages: totalPages,
-                total: total,
-              })
-            }}
-          </span>
-        </div>
-        <div class="inline-flex gap-2">
-          <button
-            type="button"
-            class="btn btn-sm btn-subtle"
-            data-testid="logs-prev"
-            :disabled="!canGoPrevious"
-            @click="goToPrevious"
-          >
-            {{ t('common.previousPage') }}
-          </button>
-          <button
-            type="button"
-            class="btn btn-sm btn-subtle"
-            data-testid="logs-next"
-            :disabled="!canGoNext"
-            @click="goToNext"
-          >
-            {{ t('common.nextPage') }}
-          </button>
-        </div>
-      </div>
+        </TableBody>
+        <template #pagination>
+          <DataTablePagination
+            v-model:page="page"
+            v-model:page-size="pageSizeModel"
+            :total-pages="totalPages"
+            :summary="paginationSummary"
+            page-size-id="logs-page-size"
+            :page-size-options="pageSizeOptions"
+            :can-previous="canGoPrevious"
+            :can-next="canGoNext"
+            summary-test-id="logs-pagination-summary"
+            previous-test-id="logs-prev"
+            next-test-id="logs-next"
+          />
+        </template>
+      </DataTable>
     </div>
   </div>
 </template>

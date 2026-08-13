@@ -15,8 +15,7 @@ const { t } = useI18n();
 <template>
   <div
     data-slot="app-shell"
-    class="app-shell relative flex flex-col"
-    :class="hideNav ? 'min-h-dvh' : 'h-dvh max-h-dvh overflow-hidden'"
+    class="app-shell relative flex h-dvh max-h-dvh flex-col overflow-hidden"
   >
     <a href="#main-content" class="skip-link">{{ t('a11y.skipToContent') }}</a>
     <template v-if="!hideNav">

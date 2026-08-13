@@ -5,5 +5,5 @@ import { requireAuth } from '@/lib/router-guards';
 export const Route = createFileRoute('/pricing')({
   beforeLoad: requireAuth,
   component: PricingFeature,
-  staticData: { titleKey: 'nav.pricing' },
+  staticData: { titleKey: 'nav.pricing', fillViewport: true },
 });

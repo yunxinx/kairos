@@ -12,16 +12,19 @@ import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import FormTextarea from '@/components/ui/FormTextarea.vue';
 import InlineError from '@/components/ui/InlineError.vue';
-import DataTablePanel from '@/components/ui/DataTablePanel.vue';
-import TableSkeleton from '@/components/ui/TableSkeleton.vue';
+import DataTable from '@/components/ui/data-table/DataTable.vue';
+import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
+import DataTableMenuSeparator from '@/components/ui/data-table/DataTableMenuSeparator.vue';
+import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
+import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
-import VirtualDataTable from '@/components/ui/VirtualDataTable.vue';
+import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
+import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
-import { managementTableColumnPresets } from '@/lib/management-table-column-presets';
 import { parseOptionalUint } from '@/lib/uint-parse';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 
@@ -50,6 +53,7 @@ const confirmingDeleteName = ref<string | null>(null);
 const actionError = ref('');
 const probeByName = ref<Record<string, ChannelProbeResult>>({});
 const testingName = ref<string | null>(null);
+const searchText = ref('');
 
 const protocolOptions = computed(() =>
   PROTOCOLS.map((value) => ({
@@ -64,6 +68,20 @@ const channelsQuery = useQuery({
 });
 
 const channels = computed(() => channelsQuery.data.value ?? []);
+const showTableSkeleton = computed(
+  () => channelsQuery.isPending.value && !channelsQuery.data.value,
+);
+
+const filteredChannels = computed(() => {
+  const q = searchText.value.trim().toLowerCase();
+  if (!q) return channels.value;
+  return channels.value.filter((channel) => {
+    if (channel.name.toLowerCase().includes(q)) return true;
+    if (channel.base_url.toLowerCase().includes(q)) return true;
+    if (channel.models.some((model) => model.toLowerCase().includes(q))) return true;
+    return t(`protocol.${channel.protocol}`).toLowerCase().includes(q);
+  });
+});
 
 function invalidateChannels() {
   return queryClient.invalidateQueries({ queryKey: ['channels'] });
@@ -283,16 +301,8 @@ function probeClass(result: ChannelProbeResult): string {
       </template>
     </PageHeader>
 
-    <TableSkeleton
-      v-if="channelsQuery.isPending.value"
-      fill-viewport
-      class="min-h-0 flex-1"
-      :columns="7"
-      :with-toolbar="false"
-    />
-
     <InlineError
-      v-else-if="channelsQuery.isError.value"
+      v-if="channelsQuery.isError.value && !channelsQuery.data.value"
       :message="extractApiError(channelsQuery.error.value).message"
       @retry="() => channelsQuery.refetch()"
     />
@@ -300,113 +310,116 @@ function probeClass(result: ChannelProbeResult): string {
     <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
       <p v-if="actionError" class="text-danger mb-4 shrink-0">{{ actionError }}</p>
 
-      <DataTablePanel fill-viewport class="min-h-0 flex-1">
-        <VirtualDataTable
-          :row-count="channels.length"
-          :columns="managementTableColumnPresets.channels"
-          :estimate-row-height="56"
-        >
-          <template #header>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{{ t('channel.name') }}</TableHead>
-                <TableHead>{{ t('channel.protocol') }}</TableHead>
-                <TableHead>{{ t('channel.baseUrl') }}</TableHead>
-                <TableHead>{{ t('channel.models') }}</TableHead>
-                <TableHead>{{ t('channel.priority') }}</TableHead>
-                <TableHead>{{ t('channel.test') }}</TableHead>
-                <TableHead>{{ t('common.actions') }}</TableHead>
-              </TableRow>
-            </TableHeader>
-          </template>
-          <template #row="{ index }">
+      <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
+        <template #toolbar>
+          <DataTableToolbar>
+            <FormTextInput
+              id="channels-search"
+              v-model="searchText"
+              type="text"
+              class="h-8 max-w-xs"
+              data-testid="channels-search"
+              :placeholder="t('channel.search')"
+              :aria-label="t('channel.search')"
+            />
+          </DataTableToolbar>
+        </template>
+        <TableHeader>
+          <TableRow>
+            <TableHead>{{ t('channel.name') }}</TableHead>
+            <TableHead>{{ t('channel.protocol') }}</TableHead>
+            <TableHead>{{ t('channel.baseUrl') }}</TableHead>
+            <TableHead>{{ t('channel.models') }}</TableHead>
+            <TableHead>{{ t('channel.priority') }}</TableHead>
+            <TableHead>{{ t('channel.test') }}</TableHead>
+            <TableHead align="center">{{ t('common.actions') }}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="7" />
+          <template v-else>
             <TableRow
-              v-if="channels[index]"
-              :key="channels[index].name"
+              v-for="channel in filteredChannels"
+              :key="channel.name"
               data-testid="channel-row"
-              :data-channel-name="channels[index].name"
+              :data-channel-name="channel.name"
             >
-              <TableCell class="font-medium">{{ channels[index].name }}</TableCell>
-              <TableCell>{{ t(`protocol.${channels[index].protocol}`) }}</TableCell>
-              <TableCell class="font-mono text-sm">{{ channels[index].base_url }}</TableCell>
+              <TableCell class="font-medium">{{ channel.name }}</TableCell>
+              <TableCell>{{ t(`protocol.${channel.protocol}`) }}</TableCell>
+              <TableCell class="font-mono text-sm">{{ channel.base_url }}</TableCell>
               <TableCell class="font-mono text-sm">
-                {{ channels[index].models.join(', ') }}
+                {{ channel.models.join(', ') }}
               </TableCell>
-              <TableCell class="font-mono">{{ channels[index].priority }}</TableCell>
+              <TableCell class="font-mono">{{ channel.priority }}</TableCell>
               <TableCell>
                 <span class="flex flex-col gap-1">
                   <button
                     type="button"
                     class="btn btn-sm btn-subtle"
                     data-testid="channel-test"
-                    :disabled="testingName === channels[index].name"
-                    @click="handleTest(channels[index].name)"
+                    :disabled="testingName === channel.name"
+                    @click="handleTest(channel.name)"
                   >
-                    {{
-                      testingName === channels[index].name
-                        ? t('channel.testing')
-                        : t('channel.test')
-                    }}
+                    {{ testingName === channel.name ? t('channel.testing') : t('channel.test') }}
                   </button>
                   <span
-                    v-if="probeByName[channels[index].name]"
+                    v-if="probeByName[channel.name]"
                     class="badge"
-                    :class="probeClass(probeByName[channels[index].name]!)"
+                    :class="probeClass(probeByName[channel.name]!)"
                     data-testid="channel-probe-result"
                   >
-                    {{ probeText(probeByName[channels[index].name]!) }}
+                    {{ probeText(probeByName[channel.name]!) }}
                   </span>
                 </span>
               </TableCell>
-              <TableCell>
-                <span class="inline-flex flex-wrap items-center gap-1">
+              <TableCell align="center">
+                <span
+                  v-if="confirmingDeleteName === channel.name"
+                  class="inline-flex items-center justify-center gap-1"
+                >
                   <button
                     type="button"
-                    class="btn btn-sm btn-subtle"
-                    data-testid="channel-edit"
-                    @click="openEdit(channels[index])"
+                    class="btn btn-sm btn-danger-filled"
+                    data-testid="channel-delete-confirm"
+                    @click="handleDelete(channel.name)"
                   >
-                    {{ t('common.edit') }}
+                    {{ t('common.confirmDelete') }}
                   </button>
                   <button
-                    v-if="confirmingDeleteName !== channels[index].name"
                     type="button"
-                    class="btn btn-sm btn-subtle text-danger"
+                    class="btn btn-sm btn-ghost"
+                    @click="confirmingDeleteName = null"
+                  >
+                    {{ t('common.cancel') }}
+                  </button>
+                </span>
+                <DataTableRowActions v-else>
+                  <DataTableMenuItem data-testid="channel-edit" @select="openEdit(channel)">
+                    {{ t('common.edit') }}
+                  </DataTableMenuItem>
+                  <DataTableMenuSeparator />
+                  <DataTableMenuItem
+                    danger
                     data-testid="channel-delete"
-                    @click="handleDelete(channels[index].name)"
+                    @select="handleDelete(channel.name)"
                   >
                     {{ t('common.delete') }}
+                  </DataTableMenuItem>
+                </DataTableRowActions>
+              </TableCell>
+            </TableRow>
+            <TableRow v-if="filteredChannels.length === 0">
+              <TableCell :colspan="7" class="h-24 whitespace-normal">
+                <EmptyState :title="t('common.emptyList')">
+                  <button type="button" class="btn btn-primary" @click="openCreate">
+                    {{ t('channel.create') }}
                   </button>
-                  <template v-else>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-danger-filled"
-                      data-testid="channel-delete-confirm"
-                      @click="handleDelete(channels[index].name)"
-                    >
-                      {{ t('common.confirmDelete') }}
-                    </button>
-                    <button
-                      type="button"
-                      class="btn btn-sm btn-ghost"
-                      @click="confirmingDeleteName = null"
-                    >
-                      {{ t('common.cancel') }}
-                    </button>
-                  </template>
-                </span>
+                </EmptyState>
               </TableCell>
             </TableRow>
           </template>
-          <template v-if="channels.length === 0" #empty>
-            <EmptyState :title="t('common.emptyList')">
-              <button type="button" class="btn btn-primary" @click="openCreate">
-                {{ t('channel.create') }}
-              </button>
-            </EmptyState>
-          </template>
-        </VirtualDataTable>
-      </DataTablePanel>
+        </TableBody>
+      </DataTable>
     </div>
 
     <AppModal v-if="showEditor" wide :labelled-by="editorTitleId" @close="showEditor = false">

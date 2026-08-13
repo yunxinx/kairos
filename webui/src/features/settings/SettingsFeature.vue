@@ -93,22 +93,24 @@ function resetForm() {
   <div>
     <PageHeader :title="t('nav.settings')" :subtitle="t('settings.subtitle')" />
 
-    <div v-if="settingsQuery.isPending.value" class="card">
-      <div class="card-body space-y-3">
-        <SkeletonBlock height="h-4" width="w-40" />
-        <SkeletonBlock height="h-10" width="w-full" />
-      </div>
-    </div>
-
     <InlineError
-      v-else-if="settingsQuery.isError.value"
+      v-if="settingsQuery.isError.value && !settingsQuery.data.value"
       :message="extractApiError(settingsQuery.error.value).message"
       @retry="() => settingsQuery.refetch()"
     />
 
     <form v-else novalidate class="space-y-4" @submit.prevent="handleSave">
       <div class="card">
-        <div class="card-body space-y-4">
+        <div
+          v-if="settingsQuery.isPending.value && !settingsQuery.data.value"
+          class="card-body space-y-4"
+        >
+          <SkeletonBlock height="h-4" width="w-40" />
+          <SkeletonBlock height="h-10" width="w-full" />
+          <SkeletonBlock height="h-4" width="w-48" />
+          <SkeletonBlock height="h-10" width="w-full" />
+        </div>
+        <div v-else class="card-body space-y-4">
           <FormField
             field-name="fullBody"
             :label="t('settings.fullBody')"
@@ -158,7 +160,7 @@ function resetForm() {
           type="submit"
           class="btn btn-primary"
           data-testid="settings-save"
-          :disabled="saveMutation.isPending.value"
+          :disabled="saveMutation.isPending.value || !settingsQuery.data.value"
         >
           {{ t('settings.save') }}
         </button>

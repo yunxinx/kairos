@@ -1,5 +1,6 @@
 import { authedTest as test, expect } from './fixtures';
 import { E2E_ADMIN_KEY } from './helpers/gateway';
+import { clickRowAction } from './helpers/table';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -39,7 +40,7 @@ test.describe('pricing resource page', () => {
     expect(saved?.cache_read_micros).toBe(1);
     expect(saved?.cache_write_micros).toBeNull();
 
-    await row.getByTestId('pricing-edit-entry').click();
+    await clickRowAction(row, page, 'pricing-edit-entry');
     await expect(page.locator('#pricing-editor-input')).toHaveValue('1.000001');
     await expect(page.locator('#pricing-editor-output')).toHaveValue('2.5');
     await expect(page.locator('#pricing-editor-cache-read')).toHaveValue('0.000001');
@@ -48,7 +49,7 @@ test.describe('pricing resource page', () => {
     await page.getByTestId('pricing-save-entry').click();
     await expect(row.getByTestId('price-output')).toHaveText('$3.25');
 
-    await row.getByTestId('pricing-delete-entry').click();
+    await clickRowAction(row, page, 'pricing-delete-entry');
     await row.getByTestId('pricing-delete-confirm').click();
     await expect(row).toHaveCount(0);
   });

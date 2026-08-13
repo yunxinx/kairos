@@ -622,6 +622,12 @@ html[lang='zh-CN'] {
   outline: none;
   box-shadow: var(--focus-ring);
 }
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+  pointer-events: none;
+}
 
 .btn-primary {
   background: var(--seed-primary);
@@ -676,6 +682,12 @@ html[lang='zh-CN'] {
 }
 .btn-ghost:hover {
   background: var(--seed-surface-alt);
+}
+
+.btn-icon {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
 }
 
 .icon-btn {
@@ -760,6 +772,55 @@ html[lang='zh-CN'] {
 [data-slot='table-cell'].whitespace-normal,
 [data-slot='table-cell'] .whitespace-normal {
   white-space: normal;
+}
+
+/* ── Data table row menu（Reka DropdownMenu；视觉对齐 shadcn-admin）── */
+.data-table-menu {
+  box-sizing: border-box;
+  min-width: 10rem;
+  background: var(--seed-surface);
+  border: 2px solid var(--seed-border);
+  border-radius: var(--seed-radius);
+  box-shadow: 2px 3px 0 0 var(--card-shadow);
+  padding: 4px;
+  outline: none;
+  z-index: var(--z-overlay);
+}
+.data-table-menu[data-state='open'] {
+  animation: reka-pop-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.data-table-menu[data-state='closed'] {
+  animation: reka-pop-out 120ms ease-in;
+}
+.data-table-menu-item {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  cursor: pointer;
+  border-radius: calc(var(--seed-radius) - 2px);
+  padding: 6px 8px;
+  font-size: 13px;
+  outline: none;
+  color: var(--seed-fg);
+}
+.data-table-menu-item[data-highlighted] {
+  background: var(--seed-surface-alt);
+}
+.data-table-menu-item[data-disabled] {
+  pointer-events: none;
+  opacity: 0.5;
+}
+.data-table-menu-item-danger {
+  color: var(--danger);
+}
+.data-table-menu-item-danger[data-highlighted] {
+  background: var(--danger-bg);
+}
+.data-table-menu-separator {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--seed-border);
 }
 
 /* ── Form Controls ── */

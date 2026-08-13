@@ -1,4 +1,5 @@
 import { authedTest as test, expect } from './fixtures';
+import { clickRowAction } from './helpers/table';
 import { startProbeUpstream } from './helpers/upstream';
 
 test.describe.configure({ mode: 'serial' });
@@ -26,7 +27,16 @@ test.describe('channel resource page', () => {
       await expect(okRow).toBeVisible();
       await expect(okRow).toContainText('gpt-4o-mini');
 
-      await okRow.getByTestId('channel-edit').click();
+      await page.getByTestId('channels-search').fill('ok-channel');
+      await expect(okRow).toBeVisible();
+      await page.getByTestId('channels-search').fill('gpt-4o-mini');
+      await expect(okRow).toBeVisible();
+      await page.getByTestId('channels-search').fill('no-such-channel');
+      await expect(okRow).toHaveCount(0);
+      await page.getByTestId('channels-search').fill('');
+      await expect(okRow).toBeVisible();
+
+      await clickRowAction(okRow, page, 'channel-edit');
       await page.locator('#channel-editor-models').fill('gpt-4o-mini\ngpt-4o');
       await page.locator('#channel-editor-aliases').fill('mini=gpt-4o-mini');
       await page.getByTestId('channel-save').click();
@@ -47,7 +57,7 @@ test.describe('channel resource page', () => {
       await failRow.getByTestId('channel-test').click();
       await expect(failRow.getByTestId('channel-probe-result')).toHaveText(/Failed · 500 · \d+ ms/);
 
-      await okRow.getByTestId('channel-edit').click();
+      await clickRowAction(okRow, page, 'channel-edit');
       await expect(page.locator('#channel-editor-models')).toHaveValue('gpt-4o-mini\ngpt-4o');
       await expect(page.locator('#channel-editor-aliases')).toHaveValue('mini=gpt-4o-mini');
       await expect(page.locator('#channel-editor-priority')).toHaveValue('10');
@@ -59,7 +69,7 @@ test.describe('channel resource page', () => {
         .getByRole('button', { name: /cancel/i })
         .click();
 
-      await okRow.getByTestId('channel-delete').click();
+      await clickRowAction(okRow, page, 'channel-delete');
       await okRow.getByTestId('channel-delete-confirm').click();
       await expect(okRow).toHaveCount(0);
     } finally {

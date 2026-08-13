@@ -81,7 +81,12 @@
     "copy": "Copy",
     "copied": "Copied",
     "previousPage": "Previous",
-    "nextPage": "Next"
+    "nextPage": "Next",
+    "firstPage": "First page",
+    "lastPage": "Last page",
+    "openRowActions": "Open row actions",
+    "pageStatus": "Page {page} of {totalPages}",
+    "rowsPerPage": "Rows per page"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -111,6 +116,7 @@
   "channel": {
     "subtitle": "Configure upstream endpoints and probe them before they take traffic.",
     "create": "Create channel",
+    "search": "Search by name, URL, or model",
     "editorCreate": "New channel",
     "editorEdit": "Edit channel",
     "name": "Name",

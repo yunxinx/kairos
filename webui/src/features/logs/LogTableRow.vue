@@ -1,20 +1,16 @@
 <script setup lang="ts">
-import type { ComponentPublicInstance } from 'vue';
 import { useI18n } from 'vue-i18n';
 import type { LogEntry } from '@/api/types';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import LogBodyPanel from '@/features/logs/LogBodyPanel.vue';
-import type { FlatLogRow } from '@/features/logs/flat-log-row';
 import { formatUnixMillis, formatUsdMicros } from '@/lib/format';
 
-const props = defineProps<{
-  flatRow: FlatLogRow;
+defineProps<{
   entry: LogEntry;
   expanded: boolean;
   detailColSpan: number;
-  measureRow: (element: unknown) => void;
 }>();
 
 const emit = defineEmits<{
@@ -23,10 +19,6 @@ const emit = defineEmits<{
 
 const { t, locale } = useI18n();
 
-function onRowRef(element: Element | ComponentPublicInstance | null) {
-  props.measureRow(element);
-}
-
 function statusBadgeClass(statusCode: number): string {
   return statusCode >= 200 && statusCode < 300 ? 'badge-success' : 'badge-danger';
 }
@@ -34,8 +26,6 @@ function statusBadgeClass(statusCode: number): string {
 
 <template>
   <TableRow
-    v-if="flatRow.kind === 'main'"
-    :ref="onRowRef"
     data-testid="log-row"
     :data-log-id="String(entry.id)"
     :data-model="entry.model"
@@ -60,10 +50,10 @@ function statusBadgeClass(statusCode: number): string {
     <TableCell class="font-mono text-sm" data-testid="log-cost">
       {{ formatUsdMicros(entry.cost_usd_micros) }}
     </TableCell>
-    <TableCell>
+    <TableCell align="right" class="w-10">
       <button
         type="button"
-        class="text-fg-muted hover:text-fg inline-flex h-7 w-7 items-center justify-center rounded-md"
+        class="btn btn-ghost btn-icon"
         data-testid="log-expand"
         :aria-expanded="expanded ? 'true' : 'false'"
         :aria-label="expanded ? t('logs.collapseDetails') : t('logs.expandDetails')"
@@ -73,7 +63,7 @@ function statusBadgeClass(statusCode: number): string {
       </button>
     </TableCell>
   </TableRow>
-  <TableRow v-else :ref="onRowRef" data-testid="log-detail-row" class="hover:bg-transparent">
+  <TableRow v-if="expanded" data-testid="log-detail-row" class="hover:bg-transparent">
     <TableCell :colspan="detailColSpan" class="align-top whitespace-normal">
       <LogBodyPanel :entry="entry" />
     </TableCell>

@@ -6,6 +6,7 @@ import UiIcon from '@/components/ui/UiIcon.vue';
 import { toggleLocale } from '@/app/providers/i18n';
 import { getStoredTheme, resolveDark, toggleTheme } from '@/lib/theme';
 import { NAV_TABS } from '@/lib/nav';
+import { prefetchAdminRoute } from '@/lib/prefetch-admin';
 import { clearAdminKey, hasAdminKey } from '@/lib/session';
 import { useResolvedDarkTheme } from '@/composables/useResolvedDarkTheme';
 
@@ -25,8 +26,10 @@ const themeActionLabel = computed(() =>
   resolveDark(getStoredTheme()) ? t('app.themeLight') : t('app.themeDark'),
 );
 
-function handleScroll() {
-  peek.value = window.scrollY > 80;
+function handleScroll(event: Event) {
+  const target = event.currentTarget;
+  const top = target instanceof HTMLElement ? target.scrollTop : window.scrollY;
+  peek.value = top > 80;
 }
 
 function toggle() {
@@ -49,6 +52,9 @@ function scrollActiveTabIntoView() {
 watch(menuOpen, (open) => {
   if (!open) return;
   void nextTick(scrollActiveTabIntoView);
+  for (const tab of tabs.value) {
+    prefetchAdminRoute(tab.to);
+  }
 });
 
 async function handleLogout() {
@@ -68,10 +74,13 @@ function handleLocaleToggle() {
   closeMenu();
 }
 
+let scrollRoot: HTMLElement | Window = window;
+
 onMounted(() => {
-  window.addEventListener('scroll', handleScroll, { passive: true });
+  scrollRoot = document.getElementById('main-content') ?? window;
+  scrollRoot.addEventListener('scroll', handleScroll, { passive: true });
 });
-onUnmounted(() => window.removeEventListener('scroll', handleScroll));
+onUnmounted(() => scrollRoot.removeEventListener('scroll', handleScroll));
 </script>
 
 <template>

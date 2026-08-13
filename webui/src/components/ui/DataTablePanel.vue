@@ -6,7 +6,7 @@ defineOptions({ inheritAttrs: false });
 const props = withDefaults(
   defineProps<{
     class?: string;
-    /** 在 flex 列布局中占满剩余高度，供表体虚拟滚动使用。 */
+    /** 在 flex 列布局中占满剩余高度，供表体在边框内滚动。 */
     fillViewport?: boolean;
   }>(),
   {

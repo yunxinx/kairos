@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n';
 import ThemeToggle from '@/app/shell/ThemeToggle.vue';
 import LocaleToggle from '@/app/shell/LocaleToggle.vue';
 import { NAV_TABS } from '@/lib/nav';
+import { prefetchAdminRoute } from '@/lib/prefetch-admin';
 import { clearAdminKey, hasAdminKey } from '@/lib/session';
 
 const { t } = useI18n();
@@ -28,6 +29,8 @@ async function handleLogout() {
           :to="tab.to"
           class="tab-link"
           :activeProps="{ class: 'router-link-active' }"
+          @pointerenter="prefetchAdminRoute(tab.to)"
+          @focus="prefetchAdminRoute(tab.to)"
         >
           {{ t(tab.labelKey) }}
         </Link>

@@ -1,5 +1,6 @@
 import { authedTest as test, expect } from './fixtures';
 import { E2E_ADMIN_KEY } from './helpers/gateway';
+import { clickRowAction } from './helpers/table';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -25,13 +26,13 @@ test.describe('token resource page', () => {
     await page.getByTestId('tokens-search').fill('');
     await expect(row).toBeVisible();
 
-    await row.getByTestId('token-recharge').click();
+    await clickRowAction(row, page, 'token-recharge');
     await page.locator('#token-balance-amount').fill('1.5');
     await page.getByTestId('token-balance-save').click();
     await expect(row.getByTestId('token-balance')).toHaveText('$1.5');
     await expect(row.getByTestId('token-settled')).toHaveText('$0');
 
-    await row.getByTestId('token-deduct').click();
+    await clickRowAction(row, page, 'token-deduct');
     await page.locator('#token-balance-amount').fill('0.25');
     await page.getByTestId('token-balance-save').click();
     await expect(row.getByTestId('token-balance')).toHaveText('$1.25');
@@ -48,13 +49,13 @@ test.describe('token resource page', () => {
     expect(balance.balance_usd_micros).toBe(1_250_000);
     expect(balance.settled_usd_micros).toBe(0);
 
-    await row.getByTestId('token-edit').click();
+    await clickRowAction(row, page, 'token-edit');
     await page.locator('#token-editor-name').fill('Alpha renamed');
     await page.getByTestId('token-save').click();
     await expect(row.getByText('Alpha renamed')).toBeVisible();
     await expect(row.getByTestId('token-balance')).toHaveText('$1.25');
 
-    await row.getByTestId('token-delete').click();
+    await clickRowAction(row, page, 'token-delete');
     await row.getByTestId('token-delete-confirm').click();
     await expect(row).toHaveCount(0);
   });
@@ -90,7 +91,7 @@ test.describe('token resource page', () => {
     });
     expect(deleted.ok()).toBeTruthy();
 
-    await row.getByTestId('token-recharge').click();
+    await clickRowAction(row, page, 'token-recharge');
     await page.locator('#token-balance-amount').fill('1');
     await page.getByTestId('token-balance-save').click();
     await expect(page.getByTestId('token-balance-error')).toContainText(/sk-e2e-gone/);

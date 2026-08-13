@@ -2,6 +2,11 @@
 export type IconName =
   | 'chevron-down'
   | 'chevron-up'
+  | 'chevron-left'
+  | 'chevron-right'
+  | 'chevrons-left'
+  | 'chevrons-right'
+  | 'more-horizontal'
   | 'check'
   | 'menu'
   | 'close'
@@ -29,6 +34,28 @@ export const iconDefs: Record<IconName, IconDef> = {
   },
   'chevron-up': {
     paths: ['M18 15l-6-6-6 6'],
+  },
+  'chevron-left': {
+    paths: ['M15 18l-6-6 6-6'],
+  },
+  'chevron-right': {
+    paths: ['M9 18l6-6-6-6'],
+  },
+  /** 分页「第一页」。路径来自 Lucide「chevrons-left」(ISC)。 */
+  'chevrons-left': {
+    paths: ['M11 17l-5-5 5-5', 'M18 17l-5-5 5-5'],
+  },
+  /** 分页「最后一页」。路径来自 Lucide「chevrons-right」(ISC)。 */
+  'chevrons-right': {
+    paths: ['M13 7l5 5-5 5', 'M6 7l5 5-5 5'],
+  },
+  /** 行操作菜单。路径来自 Lucide「more-horizontal」(ISC)。 */
+  'more-horizontal': {
+    circles: [
+      { cx: 12, cy: 12, r: 1 },
+      { cx: 19, cy: 12, r: 1 },
+      { cx: 5, cy: 12, r: 1 },
+    ],
   },
   check: {
     paths: ['M20 6L9 17l-5-5'],
