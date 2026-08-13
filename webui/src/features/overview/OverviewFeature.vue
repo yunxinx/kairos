@@ -69,7 +69,12 @@ const showError = computed(() => statsQuery.isError.value && !statsQuery.data.va
   <div>
     <PageHeader :title="t('overview.title')">
       <template #actions>
-        <FilterField :label="t('overview.days')" input-id="overview-days" class="min-w-[10rem]">
+        <FilterField
+          :label="t('overview.days')"
+          input-id="overview-days"
+          inline
+          class="min-w-[10rem]"
+        >
           <UiSelect
             id="overview-days"
             v-model="days"
