@@ -116,68 +116,122 @@ async fn admin_auth(State(admin_key): State<String>, request: Request, next: Nex
 
 // --- 令牌 ---
 
-/// 列出全部令牌（按 `token_key` 排序，保证确定性）。
-async fn list_tokens(State(deps): State<AdminDeps>) -> Result<Json<Vec<Token>>, AdminError> {
-    let snapshot = deps.snapshot.read().await;
-    let mut tokens: Vec<Token> = snapshot.tokens.values().cloned().collect();
-    tokens.sort_by(|a, b| a.token_key.cmp(&b.token_key));
-    Ok(Json(tokens))
+/// 令牌读响应 wire 契约：定义字段 + 生命周期元数据（写契约仍是 `Token`）。
+#[derive(Debug, Serialize)]
+struct TokenView {
+    token_key: String,
+    name: String,
+    limit_usd_micros: Option<i64>,
+    enabled: bool,
+    created_at: i64,
+    last_used_at: Option<i64>,
 }
 
-/// 新建令牌：已存在则冲突（409），否则写库 + 换快照 + 返回新令牌。
-async fn create_token(
-    State(deps): State<AdminDeps>,
-    body: Result<Json<Token>, axum::extract::rejection::JsonRejection>,
-) -> Result<(StatusCode, Json<Token>), AdminError> {
-    let token = body.map_err(AdminError::bad_body)?;
-    validate_token(&token)?;
-    {
-        let snapshot = deps.snapshot.read().await;
-        if snapshot.tokens.contains_key(&token.token_key) {
-            return Err(AdminError::Conflict(format!(
-                "令牌 {} 已存在",
-                token.token_key
-            )));
+impl TokenView {
+    /// 从存储层记录构造 wire 视图。
+    fn from_record(record: store::resources::TokenRecord) -> Self {
+        Self {
+            token_key: record.token.token_key,
+            name: record.token.name,
+            limit_usd_micros: record.token.limit_usd_micros,
+            enabled: record.token.enabled,
+            created_at: record.created_at,
+            last_used_at: record.last_used_at,
         }
     }
+}
+
+/// 列出全部令牌（按 `token_key` 排序，保证确定性）。
+///
+/// 直接读库而非快照：`last_used_at` 随请求路径刷新、不进快照，列表需要库内最新值。
+async fn list_tokens(State(deps): State<AdminDeps>) -> Result<Json<Vec<TokenView>>, AdminError> {
+    let mut records = store::resources::list_token_records(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
+    records.sort_by(|a, b| a.token.token_key.cmp(&b.token.token_key));
+    Ok(Json(
+        records.into_iter().map(TokenView::from_record).collect(),
+    ))
+}
+
+/// 新建令牌请求契约：不接受指定 key，key 由系统高熵生成。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenCreate {
+    name: String,
+    limit_usd_micros: Option<i64>,
+    enabled: bool,
+}
+
+/// 系统生成的令牌 key 前缀。
+const TOKEN_KEY_PREFIX: &str = "ks-";
+/// key 前缀之后的随机字符数。
+const TOKEN_KEY_RANDOM_LEN: usize = 64;
+
+/// 生成高熵令牌 key：`ks-` + 64 位大小写字母与数字（约 380 bit 熵，CSPRNG 采样）。
+fn generate_token_key() -> String {
+    use rand::distr::{Alphanumeric, SampleString};
+    let random_part = Alphanumeric.sample_string(&mut rand::rng(), TOKEN_KEY_RANDOM_LEN);
+    format!("{TOKEN_KEY_PREFIX}{random_part}")
+}
+
+/// 新建令牌：key 由系统生成（快照内查重，碰撞实际不可能发生），写库 + 换快照 + 返回新令牌。
+async fn create_token(
+    State(deps): State<AdminDeps>,
+    body: Result<Json<TokenCreate>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<TokenView>), AdminError> {
+    let create = body.map_err(AdminError::bad_body)?.0;
+    let token = Token {
+        token_key: {
+            let snapshot = deps.snapshot.read().await;
+            loop {
+                let candidate = generate_token_key();
+                if !snapshot.tokens.contains_key(&candidate) {
+                    break candidate;
+                }
+            }
+        },
+        name: create.name,
+        limit_usd_micros: create.limit_usd_micros,
+        enabled: create.enabled,
+    };
+    validate_token(&token)?;
+    let now = super::logging::unix_millis();
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::resources::upsert_token(&mut tx, &token)
+    crate::store::resources::upsert_token(&mut tx, &token, now)
         .await
         .map_err(AdminError::Store)?;
     // 令牌定义与余额分离存储：新建时同步建零额余额行，使令牌可被后续充值
     // （`adjust_balance` 的 UPDATE 只改已有行，缺行会报 MissingToken），否则
     // 新令牌永远无法被运营充值使用。
-    crate::store::ensure_token_balance(
-        &mut tx,
-        &token.token_key,
-        0.0,
-        super::logging::unix_millis(),
-    )
-    .await
-    .map_err(AdminError::Store)?;
-    tx.commit().await.map_err(db_err)?;
-    reload_and_swap(&deps).await?;
-    let created = read_token(&deps, &token.token_key).await?;
-    Ok((StatusCode::CREATED, Json(created)))
-}
-
-/// 整体替换令牌（按路径 `token_key`，路径权威）：写库 + 换快照 + 返回新令牌。
-async fn update_token(
-    State(deps): State<AdminDeps>,
-    Path(token_key): Path<String>,
-    body: Result<Json<Token>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<Token>, AdminError> {
-    let mut token = body.map_err(AdminError::bad_body)?;
-    token.token_key = token_key;
-    validate_token(&token)?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::resources::upsert_token(&mut tx, &token)
+    crate::store::ensure_token_balance(&mut tx, &token.token_key, 0.0, now)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    let updated = read_token(&deps, &token.token_key).await?;
-    Ok(Json(updated))
+    let created = read_token_record(&deps, &token.token_key).await?;
+    Ok((StatusCode::CREATED, Json(TokenView::from_record(created))))
+}
+
+/// 整体替换令牌（按路径 `token_key`，路径权威）：写库 + 换快照 + 返回新令牌。
+///
+/// upsert 的冲突分支不触碰创建时间与最后使用时间，属性编辑不重置生命周期元数据。
+async fn update_token(
+    State(deps): State<AdminDeps>,
+    Path(token_key): Path<String>,
+    body: Result<Json<Token>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<TokenView>, AdminError> {
+    let mut token = body.map_err(AdminError::bad_body)?;
+    token.token_key = token_key;
+    validate_token(&token)?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    crate::store::resources::upsert_token(&mut tx, &token, super::logging::unix_millis())
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    let updated = read_token_record(&deps, &token.token_key).await?;
+    Ok(Json(TokenView::from_record(updated)))
 }
 
 /// 删除令牌：不存在则 404，否则删除并返回被删令牌。
@@ -186,8 +240,8 @@ async fn update_token(
 async fn delete_token(
     State(deps): State<AdminDeps>,
     Path(token_key): Path<String>,
-) -> Result<Json<Token>, AdminError> {
-    let deleted = read_token(&deps, &token_key).await?;
+) -> Result<Json<TokenView>, AdminError> {
+    let deleted = read_token_record(&deps, &token_key).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::delete_token(&mut tx, &token_key)
         .await
@@ -197,7 +251,7 @@ async fn delete_token(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    Ok(Json(deleted))
+    Ok(Json(TokenView::from_record(deleted)))
 }
 
 // --- 渠道 ---
@@ -826,13 +880,14 @@ async fn reload_and_swap(deps: &AdminDeps) -> Result<(), AdminError> {
     Ok(())
 }
 
-/// 从当前快照读回一个令牌；不存在返回 `NotFound`。
-async fn read_token(deps: &AdminDeps, token_key: &str) -> Result<Token, AdminError> {
-    let snapshot = deps.snapshot.read().await;
-    snapshot
-        .tokens
-        .get(token_key)
-        .cloned()
+/// 从库读回一条令牌记录；不存在返回 `NotFound`。
+async fn read_token_record(
+    deps: &AdminDeps,
+    token_key: &str,
+) -> Result<store::resources::TokenRecord, AdminError> {
+    store::resources::get_token_record(&deps.pool, token_key)
+        .await
+        .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("令牌 {token_key} 不存在")))
 }
 

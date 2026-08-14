@@ -135,7 +135,7 @@ async fn admin_not_configured_means_no_admin_routes() {
     }
     let resp = client
         .post(format!("{}/tokens", gw.base_url()))
-        .json(&json!({ "token_key": "sk-x", "name": "x", "limit_usd_micros": null }))
+        .json(&json!({ "name": "x", "limit_usd_micros": null, "enabled": true }))
         .send()
         .await
         .expect("协议监听应可请求");
@@ -182,22 +182,31 @@ async fn unauthenticated_admin_request_is_401() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-/// 令牌 CRUD 往返 + 写后即时生效：新建立刻可用、删除立刻失效。
+/// 令牌 CRUD 往返 + 写后即时生效：新建立刻可用、删除立刻失效；key 由系统生成。
 #[tokio::test]
 async fn token_crud_roundtrip_and_immediate_effect() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    // 新建令牌。
+    // 新建令牌：不接受指定 key，系统生成 ks- 前缀 + 64 位字母数字。
     let resp = admin_json(
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "token_key": "sk-new", "name": "new-dev", "limit_usd_micros": null }),
+        json!({ "name": "new-dev", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建令牌");
-    assert_eq!(created["token_key"], "sk-new");
+    let new_key = created["token_key"]
+        .as_str()
+        .expect("应返回生成的 key")
+        .to_string();
+    assert!(new_key.starts_with("ks-"), "系统生成的 key 应以 ks- 开头");
+    assert_eq!(new_key.len(), 67, "key 应为前缀 + 64 位随机字符");
+    assert!(
+        new_key[3..].chars().all(|c| c.is_ascii_alphanumeric()),
+        "随机部分应为大小写字母与数字"
+    );
 
     // 列表反映新令牌。
     let list: Value = admin_get(&gw, "/tokens")
@@ -209,20 +218,20 @@ async fn token_crud_roundtrip_and_immediate_effect() {
         list.as_array()
             .unwrap()
             .iter()
-            .any(|t| t["token_key"] == "sk-new"),
+            .any(|t| t["token_key"] == new_key),
         "新建令牌应出现在列表"
     );
 
     // 新建令牌在请求路径即时可用：充值（余额调整属 04 票，测试内用相对量原语
     // 绕过）后请求成功。新建令牌已有零额余额行，故可被 `adjust_balance` 充值。
     let mut conn = gw.pool.acquire().await.expect("应能获取连接");
-    store::adjust_balance(&mut conn, "sk-new", 5_000_000)
+    store::adjust_balance(&mut conn, &new_key, 5_000_000)
         .await
         .expect("应能为新令牌充值");
     drop(conn);
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(completion_body()));
-    let resp = chat_request(&gw, "sk-new", TEST_MODEL).await;
+    let resp = chat_request(&gw, &new_key, TEST_MODEL).await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
@@ -231,14 +240,14 @@ async fn token_crud_roundtrip_and_immediate_effect() {
 
     // 删除后立即失效：请求路径认证失败（401），列表也移除。
     let resp = reqwest::Client::new()
-        .delete(format!("{}/tokens/sk-new", gw.admin_base_url()))
+        .delete(format!("{}/tokens/{new_key}", gw.admin_base_url()))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await
         .expect("应可删除令牌");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    let resp = chat_request(&gw, "sk-new", TEST_MODEL).await;
+    let resp = chat_request(&gw, &new_key, TEST_MODEL).await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::UNAUTHORIZED,
@@ -254,8 +263,98 @@ async fn token_crud_roundtrip_and_immediate_effect() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["token_key"] == "sk-new"),
+            .any(|t| t["token_key"] == new_key),
         "删除后令牌应移出列表"
+    );
+}
+
+/// 生命周期字段与启用开关：读响应带创建/最后使用时间，请求后刷新最后使用时间，
+/// 禁用立即在认证处拒绝（401），重新启用立即可用。
+#[tokio::test]
+async fn token_lifecycle_fields_and_disable_take_effect() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    // 新建：响应含生命周期字段，未使用前最后使用时间为空。
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({ "name": "life", "limit_usd_micros": null, "enabled": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建令牌");
+    let life_key = created["token_key"]
+        .as_str()
+        .expect("应返回生成的 key")
+        .to_string();
+    assert_eq!(created["enabled"], true);
+    assert!(
+        created["created_at"].as_i64().unwrap_or(0) > 0,
+        "创建时间应落库并回传"
+    );
+    assert!(
+        created["last_used_at"].is_null(),
+        "未使用前最后使用时间应为空"
+    );
+
+    // 充值后成功请求一次：列表中的最后使用时间被刷新。
+    let mut conn = gw.pool.acquire().await.expect("应能获取连接");
+    store::adjust_balance(&mut conn, &life_key, 5_000_000)
+        .await
+        .expect("应能充值");
+    drop(conn);
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let resp = chat_request(&gw, &life_key, TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let list: Value = admin_get(&gw, "/tokens")
+        .await
+        .json()
+        .await
+        .expect("令牌列表应可解析");
+    let life = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["token_key"] == life_key)
+        .cloned()
+        .expect("新建令牌应在列表");
+    assert!(
+        life["last_used_at"].as_i64().unwrap_or(0) > 0,
+        "请求后最后使用时间应刷新"
+    );
+
+    // 禁用后立即在认证处拒绝（401）。
+    let resp = admin_put(
+        &gw,
+        &format!("/tokens/{life_key}"),
+        json!({ "token_key": life_key, "name": "life", "limit_usd_micros": null, "enabled": false }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: Value = resp.json().await.expect("应返回变更后令牌");
+    assert_eq!(updated["enabled"], false, "PUT 回显应反映禁用");
+    let resp = chat_request(&gw, &life_key, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "禁用的令牌应被拒绝"
+    );
+
+    // 重新启用后立即可用。
+    let resp = admin_put(
+        &gw,
+        &format!("/tokens/{life_key}"),
+        json!({ "token_key": life_key, "name": "life", "limit_usd_micros": null, "enabled": true }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = chat_request(&gw, &life_key, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "重新启用的令牌应立即可用"
     );
 }
 
@@ -370,12 +469,22 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     let body: Value = resp.json().await.expect("应返回结构化错误");
     assert_eq!(body["error"]["code"], "invalid_body");
 
-    // 缺必填字段（token_key）→ 400（serde 拒绝）。
+    // 缺必填字段 → 400（serde 拒绝）。
     let resp = admin_json(
         &gw,
         reqwest::Method::POST,
         "/tokens",
         json!({ "name": "x" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 指定 token_key → 400：key 只由系统生成，创建契约不接受该字段。
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({ "token_key": "ks-custom", "name": "x", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
@@ -396,25 +505,36 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    // 重复新建 → 409，且不覆盖原资源。
-    let before: Value = admin_get(&gw, "/tokens")
+    // 重复新建 → 409，且不覆盖原资源（令牌 key 系统生成、创建不会冲突，以渠道为例）。
+    let before: Value = admin_get(&gw, "/channels")
         .await
         .json()
         .await
-        .expect("令牌列表应可解析");
+        .expect("渠道列表应可解析");
     let resp = admin_json(
         &gw,
         reqwest::Method::POST,
-        "/tokens",
-        json!({ "token_key": TEST_TOKEN_KEY, "name": "overwrite", "limit_usd_micros": null }),
+        "/channels",
+        json!({
+            "name": "test-channel",
+            "protocol": "openai_chat",
+            "base_url": gw.upstream.base_url(),
+            "api_key": "sk-other",
+            "models": ["gpt-4o"],
+            "model_aliases": {},
+            "priority": 9,
+            "weight": 9,
+            "timeout_ms": 1,
+            "max_retries": 9
+        }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
-    let after: Value = admin_get(&gw, "/tokens")
+    let after: Value = admin_get(&gw, "/channels")
         .await
         .json()
         .await
-        .expect("令牌列表应可解析");
+        .expect("渠道列表应可解析");
     assert_eq!(before, after, "冲突写不应改变库与快照");
 
     // 删除不存在的资源 → 404。
@@ -637,12 +757,20 @@ async fn runtime_resources_survive_process_restart() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "token_key": "sk-restart", "name": "restart", "limit_usd_micros": null }),
+        json!({ "name": "restart", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建令牌");
+    let restart_key = created["token_key"]
+        .as_str()
+        .expect("应返回生成的 key")
+        .to_string();
     let resp = reqwest::Client::new()
-        .post(format!("{}/tokens/sk-restart/balance", gw.admin_base_url()))
+        .post(format!(
+            "{}/tokens/{restart_key}/balance",
+            gw.admin_base_url()
+        ))
         .bearer_auth(TEST_ADMIN_KEY)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
@@ -698,7 +826,7 @@ async fn runtime_resources_survive_process_restart() {
         .set_behavior(UpstreamBehavior::Json(completion_body()));
     let resp = reqwest::Client::new()
         .post(format!("{base2}/v1/chat/completions"))
-        .bearer_auth("sk-restart")
+        .bearer_auth(&restart_key)
         .json(&json!({
             "model": "restart-only",
             "messages": [{ "role": "user", "content": "hi" }]
@@ -716,7 +844,7 @@ async fn runtime_resources_survive_process_restart() {
     let oversized_body = "x".repeat(3000);
     let resp = reqwest::Client::new()
         .post(format!("{base2}/v1/chat/completions"))
-        .bearer_auth("sk-restart")
+        .bearer_auth(&restart_key)
         .json(&json!({
             "model": TEST_MODEL,
             "messages": [{ "role": "user", "content": oversized_body }]
@@ -747,10 +875,15 @@ async fn empty_db_bootstraps_via_admin_api() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "token_key": "sk-boot", "name": "boot", "limit_usd_micros": null }),
+        json!({ "name": "boot", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建令牌");
+    let boot_key = created["token_key"]
+        .as_str()
+        .expect("应返回生成的 key")
+        .to_string();
 
     let resp = admin_json(
         &gw,
@@ -788,7 +921,7 @@ async fn empty_db_bootstraps_via_admin_api() {
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
     let resp = reqwest::Client::new()
-        .post(format!("{}/tokens/sk-boot/balance", gw.admin_base_url()))
+        .post(format!("{}/tokens/{boot_key}/balance", gw.admin_base_url()))
         .bearer_auth(TEST_ADMIN_KEY)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
@@ -798,7 +931,7 @@ async fn empty_db_bootstraps_via_admin_api() {
 
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(completion_body()));
-    let resp = chat_request(&gw, "sk-boot", TEST_MODEL).await;
+    let resp = chat_request(&gw, &boot_key, TEST_MODEL).await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
@@ -806,54 +939,50 @@ async fn empty_db_bootstraps_via_admin_api() {
     );
 }
 
-/// 删除令牌后同 key 重建：余额从零开始，不复活删除前的旧余额。
+/// 删除令牌同事务清理余额行：不留孤儿余额，杜绝任何途径复活旧余额。
 #[tokio::test]
-async fn recreated_token_does_not_resurrect_balance() {
+async fn deleting_token_clears_balance_row() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
     let client = reqwest::Client::new();
 
     // 建令牌并充值，确认请求可用（200）。
-    admin_json(
+    let resp = admin_json(
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "token_key": "sk-cycle", "name": "cycle", "limit_usd_micros": null }),
+        json!({ "name": "cycle", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建令牌");
+    let cycle_key = created["token_key"]
+        .as_str()
+        .expect("应返回生成的 key")
+        .to_string();
     let mut conn = gw.pool.acquire().await.expect("应能获取连接");
-    store::adjust_balance(&mut conn, "sk-cycle", 5_000_000)
+    store::adjust_balance(&mut conn, &cycle_key, 5_000_000)
         .await
         .expect("应能充值");
     drop(conn);
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(completion_body()));
-    let resp = chat_request(&gw, "sk-cycle", TEST_MODEL).await;
+    let resp = chat_request(&gw, &cycle_key, TEST_MODEL).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 删除后同 key 重建：余额行已随删除清理，重建播种零额。
+    // 删除后余额行一并清理：库内不再残留该 key 的余额记录。
     let resp = client
-        .delete(format!("{}/tokens/sk-cycle", gw.admin_base_url()))
+        .delete(format!("{}/tokens/{cycle_key}", gw.admin_base_url()))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await
         .expect("应可删除令牌");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let resp = admin_json(
-        &gw,
-        reqwest::Method::POST,
-        "/tokens",
-        json!({ "token_key": "sk-cycle", "name": "cycle-again", "limit_usd_micros": null }),
-    )
-    .await;
-    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
-
-    // 重建的令牌余额为零：计费准入拒绝（402），旧余额没有复活。
-    let resp = chat_request(&gw, "sk-cycle", TEST_MODEL).await;
-    assert_eq!(
-        resp.status(),
-        reqwest::StatusCode::PAYMENT_REQUIRED,
-        "重建令牌应为零余额，不复活旧余额"
-    );
+    let leftover: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM token_balance WHERE token_key = ?")
+        .bind(&cycle_key)
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能查询余额行");
+    assert_eq!(leftover.0, 0, "删除令牌应同事务清理余额行");
 }
 
 // --- 04 票：设置、余额调整与日志查询 ---
@@ -1011,7 +1140,7 @@ async fn token_attr_update_does_not_reset_balance() {
     let resp = admin_put(
         &gw,
         &format!("/tokens/{TEST_TOKEN_KEY}"),
-        json!({ "token_key": TEST_TOKEN_KEY, "name": "renamed", "limit_usd_micros": null }),
+        json!({ "token_key": TEST_TOKEN_KEY, "name": "renamed", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);

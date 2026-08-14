@@ -41,6 +41,20 @@ pub struct Token {
     pub name: String,
     /// 累计结算上限（micro-USD）；`None` 表示无上限。
     pub limit_usd_micros: Option<i64>,
+    /// 是否启用：禁用的令牌在网关认证阶段被拒绝。
+    pub enabled: bool,
+}
+
+/// 令牌的完整只读视图：定义字段 + 生命周期元数据（创建/最后使用时间）。
+///
+/// 生命周期字段由存储层维护，不属于可写契约，故不派生 serde。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRecord {
+    pub token: Token,
+    /// 创建时刻（unix 毫秒）；迁移前的存量令牌为 0。
+    pub created_at: i64,
+    /// 最后使用时刻（unix 毫秒）；`None` 表示从未使用。
+    pub last_used_at: Option<i64>,
 }
 
 /// 单模型四档单价（micro-USD / 1M tokens）；缓存档 `None` 表示回退 input 价。
@@ -188,37 +202,97 @@ pub async fn delete_channel(conn: &mut SqliteConnection, name: &str) -> Result<(
 
 /// 读出全部令牌。
 pub async fn list_tokens(pool: &SqlitePool) -> Result<Vec<Token>, StoreError> {
-    let rows = sqlx::query("SELECT token_key, name, limit_usd_micros FROM tokens")
-        .fetch_all(pool)
-        .await
-        .map_err(StoreError::Query)?;
+    Ok(list_token_records(pool)
+        .await?
+        .into_iter()
+        .map(|record| record.token)
+        .collect())
+}
 
-    let tokens = rows
-        .iter()
-        .map(|row| {
-            Ok(Token {
-                token_key: row.try_get("token_key").map_err(StoreError::Query)?,
-                name: row.try_get("name").map_err(StoreError::Query)?,
-                limit_usd_micros: row.try_get("limit_usd_micros").map_err(StoreError::Query)?,
-            })
-        })
-        .collect::<Result<Vec<_>, StoreError>>()?;
-    Ok(tokens)
+/// 读出全部令牌记录（含创建/最后使用时间等生命周期元数据）。
+pub async fn list_token_records(pool: &SqlitePool) -> Result<Vec<TokenRecord>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at \
+         FROM tokens",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    rows.iter().map(map_token_record).collect()
+}
+
+/// 按 `token_key` 读出一条令牌记录；不存在返回 `None`。
+pub async fn get_token_record(
+    pool: &SqlitePool,
+    token_key: &str,
+) -> Result<Option<TokenRecord>, StoreError> {
+    let row = sqlx::query(
+        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at \
+         FROM tokens WHERE token_key = ?",
+    )
+    .bind(token_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    row.as_ref().map(map_token_record).transpose()
+}
+
+/// 把令牌行映射为 `TokenRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
+fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreError> {
+    let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
+    Ok(TokenRecord {
+        token: Token {
+            token_key: row.try_get("token_key").map_err(StoreError::Query)?,
+            name: row.try_get("name").map_err(StoreError::Query)?,
+            limit_usd_micros: row.try_get("limit_usd_micros").map_err(StoreError::Query)?,
+            enabled: enabled != 0,
+        },
+        created_at: row.try_get("created_at").map_err(StoreError::Query)?,
+        last_used_at: row.try_get("last_used_at").map_err(StoreError::Query)?,
+    })
 }
 
 /// 新增或整体替换一个令牌（按 `token_key`），同一事务内幂等。
-pub async fn upsert_token(conn: &mut SqliteConnection, token: &Token) -> Result<(), StoreError> {
+///
+/// `created_at` 仅在首次插入时落库；冲突覆盖不改创建时间，也不改 `last_used_at`
+/// （编辑属性不算使用）。
+pub async fn upsert_token(
+    conn: &mut SqliteConnection,
+    token: &Token,
+    created_at: i64,
+) -> Result<(), StoreError> {
     sqlx::query(
-        "INSERT INTO tokens (token_key, name, limit_usd_micros) VALUES (?, ?, ?) \
+        "INSERT INTO tokens (token_key, name, limit_usd_micros, enabled, created_at) \
+         VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(token_key) DO UPDATE SET \
-           name = excluded.name, limit_usd_micros = excluded.limit_usd_micros",
+           name = excluded.name, limit_usd_micros = excluded.limit_usd_micros, \
+           enabled = excluded.enabled",
     )
     .bind(&token.token_key)
     .bind(&token.name)
     .bind(token.limit_usd_micros)
+    .bind(token.enabled)
+    .bind(created_at)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 刷新令牌的最后使用时间；供网关在请求通过计费准入后调用。
+pub async fn touch_token_used(
+    conn: &mut SqliteConnection,
+    token_key: &str,
+    at: i64,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_key = ?")
+        .bind(at)
+        .bind(token_key)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
     Ok(())
 }
 
@@ -458,7 +532,7 @@ mod tests {
         assert!(list_channels(&pool).await.expect("应能读").is_empty());
     }
 
-    /// 令牌播种 → 读回往返一致；limit 为 NULL 表示无上限。
+    /// 令牌播种 → 读回往返一致；limit 为 NULL 表示无上限，enabled 缺省启用。
     #[tokio::test]
     async fn token_upsert_then_list_roundtrip() {
         let (_dir, pool) = test_pool().await;
@@ -467,11 +541,65 @@ mod tests {
             token_key: "sk-a".to_string(),
             name: "dev".to_string(),
             limit_usd_micros: Some(5_000_000),
+            enabled: true,
         };
-        upsert_token(&mut conn, &token).await.expect("应能写令牌");
+        upsert_token(&mut conn, &token, 1_700_000_000_000)
+            .await
+            .expect("应能写令牌");
 
         let tokens = list_tokens(&pool).await.expect("应能读令牌");
         assert_eq!(tokens, vec![token]);
+    }
+
+    /// 生命周期元数据：创建时间首次插入后固定，覆盖更新不改；最后使用时间可刷新。
+    #[tokio::test]
+    async fn token_record_tracks_lifecycle() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let token = Token {
+            token_key: "sk-a".to_string(),
+            name: "dev".to_string(),
+            limit_usd_micros: None,
+            enabled: true,
+        };
+        upsert_token(&mut conn, &token, 1_000)
+            .await
+            .expect("应能写令牌");
+
+        let record = get_token_record(&pool, "sk-a")
+            .await
+            .expect("应能读记录")
+            .expect("记录应存在");
+        assert_eq!(record.created_at, 1_000);
+        assert_eq!(record.last_used_at, None, "未使用时为空");
+
+        // 覆盖更新（带不同的 created_at 入参）不改已有创建时间。
+        let mut renamed = token.clone();
+        renamed.name = "v2".to_string();
+        renamed.enabled = false;
+        upsert_token(&mut conn, &renamed, 9_999)
+            .await
+            .expect("应能覆盖令牌");
+        touch_token_used(&mut conn, "sk-a", 2_000)
+            .await
+            .expect("应能刷新最后使用时间");
+
+        let record = get_token_record(&pool, "sk-a")
+            .await
+            .expect("应能读记录")
+            .expect("记录应存在");
+        assert_eq!(record.token.name, "v2");
+        assert!(!record.token.enabled, "覆盖应更新启用状态");
+        assert_eq!(record.created_at, 1_000, "覆盖不应重置创建时间");
+        assert_eq!(record.last_used_at, Some(2_000));
+
+        assert!(
+            get_token_record(&pool, "sk-none")
+                .await
+                .expect("应能查询")
+                .is_none(),
+            "不存在的令牌返回 None"
+        );
     }
 
     /// 令牌定义存在性判断：存在返回 true，不存在返回 false。
@@ -489,7 +617,9 @@ mod tests {
                 token_key: "sk-a".to_string(),
                 name: "dev".to_string(),
                 limit_usd_micros: None,
+                enabled: true,
             },
+            1,
         )
         .await
         .expect("应能写令牌");
@@ -511,7 +641,9 @@ mod tests {
                 token_key: "sk-a".to_string(),
                 name: "v1".to_string(),
                 limit_usd_micros: None,
+                enabled: true,
             },
+            1,
         )
         .await
         .expect("应能写令牌");
@@ -527,7 +659,9 @@ mod tests {
                 token_key: "sk-a".to_string(),
                 name: "v2".to_string(),
                 limit_usd_micros: Some(9_000_000),
+                enabled: true,
             },
+            2,
         )
         .await
         .expect("应能更新令牌");

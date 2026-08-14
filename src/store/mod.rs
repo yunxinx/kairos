@@ -7,7 +7,7 @@
 pub mod resources;
 
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions};
 use thiserror::Error;
@@ -29,6 +29,10 @@ pub enum StoreError {
     InvalidResource(String),
 }
 
+/// 写锁等待上限：与 sqlx-sqlite 缺省一致，此处显式声明意图——SQLite 单写者下
+/// 请求路径结算/日志与管理面写并发时排队等待，而不是立即失败。
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 打开 SQLite 连接池并在事务内按序应用编号迁移。
 ///
 /// 缺库文件时自动创建（`create_if_missing`），迁移脚本内建在 `migrations/`。
@@ -36,7 +40,8 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(SQLITE_BUSY_TIMEOUT);
 
     let pool = SqlitePool::connect_with(options)
         .await

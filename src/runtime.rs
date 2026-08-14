@@ -158,7 +158,9 @@ mod tests {
                 token_key: "sk-a".to_string(),
                 name: "dev".to_string(),
                 limit_usd_micros: None,
+                enabled: true,
             },
+            1,
         )
         .await
         .expect("应能写令牌");

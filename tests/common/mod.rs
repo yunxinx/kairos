@@ -338,7 +338,9 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
                 limit_usd_micros: token
                     .limit_usd
                     .map(|usd| (usd * 1_000_000.0).round() as i64),
+                enabled: true,
             },
+            unix_millis(),
         )
         .await
         .expect("应能播种令牌");

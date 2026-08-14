@@ -324,6 +324,21 @@ async fn handle_request(
         )
         .await;
     }
+    // 通过计费准入即视为一次使用：刷新最后使用时间（被余额/上限拒绝的请求不算）。
+    if let Err(err) = store::resources::touch_token_used(&mut conn, &token.token_key, started).await
+    {
+        return db_error_response(
+            &deps,
+            full_body,
+            token,
+            &request.model,
+            started,
+            err,
+            inbound_protocol,
+            request_body_for_log,
+        )
+        .await;
+    }
 
     // 5. 出站：同协议且未命中别名时走直通快路径，否则经 IR 完整路径。
     // 快路径不免认证与计费（上面已准入），且 failover 同样只发生在首字节之前。
@@ -1310,7 +1325,7 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
     .await;
 }
 
-/// 从请求头提取并校验令牌 key，返回匹配的令牌定义。
+/// 从请求头提取并校验令牌 key，返回匹配的令牌定义；禁用的令牌在此被拒绝。
 fn authenticate<'a>(
     snapshot: &'a RuntimeSnapshot,
     headers: &HeaderMap,
@@ -1318,10 +1333,14 @@ fn authenticate<'a>(
     let key = extract_key(headers).ok_or_else(|| {
         anyhow::anyhow!("缺少认证令牌：请提供 Authorization: Bearer <key> 或 x-api-key")
     })?;
-    snapshot
+    let token = snapshot
         .tokens
         .get(&key)
-        .ok_or_else(|| anyhow::anyhow!("无效的认证令牌"))
+        .ok_or_else(|| anyhow::anyhow!("无效的认证令牌"))?;
+    if !token.enabled {
+        return Err(anyhow::anyhow!("认证令牌已被禁用"));
+    }
+    Ok(token)
 }
 
 /// 从两种头任一种提取令牌 key。
