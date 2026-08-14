@@ -83,6 +83,7 @@
     "navMenu": "Menu",
     "copy": "Copy",
     "copied": "Copied",
+    "clearSearch": "Clear search",
     "previousPage": "Previous",
     "nextPage": "Next",
     "firstPage": "First page",
@@ -170,14 +171,23 @@
     "saveSuccess": "Settings saved. Changes apply to new inbound requests immediately.",
     "reset": "Reset"
   },
+  "dateRange": {
+    "placeholder": "Time range",
+    "startTime": "Start time",
+    "endTime": "End time",
+    "confirm": "Apply",
+    "quick": {
+      "today": "Today",
+      "days7": "7 days",
+      "days15": "15 days",
+      "days30": "30 days",
+      "month": "This month"
+    }
+  },
   "logs": {
-    "tokenKey": "Token key",
-    "tokenKeyPlaceholder": "Exact token key",
+    "search": "Search",
+    "searchPlaceholder": "Token, name, model or channel",
     "model": "Model",
-    "modelPlaceholder": "Exact model id",
-    "from": "From",
-    "to": "To",
-    "applyFilters": "Apply",
     "clearFilters": "Clear",
     "created": "Time",
     "token": "Token",

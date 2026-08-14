@@ -7,7 +7,7 @@ import type { Price } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
-import FormTextInput from '@/components/ui/FormTextInput.vue';
+import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
@@ -132,11 +132,10 @@ function formatOptionalMicros(value: number | null): string {
       <DataTable :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
-            <FormTextInput
+            <SearchInput
               id="pricing-search"
               v-model="searchText"
-              type="text"
-              class="h-8 max-w-xs"
+              class="max-w-sm"
               data-testid="pricing-search"
               :placeholder="t('pricing.search')"
               :aria-label="t('pricing.search')"

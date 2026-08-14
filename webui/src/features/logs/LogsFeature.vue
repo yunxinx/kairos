@@ -1,14 +1,14 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onUnmounted, ref, watch } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { LogQuery } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
+import DateRangePicker from '@/components/ui/DateRangePicker.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
-import FilterField from '@/components/ui/FilterField.vue';
-import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
+import SearchInput from '@/components/ui/SearchInput.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTablePagination from '@/components/ui/data-table/DataTablePagination.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
@@ -20,23 +20,22 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow from '@/features/logs/LogTableRow.vue';
 import { LOGS_INITIAL_PAGE, LOGS_INITIAL_PAGE_SIZE } from '@/lib/admin-query-defaults';
+import type { DateRange } from '@/lib/date-range';
 import { scrollMainToTop } from '@/lib/main-scroll';
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const;
 
 const { t } = useI18n();
 
-const draftTokenKey = ref('');
-const draftModel = ref('');
-const draftFrom = ref('');
-const draftTo = ref('');
-const appliedTokenKey = ref('');
-const appliedModel = ref('');
-const appliedFrom = ref('');
-const appliedTo = ref('');
+const draftKeyword = ref('');
+const appliedKeyword = ref('');
+const appliedRange = ref<DateRange>({ from: null, to: null });
 const page = ref(LOGS_INITIAL_PAGE);
 const pageSize = ref(LOGS_INITIAL_PAGE_SIZE);
 const expandedIds = ref<Set<number>>(new Set());
+
+const appliedFrom = computed(() => appliedRange.value.from);
+const appliedTo = computed(() => appliedRange.value.to);
 
 const pageSizeModel = computed({
   get: () => String(pageSize.value),
@@ -63,41 +62,26 @@ watch(page, () => {
   scrollMainToTop();
 });
 
-function datetimeLocalToMillis(value: string): number | undefined {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const millis = new Date(trimmed).getTime();
-  return Number.isFinite(millis) ? millis : undefined;
-}
-
 function buildQuery(): LogQuery {
   const query: LogQuery = {
     page: page.value,
     page_size: pageSize.value,
   };
-  const tokenKey = appliedTokenKey.value.trim();
-  if (tokenKey) {
-    query.token_key = tokenKey;
+  const keyword = appliedKeyword.value.trim();
+  if (keyword) {
+    query.keyword = keyword;
   }
-  const model = appliedModel.value.trim();
-  if (model) {
-    query.model = model;
+  if (appliedFrom.value !== null) {
+    query.from_created_at = appliedFrom.value;
   }
-  const fromMillis = datetimeLocalToMillis(appliedFrom.value);
-  if (fromMillis !== undefined) {
-    query.from_created_at = fromMillis;
-  }
-  const toMillis = datetimeLocalToMillis(appliedTo.value);
-  if (toMillis !== undefined) {
-    query.to_created_at = toMillis;
+  if (appliedTo.value !== null) {
+    query.to_created_at = appliedTo.value;
   }
   return query;
 }
 
 const logsQuery = useQuery({
-  queryKey: ['logs', page, pageSize, appliedTokenKey, appliedModel, appliedFrom, appliedTo],
+  queryKey: ['logs', page, pageSize, appliedKeyword, appliedFrom, appliedTo],
   queryFn: () => apiClient.queryLogs(buildQuery()),
 });
 
@@ -116,21 +100,43 @@ const paginationSummary = computed(() =>
   }),
 );
 
-function applyFilters() {
-  appliedTokenKey.value = draftTokenKey.value;
-  appliedModel.value = draftModel.value;
-  appliedFrom.value = draftFrom.value;
-  appliedTo.value = draftTo.value;
+// 综合搜索防抖即时生效：与其他资源页的输入即过滤体验一致，避免每次按键都发请求。
+const KEYWORD_DEBOUNCE_MS = 300;
+let keywordTimer: number | undefined;
+
+function resetResults() {
   page.value = 1;
   expandedIds.value = new Set();
 }
 
+function applyKeywordNow() {
+  window.clearTimeout(keywordTimer);
+  keywordTimer = undefined;
+  if (appliedKeyword.value === draftKeyword.value) {
+    return;
+  }
+  appliedKeyword.value = draftKeyword.value;
+  resetResults();
+}
+
+watch(draftKeyword, () => {
+  window.clearTimeout(keywordTimer);
+  keywordTimer = window.setTimeout(applyKeywordNow, KEYWORD_DEBOUNCE_MS);
+});
+
+watch(appliedRange, resetResults);
+
+onUnmounted(() => {
+  window.clearTimeout(keywordTimer);
+});
+
 function clearFilters() {
-  draftTokenKey.value = '';
-  draftModel.value = '';
-  draftFrom.value = '';
-  draftTo.value = '';
-  applyFilters();
+  window.clearTimeout(keywordTimer);
+  keywordTimer = undefined;
+  draftKeyword.value = '';
+  appliedKeyword.value = '';
+  appliedRange.value = { from: null, to: null };
+  resetResults();
 }
 
 function toggleExpand(id: number) {
@@ -161,55 +167,33 @@ function isExpanded(id: number): boolean {
     <div v-else class="flex flex-col">
       <DataTable :busy="showTableSkeleton">
         <template #toolbar>
-          <DataTableToolbar class="items-end">
-            <FilterField
-              :label="t('logs.tokenKey')"
-              input-id="logs-token-key"
-              class="min-w-[12rem] flex-1"
-            >
-              <FormTextInput
-                id="logs-token-key"
-                v-model="draftTokenKey"
-                type="text"
-                class="h-8"
-                :placeholder="t('logs.tokenKeyPlaceholder')"
+          <DataTableToolbar>
+            <SearchInput
+              id="logs-search"
+              v-model="draftKeyword"
+              class="max-w-sm"
+              data-testid="logs-search"
+              :placeholder="t('logs.searchPlaceholder')"
+              :aria-label="t('logs.search')"
+              @keydown.enter="applyKeywordNow"
+            />
+            <template #actions>
+              <DateRangePicker
+                v-model="appliedRange"
+                trigger-id="logs-time-range"
+                trigger-test-id="logs-time-range"
+                from-input-id="logs-from"
+                to-input-id="logs-to"
               />
-            </FilterField>
-            <FilterField
-              :label="t('logs.model')"
-              input-id="logs-model"
-              class="min-w-[10rem] flex-1"
-            >
-              <FormTextInput
-                id="logs-model"
-                v-model="draftModel"
-                type="text"
-                class="h-8"
-                :placeholder="t('logs.modelPlaceholder')"
-              />
-            </FilterField>
-            <FilterField :label="t('logs.from')" input-id="logs-from" class="min-w-[12rem]">
-              <FormTextInput id="logs-from" v-model="draftFrom" type="datetime-local" class="h-8" />
-            </FilterField>
-            <FilterField :label="t('logs.to')" input-id="logs-to" class="min-w-[12rem]">
-              <FormTextInput id="logs-to" v-model="draftTo" type="datetime-local" class="h-8" />
-            </FilterField>
-            <button
-              type="button"
-              class="btn btn-primary"
-              data-testid="logs-apply-filters"
-              @click="applyFilters"
-            >
-              {{ t('logs.applyFilters') }}
-            </button>
-            <button
-              type="button"
-              class="btn btn-subtle"
-              data-testid="logs-clear-filters"
-              @click="clearFilters"
-            >
-              {{ t('logs.clearFilters') }}
-            </button>
+              <button
+                type="button"
+                class="btn btn-subtle"
+                data-testid="logs-clear-filters"
+                @click="clearFilters"
+              >
+                {{ t('logs.clearFilters') }}
+              </button>
+            </template>
           </DataTableToolbar>
         </template>
         <TableHeader>

@@ -16,7 +16,9 @@ export type IconName =
   | 'log-out'
   | 'circle-alert'
   | 'lock'
-  | 'lock-open';
+  | 'lock-open'
+  | 'calendar'
+  | 'search';
 
 export type IconDef = {
   viewBox?: string;
@@ -129,6 +131,25 @@ export const iconDefs: Record<IconName, IconDef> = {
       'M5 11H19A2 2 0 0 1 21 13V20A2 2 0 0 1 19 22H5A2 2 0 0 1 3 20V13A2 2 0 0 1 5 11Z',
       'M7 11V7a5 5 0 0 1 9.9-1',
     ],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  /** 日历（时间范围选择）。路径来自 Lucide「calendar」(ISC)。 */
+  calendar: {
+    paths: ['M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z', 'M3 10h18'],
+    lines: [
+      { x1: 8, y1: 2, x2: 8, y2: 6 },
+      { x1: 16, y1: 2, x2: 16, y2: 6 },
+    ],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  /** 搜索。路径来自 Lucide「search」(ISC)。 */
+  search: {
+    circles: [{ cx: 11, cy: 11, r: 8 }],
+    paths: ['M21 21l-4.35-4.35'],
     strokeWidth: 2,
     strokeLinecap: 'round',
     strokeLinejoin: 'round',

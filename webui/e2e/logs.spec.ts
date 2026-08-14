@@ -1,4 +1,3 @@
-import type { Page } from '@playwright/test';
 import { authedTest as test, expect } from './fixtures';
 import { seedRequestLogs, utf8Bytes } from './helpers/seed-logs';
 import { usdLabel } from './helpers/usd';
@@ -11,12 +10,8 @@ function toDatetimeLocal(millis: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-async function applyLogFilters(page: Page): Promise<void> {
-  await page.getByTestId('logs-apply-filters').click();
-}
-
 test.describe('request logs page', () => {
-  test('filters by token and model, paginates, and decodes bodies', async ({ page }) => {
+  test('filters by keyword and time range, paginates, and decodes bodies', async ({ page }) => {
     const now = Date.now();
     const older = now - 3_600_000;
     const jsonRequest = utf8Bytes('{"hello":"world","n":1}');
@@ -62,8 +57,7 @@ test.describe('request logs page', () => {
     await page.goto('/requests');
     await expect(page.getByRole('heading', { name: /request logs/i })).toBeVisible();
 
-    await page.locator('#logs-token-key').fill('sk-e2e-logs-page');
-    await applyLogFilters(page);
+    await page.locator('#logs-search').fill('sk-e2e-logs-page');
 
     await page.locator('#logs-page-size').click();
     await page.getByRole('option', { name: '10', exact: true }).click();
@@ -90,9 +84,7 @@ test.describe('request logs page', () => {
     await page.getByTestId('log-request-copy').click();
     await expect(page.getByTestId('log-request-copy')).toHaveText(/copied/i);
 
-    await page.locator('#logs-token-key').fill('sk-e2e-logs-filter');
-    await page.locator('#logs-model').fill('e2e-filter-model');
-    await applyLogFilters(page);
+    await page.locator('#logs-search').fill('sk-e2e-logs-filter');
     await expect(page.getByTestId('log-row')).toHaveCount(1);
     const filterRow = page.getByTestId('log-row');
     await expect(filterRow.getByTestId('log-status')).toHaveText('429');
@@ -103,19 +95,23 @@ test.describe('request logs page', () => {
     await expect(page.getByTestId('log-request-body-binary')).toContainText(/binary/i);
     await expect(page.getByTestId('log-response-body')).toHaveText('plain text body');
 
+    // 时间范围改经复合选择器：打开弹层 → 快速选择「今天」→ 精调起止 → 确认。
+    await page.getByTestId('logs-time-range').click();
+    await page.getByTestId('date-range-quick-today').click();
+    await expect(page.locator('#logs-from')).not.toHaveValue('');
     await page.locator('#logs-from').fill(toDatetimeLocal(now - 60_000));
     await page.locator('#logs-to').fill(toDatetimeLocal(now + 60_000));
-    await page.locator('#logs-token-key').fill('sk-e2e-logs-page');
-    await page.locator('#logs-model').fill('');
-    await applyLogFilters(page);
+    await page.getByTestId('date-range-confirm').click();
+    await page.locator('#logs-search').fill('sk-e2e-logs-page');
     await expect(page.getByTestId('log-row').first()).toBeVisible();
     await expect(page.getByTestId('log-row')).toHaveCount(10);
 
     await page.getByTestId('logs-clear-filters').click();
-    await page.locator('#logs-token-key').fill('sk-e2e-logs-filter');
+    await page.locator('#logs-search').fill('sk-e2e-logs-filter');
+    await page.getByTestId('logs-time-range').click();
     await page.locator('#logs-from').fill(toDatetimeLocal(now - 60_000));
     await page.locator('#logs-to').fill(toDatetimeLocal(now + 60_000));
-    await applyLogFilters(page);
+    await page.getByTestId('date-range-confirm').click();
     await expect(page.getByTestId('logs-empty')).toBeVisible();
   });
 });

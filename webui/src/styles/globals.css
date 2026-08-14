@@ -21,6 +21,7 @@
 
 /* ── Design Tokens ── */
 :root {
+  color-scheme: light;
   --seed-bg: #f1f3f9;
   --seed-fg: #0a0e1c;
   --seed-primary: #3b82f6;
@@ -51,6 +52,7 @@
 
 /* 深色：抬升表面层级与次要文字亮度，避免与背景融成一片 */
 .dark {
+  color-scheme: dark;
   --seed-bg: #111827;
   --seed-fg: #f3f4f8;
   --seed-surface: #1e293b;
@@ -889,6 +891,50 @@ html[lang='zh-CN'] {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 20%, transparent);
 }
 
+/* ── Search input ── */
+.search-input {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+.search-input-field {
+  box-sizing: border-box;
+  width: 100%;
+  height: 2rem;
+  padding-left: 32px;
+  padding-right: 30px;
+}
+.search-input-icon {
+  position: absolute;
+  left: 10px;
+  color: var(--fg-subtle);
+  pointer-events: none;
+  flex-shrink: 0;
+}
+.search-input-clear {
+  position: absolute;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  padding: 0;
+  border: none;
+  border-radius: var(--seed-radius);
+  background: transparent;
+  color: color-mix(in srgb, var(--fg-muted) 68%, transparent);
+  cursor: pointer;
+  transition: color 150ms ease-in-out;
+}
+.search-input-clear:hover {
+  color: color-mix(in srgb, var(--fg-muted) 88%, var(--seed-fg));
+}
+.search-input-clear:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
 /* ── Form field + hint bubble ── */
 .form-field {
   display: block;
@@ -1630,6 +1676,53 @@ html[lang='zh-CN'] {
   z-index: var(--z-popover);
   width: min(560px, calc(100vw - 24px));
   min-width: min(480px, calc(100vw - 24px));
+}
+
+/* ── Date range picker ── */
+.date-range-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 14rem;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    border-color 150ms ease-in-out,
+    box-shadow 150ms ease-in-out;
+}
+.date-range-trigger:hover {
+  border-color: var(--seed-primary);
+}
+
+.date-range-quick {
+  appearance: none;
+  padding: 4px 12px;
+  border: 1px solid var(--seed-border);
+  border-radius: 999px;
+  background: var(--seed-surface);
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    color 150ms ease-in-out,
+    border-color 150ms ease-in-out,
+    background 150ms ease-in-out;
+}
+.date-range-quick:hover {
+  color: var(--seed-fg);
+  border-color: var(--seed-primary);
+}
+.date-range-quick:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.date-range-quick[aria-pressed='true'] {
+  color: var(--seed-primary);
+  border-color: var(--seed-primary);
+  background: color-mix(in srgb, var(--seed-primary) 10%, var(--seed-surface));
 }
 @keyframes reka-pop-in {
   from {
