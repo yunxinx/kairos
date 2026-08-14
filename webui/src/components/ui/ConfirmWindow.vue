@@ -62,7 +62,7 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
       <p class="text-sm">{{ message }}</p>
       <p v-if="error" class="text-danger text-sm">{{ error }}</p>
     </div>
-    <div class="card-footer card-body flex justify-end gap-2">
+    <div class="card-footer card-body flex justify-between gap-2">
       <button type="button" class="btn" @click="emit('close')">
         {{ t('common.cancel') }}
       </button>
