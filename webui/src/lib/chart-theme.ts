@@ -9,15 +9,6 @@ function readCssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-function buildChartColors(): string[] {
-  return [
-    readCssVar('--seed-primary') || '#3b82f6',
-    readCssVar('--info') || '#3b82f6',
-    readCssVar('--success') || '#16a34a',
-    readCssVar('--warn') || '#eab308',
-  ];
-}
-
 function axisStyle(): { color: string } {
   return { color: readCssVar('--fg-subtle') };
 }
@@ -42,9 +33,9 @@ function mixHex(baseHex: string, accentHex: string, weight: number): string {
 }
 
 function heatmapLevelColors(): string[] {
-  const primary = readCssVar('--seed-primary') || '#3b82f6';
-  const surface = readCssVar('--seed-surface') || '#ffffff';
-  const surfaceAlt = readCssVar('--seed-surface-alt') || '#f4f4f5';
+  const primary = readCssVar('--seed-primary');
+  const surface = readCssVar('--seed-surface');
+  const surfaceAlt = readCssVar('--seed-surface-alt');
   return [
     surfaceAlt,
     mixHex(surface, primary, 0.2),
@@ -53,6 +44,10 @@ function heatmapLevelColors(): string[] {
     mixHex(surface, primary, 0.8),
     primary,
   ];
+}
+
+function trendSeriesColors(): [string, string] {
+  return [readCssVar('--seed-primary'), readCssVar('--blue-light')];
 }
 
 function tooltipStyle(): Record<string, unknown> {
@@ -68,6 +63,90 @@ function tooltipStyle(): Record<string, unknown> {
   };
 }
 
+/** ECharts HTML 浮窗默认 `white-space: nowrap`，必须用 `<br/>` 换行。 */
+function joinTooltipLines(lines: string[]): string {
+  return lines.join('<br/>');
+}
+
+function escapeTooltipText(text: string): string {
+  return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+/** 浮窗日期做成与页面一致的标记/徽章，而不是标题下划线。 */
+function tooltipTitleHtml(title: string): string {
+  return `<div class="overview-chart-tooltip-title"><span class="badge badge-neutral font-mono">${escapeTooltipText(title)}</span></div>`;
+}
+
+interface HeatmapTooltipRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface HeatmapTooltipSize {
+  contentSize: [number, number];
+  viewSize: [number, number];
+}
+
+/**
+ * 热力格上方优先，不够再下方，再贴格子左右。最后才相对指针偏移。
+ * 避开指针的那条轴不 clamp 回视口，避免把浮窗压到指针上。
+ */
+function heatmapTooltipPosition(
+  point: [number, number],
+  _params: unknown,
+  _el: unknown,
+  rect: HeatmapTooltipRect | null,
+  size: HeatmapTooltipSize,
+): [number, number] {
+  const gap = 8;
+  const [tipWidth, tipHeight] = size.contentSize;
+  const [viewWidth, viewHeight] = size.viewSize;
+  const [mouseX, mouseY] = point;
+  const maxX = Math.max(0, viewWidth - tipWidth);
+  const maxY = Math.max(0, viewHeight - tipHeight);
+  const clampX = (x: number): number => Math.min(Math.max(x, 0), maxX);
+  const clampY = (y: number): number => Math.min(Math.max(y, 0), maxY);
+
+  if (rect) {
+    const centeredX = clampX(rect.x + rect.width / 2 - tipWidth / 2);
+    const above = rect.y - tipHeight - gap;
+    if (above >= 0) return [centeredX, above];
+    const below = rect.y + rect.height + gap;
+    if (below + tipHeight <= viewHeight) return [centeredX, below];
+
+    const yBesideCell = clampY(rect.y + rect.height / 2 - tipHeight / 2);
+    const right = rect.x + rect.width + gap;
+    if (right + tipWidth <= viewWidth) return [right, yBesideCell];
+    const left = rect.x - tipWidth - gap;
+    if (left >= 0) return [left, yBesideCell];
+    const roomRight = viewWidth - (rect.x + rect.width);
+    return [roomRight >= rect.x ? right : left, yBesideCell];
+  }
+
+  const right = mouseX + gap;
+  const left = mouseX - tipWidth - gap;
+  const x = right + tipWidth <= viewWidth || mouseX < viewWidth / 2 ? right : left;
+  const abovePointer = mouseY - tipHeight - gap;
+  const y = abovePointer >= 0 ? abovePointer : mouseY + gap;
+  return [x, y];
+}
+
+interface AxisPointerLabelParams {
+  value?: unknown;
+}
+
+function formatAxisPointerLabel(
+  params: AxisPointerLabelParams,
+  formatLabel: (value: number) => string,
+): string {
+  const raw = params.value;
+  const value = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(value)) return '';
+  return formatLabel(value);
+}
+
 /** UTC 小时标签 `YYYY-MM-DDTHH:00:00Z` → `HH:00`；日历日原样。 */
 export function formatTrendLabel(date: string): string {
   const hour = /^(\d{4}-\d{2}-\d{2})T(\d{2}):/.exec(date);
@@ -77,54 +156,171 @@ export function formatTrendLabel(date: string): string {
   return date;
 }
 
-/** 趋势：请求量走左轴，费用（美元）走右轴。浮窗颜色跟当前主题。 */
-export function buildTrendChartOption(
-  labels: string[],
-  series: { name: string; data: number[]; yAxisIndex?: number }[],
+export interface TrendChartSeries {
+  name: string;
+  type: 'line' | 'bar';
+  data: number[];
+  yAxisIndex?: number;
+  formatValue: (value: number) => string;
+}
+
+export interface TrendChartAxis {
+  name: string;
+  formatLabel: (value: number) => string;
+}
+
+interface TrendTooltipPoint {
+  seriesName?: string;
+  value?: number;
+  axisValue?: string;
+  dataIndex?: number;
+  marker?: string;
+}
+
+export interface TrendVisibleAxes {
+  left: boolean;
+  right: boolean;
+}
+
+export interface TrendChartInput {
+  labels: string[];
+  series: TrendChartSeries[];
+  axes: { left: TrendChartAxis; right: TrendChartAxis };
+  extraTooltipLines?: (dataIndex: number) => string[];
+  visibleAxes?: TrendVisibleAxes;
+}
+
+function valueAxis(
+  axis: TrendChartAxis,
+  options: {
+    show: boolean;
+    minInterval?: number;
+    splitLine: boolean;
+    border: string;
+  },
 ): Record<string, unknown> {
-  const colors = buildChartColors();
+  return {
+    type: 'value',
+    show: options.show,
+    name: options.show ? axis.name : '',
+    min: 0,
+    ...(options.minInterval === undefined ? {} : { minInterval: options.minInterval }),
+    alignTicks: true,
+    nameGap: 8,
+    nameTextStyle: axisStyle(),
+    axisLine: { show: false },
+    splitLine: options.splitLine
+      ? { show: true, lineStyle: { color: options.border } }
+      : { show: false },
+    axisLabel: {
+      ...axisStyle(),
+      show: options.show,
+      formatter: (value: number) => axis.formatLabel(value),
+    },
+    axisPointer: {
+      show: options.show,
+      label: {
+        formatter: (params: AxisPointerLabelParams) =>
+          formatAxisPointerLabel(params, axis.formatLabel),
+      },
+    },
+  };
+}
+
+/** 趋势：请求量折线走左轴，费用柱走右轴。浮窗颜色跟当前主题。 */
+export function buildTrendChartOption(input: TrendChartInput): Record<string, unknown> {
+  const visibleAxes = input.visibleAxes ?? { left: true, right: true };
+  const colors = trendSeriesColors();
   const border = readCssVar('--seed-border');
+  const subtle = readCssVar('--fg-subtle');
+  const showLineSymbol = input.labels.length <= 14;
+  const leftName = input.series.find((item) => (item.yAxisIndex ?? 0) === 0)?.name;
+  const rightName = input.series.find((item) => item.yAxisIndex === 1)?.name;
+
   return {
     color: colors,
     animationDurationUpdate: 200,
-    grid: { left: 48, right: 56, top: 36, bottom: 32 },
+    grid: { left: 4, right: 4, top: 52, bottom: 12, containLabel: true },
     legend: {
       top: 0,
       textStyle: axisStyle(),
+      selected: {
+        ...(leftName ? { [leftName]: visibleAxes.left } : {}),
+        ...(rightName ? { [rightName]: visibleAxes.right } : {}),
+      },
     },
     tooltip: {
       trigger: 'axis',
       ...tooltipStyle(),
-    },
-    xAxis: {
-      type: 'category',
-      data: labels,
-      axisLine: { lineStyle: { color: border } },
-      axisLabel: axisStyle(),
-    },
-    yAxis: [
-      {
-        type: 'value',
-        axisLine: { show: false },
-        splitLine: { lineStyle: { color: border } },
-        axisLabel: axisStyle(),
+      axisPointer: {
+        type: 'cross',
+        lineStyle: { color: border },
+        crossStyle: { color: subtle },
       },
+      formatter: (params: TrendTooltipPoint | TrendTooltipPoint[]) => {
+        const points = Array.isArray(params) ? params : [params];
+        const title = points[0]?.axisValue;
+        if (typeof title !== 'string') return '';
+        const dataIndex = points[0]?.dataIndex;
+        const extras =
+          typeof dataIndex === 'number' ? (input.extraTooltipLines?.(dataIndex) ?? []) : [];
+        const rows = points.flatMap((point) => {
+          const seriesItem = input.series.find((item) => item.name === point.seriesName);
+          if (!seriesItem || typeof point.value !== 'number') return [];
+          const marker = typeof point.marker === 'string' ? `${point.marker} ` : '';
+          return [
+            `${marker}${escapeTooltipText(`${seriesItem.name}: ${seriesItem.formatValue(point.value)}`)}`,
+          ];
+        });
+        const extraRows = extras.map((line) => escapeTooltipText(line));
+        return `${tooltipTitleHtml(title)}${joinTooltipLines([...rows, ...extraRows])}`;
+      },
+    },
+    xAxis: [
       {
-        type: 'value',
-        axisLine: { show: false },
-        splitLine: { show: false },
-        axisLabel: axisStyle(),
+        type: 'category',
+        data: input.labels,
+        axisTick: { alignWithLabel: true },
+        axisPointer: { type: 'shadow' },
+        axisLine: { lineStyle: { color: border } },
+        axisLabel: { ...axisStyle(), hideOverlap: true },
       },
     ],
-    series: series.map((item) => ({
-      name: item.name,
-      type: 'line',
-      smooth: true,
-      showSymbol: labels.length <= 14,
-      yAxisIndex: item.yAxisIndex ?? 0,
-      areaStyle: { opacity: 0.06 },
-      data: item.data,
-    })),
+    yAxis: [
+      valueAxis(input.axes.left, {
+        show: visibleAxes.left,
+        minInterval: 1,
+        splitLine: visibleAxes.left,
+        border,
+      }),
+      valueAxis(input.axes.right, {
+        show: visibleAxes.right,
+        splitLine: !visibleAxes.left && visibleAxes.right,
+        border,
+      }),
+    ],
+    series: input.series.map((item, index) => {
+      const yAxisIndex = item.yAxisIndex ?? 0;
+      if (item.type === 'bar') {
+        return {
+          name: item.name,
+          type: 'bar',
+          yAxisIndex,
+          barMaxWidth: 36,
+          itemStyle: { color: colors[index] ?? colors[1] },
+          data: item.data,
+        };
+      }
+      return {
+        name: item.name,
+        type: 'line',
+        yAxisIndex,
+        z: 3,
+        smooth: true,
+        showSymbol: showLineSymbol,
+        data: item.data,
+      };
+    }),
   };
 }
 
@@ -165,9 +361,8 @@ export function buildHeatmapChartOption(
     animationDurationUpdate: 0,
     tooltip: {
       trigger: 'item',
-      position: 'top',
-      confine: false,
-      appendTo: () => document.body,
+      position: heatmapTooltipPosition,
+      className: 'overview-heatmap-tooltip',
       ...tooltipStyle(),
       formatter: (params: { data?: [number, number, number] }) => {
         const tuple = params.data;
@@ -175,12 +370,11 @@ export function buildHeatmapChartOption(
         const [weekIndex, dayIndex] = tuple;
         const cell = heatmap.weeks[weekIndex]?.[dayIndex];
         if (!cell) return '';
-        return [
-          cell.date,
+        return `${tooltipTitleHtml(cell.date)}${joinTooltipLines([
           `${labels.requests}: ${formatters.count(cell.requestCount)}`,
           `${labels.tokenSpend}: ${formatters.tokens(cell.tokenCount)}`,
           `${labels.cost}: ${formatters.cost(cell.costUsdMicros)}`,
-        ].join('\n');
+        ])}`;
       },
     },
     grid: {

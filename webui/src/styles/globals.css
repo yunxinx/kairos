@@ -349,6 +349,13 @@ html[lang='zh-CN'] {
 .overview-heatmap-card .overview-panel-body {
   overflow: visible;
 }
+.overview-trend-body {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+.overview-chart-tooltip-title {
+  margin: 0 0 var(--spacing-overview-activity-gap) 0;
+}
 .overview-heatmap-body {
   display: flex;
   flex-direction: column;

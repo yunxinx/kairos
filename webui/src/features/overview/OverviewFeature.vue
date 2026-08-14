@@ -73,7 +73,7 @@ const trendTitle = computed(() =>
           <div class="card-header">
             <h2 class="font-serif text-base font-semibold">{{ trendTitle }}</h2>
           </div>
-          <div class="card-body">
+          <div class="card-body overview-trend-body">
             <div data-testid="overview-trend-chart" class="h-chart">
               <ChartPanelSkeleton v-if="showSkeleton" />
               <Suspense v-else>
