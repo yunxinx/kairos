@@ -13,6 +13,8 @@ import type {
   StatsView,
   LifetimeStats,
   Token,
+  TokenCreate,
+  TokenView,
 } from '@/api/types';
 
 function buildQuery(params: object): string {
@@ -57,22 +59,22 @@ async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: strin
 }
 
 export const apiClient = {
-  listTokens(keyOverride?: string): Promise<Token[]> {
+  listTokens(keyOverride?: string): Promise<TokenView[]> {
     return apiFetch('/tokens', { method: 'GET' }, keyOverride);
   },
 
-  createToken(body: Token): Promise<Token> {
+  createToken(body: TokenCreate): Promise<TokenView> {
     return apiFetch('/tokens', { method: 'POST', body: JSON.stringify(body) });
   },
 
-  updateToken(tokenKey: string, body: Token): Promise<Token> {
+  updateToken(tokenKey: string, body: Token): Promise<TokenView> {
     return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}`, {
       method: 'PUT',
       body: JSON.stringify(body),
     });
   },
 
-  deleteToken(tokenKey: string): Promise<Token> {
+  deleteToken(tokenKey: string): Promise<TokenView> {
     return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}`, { method: 'DELETE' });
   },
 

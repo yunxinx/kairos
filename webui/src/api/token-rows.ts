@@ -1,7 +1,7 @@
 import { apiClient } from '@/api/client';
-import type { BalanceView, Token } from '@/api/types';
+import type { BalanceView, TokenView } from '@/api/types';
 
-export type TokenRow = Token & {
+export type TokenRow = TokenView & {
   balance_usd_micros: number;
   settled_usd_micros: number;
 };

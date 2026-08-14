@@ -18,7 +18,9 @@ export type IconName =
   | 'lock'
   | 'lock-open'
   | 'calendar'
-  | 'search';
+  | 'search'
+  | 'copy'
+  | 'pencil';
 
 export type IconDef = {
   viewBox?: string;
@@ -150,6 +152,20 @@ export const iconDefs: Record<IconName, IconDef> = {
   search: {
     circles: [{ cx: 11, cy: 11, r: 8 }],
     paths: ['M21 21l-4.35-4.35'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  /** 复制。路径来自 Lucide「copy」(ISC)，矩形档以闭合路径表达。 */
+  copy: {
+    paths: ['M8 8h14v14H8Z', 'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  /** 编辑。路径来自 Lucide「pencil」(ISC)。 */
+  pencil: {
+    paths: ['M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z'],
     strokeWidth: 2,
     strokeLinecap: 'round',
     strokeLinejoin: 'round',

@@ -59,6 +59,72 @@ export function formatUnixMillis(millis: number, locale?: string): string {
   return new Date(millis).toLocaleString(resolveNumberLocale(locale));
 }
 
+/** 掩码中段后仍保留明文的最小长度：前 8 + 掩码 + 后 8。 */
+const TOKEN_KEY_VISIBLE_EDGE = 8;
+const TOKEN_KEY_MASK = '******';
+
+/** 令牌 key 掩码展示：前、后各保留 8 位明文，中间固定以六个 `*` 代替。 */
+export function maskTokenKey(key: string): string {
+  if (key.length <= TOKEN_KEY_VISIBLE_EDGE * 2) {
+    return key;
+  }
+  return `${key.slice(0, TOKEN_KEY_VISIBLE_EDGE)}${TOKEN_KEY_MASK}${key.slice(-TOKEN_KEY_VISIBLE_EDGE)}`;
+}
+
+const MILLIS_PER_SECOND = 1_000;
+const DAYS_PER_MONTH = 30;
+const DAYS_PER_YEAR = 365;
+
+/** 相对时间的分档结果，展示层据此选择文案模板。 */
+export type RelativeTimeParts =
+  | { kind: 'seconds'; seconds: number }
+  | { kind: 'minutesSeconds'; minutes: number; seconds: number }
+  | { kind: 'hoursMinutes'; hours: number; minutes: number }
+  | { kind: 'daysHours'; days: number; hours: number }
+  | { kind: 'monthsDays'; months: number; days: number }
+  | { kind: 'yearsMonthsDays'; years: number; months: number; days: number };
+
+/**
+ * 时间差（毫秒）→ 相对时间分档。
+ *
+ * 分档规则：<1 分钟显示秒；<1 小时显示「分 秒」；<1 天显示「时 分」；
+ * <1 月（按 30 天）显示「天 时」；<1 年（按 365 天）显示「月 天」；
+ * 达到年单位显示「年 月 天」。月/年为近似换算。
+ */
+export function relativeTimeParts(deltaMillis: number): RelativeTimeParts {
+  const totalSeconds = Math.max(0, Math.floor(deltaMillis / MILLIS_PER_SECOND));
+  if (totalSeconds < 60) {
+    return { kind: 'seconds', seconds: totalSeconds };
+  }
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    return { kind: 'minutesSeconds', minutes: totalMinutes, seconds: totalSeconds % 60 };
+  }
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) {
+    return { kind: 'hoursMinutes', hours: totalHours, minutes: totalMinutes % 60 };
+  }
+  const totalDays = Math.floor(totalHours / 24);
+  if (totalDays < DAYS_PER_MONTH) {
+    return { kind: 'daysHours', days: totalDays, hours: totalHours % 24 };
+  }
+  if (totalDays < DAYS_PER_YEAR) {
+    return {
+      kind: 'monthsDays',
+      months: Math.floor(totalDays / DAYS_PER_MONTH),
+      days: totalDays % DAYS_PER_MONTH,
+    };
+  }
+  const years = Math.floor(totalDays / DAYS_PER_YEAR);
+  const remainderDays = totalDays - years * DAYS_PER_YEAR;
+  return {
+    kind: 'yearsMonthsDays',
+    years,
+    months: Math.floor(remainderDays / DAYS_PER_MONTH),
+    days: remainderDays % DAYS_PER_MONTH,
+  };
+}
+
 /** 整数计数 → 本地化千分位，展示层用。 */
 export function formatCount(value: number, locale?: string): string {
   return new Intl.NumberFormat(resolveNumberLocale(locale)).format(value);

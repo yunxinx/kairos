@@ -1,11 +1,23 @@
 /** 渠道 wire 协议，与后端 `Protocol` serde rename 一致。 */
 export type Protocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
 
-/** 令牌定义；余额独立于本结构。 */
+/** 令牌写契约；余额与生命周期元数据不在其中。 */
 export interface Token {
   token_key: string;
   name: string;
   limit_usd_micros: number | null;
+  enabled: boolean;
+}
+
+/** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */
+export type TokenCreate = Omit<Token, 'token_key'>;
+
+/** 令牌读响应：写契约字段 + 生命周期元数据。 */
+export interface TokenView extends Token {
+  /** 创建时刻（unix 毫秒）。 */
+  created_at: number;
+  /** 最后使用时刻（unix 毫秒）；null 表示从未使用。 */
+  last_used_at: number | null;
 }
 
 /** 渠道：出站接入单元。 */
