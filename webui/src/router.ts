@@ -16,7 +16,5 @@ declare module '@tanstack/vue-router' {
 
   interface StaticDataRouteOption {
     titleKey?: string;
-    /** 表格页：内容区填满视口，在表内滚动。 */
-    fillViewport?: boolean;
   }
 }

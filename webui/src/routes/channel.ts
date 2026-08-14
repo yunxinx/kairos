@@ -5,5 +5,5 @@ import { requireAuth } from '@/lib/router-guards';
 export const Route = createFileRoute('/channel')({
   beforeLoad: requireAuth,
   component: ChannelFeature,
-  staticData: { titleKey: 'nav.channel', fillViewport: true },
+  staticData: { titleKey: 'nav.channel' },
 });

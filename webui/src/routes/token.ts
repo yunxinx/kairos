@@ -5,5 +5,5 @@ import { requireAuth } from '@/lib/router-guards';
 export const Route = createFileRoute('/token')({
   beforeLoad: requireAuth,
   component: TokensFeature,
-  staticData: { titleKey: 'nav.tokens', fillViewport: true },
+  staticData: { titleKey: 'nav.tokens' },
 });

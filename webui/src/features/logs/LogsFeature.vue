@@ -20,6 +20,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow from '@/features/logs/LogTableRow.vue';
 import { LOGS_INITIAL_PAGE, LOGS_INITIAL_PAGE_SIZE } from '@/lib/admin-query-defaults';
+import { scrollMainToTop } from '@/lib/main-scroll';
 
 const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const;
 
@@ -59,6 +60,7 @@ const pageSizeOptions = computed(() =>
 
 watch(page, () => {
   expandedIds.value = new Set();
+  scrollMainToTop();
 });
 
 function datetimeLocalToMillis(value: string): number | undefined {
@@ -147,7 +149,7 @@ function isExpanded(id: number): boolean {
 </script>
 
 <template>
-  <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+  <div class="flex flex-col">
     <PageHeader :title="t('nav.logs')" />
 
     <InlineError
@@ -156,8 +158,8 @@ function isExpanded(id: number): boolean {
       @retry="() => logsQuery.refetch()"
     />
 
-    <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
+    <div v-else class="flex flex-col">
+      <DataTable :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar class="items-end">
             <FilterField

@@ -8,7 +8,7 @@ import { useShellMode } from '@/composables/useShellMode';
 
 useDocumentTitle();
 
-const { showAdminNav, suppressPageContent, showPublicFooter, fillViewport } = useShellMode();
+const { showAdminNav, suppressPageContent, showPublicFooter } = useShellMode();
 </script>
 
 <template>
@@ -16,7 +16,6 @@ const { showAdminNav, suppressPageContent, showPublicFooter, fillViewport } = us
     :hide-nav="!showAdminNav"
     :show-public-footer="showPublicFooter"
     :suppress-content="suppressPageContent"
-    :fill-viewport="fillViewport"
   >
     <template #navbar>
       <NavBar />

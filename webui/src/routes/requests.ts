@@ -5,5 +5,5 @@ import { requireAuth } from '@/lib/router-guards';
 export const Route = createFileRoute('/requests')({
   beforeLoad: requireAuth,
   component: LogsFeature,
-  staticData: { titleKey: 'nav.logs', fillViewport: true },
+  staticData: { titleKey: 'nav.logs' },
 });

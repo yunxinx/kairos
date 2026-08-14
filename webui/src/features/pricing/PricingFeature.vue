@@ -119,7 +119,7 @@ function formatOptionalMicros(value: number | null): string {
 </script>
 
 <template>
-  <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+  <div class="flex flex-col">
     <PageHeader :title="t('nav.pricing')" />
 
     <InlineError
@@ -128,8 +128,8 @@ function formatOptionalMicros(value: number | null): string {
       @retry="() => pricesQuery.refetch()"
     />
 
-    <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
+    <div v-else class="flex flex-col">
+      <DataTable :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
             <FormTextInput

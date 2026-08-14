@@ -166,7 +166,7 @@ function probeClass(result: ChannelProbeResult): string {
 </script>
 
 <template>
-  <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+  <div class="flex flex-col">
     <PageHeader :title="t('nav.channel')" />
 
     <InlineError
@@ -175,10 +175,10 @@ function probeClass(result: ChannelProbeResult): string {
       @retry="() => channelsQuery.refetch()"
     />
 
-    <div v-else class="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div v-else class="flex flex-col">
       <p v-if="actionError" class="text-danger mb-4 shrink-0">{{ actionError }}</p>
 
-      <DataTable fill-viewport class="min-h-0 flex-1" :busy="showTableSkeleton">
+      <DataTable :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
             <FormTextInput
