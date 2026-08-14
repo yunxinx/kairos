@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed } from 'vue';
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { LineChart } from 'echarts/charts';
@@ -7,6 +7,7 @@ import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/compon
 import VChart from 'vue-echarts';
 import { useI18n } from 'vue-i18n';
 import type { DailyPoint } from '@/api/types';
+import { useChartThemeTick } from '@/composables/useChartThemeTick';
 import { buildTrendChartOption, formatTrendLabel } from '@/lib/chart-theme';
 
 use([CanvasRenderer, LineChart, GridComponent, LegendComponent, TooltipComponent]);
@@ -16,24 +17,7 @@ const props = defineProps<{
 }>();
 
 const { t } = useI18n();
-
-/** html.dark 切换时重读 CSS 变量，让浮窗/轴线跟主题。 */
-const themeTick = ref(0);
-let themeObserver: MutationObserver | undefined;
-
-onMounted(() => {
-  themeObserver = new MutationObserver(() => {
-    themeTick.value += 1;
-  });
-  themeObserver.observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ['class'],
-  });
-});
-
-onUnmounted(() => {
-  themeObserver?.disconnect();
-});
+const themeTick = useChartThemeTick();
 
 const chartOption = computed(() => {
   void themeTick.value;
