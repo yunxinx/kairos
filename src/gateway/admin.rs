@@ -236,17 +236,19 @@ async fn update_token(
 
 /// 删除令牌：不存在则 404，否则删除并返回被删令牌。
 ///
-/// 同事务清理余额行：残留的余额行会让同 key 重建的令牌复活旧余额。
+/// 同事务先删余额、后删令牌定义：`token_balance.token_key` 外键指向 `tokens`
+/// （ON DELETE CASCADE 兜底）；显式清理余额行，不依赖级联语义。余额行残留会
+/// 让同 key 重建的令牌复活旧余额。
 async fn delete_token(
     State(deps): State<AdminDeps>,
     Path(token_key): Path<String>,
 ) -> Result<Json<TokenView>, AdminError> {
     let deleted = read_token_record(&deps, &token_key).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::resources::delete_token(&mut tx, &token_key)
+    crate::store::delete_token_balance(&mut tx, &token_key)
         .await
         .map_err(AdminError::Store)?;
-    crate::store::delete_token_balance(&mut tx, &token_key)
+    crate::store::resources::delete_token(&mut tx, &token_key)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;

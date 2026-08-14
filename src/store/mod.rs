@@ -9,7 +9,10 @@ pub mod resources;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sqlx::{Row, SqliteConnection, SqlitePool, sqlite::SqliteConnectOptions};
+use sqlx::{
+    Row, SqliteConnection, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
+};
 use thiserror::Error;
 
 use crate::core::billing::PriceSnapshot;
@@ -36,12 +39,21 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// 打开 SQLite 连接池并在事务内按序应用编号迁移。
 ///
 /// 缺库文件时自动创建（`create_if_missing`），迁移脚本内建在 `migrations/`。
+/// 连接选项统一治理 SQLite 的坏默认值：外键强制、写锁排队、WAL 日志模式。
 pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
         .foreign_keys(true)
-        .busy_timeout(SQLITE_BUSY_TIMEOUT);
+        .busy_timeout(SQLITE_BUSY_TIMEOUT)
+        // WAL：读写互不阻塞；提交只追加写 WAL，免去 DELETE 模式每次提交把被
+        // 修改页原像复制进回滚日志的开销。WAL 会持久记录在库文件头，后续
+        // 打开自动沿用。
+        .journal_mode(SqliteJournalMode::Wal)
+        // WAL 下 NORMAL 只在检查点前同步，崩溃不损坏库文件（掉电可能丢失上
+        // 次检查点以来已提交的事务），官方推荐档位；FULL 每次提交都同步，
+        // 无必要。
+        .synchronous(SqliteSynchronous::Normal);
 
     let pool = SqlitePool::connect_with(options)
         .await
@@ -751,6 +763,7 @@ fn map_request_log_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestLog, Stor
 mod tests {
     use super::*;
     use crate::core::billing::PriceSnapshot;
+    use sqlx::Connection;
 
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -761,11 +774,25 @@ mod tests {
         (dir, pool)
     }
 
+    /// 直写一条令牌定义行：`token_balance` 外键指向 `tokens`，余额相关测试
+    /// 需先有归属令牌。
+    async fn seed_token(conn: &mut SqliteConnection, token_key: &str) {
+        sqlx::query(
+            "INSERT INTO tokens (token_key, name, enabled, created_at) VALUES (?, ?, 1, 0)",
+        )
+        .bind(token_key)
+        .bind(token_key)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写令牌行");
+    }
+
     /// 余额相对调整：充值/扣减同一原语，原子生效。
     #[tokio::test]
     async fn adjust_balance_recharges_and_deducts() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-a").await;
         ensure_token_balance(&mut conn, "sk-a", 10.0, 1)
             .await
             .expect("应能初始化余额");
@@ -782,6 +809,300 @@ mod tests {
             .expect("应能扣减");
         assert_eq!(after_deduct.balance_usd_micros, 12_000_000);
         assert_eq!(after_deduct.settled_usd_micros, 0);
+    }
+
+    /// 连接选项治理 SQLite 坏默认值：WAL 日志模式、NORMAL 同步、外键强制、
+    /// 写锁排队 5 秒（缺省分别是 DELETE、FULL、关闭、立即 BUSY）。
+    #[tokio::test]
+    async fn open_applies_hardened_pragmas() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("应能查日志模式");
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("应能查同步档位");
+        assert_eq!(synchronous, 1, "1 = NORMAL");
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("应能查外键开关");
+        assert_eq!(foreign_keys, 1);
+
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("应能查写锁等待");
+        assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    /// 业务表一律 STRICT：错类型写入直接报错，而非按亲和性静默收下。逐表探测，
+    /// 任一表回退成非 STRICT 都会被此测试捕获。探测方向：INTEGER 列写 TEXT/REAL；
+    /// `settings` 无 INTEGER 列，用 BLOB 写 TEXT 列（STRICT 拒绝，非 STRICT 的
+    /// TEXT 亲和性会原样收下）。
+    #[tokio::test]
+    async fn strict_tables_reject_wrong_types() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        // token_balance 有外键，先播种归属令牌，让探测只命中 STRICT 而非外键。
+        seed_token(&mut conn, "strict-probe").await;
+
+        let probes = [
+            (
+                "smoke_probe",
+                "INSERT INTO smoke_probe (note, id) VALUES ('x', 'not-a-number')",
+            ),
+            (
+                "tokens",
+                "INSERT INTO tokens (token_key, name, enabled, created_at) \
+                 VALUES ('k1', 'n', 1, 'not-a-number')",
+            ),
+            (
+                "token_balance",
+                "INSERT INTO token_balance (token_key, balance_usd_micros, settled_usd_micros, created_at) \
+                 VALUES ('strict-probe', 'not-a-number', 0, 0)",
+            ),
+            (
+                "request_log",
+                "INSERT INTO request_log (token_name, inbound_protocol, model, channel, \
+                     status_code, latency_ms, created_at) \
+                 VALUES ('t', 'openai_chat', 'm', 'c', 200, 10, 'not-a-number')",
+            ),
+            (
+                "channels",
+                "INSERT INTO channels (name, protocol, base_url, api_key, models_json, \
+                     model_aliases_json, priority, weight, timeout_ms, max_retries) \
+                 VALUES ('c', 'openai_chat', 'u', 'k', '[]', '{}', 'not-a-number', 1, 1000, 1)",
+            ),
+            (
+                "prices",
+                "INSERT INTO prices (model, input_micros, output_micros) \
+                 VALUES ('m', 'not-a-number', 0)",
+            ),
+            (
+                "settings",
+                "INSERT INTO settings (setting_key, setting_value) VALUES ('k2', x'00')",
+            ),
+        ];
+        for (table, sql) in probes {
+            let result = sqlx::query(sql).execute(&pool).await;
+            assert!(
+                result.is_err(),
+                "{table} 应仍是 STRICT 表，错类型写入须被拒"
+            );
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO prices (model, input_micros, output_micros) VALUES ('m2', 1.5, 0)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(result.is_err(), "INTEGER 列写 REAL 应被 STRICT 拒绝");
+    }
+
+    /// token_balance 外键：无归属令牌的余额行被拒绝；删除令牌级联清理余额行，
+    /// 同 key 重建不再复活旧余额。
+    #[tokio::test]
+    async fn token_balance_fk_enforced_and_cascades() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+
+        let orphan = sqlx::query(
+            "INSERT INTO token_balance (token_key, balance_usd_micros, settled_usd_micros, created_at) \
+             VALUES ('sk-ghost', 0, 0, 0)",
+        )
+        .execute(&mut *conn)
+        .await;
+        assert!(orphan.is_err(), "外键应拒绝无归属令牌的余额行");
+
+        seed_token(&mut conn, "sk-a").await;
+        ensure_token_balance(&mut conn, "sk-a", 5.0, 1)
+            .await
+            .expect("应能初始化余额");
+        sqlx::query("DELETE FROM tokens WHERE token_key = ?")
+            .bind("sk-a")
+            .execute(&mut *conn)
+            .await
+            .expect("应能删令牌");
+        let balance = get_token_balance(&mut conn, "sk-a")
+            .await
+            .expect("应能查余额");
+        assert!(balance.is_none(), "级联删除应带走余额行");
+    }
+
+    /// 迁移 0001–0006 全部应用后的表终态（非 STRICT、无外键）。配合播种
+    /// `_sqlx_migrations` 记账行（版本 1–6 标记已应用），`open()` 只会应用
+    /// 迁移 0007，精确模拟存量库升级。
+    const LEGACY_SCHEMA: &str = "
+        CREATE TABLE smoke_probe (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            note TEXT NOT NULL
+        );
+        CREATE TABLE request_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            token_name TEXT NOT NULL,
+            inbound_protocol TEXT NOT NULL,
+            model TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            status_code INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            token_key TEXT NOT NULL DEFAULT '',
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            input_price_usd_micros INTEGER NOT NULL DEFAULT 0,
+            output_price_usd_micros INTEGER NOT NULL DEFAULT 0,
+            cache_read_price_usd_micros INTEGER NOT NULL DEFAULT 0,
+            cache_write_price_usd_micros INTEGER NOT NULL DEFAULT 0,
+            cost_usd_micros INTEGER NOT NULL DEFAULT 0,
+            request_body BLOB,
+            response_body BLOB
+        );
+        CREATE TABLE token_balance (
+            token_key TEXT PRIMARY KEY,
+            balance_usd_micros INTEGER NOT NULL,
+            settled_usd_micros INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE channels (
+            name TEXT PRIMARY KEY,
+            protocol TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            models_json TEXT NOT NULL,
+            model_aliases_json TEXT NOT NULL,
+            priority INTEGER NOT NULL,
+            weight INTEGER NOT NULL,
+            timeout_ms INTEGER NOT NULL,
+            max_retries INTEGER NOT NULL
+        );
+        CREATE TABLE tokens (
+            token_key TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            limit_usd_micros INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL DEFAULT 0,
+            last_used_at INTEGER
+        );
+        CREATE TABLE prices (
+            model TEXT PRIMARY KEY,
+            input_micros INTEGER NOT NULL,
+            output_micros INTEGER NOT NULL,
+            cache_read_micros INTEGER,
+            cache_write_micros INTEGER
+        );
+        CREATE TABLE settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT NOT NULL
+        );";
+
+    /// sqlx 迁移记账表（结构与 sqlx-sqlite 建表语句一致）：手工播种版本 1–6
+    /// 的已应用记录，校验和取自 `migrate!()` 嵌入内容，与真实应用无异。
+    async fn seed_migrations_bookkeeping(raw: &mut SqliteConnection) {
+        sqlx::raw_sql(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            );",
+        )
+        .execute(&mut *raw)
+        .await
+        .expect("应能建迁移记账表");
+        for migration in sqlx::migrate!().iter().filter(|m| m.version < 7) {
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+                 VALUES (?, ?, TRUE, ?, -1)",
+            )
+            .bind(migration.version)
+            .bind(&*migration.description)
+            .bind(&*migration.checksum)
+            .execute(&mut *raw)
+            .await
+            .expect("应能记账已应用迁移");
+        }
+    }
+
+    /// 存量库升级路径：真实部署的旧库带脏数据（BLOB 列被写入 TEXT、孤儿余额行），
+    /// `open()` 应用迁移 0007 后须完成清理、字节无损转 BLOB、全表 STRICT 化，
+    /// 且 AUTOINCREMENT 计数延续。
+    #[tokio::test]
+    async fn legacy_db_upgrades_through_migration_0007() {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let path = dir.path().join("legacy.db");
+        std::fs::File::create(&path).expect("应能创建空库文件");
+        let mut raw = SqliteConnection::connect(path.to_str().expect("路径应可转字符串"))
+            .await
+            .expect("应能建旧库");
+        seed_migrations_bookkeeping(&mut raw).await;
+        sqlx::raw_sql(LEGACY_SCHEMA)
+            .execute(&mut raw)
+            .await
+            .expect("应能建旧 schema");
+        sqlx::query("INSERT INTO tokens (token_key, name) VALUES ('sk-live', '生产')")
+            .execute(&mut raw)
+            .await
+            .expect("应能写旧令牌");
+        // 脏数据一：无归属令牌的孤儿余额行。
+        sqlx::query(
+            "INSERT INTO token_balance (token_key, balance_usd_micros, settled_usd_micros, created_at) \
+             VALUES ('sk-orphan', 999, 0, 0)",
+        )
+        .execute(&mut raw)
+        .await
+        .expect("旧库无外键，孤儿余额应能写入");
+        // 脏数据二：BLOB 列被按 TEXT 亲和性收下字符串。
+        sqlx::query(
+            "INSERT INTO request_log (created_at, token_name, inbound_protocol, model, channel, \
+                 status_code, latency_ms, token_key, request_body) \
+             VALUES (1, '生产', 'openai_chat', 'gpt-4o', 'c1', 200, 10, 'sk-live', 'legacy text body')",
+        )
+        .execute(&mut raw)
+        .await
+        .expect("旧库非 STRICT，TEXT 写 BLOB 列应能写入");
+        raw.close().await.expect("应能关闭旧库连接");
+
+        let pool = open(&path).await.expect("迁移应能吃下带脏数据的旧库");
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+
+        let strict: i64 =
+            sqlx::query_scalar("SELECT strict FROM pragma_table_list WHERE name = 'request_log'")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("应能查表属性");
+        assert_eq!(strict, 1, "重建后应为 STRICT 表");
+
+        let body: Vec<u8> = sqlx::query_scalar("SELECT request_body FROM request_log")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("日志应被保留");
+        assert_eq!(body, b"legacy text body", "TEXT 应字节无损转为 BLOB");
+
+        let balance = get_token_balance(&mut conn, "sk-orphan")
+            .await
+            .expect("应能查余额");
+        assert!(balance.is_none(), "孤儿余额行应被迁移清理");
+        let balance = get_token_balance(&mut conn, "sk-live")
+            .await
+            .expect("应能查余额");
+        assert!(balance.is_none(), "合法令牌的余额行本就不存在");
+
+        let id = insert_smoke(&pool, "after-upgrade")
+            .await
+            .expect("升级后应能写入");
+        assert!(id >= 1, "AUTOINCREMENT 计数应延续");
     }
 
     /// 请求日志分页查询：时间倒序、LIMIT/OFFSET 生效、过滤维度生效。
