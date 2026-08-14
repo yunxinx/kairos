@@ -199,16 +199,35 @@ test.describe('overview page', () => {
       String(expectedToday?.request_count),
     );
     await page.getByTestId('overview-heatmap').scrollIntoViewIfNeeded();
-    await todayHeat.hover();
-    const heatTip = page.getByTestId('overview-heatmap-tooltip');
-    await expect(heatTip).toBeVisible();
-    await expect(heatTip).toContainText(String(expectedToday?.request_count));
-    await expect(heatTip).toContainText(
-      formatTokensMillions(
-        (expectedToday?.input_tokens ?? 0) + (expectedToday?.output_tokens ?? 0),
-      ),
-    );
-    await expect(heatTip).toContainText(usdLabel(expectedToday?.cost_usd_micros ?? 0));
+    await expect(page.getByTestId('overview-heatmap').locator('canvas').first()).toBeVisible();
+  });
+
+  test('aligns share and activity columns to the same height', async ({ page }) => {
+    seedOverviewLogs(Date.now());
+    await page.goto('/overview');
+    await expect(page.getByTestId('overview-share-panel')).toBeVisible();
+    await expect(page.getByTestId('overview-activity-stack')).toBeVisible();
+
+    const layout = await page.evaluate(() => {
+      const share = document.querySelector('[data-testid="overview-share-panel"]');
+      const stack = document.querySelector('[data-testid="overview-activity-stack"]');
+      if (!(share instanceof HTMLElement) || !(stack instanceof HTMLElement)) {
+        return null;
+      }
+      const shareBox = share.getBoundingClientRect();
+      const stackBox = stack.getBoundingClientRect();
+      return {
+        shareHeight: shareBox.height,
+        stackHeight: stackBox.height,
+        topDelta: Math.abs(shareBox.top - stackBox.top),
+        bottomDelta: Math.abs(shareBox.bottom - stackBox.bottom),
+      };
+    });
+
+    expect(layout).not.toBeNull();
+    expect(Math.abs(layout!.shareHeight - layout!.stackHeight)).toBeLessThan(0.5);
+    expect(layout!.topDelta).toBeLessThan(0.5);
+    expect(layout!.bottomDelta).toBeLessThan(0.5);
   });
 
   test('lets the overview page scroll when content exceeds the viewport', async ({ page }) => {

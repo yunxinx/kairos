@@ -15,7 +15,12 @@
   --z-popover: 130;
   --spacing-touch: 2.75rem;
   --height-chart: 20rem;
-  --height-overview-panel: 28rem;
+  /* 概览底栏列高 = card-header + card-body 上下内边距 + 图表区（与逐日趋势卡同构） */
+  --height-overview-card-header: 2.8125rem;
+  --height-overview-bottom-column: calc(
+    var(--height-chart) + 2rem + var(--height-overview-card-header)
+  );
+  --spacing-overview-activity-gap: 0.75rem;
 }
 
 .max-w-content {
@@ -83,5 +88,5 @@
 }
 
 .h-overview-panel {
-  height: var(--height-overview-panel);
+  height: var(--height-overview-bottom-column);
 }

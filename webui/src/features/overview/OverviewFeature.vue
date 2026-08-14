@@ -1,8 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
-import { useQuery } from '@tanstack/vue-query';
+import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
-import { apiClient, extractApiError } from '@/api/client';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import FilterField from '@/components/ui/FilterField.vue';
 import InlineError from '@/components/ui/InlineError.vue';
@@ -10,13 +8,28 @@ import UiSelect from '@/components/ui/UiSelect.vue';
 import OverviewKpiGrid from '@/features/overview/OverviewKpiGrid.vue';
 import OverviewShareList from '@/features/overview/OverviewShareList.vue';
 import OverviewHeatmap from '@/features/overview/OverviewHeatmap.vue';
+import OverviewLifetime from '@/features/overview/OverviewLifetime.vue';
 import ChartPanelSkeleton from '@/features/overview/ChartPanelSkeleton.vue';
 import { OverviewTrendChart } from '@/features/overview/overview-charts.async';
-import { OVERVIEW_DEFAULT_DAYS } from '@/lib/admin-query-defaults';
+import { useOverviewStats } from '@/features/overview/useOverviewStats';
 
 const { t } = useI18n();
 
-const days = ref(String(OVERVIEW_DEFAULT_DAYS));
+const {
+  days,
+  summary,
+  daily,
+  byModel,
+  byChannel,
+  lifetime,
+  lifetimeLoading,
+  lifetimeError,
+  statsErrorMessage,
+  showSkeleton,
+  showError,
+  retryStats,
+  retryLifetime,
+} = useOverviewStats();
 
 const dayOptions = computed(() =>
   ['1', '7', '30', '90'].map((value) => ({
@@ -25,45 +38,9 @@ const dayOptions = computed(() =>
   })),
 );
 
-const statsQuery = useQuery({
-  queryKey: ['stats', days],
-  queryFn: () => apiClient.getStats(Number(days.value)),
-});
-
-const lifetimeQuery = useQuery({
-  queryKey: ['stats', 'lifetime'],
-  queryFn: () => apiClient.getLifetimeStats(),
-});
-
-const summary = computed(() => statsQuery.data.value?.summary);
-const daily = computed(() => statsQuery.data.value?.daily ?? []);
-const byModel = computed(() =>
-  (statsQuery.data.value?.by_model ?? []).map((share) => ({
-    name: share.model,
-    requestCount: share.request_count,
-    costUsdMicros: share.cost_usd_micros,
-  })),
-);
-const byChannel = computed(() =>
-  (statsQuery.data.value?.by_channel ?? []).map((share) => ({
-    name: share.channel,
-    requestCount: share.request_count,
-    costUsdMicros: share.cost_usd_micros,
-  })),
-);
-
 const trendTitle = computed(() =>
   days.value === '1' ? t('overview.trendHourly') : t('overview.trend'),
 );
-
-const lifetime = computed(() => lifetimeQuery.data.value ?? null);
-const lifetimeLoading = computed(() => lifetimeQuery.isPending.value && !lifetimeQuery.data.value);
-const lifetimeError = computed(() => {
-  if (!lifetimeQuery.isError.value || lifetimeQuery.data.value) return '';
-  return extractApiError(lifetimeQuery.error.value).message;
-});
-const showSkeleton = computed(() => statsQuery.isPending.value && !statsQuery.data.value);
-const showError = computed(() => statsQuery.isError.value && !statsQuery.data.value);
 </script>
 
 <template>
@@ -86,11 +63,7 @@ const showError = computed(() => statsQuery.isError.value && !statsQuery.data.va
       </template>
     </PageHeader>
 
-    <InlineError
-      v-if="showError"
-      :message="extractApiError(statsQuery.error.value).message"
-      @retry="() => statsQuery.refetch()"
-    />
+    <InlineError v-if="showError" :message="statsErrorMessage" @retry="retryStats" />
 
     <template v-else>
       <OverviewKpiGrid class="mb-6" :summary="summary ?? null" />
@@ -128,20 +101,26 @@ const showError = computed(() => statsQuery.isError.value && !statsQuery.data.va
         </div>
       </section>
 
-      <section class="grid items-stretch gap-6 lg:grid-cols-2">
+      <section class="overview-bottom-grid grid items-stretch gap-6 lg:grid-cols-2">
         <OverviewShareList
           :model-items="byModel"
           :channel-items="byChannel"
           :loading="showSkeleton"
         />
-        <OverviewHeatmap
-          :daily="daily"
-          :lifetime="lifetime"
-          :lifetime-loading="lifetimeLoading"
-          :lifetime-error="lifetimeError"
-          :loading="showSkeleton"
-          @retry-lifetime="() => lifetimeQuery.refetch()"
-        />
+        <div class="overview-activity-stack" data-testid="overview-activity-stack">
+          <OverviewHeatmap
+            class="overview-activity-heatmap"
+            :daily="daily"
+            :loading="showSkeleton"
+          />
+          <OverviewLifetime
+            class="overview-activity-lifetime"
+            :lifetime="lifetime"
+            :lifetime-loading="lifetimeLoading"
+            :lifetime-error="lifetimeError"
+            @retry-lifetime="retryLifetime"
+          />
+        </div>
       </section>
     </template>
   </div>

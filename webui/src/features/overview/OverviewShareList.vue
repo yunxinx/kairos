@@ -69,7 +69,7 @@ function nameBinding(name: string): Record<string, string> {
 </script>
 
 <template>
-  <div class="card overview-panel">
+  <div class="card overview-panel" data-testid="overview-share-panel">
     <div class="card-header">
       <h2 class="min-w-0 truncate font-serif text-base font-semibold">
         {{ t('overview.shareTabs') }}
@@ -100,8 +100,13 @@ function nameBinding(name: string): Record<string, string> {
         </button>
       </div>
     </div>
-    <div class="card-body overview-panel-body seed-scrollbar">
-      <ul v-if="loading" class="space-y-4" role="status" :aria-label="t('common.loading')">
+    <div class="card-body overview-panel-body overview-share-body">
+      <ul
+        v-if="loading"
+        class="overview-share-list"
+        role="status"
+        :aria-label="t('common.loading')"
+      >
         <li
           v-for="row in SHARE_LIST_LIMIT"
           :key="'share-skeleton-' + row"
@@ -116,7 +121,7 @@ function nameBinding(name: string): Record<string, string> {
           <SkeletonBlock height="h-3" width="w-24" />
         </li>
       </ul>
-      <ul v-else-if="ranked.length > 0" class="space-y-4">
+      <ul v-else-if="ranked.length > 0" class="overview-share-list">
         <li
           v-for="item in ranked"
           :key="item.name"

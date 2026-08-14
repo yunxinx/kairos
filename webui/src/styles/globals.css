@@ -310,38 +310,127 @@ html[lang='zh-CN'] {
   }
 }
 
-/* 概览底栏两卡：固定高度，避免列表变短时把格子撑缩 */
+/* 概览底栏：固定高度，避免列表变短时把格子撑缩 */
 .overview-panel {
-  height: var(--height-overview-panel);
-  min-height: var(--height-overview-panel);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.overview-bottom-grid > .overview-panel,
+.overview-bottom-grid > .overview-activity-stack {
+  height: var(--height-overview-bottom-column);
+  min-height: var(--height-overview-bottom-column);
+  max-height: var(--height-overview-bottom-column);
 }
 .overview-panel-body {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
 }
-.overview-heatmap-body {
+/* 流量分布：内容区高度与逐日趋势图表区一致，行在区内均匀分布、不滚动 */
+.overview-share-body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
-.heatmap-upper {
+/* 流量分布：固定 5 行槽位（与 SHARE_LIST_LIMIT 一致），不足时底部留空、行距不变 */
+.overview-share-list {
+  flex: 1;
+  display: grid;
+  grid-template-rows: repeat(5, minmax(0, 1fr));
+  min-height: 0;
+}
+.overview-share-list > li {
+  min-height: 0;
+}
+.overview-heatmap-card.overview-panel {
+  overflow: visible;
+}
+.overview-heatmap-card .overview-panel-body {
+  overflow: visible;
+}
+.overview-heatmap-body {
   display: flex;
-  flex-shrink: 0;
   flex-direction: column;
+  overflow: visible;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.overview-heatmap-chart {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+}
+.overview-heatmap-card {
   min-height: 0;
 }
 
-/* 分段胶囊：滑块贴满轨道，轨道与卡片顶栏仍保持间距 */
+/* 概览右栏：热力图 + 累计统计 8:2，总高由 .overview-bottom-grid 约束 */
+.overview-activity-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-overview-activity-gap);
+  min-height: 0;
+}
+.overview-activity-heatmap {
+  flex: 8 1 0;
+  min-height: 0;
+}
+.overview-activity-heatmap .overview-panel {
+  height: 100%;
+  min-height: 0;
+}
+.overview-activity-lifetime {
+  flex: 2 1 0;
+  min-height: 0;
+}
+.overview-lifetime-card {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.overview-lifetime-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-content: center;
+  gap: 12px;
+  min-height: 0;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.overview-lifetime-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--fg-muted);
+}
+.overview-lifetime-value {
+  margin-top: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 1.125rem;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--seed-fg);
+}
+.overview-lifetime-error {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* 分段胶囊：高度对齐 card-header 内 text-base 行高，避免左右卡片分割线错位 */
 .share-switch {
   position: relative;
   display: grid;
   grid-template-columns: 1fr 1fr;
   isolation: isolate;
   overflow: hidden;
+  height: 1.5rem;
+  box-sizing: border-box;
   padding: 0;
   background: var(--seed-surface-alt);
   border: 1px solid var(--seed-border);
@@ -367,13 +456,16 @@ html[lang='zh-CN'] {
 .share-switch-btn {
   position: relative;
   z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   appearance: none;
   background: transparent;
   border: none;
-  padding: 4px 10px;
+  padding: 0 10px;
   font-size: 12px;
   font-weight: 600;
-  line-height: 1.4;
+  line-height: 1;
   color: var(--fg-muted);
   cursor: pointer;
   white-space: nowrap;
@@ -393,161 +485,6 @@ html[lang='zh-CN'] {
   .share-switch::before {
     transition: none;
   }
-}
-
-/* GitHub 式贡献热力：约 53 周方格，无流量也占空格，格子保持正方形 */
-.heatmap {
-  display: flex;
-  flex: 0 1 auto;
-  min-height: 0;
-  width: 100%;
-  align-items: flex-start;
-}
-.heatmap-calendar {
-  display: grid;
-  width: 100%;
-  grid-template-columns: 1.75rem minmax(0, 1fr);
-  grid-template-rows: 1.125rem auto;
-  column-gap: 0.4rem;
-  row-gap: 0.2rem;
-}
-.heatmap-months {
-  display: grid;
-  grid-template-columns: repeat(var(--heatmap-weeks, 53), minmax(0, 1fr));
-  column-gap: 2px;
-  min-height: 1.125rem;
-}
-.heatmap-month {
-  overflow: visible;
-  font-size: 10px;
-  line-height: 1.125rem;
-  color: var(--fg-muted);
-  white-space: nowrap;
-}
-.heatmap-weekdays {
-  display: grid;
-  grid-template-rows: repeat(7, minmax(0, 1fr));
-  row-gap: 2px;
-  min-height: 0;
-}
-.heatmap-weekday {
-  display: flex;
-  align-items: center;
-  font-size: 9px;
-  line-height: 1;
-  color: var(--fg-muted);
-}
-.heatmap-grid {
-  display: grid;
-  width: 100%;
-  aspect-ratio: calc(var(--heatmap-weeks, 53) / 7);
-  grid-template-columns: repeat(var(--heatmap-weeks, 53), minmax(0, 1fr));
-  grid-template-rows: repeat(7, minmax(0, 1fr));
-  grid-auto-flow: column;
-  gap: 2px;
-}
-.heatmap-cell {
-  display: block;
-  min-width: 0;
-  min-height: 0;
-  width: 100%;
-  height: 100%;
-  border-radius: 2px;
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--seed-border) 70%, transparent);
-}
-.heatmap-cell[data-date] {
-  cursor: default;
-}
-.heatmap-level-0 {
-  background: var(--seed-surface-alt);
-}
-.heatmap-level-1 {
-  background: color-mix(in srgb, var(--seed-primary) 28%, var(--seed-surface));
-}
-.heatmap-level-2 {
-  background: color-mix(in srgb, var(--seed-primary) 48%, var(--seed-surface));
-}
-.heatmap-level-3 {
-  background: color-mix(in srgb, var(--seed-primary) 72%, var(--seed-surface));
-}
-.heatmap-level-4 {
-  background: var(--seed-primary);
-}
-.heatmap-legend {
-  display: flex;
-  flex-shrink: 0;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 4px;
-  margin-top: 8px;
-  padding-top: 0;
-  font-size: 10px;
-  color: var(--fg-muted);
-}
-.heatmap-lifetime {
-  display: grid;
-  flex: 1 1 0;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  align-content: center;
-  gap: 12px;
-  min-height: 0;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--seed-border);
-}
-.heatmap-lifetime-label {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--fg-muted);
-}
-.heatmap-lifetime-value {
-  margin-top: 4px;
-  font-family: ui-monospace, monospace;
-  font-size: 1.125rem;
-  font-weight: 700;
-  line-height: 1.3;
-  color: var(--seed-fg);
-}
-.heatmap-lifetime-error {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.heatmap-legend-swatch {
-  width: 0.6875rem;
-  height: 0.6875rem;
-  flex-shrink: 0;
-}
-.heatmap-tooltip {
-  position: fixed;
-  z-index: var(--z-floating);
-  pointer-events: none;
-  min-width: 10rem;
-  padding: 8px 10px;
-  background: var(--seed-surface);
-  border: 1px solid var(--seed-border);
-  border-radius: var(--seed-radius);
-  box-shadow: 2px 3px 0 0 var(--card-shadow);
-  font-size: 12px;
-  color: var(--fg-muted);
-  line-height: 1.5;
-}
-.heatmap-tooltip-date {
-  margin-bottom: 4px;
-  font-weight: 600;
-  color: var(--seed-fg);
-}
-.heatmap-tooltip-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 1.25rem;
-}
-.heatmap-tooltip-value {
-  font-family: ui-monospace, monospace;
-  color: var(--seed-fg);
 }
 
 /* 点阵：见 body:has(.dotted-bg)::before；组件保留 .dotted-bg 类名即可 */

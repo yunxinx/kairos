@@ -1,6 +1,6 @@
 import type { DailyPoint } from '@/api/types';
 
-export type HeatmapLevel = 0 | 1 | 2 | 3 | 4;
+export type HeatmapLevel = 0 | 1 | 2 | 3 | 4 | 5;
 
 export interface HeatmapCell {
   date: string;
@@ -20,12 +20,55 @@ export const HEATMAP_WEEK_COUNT = 53;
 
 const MS_PER_DAY = 86_400_000;
 
-function levelForCount(count: number, max: number): HeatmapLevel {
-  if (count <= 0 || max <= 0) return 0;
-  const scaled = Math.ceil((count / max) * 4);
-  if (scaled <= 1) return 1;
-  if (scaled >= 4) return 4;
-  return scaled as HeatmapLevel;
+/** 色条有效分档下限：低于此值的格子仅上色、不参与底部 5 档悬停联动。 */
+export const HEATMAP_TIER_MIN_REQUESTS = 10;
+
+/** 底部色条档位数（均 ≥ `HEATMAP_TIER_MIN_REQUESTS`）。 */
+export const HEATMAP_TIER_COUNT = 5;
+
+export interface HeatmapTier {
+  /** 1 = 色条最左（最低档），5 = 最右（最高档）。 */
+  index: number;
+  min: number;
+  max: number;
+}
+
+export interface HeatmapTierScale {
+  maxCount: number;
+  tiers: HeatmapTier[];
+}
+
+/** 将 `[HEATMAP_TIER_MIN_REQUESTS, maxCount]` 均分为 5 档；`maxCount` 不足下限时返回空档。 */
+export function buildHeatmapTierScale(maxCount: number): HeatmapTierScale {
+  if (maxCount < HEATMAP_TIER_MIN_REQUESTS) {
+    return { maxCount, tiers: [] };
+  }
+
+  const span = maxCount - HEATMAP_TIER_MIN_REQUESTS + 1;
+  const tiers: HeatmapTier[] = [];
+  let prevEnd = HEATMAP_TIER_MIN_REQUESTS - 1;
+
+  for (let i = 0; i < HEATMAP_TIER_COUNT; i++) {
+    const min = i === 0 ? HEATMAP_TIER_MIN_REQUESTS : prevEnd + 1;
+    const max =
+      i === HEATMAP_TIER_COUNT - 1
+        ? maxCount
+        : HEATMAP_TIER_MIN_REQUESTS + Math.floor((span * (i + 1)) / HEATMAP_TIER_COUNT) - 1;
+    prevEnd = max;
+    tiers.push({ index: i + 1, min, max });
+  }
+
+  return { maxCount, tiers };
+}
+
+function levelForCount(count: number, tierScale: HeatmapTierScale): HeatmapLevel {
+  if (count < HEATMAP_TIER_MIN_REQUESTS) return 0;
+  for (const tier of tierScale.tiers) {
+    if (count >= tier.min && count <= tier.max) {
+      return tier.index as HeatmapLevel;
+    }
+  }
+  return 0;
 }
 
 function formatUtcDay(millis: number): string {
@@ -104,6 +147,7 @@ export function buildHeatmap(daily: DailyPoint[], nowMillis: number = Date.now()
   for (const item of byDay.values()) {
     if (item.requestCount > max) max = item.requestCount;
   }
+  const tierScale = buildHeatmapTierScale(max);
 
   let end = utcDayStart(nowMillis);
   while (new Date(end).getUTCDay() !== 6) {
@@ -122,7 +166,7 @@ export function buildHeatmap(daily: DailyPoint[], nowMillis: number = Date.now()
       requestCount,
       tokenCount: rolled?.tokenCount ?? 0,
       costUsdMicros: rolled?.costUsdMicros ?? 0,
-      level: levelForCount(requestCount, max),
+      level: levelForCount(requestCount, tierScale),
     });
     if (week.length === 7) {
       weeks.push(week);
@@ -138,4 +182,28 @@ export function buildHeatmap(daily: DailyPoint[], nowMillis: number = Date.now()
   });
 
   return { weeks, monthLabels };
+}
+
+/** 扁平化网格，供 ECharts 与无障碍探针复用。 */
+export function flattenHeatmapCells(heatmap: CalendarHeatmap): HeatmapCell[] {
+  return heatmap.weeks.flat();
+}
+
+/** ECharts 热力序列：`[weekIndex, weekdayIndex, requestCount]`。 */
+export function buildHeatmapSeriesData(heatmap: CalendarHeatmap): [number, number, number][] {
+  const data: [number, number, number][] = [];
+  heatmap.weeks.forEach((week, weekIndex) => {
+    week.forEach((cell, dayIndex) => {
+      data.push([weekIndex, dayIndex, cell.requestCount]);
+    });
+  });
+  return data;
+}
+
+export function heatmapMaxRequestCount(heatmap: CalendarHeatmap): number {
+  let max = 0;
+  for (const cell of flattenHeatmapCells(heatmap)) {
+    if (cell.requestCount > max) max = cell.requestCount;
+  }
+  return max;
 }
