@@ -105,10 +105,13 @@ async function expectCardsMatchStats(page: Page, stats: StatsView): Promise<void
     formatCount(stats.summary.success_count, 'en'),
   );
   await expect(page.getByTestId('overview-input-tokens')).toHaveText(
-    formatCount(stats.summary.input_tokens, 'en'),
+    formatTokensMillions(stats.summary.input_tokens),
   );
   await expect(page.getByTestId('overview-output-tokens')).toHaveText(
-    formatCount(stats.summary.output_tokens, 'en'),
+    formatTokensMillions(stats.summary.output_tokens),
+  );
+  await expect(page.getByTestId('overview-tokens-millions')).toHaveText(
+    formatTokensMillions(stats.summary.input_tokens + stats.summary.output_tokens),
   );
   await expect(page.getByTestId('overview-cost')).toHaveText(
     usdLabel(stats.summary.cost_usd_micros),
@@ -200,6 +203,37 @@ test.describe('overview page', () => {
     );
     await page.getByTestId('overview-heatmap').scrollIntoViewIfNeeded();
     await expect(page.getByTestId('overview-heatmap').locator('canvas').first()).toBeVisible();
+  });
+
+  test('hides the heatmap tooltip after the pointer leaves the chart', async ({ page }) => {
+    seedOverviewLogs(Date.now());
+    await page.goto('/overview');
+    const heatmap = page.getByTestId('overview-heatmap');
+    await heatmap.scrollIntoViewIfNeeded();
+    const canvas = heatmap.locator('canvas').first();
+    await expect(canvas).toBeVisible();
+    const box = await canvas.boundingBox();
+    expect(box).not.toBeNull();
+
+    const tooltip = page.locator('.overview-heatmap-tooltip');
+    const samplePoints: Array<[number, number]> = [
+      [0.9, 0.35],
+      [0.82, 0.42],
+      [0.7, 0.38],
+      [0.55, 0.5],
+    ];
+    let shown = false;
+    for (const [x, y] of samplePoints) {
+      await page.mouse.move(box!.x + box!.width * x, box!.y + box!.height * y);
+      if (await tooltip.isVisible()) {
+        shown = true;
+        break;
+      }
+    }
+    expect(shown).toBe(true);
+
+    await page.getByRole('heading', { name: /overview/i }).hover();
+    await expect(tooltip).toBeHidden();
   });
 
   test('aligns share and activity columns to the same height', async ({ page }) => {
