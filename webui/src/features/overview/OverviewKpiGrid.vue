@@ -3,7 +3,7 @@ import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import type { StatsSummary } from '@/api/types';
 import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
-import { formatCount, formatPercent, formatUsdMicros } from '@/lib/format';
+import { formatCount, formatPercent, formatTokensMillions, formatUsdMicros } from '@/lib/format';
 
 const props = defineProps<{
   summary: StatsSummary | null;
@@ -34,7 +34,21 @@ const tokenTotal = computed(() => {
     <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
       <div class="card">
         <div class="card-body">
-          <div class="text-fg-muted text-xs font-medium">{{ t('overview.requests') }}</div>
+          <div class="flex items-baseline justify-between gap-2">
+            <div class="text-fg-muted text-xs font-medium">{{ t('overview.requests') }}</div>
+            <div v-if="summary" class="text-fg-subtle font-mono text-xs font-normal">
+              <span data-testid="overview-token-count">{{
+                formatCount(summary.token_count, locale)
+              }}</span>
+              {{ t('overview.tokenCount') }}
+              <span aria-hidden="true"> · </span>
+              <span data-testid="overview-channel-count">{{
+                formatCount(summary.channel_count, locale)
+              }}</span>
+              {{ t('overview.channelCount') }}
+            </div>
+            <SkeletonBlock v-else height="h-3" width="w-32" />
+          </div>
           <div v-if="summary" class="mt-2 font-mono text-2xl font-bold">
             <span data-testid="overview-request-count">{{
               formatCount(summary.request_count, locale)
@@ -63,19 +77,29 @@ const tokenTotal = computed(() => {
 
       <div class="card">
         <div class="card-body">
-          <div class="text-fg-muted text-xs font-medium">{{ t('overview.tokensTotal') }}</div>
+          <div class="flex items-baseline justify-between gap-2">
+            <div class="text-fg-muted text-xs font-medium">{{ t('overview.tokensTotal') }}</div>
+            <div
+              v-if="summary"
+              class="text-fg-subtle font-mono text-xs font-normal"
+              data-testid="overview-tokens-millions"
+            >
+              {{ formatTokensMillions(tokenTotal) }}
+            </div>
+            <SkeletonBlock v-else height="h-3" width="w-16" />
+          </div>
           <div v-if="summary" class="mt-2 font-mono text-2xl font-bold">
             {{ formatCount(tokenTotal, locale) }}
           </div>
           <SkeletonBlock v-else height="h-8" width="w-24" class="mt-2" />
           <p v-if="summary" class="text-fg-muted mt-1 font-mono text-xs">
             <span data-testid="overview-input-tokens">{{
-              formatCount(summary.input_tokens, locale)
+              formatTokensMillions(summary.input_tokens)
             }}</span>
             {{ t('overview.inputShort') }}
             <span aria-hidden="true"> · </span>
             <span data-testid="overview-output-tokens">{{
-              formatCount(summary.output_tokens, locale)
+              formatTokensMillions(summary.output_tokens)
             }}</span>
             {{ t('overview.outputShort') }}
           </p>
@@ -83,16 +107,5 @@ const tokenTotal = computed(() => {
         </div>
       </div>
     </div>
-
-    <p v-if="summary" class="text-fg-subtle mt-3 font-mono text-xs">
-      <span data-testid="overview-token-count">{{ formatCount(summary.token_count, locale) }}</span>
-      {{ t('overview.tokenCount') }}
-      <span aria-hidden="true"> · </span>
-      <span data-testid="overview-channel-count">{{
-        formatCount(summary.channel_count, locale)
-      }}</span>
-      {{ t('overview.channelCount') }}
-    </p>
-    <SkeletonBlock v-else height="h-3" width="w-48" class="mt-3" />
   </section>
 </template>
