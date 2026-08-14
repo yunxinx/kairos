@@ -90,7 +90,11 @@
     "lastPage": "最后一页",
     "openRowActions": "打开行操作",
     "pageStatus": "第 {page} / {totalPages} 页",
-    "rowsPerPage": "每页行数"
+    "rowsPerPage": "每页行数",
+    "selectAll": "全选",
+    "selectRow": "选择行",
+    "clearSelection": "清除选择",
+    "selectedCount": "已选 {count} 项"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -126,7 +130,9 @@
     "disable": "禁用",
     "enable": "启用",
     "deleteTitle": "删除令牌",
-    "deleteMessage": "确定删除令牌「{name}」？删除后不可恢复。"
+    "deleteMessage": "确定删除令牌「{name}」？删除后不可恢复。",
+    "bulkDeleteTitle": "删除令牌",
+    "bulkDeleteMessage": "确定删除选中的 {count} 枚令牌？删除后不可恢复。"
   },
   "time": {
     "secondsAgo": "{seconds} 秒前",
@@ -159,7 +165,9 @@
     "probeFailure": "失败 · {status} · {latency} ms",
     "probeUnreachable": "不可达 · {latency} ms",
     "deleteTitle": "删除渠道",
-    "deleteMessage": "确定删除渠道「{name}」？删除后不可恢复。"
+    "deleteMessage": "确定删除渠道「{name}」？删除后不可恢复。",
+    "bulkDeleteTitle": "删除渠道",
+    "bulkDeleteMessage": "确定删除选中的 {count} 条渠道？删除后不可恢复。"
   },
   "pricing": {
     "createEntry": "添加价格",
@@ -174,7 +182,9 @@
     "usdGuide": "每 1M tokens 的美元单价，最多六位小数。",
     "optionalUsdGuide": "可选。留空则回退到输入单价。",
     "deleteTitle": "删除价格",
-    "deleteMessage": "确定删除「{name}」的价格？删除后不可恢复。"
+    "deleteMessage": "确定删除「{name}」的价格？删除后不可恢复。",
+    "bulkDeleteTitle": "删除价格",
+    "bulkDeleteMessage": "确定删除选中的 {count} 个模型的价格？删除后不可恢复。"
   },
   "settings": {
     "sections": "设置分类",

@@ -1799,7 +1799,8 @@ html[lang='zh-CN'] {
   border-color: var(--seed-primary);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--seed-primary) 20%, transparent);
 }
-.ui-checkbox[data-state='checked'] .ui-checkbox__control {
+.ui-checkbox[data-state='checked'] .ui-checkbox__control,
+.ui-checkbox[data-state='indeterminate'] .ui-checkbox__control {
   background: var(--seed-primary);
   border-color: var(--seed-primary);
   color: var(--fg-on-primary);
@@ -1818,7 +1819,8 @@ html[lang='zh-CN'] {
     opacity 120ms ease-out,
     transform 120ms ease-out;
 }
-.ui-checkbox[data-state='checked'] .ui-checkbox__indicator {
+.ui-checkbox[data-state='checked'] .ui-checkbox__indicator,
+.ui-checkbox[data-state='indeterminate'] .ui-checkbox__indicator {
   opacity: 1;
   transform: scale(1);
 }
@@ -1830,4 +1832,41 @@ html[lang='zh-CN'] {
 .ui-checkbox__label {
   min-width: 0;
   color: inherit;
+}
+
+/* ── 批量操作浮动条 ── */
+/* 选中行后视口底部居中浮出；层级刻意低于 --z-window，确认浮窗可盖在其上。 */
+.bulk-bar {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  z-index: calc(var(--z-window) - 10);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--seed-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--seed-surface) 92%, transparent);
+  backdrop-filter: blur(8px);
+}
+.bulk-bar__divider {
+  width: 1px;
+  height: 20px;
+  flex: 0 0 1px;
+  background: var(--seed-border);
+}
+/* utilities 位于 @layer utilities，恒被 layer 外的 .btn 压制；尺寸类必须写在 layer 外。 */
+.bulk-bar__delete {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+.bulk-bar__clear {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 9999px;
 }

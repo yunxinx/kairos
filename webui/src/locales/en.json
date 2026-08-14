@@ -90,7 +90,11 @@
     "lastPage": "Last page",
     "openRowActions": "Open row actions",
     "pageStatus": "Page {page} of {totalPages}",
-    "rowsPerPage": "Rows per page"
+    "rowsPerPage": "Rows per page",
+    "selectAll": "Select all",
+    "selectRow": "Select row",
+    "clearSelection": "Clear selection",
+    "selectedCount": "{count} selected"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -126,7 +130,9 @@
     "disable": "Disable",
     "enable": "Enable",
     "deleteTitle": "Delete token",
-    "deleteMessage": "Delete token \"{name}\"? This cannot be undone."
+    "deleteMessage": "Delete token \"{name}\"? This cannot be undone.",
+    "bulkDeleteTitle": "Delete tokens",
+    "bulkDeleteMessage": "Delete {count} selected tokens? This cannot be undone."
   },
   "time": {
     "secondsAgo": "{seconds} seconds ago",
@@ -159,7 +165,9 @@
     "probeFailure": "Failed · {status} · {latency} ms",
     "probeUnreachable": "Unreachable · {latency} ms",
     "deleteTitle": "Delete channel",
-    "deleteMessage": "Delete channel \"{name}\"? This cannot be undone."
+    "deleteMessage": "Delete channel \"{name}\"? This cannot be undone.",
+    "bulkDeleteTitle": "Delete channels",
+    "bulkDeleteMessage": "Delete {count} selected channels? This cannot be undone."
   },
   "pricing": {
     "createEntry": "Add price",
@@ -174,7 +182,9 @@
     "usdGuide": "Dollars per 1M tokens, up to six decimal places.",
     "optionalUsdGuide": "Optional. Leave empty to fall back to the input price.",
     "deleteTitle": "Delete price",
-    "deleteMessage": "Delete the price for \"{name}\"? This cannot be undone."
+    "deleteMessage": "Delete the price for \"{name}\"? This cannot be undone.",
+    "bulkDeleteTitle": "Delete prices",
+    "bulkDeleteMessage": "Delete prices for {count} selected models? This cannot be undone."
   },
   "settings": {
     "sections": "Settings sections",

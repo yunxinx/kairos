@@ -136,4 +136,35 @@ test.describe('token resource page', () => {
     await expect(page.locator('[data-form-field="amount"] .form-field-hint')).toBeVisible();
     await expect(page.getByTestId('token-editor-error')).toHaveCount(0);
   });
+
+  test('bulk selects tokens and deletes them from the floating bulk bar', async ({ page }) => {
+    await page.goto('/token');
+    await page.getByTestId('create-token').click();
+    await page.locator('[id^="token-editor-name"]').fill('Bulk A');
+    await page.getByTestId('token-save').click();
+    await expect(page.locator('[data-testid="token-row"]', { hasText: 'Bulk A' })).toBeVisible();
+
+    await page.getByTestId('create-token').click();
+    await page.locator('[id^="token-editor-name"]').fill('Bulk B');
+    await page.getByTestId('token-save').click();
+    await expect(page.locator('[data-testid="token-row"]', { hasText: 'Bulk B' })).toBeVisible();
+
+    // 搜索收敛到 Bulk 行，全选只作用于可见行。
+    await page.getByTestId('tokens-search').fill('Bulk');
+    await page
+      .locator('[data-testid="token-row"]', { hasText: 'Bulk A' })
+      .getByTestId('token-select')
+      .click();
+    await expect(page.getByTestId('tokens-bulk-bar')).toBeVisible();
+    await expect(page.getByTestId('bulk-count')).toHaveText('1 selected');
+
+    await page.getByTestId('tokens-select-all').click();
+    await expect(page.getByTestId('bulk-count')).toHaveText('2 selected');
+
+    // 浮动条删除 → 确认浮窗 → 行消失、浮动条收起。
+    await page.getByTestId('tokens-bulk-delete').click();
+    await page.getByRole('dialog').getByTestId('token-bulk-delete-confirm').click();
+    await expect(page.locator('[data-testid="token-row"]')).toHaveCount(0);
+    await expect(page.getByTestId('tokens-bulk-bar')).toHaveCount(0);
+  });
 });

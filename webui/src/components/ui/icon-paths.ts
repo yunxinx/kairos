@@ -8,6 +8,7 @@ export type IconName =
   | 'chevrons-right'
   | 'more-horizontal'
   | 'check'
+  | 'minus'
   | 'menu'
   | 'close'
   | 'sun'
@@ -64,6 +65,12 @@ export const iconDefs: Record<IconName, IconDef> = {
   check: {
     paths: ['M20 6L9 17l-5-5'],
     strokeWidth: 2.5,
+  },
+  /** 半选态。路径来自 Lucide「minus」(ISC)。 */
+  minus: {
+    paths: ['M5 12h14'],
+    strokeWidth: 2.5,
+    strokeLinecap: 'round',
   },
   menu: {
     lines: [

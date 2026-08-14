@@ -1,32 +1,39 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import { loadTokenRows, type TokenRow } from '@/api/token-rows';
 import PageHeader from '@/app/layout/PageHeader.vue';
+import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
+import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
 import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
+import SelectCell from '@/components/ui/data-table/SelectCell.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
+import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
+import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import TokenEditorWindow from '@/features/tokens/TokenEditorWindow.vue';
 import { formatUnixMillis, formatUsdMicros, maskTokenKey, relativeTimeParts } from '@/lib/format';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type TokenWindowPayload =
-  { kind: 'editor'; token: TokenRow | null } | { kind: 'delete'; token: TokenRow };
+  | { kind: 'editor'; token: TokenRow | null }
+  | { kind: 'delete'; token: TokenRow }
+  | BulkDeletePayload;
 
 /** 额度进度条颜色分档：<70% 绿、70–90% 黄、≥90% 红。 */
 const QUOTA_WARN_RATIO = 0.7;
@@ -72,6 +79,34 @@ const filteredTokens = computed(() => {
   return tokens.value.filter(
     (token) => token.name.toLowerCase().includes(q) || token.token_key.toLowerCase().includes(q),
   );
+});
+
+// 行选择：全选只作用于当前可见行；被筛掉的已选行保留选择但不计入全选。
+const selection = useRowSelection<string>();
+
+const allVisibleSelected = computed({
+  get: () =>
+    filteredTokens.value.length > 0 &&
+    filteredTokens.value.every((token) => selection.isSelected(token.token_key)),
+  set: (value) =>
+    selection.setMany(
+      filteredTokens.value.map((token) => token.token_key),
+      value,
+    ),
+});
+
+const someVisibleSelected = computed(() =>
+  filteredTokens.value.some((token) => selection.isSelected(token.token_key)),
+);
+
+// 删除或刷新后列表键变化，剔除幽灵选择。
+watch(tokens, (rows) => selection.prune(rows.map((row) => row.token_key)));
+
+const bulkDelete = useBulkDelete<string>({
+  selection,
+  windowStack: { windows, close: closeWindow },
+  queryKey: ['tokens'],
+  deleteOne: (tokenKey) => apiClient.deleteToken(tokenKey),
 });
 
 // 相对时间随时间推移刷新：定时推进 now，避免「3 秒前」长期停留。
@@ -221,6 +256,15 @@ function openDelete(token: TokenRow) {
   const entry = openWindow(takePendingAnchor(), { kind: 'delete', token });
   if (entry) deleteErrors.value[entry.id] = '';
 }
+
+function openBulkDelete() {
+  const existing = windows.value.find((entry) => entry.payload.kind === 'bulk-delete');
+  if (existing) {
+    bringToFront(existing.id);
+    return;
+  }
+  openWindow(takePendingAnchor(), { kind: 'bulk-delete' });
+}
 </script>
 
 <template>
@@ -259,6 +303,16 @@ function openDelete(token: TokenRow) {
         </template>
         <TableHeader>
           <TableRow>
+            <TableHead class="w-10">
+              <div class="flex items-center justify-center">
+                <Checkbox
+                  v-model="allVisibleSelected"
+                  :indeterminate="someVisibleSelected && !allVisibleSelected"
+                  data-testid="tokens-select-all"
+                  :aria-label="t('common.selectAll')"
+                />
+              </div>
+            </TableHead>
             <TableHead class="min-w-44">{{ t('tokens.name') }}</TableHead>
             <TableHead class="min-w-56">{{ t('tokens.key') }}</TableHead>
             <TableHead>{{ t('tokens.quota') }}</TableHead>
@@ -269,14 +323,20 @@ function openDelete(token: TokenRow) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="7" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
           <template v-else>
             <TableRow
               v-for="token in filteredTokens"
               :key="token.token_key"
               data-testid="token-row"
               :data-token-key="token.token_key"
+              :data-state="selection.isSelected(token.token_key) ? 'selected' : undefined"
             >
+              <SelectCell
+                :checked="selection.isSelected(token.token_key)"
+                test-id="token-select"
+                @toggle="selection.toggle(token.token_key)"
+              />
               <TableCell class="font-medium">{{ token.name }}</TableCell>
               <TableCell>
                 <span class="inline-flex items-center gap-1">
@@ -373,7 +433,7 @@ function openDelete(token: TokenRow) {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredTokens.length === 0">
-              <TableCell :colspan="7" class="h-24 whitespace-normal">
+              <TableCell :colspan="8" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('tokens.create') }}
@@ -384,6 +444,21 @@ function openDelete(token: TokenRow) {
           </template>
         </TableBody>
       </DataTable>
+      <DataTableBulkBar
+        :count="selection.count.value"
+        data-testid="tokens-bulk-bar"
+        @clear="selection.clear"
+      >
+        <button
+          type="button"
+          class="btn btn-danger-filled bulk-bar__delete"
+          data-testid="tokens-bulk-delete"
+          @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+          @click="openBulkDelete"
+        >
+          {{ t('common.delete') }}
+        </button>
+      </DataTableBulkBar>
       <p v-if="actionError" class="text-danger mt-2 text-sm" data-testid="token-action-error">
         {{ actionError }}
       </p>
@@ -403,7 +478,7 @@ function openDelete(token: TokenRow) {
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
       />
       <ConfirmWindow
-        v-else
+        v-else-if="win.payload.kind === 'delete'"
         :title="t('tokens.deleteTitle')"
         :message="t('tokens.deleteMessage', { name: win.payload.token.name })"
         :anchor="win.anchor"
@@ -418,6 +493,23 @@ function openDelete(token: TokenRow) {
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
         @confirm="deleteMutation.mutate(win.payload.token.token_key)"
+      />
+      <ConfirmWindow
+        v-else
+        :title="t('tokens.bulkDeleteTitle')"
+        :message="t('tokens.bulkDeleteMessage', { count: selection.count.value })"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        :error="bulkDelete.error.value"
+        :busy="bulkDelete.isPending.value"
+        confirm-test-id="token-bulk-delete-confirm"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
   </div>
