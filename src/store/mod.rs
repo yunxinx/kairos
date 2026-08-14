@@ -256,6 +256,8 @@ pub struct RequestLogQuery {
     pub token_key: Option<String>,
     /// 按模型精确过滤。
     pub model: Option<String>,
+    /// 综合关键字：对 `token_key`/`token_name`/`model`/`channel` 做 LIKE 子串匹配（OR）。
+    pub keyword: Option<String>,
     /// 只返回 `created_at >= from_created_at`。
     pub from_created_at: Option<i64>,
     /// 只返回 `created_at <= to_created_at`。
@@ -651,6 +653,23 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
         push_where_cond(qb, &mut first, "model = ");
         qb.push_bind(model);
     }
+    if let Some(keyword) = filter
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|kw| !kw.is_empty())
+    {
+        let pattern = like_substring_pattern(keyword);
+        push_where_cond(qb, &mut first, "(token_key LIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" ESCAPE '\\' OR token_name LIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" ESCAPE '\\' OR model LIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" ESCAPE '\\' OR channel LIKE ");
+        qb.push_bind(pattern);
+        qb.push(" ESCAPE '\\')");
+    }
     if let Some(from) = filter.from_created_at {
         push_where_cond(qb, &mut first, "created_at >= ");
         qb.push_bind(from);
@@ -659,6 +678,20 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
         push_where_cond(qb, &mut first, "created_at <= ");
         qb.push_bind(to);
     }
+}
+
+/// 关键字 → LIKE 子串模式：转义 `\`/`%`/`_`（配合 `ESCAPE '\'`），两端补 `%`。
+fn like_substring_pattern(keyword: &str) -> String {
+    let mut pattern = String::with_capacity(keyword.len() + 2);
+    pattern.push('%');
+    for ch in keyword.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
 }
 
 /// 向查询拼接一个条件：首个条件以 `WHERE` 开头，其余以 `AND` 连接。
@@ -820,6 +853,87 @@ mod tests {
             2
         );
         assert!(rows.iter().all(|r| r.created_at >= 1002));
+    }
+
+    /// `keyword` 综合搜索：对 token_key/token_name/model/channel 做 LIKE OR 子串匹配，
+    /// 与其余条件 AND 组合；`%`/`_` 等通配符按字面量转义。
+    #[tokio::test]
+    async fn request_log_query_filters_by_keyword() {
+        let (_dir, pool) = test_pool().await;
+        let price = PriceSnapshot {
+            input_micros: 0,
+            output_micros: 0,
+            cache_read_micros: 0,
+            cache_write_micros: 0,
+        };
+        let rows = [
+            ("sk-alpha", "生产令牌", "gpt-4o", "azure-east"),
+            ("sk-beta", "测试", "claude-3", "openai-direct"),
+            ("sk-gamma", "试用", "gpt-4o-mini", "azure-west"),
+        ];
+        for (i, (token_key, token_name, model, channel)) in rows.iter().enumerate() {
+            insert_request_log(
+                &pool,
+                &RequestLog {
+                    id: 0,
+                    created_at: 2000 + i as i64,
+                    token_name: (*token_name).to_string(),
+                    token_key: (*token_key).to_string(),
+                    inbound_protocol: "openai_chat".to_string(),
+                    model: (*model).to_string(),
+                    channel: (*channel).to_string(),
+                    status_code: 200,
+                    latency_ms: 10,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    price,
+                    cost_usd_micros: 0,
+                    request_body: None,
+                    response_body: None,
+                },
+            )
+            .await
+            .expect("应能写请求日志");
+        }
+
+        // 命中 token_key 子串。
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.keyword = Some("alpha".to_string());
+        let rows = query_request_logs(&pool, &filter).await.expect("应能查询");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].token_key, "sk-alpha");
+
+        // 命中 channel 子串（OR 语义：azure 命中两条）。
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.keyword = Some("azure".to_string());
+        assert_eq!(
+            count_request_logs(&pool, &filter).await.expect("应能统计"),
+            2
+        );
+
+        // 命中 token_name（中文）并与模型条件 AND 组合。
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.keyword = Some("令牌".to_string());
+        filter.model = Some("gpt-4o".to_string());
+        let rows = query_request_logs(&pool, &filter).await.expect("应能查询");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].token_name, "生产令牌");
+
+        // 通配符按字面量处理：`_` 不应匹配任意字符。
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.keyword = Some("sk_".to_string());
+        let rows = query_request_logs(&pool, &filter).await.expect("应能查询");
+        assert!(rows.is_empty(), "转义后 `_` 不是通配符");
+
+        // 空白关键字视作不过滤。
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.keyword = Some("   ".to_string());
+        assert_eq!(
+            count_request_logs(&pool, &filter).await.expect("应能统计"),
+            3
+        );
     }
 
     /// 分页参数在查询边界防御：`Default` 派生的 page/page_size 为 0 时不 panic、

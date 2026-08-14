@@ -1083,6 +1083,26 @@ async fn logs_paginate_and_filter() {
     let page: Value = resp.json().await.expect("日志应可解析");
     assert_eq!(page["total"], 3);
 
+    // 综合关键字：模型子串命中全部 3 条。
+    let resp = client
+        .get(format!("{admin}/logs?keyword={TEST_MODEL}"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可过滤日志");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 3);
+
+    // 综合关键字：无命中时 total 为 0。
+    let resp = client
+        .get(format!("{admin}/logs?keyword=no-such-keyword"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可过滤日志");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 0);
+
     // 分页：page_size=2 → 第一页 2 条、第二页 1 条。
     let resp = client
         .get(format!("{admin}/logs?page=1&page_size=2"))

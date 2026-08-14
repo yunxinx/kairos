@@ -444,6 +444,7 @@ async fn adjust_token_balance(
 struct LogQueryParams {
     token_key: Option<String>,
     model: Option<String>,
+    keyword: Option<String>,
     from_created_at: Option<i64>,
     to_created_at: Option<i64>,
     page: Option<u64>,
@@ -512,7 +513,7 @@ struct LogPage {
     total: u64,
 }
 
-/// 分页查询请求日志（时间倒序），按令牌/模型/时间范围过滤，只读。
+/// 分页查询请求日志（时间倒序），按令牌/模型/综合关键字/时间范围过滤，只读。
 ///
 /// `page`/`page_size` 缺省 1/20；`page_size` 上限 200（由存储层夹取），响应的
 /// `page`/`page_size` 反映实际采用值。非法查询参数（如非数字页码）返回结构化 400。
@@ -527,6 +528,7 @@ async fn query_logs(
         store::RequestLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
     filter.token_key = params.token_key;
     filter.model = params.model;
+    filter.keyword = params.keyword.filter(|keyword| !keyword.trim().is_empty());
     filter.from_created_at = params.from_created_at;
     filter.to_created_at = params.to_created_at;
 

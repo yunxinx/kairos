@@ -85,6 +85,8 @@ export interface Page<T> {
 export interface LogQuery {
   token_key?: string;
   model?: string;
+  /** 综合关键字：对令牌/模型/渠道做子串匹配（OR）。 */
+  keyword?: string;
   from_created_at?: number;
   to_created_at?: number;
   page?: number;
