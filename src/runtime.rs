@@ -25,8 +25,8 @@ pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 100 * 1024 * 1024;
 /// 只读该引用——即使管理 API 之后替换了快照，在途请求仍按准入时刻的资源走完。
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
-    /// 渠道（路由候选），按 store 返回顺序。
-    pub channels: Vec<resources::Channel>,
+    /// 渠道（路由候选，含库生成 id），按 store 返回顺序。
+    pub channels: Vec<resources::ChannelRecord>,
     /// 令牌定义，按 `token_key` 索引（认证查找）。
     pub tokens: HashMap<String, resources::Token>,
     /// 价格表，按模型名索引（计费准入）。
@@ -48,7 +48,7 @@ pub type SnapshotHandle = Arc<RwLock<Arc<RuntimeSnapshot>>>;
 /// 四类资源分别读取：渠道/令牌/价格直接装载，运行时开关经 `load_settings` 解析
 /// 出 `full_body` 与 `max_request_bytes`（缺省用默认值）。
 pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreError> {
-    let channels = resources::list_channels(pool).await?;
+    let channels = resources::list_channel_records(pool).await?;
     let token_rows = resources::list_tokens(pool).await?;
     let price_rows = resources::list_prices(pool).await?;
     let settings = resources::list_settings(pool).await?;
@@ -135,7 +135,7 @@ mod tests {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
 
-        resources::upsert_channel(
+        resources::insert_channel(
             &mut conn,
             &resources::Channel {
                 name: "c1".to_string(),
@@ -148,6 +148,7 @@ mod tests {
                 weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
+                enabled: true,
             },
         )
         .await
@@ -190,7 +191,7 @@ mod tests {
 
         let snap = load_snapshot(&pool).await.expect("应能加载快照");
         assert_eq!(snap.channels.len(), 1);
-        assert_eq!(snap.channels[0].name, "c1");
+        assert_eq!(snap.channels[0].channel.name, "c1");
         assert!(snap.tokens.contains_key("sk-a"));
         assert!(snap.prices.contains_key("gpt-4o"));
         assert!(snap.full_body, "开关应生效");

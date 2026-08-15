@@ -283,6 +283,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             weight: 1,
             timeout_ms: 1000,
             max_retries: 0,
+            enabled: true,
         }],
         tokens: vec![SeedToken {
             token_key: TEST_TOKEN_KEY.to_string(),
@@ -321,11 +322,11 @@ pub fn empty_seed(_upstream_base: &str) -> Seed {
     }
 }
 
-/// 把 seed 播种进数据库：渠道/价格直接 upsert，令牌则定义 + 初始余额。
+/// 把 seed 播种进数据库：渠道/价格直接插入，令牌则定义 + 初始余额。
 pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
     let mut conn = pool.acquire().await.expect("应能获取连接");
     for channel in &seed.channels {
-        resources::upsert_channel(&mut conn, channel)
+        resources::insert_channel(&mut conn, channel)
             .await
             .expect("应能播种渠道");
     }

@@ -469,6 +469,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
+                enabled: true,
             },
             Channel {
                 name: "cross-protocol".to_string(),
@@ -481,6 +482,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
+                enabled: true,
             },
         ];
         seed
@@ -534,6 +536,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
+                enabled: true,
             },
             Channel {
                 name: "backup".to_string(),
@@ -546,6 +549,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
+                enabled: true,
             },
         ];
         seed

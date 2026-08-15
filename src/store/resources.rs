@@ -31,6 +31,18 @@ pub struct Channel {
     pub weight: u32,
     pub timeout_ms: u64,
     pub max_retries: u32,
+    /// 是否启用：禁用的渠道不参与路由候选与失败切换。
+    pub enabled: bool,
+}
+
+/// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
+///
+/// `id` 由存储层维护，不属于可写契约（`Channel` JSON），故不派生 serde。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRecord {
+    /// 库生成的稳定身份；管理 API 以此定位渠道，改名不改变 id。
+    pub id: i64,
+    pub channel: Channel,
 }
 
 /// 令牌：认证与计费的最小单位；余额独立存 `token_balance` 表。
@@ -107,11 +119,11 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
     }
 }
 
-/// 读出全部渠道。
-pub async fn list_channels(pool: &SqlitePool) -> Result<Vec<Channel>, StoreError> {
+/// 读出全部渠道记录（含库生成的 `id`）。
+pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord>, StoreError> {
     let rows = sqlx::query(
-        "SELECT name, protocol, base_url, api_key, models_json, model_aliases_json, \
-         priority, weight, timeout_ms, max_retries FROM channels",
+        "SELECT id, name, protocol, base_url, api_key, models_json, model_aliases_json, \
+         priority, weight, timeout_ms, max_retries, enabled FROM channels",
     )
     .fetch_all(pool)
     .await
@@ -119,15 +131,16 @@ pub async fn list_channels(pool: &SqlitePool) -> Result<Vec<Channel>, StoreError
 
     let mut channels = Vec::with_capacity(rows.len());
     for row in rows {
-        channels.push(map_channel_row(&row)?);
+        channels.push(map_channel_record(&row)?);
     }
     Ok(channels)
 }
 
-/// 把渠道行映射为 `Channel`。
-fn map_channel_row(row: &sqlx::sqlite::SqliteRow) -> Result<Channel, StoreError> {
+/// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
+fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
     let name: String = row.try_get("name").map_err(StoreError::Query)?;
     let protocol_wire: String = row.try_get("protocol").map_err(StoreError::Query)?;
+    let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
     // 先解析集合字段（错误信息需要引用 name），再构造结构体以避免移动后借用。
     let models: Vec<String> = serde_json::from_str(
         &row.try_get::<String, _>("models_json")
@@ -140,38 +153,40 @@ fn map_channel_row(row: &sqlx::sqlite::SqliteRow) -> Result<Channel, StoreError>
     )
     .map_err(|_| StoreError::InvalidResource(format!("渠道 {name} 的 model_aliases_json 非法")))?;
 
-    Ok(Channel {
-        base_url: row.try_get("base_url").map_err(StoreError::Query)?,
-        api_key: row.try_get("api_key").map_err(StoreError::Query)?,
-        priority: row.try_get("priority").map_err(StoreError::Query)?,
-        weight: row.try_get("weight").map_err(StoreError::Query)?,
-        timeout_ms: row.try_get("timeout_ms").map_err(StoreError::Query)?,
-        max_retries: row.try_get("max_retries").map_err(StoreError::Query)?,
-        name,
-        protocol: protocol_from_wire(&protocol_wire)?,
-        models,
-        model_aliases,
+    Ok(ChannelRecord {
+        id: row.try_get("id").map_err(StoreError::Query)?,
+        channel: Channel {
+            base_url: row.try_get("base_url").map_err(StoreError::Query)?,
+            api_key: row.try_get("api_key").map_err(StoreError::Query)?,
+            priority: row.try_get("priority").map_err(StoreError::Query)?,
+            weight: row.try_get("weight").map_err(StoreError::Query)?,
+            timeout_ms: row.try_get("timeout_ms").map_err(StoreError::Query)?,
+            max_retries: row.try_get("max_retries").map_err(StoreError::Query)?,
+            enabled: enabled != 0,
+            name,
+            protocol: protocol_from_wire(&protocol_wire)?,
+            models,
+            model_aliases,
+        },
     })
 }
 
-/// 新增或整体替换一个渠道（按 `name`），同一事务内幂等。
-pub async fn upsert_channel(
+/// 新增一个渠道，返回库生成的 `id`。
+///
+/// 同名由 `channels.name` UNIQUE 约束拒绝；调用方应在事务外先查重，
+/// 以便把库错误映射为业务冲突而非 500。
+pub async fn insert_channel(
     conn: &mut SqliteConnection,
     channel: &Channel,
-) -> Result<(), StoreError> {
+) -> Result<i64, StoreError> {
     let models_json = serde_json::to_string(&channel.models).map_err(serde_error)?;
     let aliases_json = serde_json::to_string(&channel.model_aliases).map_err(serde_error)?;
 
-    sqlx::query(
+    let result = sqlx::query(
         "INSERT INTO channels \
          (name, protocol, base_url, api_key, models_json, model_aliases_json, \
-          priority, weight, timeout_ms, max_retries) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(name) DO UPDATE SET \
-           protocol = excluded.protocol, base_url = excluded.base_url, api_key = excluded.api_key, \
-           models_json = excluded.models_json, model_aliases_json = excluded.model_aliases_json, \
-           priority = excluded.priority, weight = excluded.weight, \
-           timeout_ms = excluded.timeout_ms, max_retries = excluded.max_retries",
+          priority, weight, timeout_ms, max_retries, enabled) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -183,6 +198,42 @@ pub async fn upsert_channel(
     .bind(channel.weight)
     .bind(channel.timeout_ms as i64)
     .bind(channel.max_retries)
+    .bind(channel.enabled)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+
+    Ok(result.last_insert_rowid())
+}
+
+/// 按 `id` 整体替换渠道定义；`name` 变化即改名，`id` 保持不变。
+pub async fn update_channel(
+    conn: &mut SqliteConnection,
+    id: i64,
+    channel: &Channel,
+) -> Result<(), StoreError> {
+    let models_json = serde_json::to_string(&channel.models).map_err(serde_error)?;
+    let aliases_json = serde_json::to_string(&channel.model_aliases).map_err(serde_error)?;
+
+    sqlx::query(
+        "UPDATE channels SET \
+           name = ?, protocol = ?, base_url = ?, api_key = ?, \
+           models_json = ?, model_aliases_json = ?, \
+           priority = ?, weight = ?, timeout_ms = ?, max_retries = ?, enabled = ? \
+         WHERE id = ?",
+    )
+    .bind(&channel.name)
+    .bind(protocol_to_wire(channel.protocol))
+    .bind(&channel.base_url)
+    .bind(&channel.api_key)
+    .bind(&models_json)
+    .bind(&aliases_json)
+    .bind(channel.priority)
+    .bind(channel.weight)
+    .bind(channel.timeout_ms as i64)
+    .bind(channel.max_retries)
+    .bind(channel.enabled)
+    .bind(id)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -190,10 +241,10 @@ pub async fn upsert_channel(
     Ok(())
 }
 
-/// 按 `name` 删除渠道；不存在视为成功（幂等）。
-pub async fn delete_channel(conn: &mut SqliteConnection, name: &str) -> Result<(), StoreError> {
-    sqlx::query("DELETE FROM channels WHERE name = ?")
-        .bind(name)
+/// 按 `id` 删除渠道；不存在视为成功（幂等）。
+pub async fn delete_channel(conn: &mut SqliteConnection, id: i64) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM channels WHERE id = ?")
+        .bind(id)
         .execute(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
@@ -481,55 +532,65 @@ mod tests {
             weight: 2,
             timeout_ms: 120_000,
             max_retries: 2,
+            enabled: true,
         }
     }
 
-    /// 渠道播种 → 读回往返一致（含集合字段与协议）。
+    /// 渠道插入 → 读回往返一致（含库生成的 id、集合字段与协议）。
     #[tokio::test]
-    async fn channel_upsert_then_list_roundtrip() {
+    async fn channel_insert_then_list_roundtrip() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
-        upsert_channel(&mut conn, &sample_channel())
+        let id = insert_channel(&mut conn, &sample_channel())
             .await
             .expect("应能写渠道");
+        assert!(id > 0, "插入应返回库生成的 id");
 
-        let channels = list_channels(&pool).await.expect("应能读渠道");
-        assert_eq!(channels, vec![sample_channel()]);
+        let records = list_channel_records(&pool).await.expect("应能读渠道");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, id);
+        assert_eq!(records[0].channel, sample_channel());
     }
 
-    /// 同 name 再次 upsert 为整体替换，不产生重复行。
+    /// 按 id 整体替换：可改字段也可改名，id 保持不变，不产生重复行。
     #[tokio::test]
-    async fn channel_upsert_overwrites_same_name() {
+    async fn channel_update_by_id_replaces_definition_and_renames() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
-        upsert_channel(&mut conn, &sample_channel())
+        let id = insert_channel(&mut conn, &sample_channel())
             .await
             .expect("应能写渠道");
         let mut updated = sample_channel();
+        updated.name = "c1-renamed".to_string();
         updated.timeout_ms = 3_000;
-        upsert_channel(&mut conn, &updated)
+        updated.enabled = false;
+        update_channel(&mut conn, id, &updated)
             .await
-            .expect("应能覆盖渠道");
+            .expect("应能按 id 覆盖渠道");
 
-        let channels = list_channels(&pool).await.expect("应能读渠道");
-        assert_eq!(channels.len(), 1, "覆盖后仍为单行");
-        assert_eq!(channels[0].timeout_ms, 3_000);
+        let records = list_channel_records(&pool).await.expect("应能读渠道");
+        assert_eq!(records.len(), 1, "覆盖后仍为单行");
+        assert_eq!(records[0].id, id, "改名不应改变 id");
+        assert_eq!(records[0].channel, updated, "字段与改名应整体生效");
     }
 
-    /// 删除渠道后读回为空；删除不存在的 name 幂等成功。
+    /// 按 id 删除渠道后读回为空；重复删除同一 id 幂等成功。
     #[tokio::test]
     async fn channel_delete_is_idempotent() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
-        upsert_channel(&mut conn, &sample_channel())
+        let id = insert_channel(&mut conn, &sample_channel())
             .await
             .expect("应能写渠道");
-        delete_channel(&mut conn, "c1").await.expect("应能删渠道");
-        delete_channel(&mut conn, "c1")
-            .await
-            .expect("重复删除应幂等");
+        delete_channel(&mut conn, id).await.expect("应能删渠道");
+        delete_channel(&mut conn, id).await.expect("重复删除应幂等");
 
-        assert!(list_channels(&pool).await.expect("应能读").is_empty());
+        assert!(
+            list_channel_records(&pool)
+                .await
+                .expect("应能读")
+                .is_empty()
+        );
     }
 
     /// 令牌播种 → 读回往返一致；limit 为 NULL 表示无上限，enabled 缺省启用。
@@ -772,7 +833,7 @@ mod tests {
 
         // 事务内先写一条有效渠道，再执行一条必然失败的语句。
         let mut tx = pool.begin().await.expect("应能开启事务");
-        upsert_channel(&mut tx, &sample_channel())
+        insert_channel(&mut tx, &sample_channel())
             .await
             .expect("事务内写渠道应成功");
         let err = sqlx::query("INSERT INTO channels (name) VALUES (?)")
@@ -783,7 +844,10 @@ mod tests {
         tx.rollback().await.expect("应能回滚");
 
         assert!(
-            list_channels(&pool).await.expect("应能读渠道").is_empty(),
+            list_channel_records(&pool)
+                .await
+                .expect("应能读渠道")
+                .is_empty(),
             "回滚后事务内写入不应残留"
         );
     }

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use rand::RngExt;
 
-use crate::store::resources::Channel;
+use crate::store::resources::{Channel, ChannelRecord};
 
 /// 一次路由的结果：按 failover 顺序排列的候选渠道 + 出站模型名。
 ///
@@ -16,7 +16,7 @@ use crate::store::resources::Channel;
 /// 渠道共享同一出站模型名（同一模型的不同渠道）。
 #[derive(Debug, Clone)]
 pub struct Route {
-    /// 按尝试顺序排列的候选渠道（引用自配置）。
+    /// 按尝试顺序排列的候选渠道（克隆自配置记录）。
     pub channels: Vec<Channel>,
     /// 出站请求应使用的模型名（别名重写后）。
     pub outbound_model: String,
@@ -24,19 +24,25 @@ pub struct Route {
 
 /// 为 `model` 在 `channels` 中选出候选并按 failover 顺序排列。
 ///
+/// 候选须处于启用状态（禁用的渠道不参与路由与失败切换）。
 /// 优先级按数值升序（数值越小越先尝试）；同一优先级内按 weight 加权随机排序，
 /// 作为本次请求的失败切换顺序。全部候选都在结果里（低优先级渠道是兜底），
 /// 无任何候选时返回 `None`。
-pub fn route(channels: &[Channel], model: &str) -> Option<Route> {
-    let candidates: Vec<&Channel> = channels
+pub fn route(channels: &[ChannelRecord], model: &str) -> Option<Route> {
+    let candidates: Vec<&ChannelRecord> = channels
         .iter()
-        .filter(|c| c.models.iter().any(|m| m == model) || c.model_aliases.contains_key(model))
+        .filter(|record| {
+            let c = &record.channel;
+            c.enabled
+                && (c.models.iter().any(|m| m == model) || c.model_aliases.contains_key(model))
+        })
         .collect();
     if candidates.is_empty() {
         return None;
     }
 
     let outbound_model = candidates[0]
+        .channel
         .model_aliases
         .get(model)
         .cloned()
@@ -44,9 +50,12 @@ pub fn route(channels: &[Channel], model: &str) -> Option<Route> {
 
     // 按 priority 升序分组：数值越小优先级越高，先被尝试；组内按 weight 加权
     // 随机排序，作为 failover 顺序。全部候选都在结果里（低优先级渠道是兜底）。
-    let mut priority_groups: HashMap<u32, Vec<&Channel>> = HashMap::new();
-    for &c in &candidates {
-        priority_groups.entry(c.priority).or_default().push(c);
+    let mut priority_groups: HashMap<u32, Vec<&ChannelRecord>> = HashMap::new();
+    for &record in &candidates {
+        priority_groups
+            .entry(record.channel.priority)
+            .or_default()
+            .push(record);
     }
     let mut priorities: Vec<u32> = priority_groups.keys().copied().collect();
     priorities.sort_unstable();
@@ -61,10 +70,10 @@ pub fn route(channels: &[Channel], model: &str) -> Option<Route> {
         let mut keys: Vec<(f64, usize)> = group
             .iter()
             .enumerate()
-            .map(|(i, c)| (exp_key(c.weight, &mut rng), i))
+            .map(|(i, record)| (exp_key(record.channel.weight, &mut rng), i))
             .collect();
         keys.sort_by(|a, b| a.0.total_cmp(&b.0));
-        channels.extend(keys.into_iter().map(|(_, i)| group[i].clone()));
+        channels.extend(keys.into_iter().map(|(_, i)| group[i].channel.clone()));
     }
 
     Some(Route {
@@ -99,16 +108,22 @@ mod tests {
             weight,
             timeout_ms: 1000,
             max_retries: 0,
+            enabled: true,
         }
+    }
+
+    /// 测试用记录包装：id 仅作身份占位，路由不依赖其取值。
+    fn record(id: i64, channel: Channel) -> ChannelRecord {
+        ChannelRecord { id, channel }
     }
 
     /// priority 升序优先：最高优先级（数值最小）的渠道先被尝试，低优先级兜底。
     #[test]
     fn orders_by_priority_ascending() {
         let channels = vec![
-            channel("p2-a", 2, 1, &["gpt-4o"]),
-            channel("p1-a", 1, 1, &["gpt-4o"]),
-            channel("p1-b", 1, 1, &["gpt-4o"]),
+            record(1, channel("p2-a", 2, 1, &["gpt-4o"])),
+            record(2, channel("p1-a", 1, 1, &["gpt-4o"])),
+            record(3, channel("p1-b", 1, 1, &["gpt-4o"])),
         ];
         let route = route(&channels, "gpt-4o").expect("应有候选");
         assert_eq!(route.channels.len(), 3, "全部候选都应参与 failover");
@@ -122,8 +137,8 @@ mod tests {
     #[test]
     fn higher_weight_tends_to_front() {
         let channels = vec![
-            channel("heavy", 1, 100, &["gpt-4o"]),
-            channel("light", 1, 1, &["gpt-4o"]),
+            record(1, channel("heavy", 1, 100, &["gpt-4o"])),
+            record(2, channel("light", 1, 1, &["gpt-4o"])),
         ];
         // 大量采样，统计 heavy 排第一的频率应显著高于 light。
         let mut heavy_first = 0;
@@ -143,8 +158,30 @@ mod tests {
     /// 无任何候选渠道 → 返回 None。
     #[test]
     fn no_candidate_is_none() {
-        let channels = vec![channel("a", 1, 1, &["other-model"])];
+        let channels = vec![record(1, channel("a", 1, 1, &["other-model"]))];
         assert!(route(&channels, "gpt-4o").is_none());
+    }
+
+    /// 禁用的渠道不参与路由：仅剩启用渠道入选。
+    #[test]
+    fn disabled_channel_is_excluded() {
+        let mut disabled = channel("off", 1, 1, &["gpt-4o"]);
+        disabled.enabled = false;
+        let channels = vec![
+            record(1, disabled),
+            record(2, channel("on", 2, 1, &["gpt-4o"])),
+        ];
+        let route = route(&channels, "gpt-4o").expect("启用渠道应可命中");
+        assert_eq!(route.channels.len(), 1, "禁用渠道不应进入候选");
+        assert_eq!(route.channels[0].name, "on");
+    }
+
+    /// 全部候选都被禁用 → 与无候选同等处理，返回 None。
+    #[test]
+    fn all_disabled_is_none() {
+        let mut only = channel("off", 1, 1, &["gpt-4o"]);
+        only.enabled = false;
+        assert!(route(&[record(1, only)], "gpt-4o").is_none());
     }
 
     /// 别名 key 命中候选，出站模型名重写为 alias value。
@@ -153,14 +190,14 @@ mod tests {
         let mut c = channel("c", 1, 1, &["gpt-4o"]);
         c.model_aliases
             .insert("fast".to_string(), "gpt-4o-mini".to_string());
-        let route = route(&[c], "fast").expect("别名短名应命中");
+        let route = route(&[record(1, c)], "fast").expect("别名短名应命中");
         assert_eq!(route.outbound_model, "gpt-4o-mini");
     }
 
     /// 未命中别名时出站模型名原样。
     #[test]
     fn outbound_model_unchanged_without_alias() {
-        let channels = vec![channel("c", 1, 1, &["gpt-4o"])];
+        let channels = vec![record(1, channel("c", 1, 1, &["gpt-4o"]))];
         let route = route(&channels, "gpt-4o").expect("应有候选");
         assert_eq!(route.outbound_model, "gpt-4o");
     }

@@ -21,6 +21,40 @@ async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
         .expect("管理请求应可达")
 }
 
+/// 按名查出渠道的库生成 id，供按 id 定位的端点使用。
+async fn channel_id_by_name(gw: &TestGateway, name: &str) -> i64 {
+    let list: Value = admin_get(gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let channel = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("渠道 {name} 应在列表"))
+        .clone();
+    channel["id"].as_i64().expect("列表应回传整数 id")
+}
+
+/// 渠道完整 JSON body：openai_chat 指向给定上游，其余字段取常规默认且启用。
+fn channel_body(name: &str, base_url: String, models: Value) -> Value {
+    json!({
+        "name": name,
+        "protocol": "openai_chat",
+        "base_url": base_url,
+        "api_key": "sk-upstream",
+        "models": models,
+        "model_aliases": {},
+        "priority": 1,
+        "weight": 1,
+        "timeout_ms": 1000,
+        "max_retries": 0,
+        "enabled": true
+    })
+}
+
 /// 带 `TEST_ADMIN_KEY` 认证、携带 JSON body 的请求。
 async fn admin_json(
     gw: &TestGateway,
@@ -145,7 +179,7 @@ async fn admin_not_configured_means_no_admin_routes() {
         "协议监听不应接受管理写入"
     );
     let resp = client
-        .post(format!("{}/channels/test-channel/test", gw.base_url()))
+        .post(format!("{}/channels/1/test", gw.base_url()))
         .send()
         .await
         .expect("协议监听应可请求");
@@ -369,21 +403,16 @@ async fn channel_and_price_immediate_effect() {
         &gw,
         reqwest::Method::POST,
         "/channels",
-        json!({
-            "name": "mini-channel",
-            "protocol": "openai_chat",
-            "base_url": gw.upstream.base_url(),
-            "api_key": "sk-upstream",
-            "models": ["gpt-4o-mini"],
-            "model_aliases": {},
-            "priority": 1,
-            "weight": 1,
-            "timeout_ms": 1000,
-            "max_retries": 0
-        }),
+        channel_body(
+            "mini-channel",
+            gw.upstream.base_url(),
+            json!(["gpt-4o-mini"]),
+        ),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let mini_id = created["id"].as_i64().expect("创建应回传库生成的 id");
 
     // 渠道已建但无价格：请求被计费准入拒绝（503）。
     let resp = chat_request(&gw, TEST_TOKEN_KEY, "gpt-4o-mini").await;
@@ -418,6 +447,43 @@ async fn channel_and_price_immediate_effect() {
         "有价格后请求应立即可用"
     );
 
+    // 禁用渠道：模型失去可用候选，请求 503（与无渠道同等处理）。
+    let mut disabled = channel_body(
+        "mini-channel",
+        gw.upstream.base_url(),
+        json!(["gpt-4o-mini"]),
+    );
+    disabled["enabled"] = json!(false);
+    let resp = admin_put(&gw, &format!("/channels/{mini_id}"), disabled).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: Value = resp.json().await.expect("应返回变更后渠道");
+    assert_eq!(updated["enabled"], false, "PUT 回显应反映禁用");
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "gpt-4o-mini").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "禁用的渠道不应参与路由"
+    );
+
+    // 重新启用后立即可用。
+    let resp = admin_put(
+        &gw,
+        &format!("/channels/{mini_id}"),
+        channel_body(
+            "mini-channel",
+            gw.upstream.base_url(),
+            json!(["gpt-4o-mini"]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "gpt-4o-mini").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "重新启用的渠道应立即可用"
+    );
+
     // 删除价格：请求再次 503（无价格）。
     let resp = client
         .delete(format!("{}/prices/gpt-4o-mini", gw.admin_base_url()))
@@ -435,7 +501,7 @@ async fn channel_and_price_immediate_effect() {
 
     // 删除渠道：模型失去路由，请求 503（无渠道）。
     let resp = client
-        .delete(format!("{}/channels/mini-channel", gw.admin_base_url()))
+        .delete(format!("{}/channels/{mini_id}", gw.admin_base_url()))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await
@@ -447,6 +513,107 @@ async fn channel_and_price_immediate_effect() {
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
         "删除渠道后模型应无路由"
     );
+}
+
+/// 渠道改名：按 id 定位的 PUT 携带新 name 即改名，id 保持稳定、即时可路由；
+/// 新名已被占用返回 409，id 不存在返回 404。
+#[tokio::test]
+async fn channel_rename_moves_definition() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    // 先按名查出 seed 渠道的 id。
+    let list: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let seed_channel = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "test-channel")
+        .expect("seed 渠道应在列表")
+        .clone();
+    let channel_id = seed_channel["id"].as_i64().expect("列表应回传库生成的 id");
+
+    // 改名 test-channel → renamed-channel：回显为新名，id 保持不变。
+    let resp = admin_put(
+        &gw,
+        &format!("/channels/{channel_id}"),
+        channel_body(
+            "renamed-channel",
+            gw.upstream.base_url(),
+            json!([TEST_MODEL]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let updated: Value = resp.json().await.expect("应返回变更后渠道");
+    assert_eq!(updated["name"], "renamed-channel", "PUT 回显应为新名");
+    assert_eq!(updated["id"], channel_id, "改名不应改变 id");
+
+    // 列表中新名在、旧名消失；改名后立即可路由。
+    let list: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"renamed-channel"), "新名应在列表");
+    assert!(!names.contains(&"test-channel"), "旧名应被移除");
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "改名后模型应立即可路由"
+    );
+
+    // 改成已存在的名字 → 409，且不产生副作用。
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body(
+            "second-channel",
+            gw.upstream.base_url(),
+            json!(["other-model"]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let resp = admin_put(
+        &gw,
+        &format!("/channels/{channel_id}"),
+        channel_body(
+            "second-channel",
+            gw.upstream.base_url(),
+            json!([TEST_MODEL]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "冲突改名不应影响原渠道"
+    );
+
+    // id 不存在 → 404。
+    let resp = admin_put(
+        &gw,
+        "/channels/999999",
+        channel_body("whatever", gw.upstream.base_url(), json!([TEST_MODEL])),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 /// 非法输入返回结构化错误；失败与冲突的写不污染库与快照。
@@ -505,30 +672,25 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // 渠道权重为 0 → 400：权重是加权随机除数，API 直写也须被拒。
+    let mut zero_weight = channel_body("zero-weight", gw.upstream.base_url(), json!([TEST_MODEL]));
+    zero_weight["weight"] = json!(0);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", zero_weight).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
     // 重复新建 → 409，且不覆盖原资源（令牌 key 系统生成、创建不会冲突，以渠道为例）。
     let before: Value = admin_get(&gw, "/channels")
         .await
         .json()
         .await
         .expect("渠道列表应可解析");
-    let resp = admin_json(
-        &gw,
-        reqwest::Method::POST,
-        "/channels",
-        json!({
-            "name": "test-channel",
-            "protocol": "openai_chat",
-            "base_url": gw.upstream.base_url(),
-            "api_key": "sk-other",
-            "models": ["gpt-4o"],
-            "model_aliases": {},
-            "priority": 9,
-            "weight": 9,
-            "timeout_ms": 1,
-            "max_retries": 9
-        }),
-    )
-    .await;
+    let mut conflict = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    conflict["api_key"] = json!("sk-other");
+    conflict["priority"] = json!(9);
+    conflict["weight"] = json!(9);
+    conflict["timeout_ms"] = json!(1);
+    conflict["max_retries"] = json!(9);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", conflict).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     let after: Value = admin_get(&gw, "/channels")
         .await
@@ -551,25 +713,9 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
 #[tokio::test]
 async fn unknown_field_is_rejected() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
-    let resp = admin_json(
-        &gw,
-        reqwest::Method::POST,
-        "/channels",
-        json!({
-            "name": "typo-channel",
-            "protcol": "openai_chat",
-            "protocol": "openai_chat",
-            "base_url": gw.upstream.base_url(),
-            "api_key": "sk-upstream",
-            "models": [],
-            "model_aliases": {},
-            "priority": 1,
-            "weight": 1,
-            "timeout_ms": 1000,
-            "max_retries": 0
-        }),
-    )
-    .await;
+    let mut typo = channel_body("typo-channel", gw.upstream.base_url(), json!([]));
+    typo["protcol"] = json!("openai_chat");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", typo).await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = resp.json().await.expect("应返回结构化错误");
     assert_eq!(body["error"]["code"], "invalid_body");
@@ -598,7 +744,7 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
         );
     }
     let resp = client
-        .post(format!("{}/channels/test-channel/test", gw.base_url()))
+        .post(format!("{}/channels/1/test", gw.base_url()))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await
@@ -790,18 +936,11 @@ async fn runtime_resources_survive_process_restart() {
         &gw,
         reqwest::Method::POST,
         "/channels",
-        json!({
-            "name": "restart-channel",
-            "protocol": "openai_chat",
-            "base_url": gw.upstream.base_url(),
-            "api_key": "sk-upstream",
-            "models": ["restart-only"],
-            "model_aliases": {},
-            "priority": 1,
-            "weight": 1,
-            "timeout_ms": 1000,
-            "max_retries": 0
-        }),
+        channel_body(
+            "restart-channel",
+            gw.upstream.base_url(),
+            json!(["restart-only"]),
+        ),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
@@ -889,18 +1028,7 @@ async fn empty_db_bootstraps_via_admin_api() {
         &gw,
         reqwest::Method::POST,
         "/channels",
-        json!({
-            "name": "boot-channel",
-            "protocol": "openai_chat",
-            "base_url": gw.upstream.base_url(),
-            "api_key": "sk-upstream",
-            "models": [TEST_MODEL],
-            "model_aliases": {},
-            "priority": 1,
-            "weight": 1,
-            "timeout_ms": 1000,
-            "max_retries": 0
-        }),
+        channel_body("boot-channel", gw.upstream.base_url(), json!([TEST_MODEL])),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
@@ -1624,9 +1752,10 @@ async fn channel_probe_success_skips_billing_and_logging() {
         .await
         .expect("应能统计日志");
 
+    let channel_id = channel_id_by_name(&gw, "test-channel").await;
     let resp = reqwest::Client::new()
         .post(format!(
-            "{}/channels/test-channel/test",
+            "{}/channels/{channel_id}/test",
             gw.admin_base_url()
         ))
         .bearer_auth(TEST_ADMIN_KEY)
@@ -1677,9 +1806,10 @@ async fn channel_probe_upstream_error_is_reachable_with_status() {
         .await
         .expect("应能统计日志");
 
+    let channel_id = channel_id_by_name(&gw, "test-channel").await;
     let resp = reqwest::Client::new()
         .post(format!(
-            "{}/channels/test-channel/test",
+            "{}/channels/{channel_id}/test",
             gw.admin_base_url()
         ))
         .bearer_auth(TEST_ADMIN_KEY)
@@ -1710,31 +1840,22 @@ async fn channel_probe_upstream_error_is_reachable_with_status() {
 async fn channel_probe_timeout_is_unreachable() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    let resp = admin_json(
-        &gw,
-        reqwest::Method::POST,
-        "/channels",
-        json!({
-            "name": "timeout-channel",
-            "protocol": "openai_chat",
-            "base_url": gw.upstream.base_url(),
-            "api_key": "sk-upstream",
-            "models": [TEST_MODEL],
-            "model_aliases": {},
-            "priority": 1,
-            "weight": 1,
-            "timeout_ms": 200,
-            "max_retries": 0
-        }),
-    )
-    .await;
+    let mut timeout_body = channel_body(
+        "timeout-channel",
+        gw.upstream.base_url(),
+        json!([TEST_MODEL]),
+    );
+    timeout_body["timeout_ms"] = json!(200);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", timeout_body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let timeout_id = created["id"].as_i64().expect("创建应回传整数 id");
 
     gw.upstream.set_behavior(UpstreamBehavior::Hang);
 
     let resp = reqwest::Client::new()
         .post(format!(
-            "{}/channels/timeout-channel/test",
+            "{}/channels/{timeout_id}/test",
             gw.admin_base_url()
         ))
         .bearer_auth(TEST_ADMIN_KEY)
@@ -1774,14 +1895,14 @@ async fn stats_and_probe_auth_and_unknown_channel() {
     assert_eq!(body["error"]["code"], "unauthorized");
 
     let resp = client
-        .post(format!("{admin}/channels/test-channel/test"))
+        .post(format!("{admin}/channels/1/test"))
         .send()
         .await
         .expect("应可请求管理面");
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let resp = client
-        .post(format!("{admin}/channels/does-not-exist/test"))
+        .post(format!("{admin}/channels/999999/test"))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await

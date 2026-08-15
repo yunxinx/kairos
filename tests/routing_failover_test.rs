@@ -53,6 +53,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             weight: 1,
             timeout_ms: 1000,
             max_retries: 0,
+            enabled: true,
         },
         Channel {
             name: "ch-1".to_string(),
@@ -65,6 +66,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             weight: 1,
             timeout_ms: 1000,
             max_retries: 0,
+            enabled: true,
         },
     ];
     seed

@@ -9,7 +9,7 @@
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
 //! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）、
 //! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）与渠道连通性探测
-//! （`/channels/{name}/test`）。
+//! （`/channels/{id}/test`）。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ use crate::{
     core::ir::{ChatRequest, ContentPart, Message, Role},
     runtime, store,
     store::StoreError,
-    store::resources::{Channel, Price, Settings, Token},
+    store::resources::{Channel, ChannelRecord, Price, Settings, Token},
 };
 
 use super::http::OutboundAuth;
@@ -73,11 +73,8 @@ pub fn router(
         )
         .route("/tokens/{token_key}/balance", post(adjust_token_balance))
         .route("/channels", get(list_channels).post(create_channel))
-        .route(
-            "/channels/{name}",
-            put(update_channel).delete(delete_channel),
-        )
-        .route("/channels/{name}/test", post(test_channel))
+        .route("/channels/{id}", put(update_channel).delete(delete_channel))
+        .route("/channels/{id}/test", post(test_channel))
         .route("/prices", get(list_prices).post(create_price))
         .route("/prices/{model}", put(update_price).delete(delete_price))
         .route("/settings", get(get_settings).put(update_settings))
@@ -258,22 +255,60 @@ async fn delete_token(
 
 // --- 渠道 ---
 
-/// 列出全部渠道（保持快照顺序）。
-async fn list_channels(State(deps): State<AdminDeps>) -> Result<Json<Vec<Channel>>, AdminError> {
-    let snapshot = deps.snapshot.read().await;
-    Ok(Json(snapshot.channels.clone()))
+/// 渠道读视图：库生成的稳定身份 + 定义字段（同级展开序列化）。
+///
+/// 写契约仍是无 id 的 `Channel`；id 只随读响应返回。
+#[derive(Debug, Serialize)]
+struct ChannelView {
+    id: i64,
+    #[serde(flatten)]
+    channel: Channel,
 }
 
-/// 新建渠道：同名已存在则冲突（409），否则写库 + 换快照 + 返回新渠道。
+impl ChannelView {
+    fn from_record(record: ChannelRecord) -> Self {
+        ChannelView {
+            id: record.id,
+            channel: record.channel,
+        }
+    }
+}
+
+/// 解析路径中的渠道 id；非整数不标识任何渠道，按不存在处理（404）。
+fn parse_channel_id(raw: String) -> Result<i64, AdminError> {
+    raw.parse::<i64>()
+        .map_err(|_| AdminError::NotFound(format!("渠道 {raw} 不存在")))
+}
+
+/// 列出全部渠道（保持快照顺序），返回带 id 的视图。
+async fn list_channels(
+    State(deps): State<AdminDeps>,
+) -> Result<Json<Vec<ChannelView>>, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    Ok(Json(
+        snapshot
+            .channels
+            .iter()
+            .cloned()
+            .map(ChannelView::from_record)
+            .collect(),
+    ))
+}
+
+/// 新建渠道：同名已存在则冲突（409），否则写库 + 换快照 + 返回新渠道视图。
 async fn create_channel(
     State(deps): State<AdminDeps>,
     body: Result<Json<Channel>, axum::extract::rejection::JsonRejection>,
-) -> Result<(StatusCode, Json<Channel>), AdminError> {
+) -> Result<(StatusCode, Json<ChannelView>), AdminError> {
     let channel = body.map_err(AdminError::bad_body)?;
     validate_channel(&channel)?;
     {
         let snapshot = deps.snapshot.read().await;
-        if snapshot.channels.iter().any(|c| c.name == channel.name) {
+        if snapshot
+            .channels
+            .iter()
+            .any(|record| record.channel.name == channel.name)
+        {
             return Err(AdminError::Conflict(format!(
                 "渠道 {} 已存在",
                 channel.name
@@ -281,47 +316,69 @@ async fn create_channel(
         }
     }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::resources::upsert_channel(&mut tx, &channel)
+    let id = crate::store::resources::insert_channel(&mut tx, &channel)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    let created = read_channel(&deps, &channel.name).await?;
-    Ok((StatusCode::CREATED, Json(created)))
+    let created = read_channel_record(&deps, id).await?;
+    Ok((StatusCode::CREATED, Json(ChannelView::from_record(created))))
 }
 
-/// 整体替换渠道（按路径 `name`，路径权威）：写库 + 换快照 + 返回新渠道。
+/// 整体替换渠道（按路径 `id` 定位）：写库 + 换快照 + 返回新渠道视图。
+///
+/// `name` 变化即改名，id 保持不变；新名已被其它渠道占用返回 409。
 async fn update_channel(
     State(deps): State<AdminDeps>,
-    Path(name): Path<String>,
+    Path(raw_id): Path<String>,
     body: Result<Json<Channel>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<Channel>, AdminError> {
-    let mut channel = body.map_err(AdminError::bad_body)?;
-    channel.name = name;
+) -> Result<Json<ChannelView>, AdminError> {
+    let id = parse_channel_id(raw_id)?;
+    let channel = body.map_err(AdminError::bad_body)?;
     validate_channel(&channel)?;
+    {
+        let snapshot = deps.snapshot.read().await;
+        let current = snapshot
+            .channels
+            .iter()
+            .find(|record| record.id == id)
+            .ok_or_else(|| AdminError::NotFound(format!("渠道 {id} 不存在")))?;
+        if channel.name != current.channel.name
+            && snapshot
+                .channels
+                .iter()
+                .any(|record| record.channel.name == channel.name)
+        {
+            return Err(AdminError::Conflict(format!(
+                "渠道 {} 已存在",
+                channel.name
+            )));
+        }
+    }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::resources::upsert_channel(&mut tx, &channel)
+    crate::store::resources::update_channel(&mut tx, id, &channel)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    let updated = read_channel(&deps, &channel.name).await?;
-    Ok(Json(updated))
+    let updated = read_channel_record(&deps, id).await?;
+    Ok(Json(ChannelView::from_record(updated)))
 }
 
-/// 删除渠道：不存在则 404，否则删除并返回被删渠道。
+/// 删除渠道（按路径 `id`）：不存在则 404，否则删除并返回被删渠道视图。
 async fn delete_channel(
     State(deps): State<AdminDeps>,
-    Path(name): Path<String>,
-) -> Result<Json<Channel>, AdminError> {
-    let deleted = read_channel(&deps, &name).await?;
+    Path(raw_id): Path<String>,
+) -> Result<Json<ChannelView>, AdminError> {
+    let id = parse_channel_id(raw_id)?;
+    let deleted = read_channel_record(&deps, id).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::resources::delete_channel(&mut tx, &name)
+    crate::store::resources::delete_channel(&mut tx, id)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    Ok(Json(deleted))
+    Ok(Json(ChannelView::from_record(deleted)))
 }
 
 // --- 价格 ---
@@ -751,13 +808,15 @@ struct ChannelProbeResult {
 /// 向渠道 `base_url` 发一条最小非流式请求，按渠道协议编码，回报可达性。
 async fn test_channel(
     State(deps): State<AdminDeps>,
-    Path(name): Path<String>,
+    Path(raw_id): Path<String>,
 ) -> Result<Json<ChannelProbeResult>, AdminError> {
-    let channel = read_channel(&deps, &name).await?;
+    let id = parse_channel_id(raw_id)?;
+    let record = read_channel_record(&deps, id).await?;
+    let channel = record.channel;
     let model = channel
         .models
         .first()
-        .ok_or_else(|| AdminError::InvalidBody(format!("渠道 {name} 未配置模型，无法探测")))?;
+        .ok_or_else(|| AdminError::InvalidBody(format!("渠道 {id} 未配置模型，无法探测")))?;
     let request = minimal_probe_request(model);
     let mut warnings = Vec::new();
     let outbound = protocol::encode_request(&request, channel.protocol, &mut warnings);
@@ -893,15 +952,15 @@ async fn read_token_record(
         .ok_or_else(|| AdminError::NotFound(format!("令牌 {token_key} 不存在")))
 }
 
-/// 从当前快照读回一个渠道；不存在返回 `NotFound`。
-async fn read_channel(deps: &AdminDeps, name: &str) -> Result<Channel, AdminError> {
+/// 从当前快照按 id 读回一条渠道记录；不存在返回 `NotFound`。
+async fn read_channel_record(deps: &AdminDeps, id: i64) -> Result<ChannelRecord, AdminError> {
     let snapshot = deps.snapshot.read().await;
     snapshot
         .channels
         .iter()
-        .find(|channel| channel.name == name)
+        .find(|record| record.id == id)
         .cloned()
-        .ok_or_else(|| AdminError::NotFound(format!("渠道 {name} 不存在")))
+        .ok_or_else(|| AdminError::NotFound(format!("渠道 {id} 不存在")))
 }
 
 /// 从当前快照读回一个价格；不存在返回 `NotFound`。
@@ -934,7 +993,7 @@ fn validate_token(token: &Token) -> Result<(), AdminError> {
     Ok(())
 }
 
-/// 校验渠道字段：名/上游地址/密钥非空。
+/// 校验渠道字段：名/上游地址/密钥非空，权重至少为 1。
 fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     if channel.name.trim().is_empty() {
         return Err(AdminError::InvalidBody("name 不能为空".to_string()));
@@ -944,6 +1003,9 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     }
     if channel.api_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
+    }
+    if channel.weight < 1 {
+        return Err(AdminError::InvalidBody("weight 不能小于 1".to_string()));
     }
     Ok(())
 }
