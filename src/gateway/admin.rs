@@ -796,30 +796,71 @@ async fn get_lifetime_stats(
 
 // --- 渠道连通性探测 ---
 
-/// 渠道探测结果：可达性、状态码、延迟、失败时的错误摘要。
+/// 渠道探测请求：指定要测的模型（清单条目或别名映射的主模型名）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelProbeRequest {
+    model: String,
+}
+
+/// 渠道探测结果：可达性、超时、状态码、延迟、错误摘要与上游 body 截断。
 ///
 /// 探测不经令牌认证/计费、不落 `request_log`。超时沿用渠道 `timeout_ms`。
 #[derive(Debug, Serialize)]
 struct ChannelProbeResult {
     reachable: bool,
+    timed_out: bool,
     status_code: Option<u16>,
     latency_ms: u64,
     error: Option<String>,
+    upstream_body: Option<String>,
+}
+
+/// 解析探测出站模型名：清单里的主模型名、清单里的别名、或仅别名生效时的主模型名。
+fn resolve_probe_model(channel: &Channel, requested: &str) -> Option<String> {
+    if requested.is_empty() {
+        return None;
+    }
+    if let Some(canonical) = channel.model_aliases.get(requested)
+        && channel
+            .models
+            .iter()
+            .any(|item| item == requested || item == canonical)
+    {
+        return Some(canonical.clone());
+    }
+    if channel.models.iter().any(|item| item == requested) {
+        return Some(requested.to_string());
+    }
+    if channel.models.iter().any(|item| {
+        channel
+            .model_aliases
+            .get(item)
+            .is_some_and(|canonical| canonical == requested)
+    }) {
+        return Some(requested.to_string());
+    }
+    None
 }
 
 /// 向渠道 `base_url` 发一条最小非流式请求，按渠道协议编码，回报可达性。
 async fn test_channel(
     State(deps): State<AdminDeps>,
     Path(raw_id): Path<String>,
+    body: Result<Json<ChannelProbeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ChannelProbeResult>, AdminError> {
+    let Json(req) = body.map_err(AdminError::bad_body)?;
+    let requested = req.model.trim();
+    if requested.is_empty() {
+        return Err(AdminError::InvalidBody("model 不能为空".to_string()));
+    }
     let id = parse_channel_id(raw_id)?;
     let record = read_channel_record(&deps, id).await?;
     let channel = record.channel;
-    let model = channel
-        .models
-        .first()
-        .ok_or_else(|| AdminError::InvalidBody(format!("渠道 {id} 未配置模型，无法探测")))?;
-    let request = minimal_probe_request(model);
+    let model = resolve_probe_model(&channel, requested).ok_or_else(|| {
+        AdminError::InvalidBody(format!("模型 {requested} 不在渠道 {id} 的清单中"))
+    })?;
+    let request = minimal_probe_request(&model);
     let mut warnings = Vec::new();
     let outbound = protocol::encode_request(&request, channel.protocol, &mut warnings);
     let upstream_url = format!(
@@ -847,18 +888,27 @@ async fn test_channel(
             } else {
                 Some(probe_error_summary(&body_text, status_code))
             };
+            let upstream_body = if body_text.is_empty() {
+                None
+            } else {
+                Some(truncate_error(body_text))
+            };
             ChannelProbeResult {
                 reachable: true,
+                timed_out: false,
                 status_code: Some(status_code),
                 latency_ms: elapsed_ms(started),
                 error,
+                upstream_body,
             }
         }
         Err(err) => ChannelProbeResult {
             reachable: false,
+            timed_out: err.is_timeout(),
             status_code: None,
             latency_ms: elapsed_ms(started),
             error: Some(truncate_error(upstream_unreachable_message(&err))),
+            upstream_body: None,
         },
     };
     Ok(Json(result))

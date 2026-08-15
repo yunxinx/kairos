@@ -1759,18 +1759,27 @@ async fn channel_probe_success_skips_billing_and_logging() {
             gw.admin_base_url()
         ))
         .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
         .expect("应可探测渠道");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.expect("探测结果应可解析");
     assert_eq!(body["reachable"], true);
+    assert_eq!(body["timed_out"], false);
     assert_eq!(body["status_code"], 200);
     assert!(
         body["latency_ms"].as_u64().unwrap() < 5_000,
         "成功探测延迟应在合理范围"
     );
     assert!(body["error"].is_null() || body.get("error").is_none());
+    assert!(
+        body["upstream_body"]
+            .as_str()
+            .map(|s| s.contains("Hello"))
+            .unwrap_or(false),
+        "成功应带回上游响应摘要"
+    );
 
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1, "探测应向渠道发一条出站请求");
@@ -1813,12 +1822,14 @@ async fn channel_probe_upstream_error_is_reachable_with_status() {
             gw.admin_base_url()
         ))
         .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
         .expect("应可探测渠道");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.expect("探测结果应可解析");
     assert_eq!(body["reachable"], true, "拿到 HTTP 响应即可达");
+    assert_eq!(body["timed_out"], false);
     assert_eq!(body["status_code"], 401);
     assert!(
         body["error"]
@@ -1859,12 +1870,14 @@ async fn channel_probe_timeout_is_unreachable() {
             gw.admin_base_url()
         ))
         .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
         .expect("应可探测渠道");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.expect("探测结果应可解析");
     assert_eq!(body["reachable"], false);
+    assert_eq!(body["timed_out"], true);
     assert!(body["status_code"].is_null());
     let error = body["error"].as_str().unwrap_or("");
     assert!(
@@ -1876,6 +1889,74 @@ async fn channel_probe_timeout_is_unreachable() {
         (100..3_000).contains(&latency),
         "延迟应贴近渠道 timeout_ms=200，实际 {latency}"
     );
+}
+
+/// 探测指定模型：出站使用请求体中的 model，拒绝清单外模型。
+#[tokio::test]
+async fn channel_probe_uses_requested_model_and_rejects_unknown() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+
+    let mut extra = channel_body(
+        "multi-model",
+        gw.upstream.base_url(),
+        json!([TEST_MODEL, "gpt-4o-mini"]),
+    );
+    extra["model_aliases"] = json!({ "mini": "gpt-4o-mini" });
+    extra["models"] = json!([TEST_MODEL, "gpt-4o-mini", "mini"]);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", extra).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let channel_id = created["id"].as_i64().expect("创建应回传整数 id");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        &format!("/channels/{channel_id}/test"),
+        json!({ "model": "gpt-4o-mini" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let received = gw.upstream.received();
+    assert_eq!(received.last().unwrap()["model"], "gpt-4o-mini");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        &format!("/channels/{channel_id}/test"),
+        json!({ "model": "not-in-list" }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "invalid_body");
+}
+
+/// 仅别名在清单时：请求主模型名，出站仍用主模型名。
+#[tokio::test]
+async fn channel_probe_alias_only_uses_canonical() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+
+    let mut alias_only = channel_body("alias-only", gw.upstream.base_url(), json!(["mini"]));
+    alias_only["model_aliases"] = json!({ "mini": TEST_MODEL });
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", alias_only).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let channel_id = created["id"].as_i64().expect("创建应回传整数 id");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        &format!("/channels/{channel_id}/test"),
+        json!({ "model": TEST_MODEL }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let received = gw.upstream.received();
+    assert_eq!(received.last().unwrap()["model"], TEST_MODEL);
 }
 
 /// 拉取上游模型列表：渠道草稿无需已保存，解析 `data[].id` 并保持上游顺序。
@@ -2002,6 +2083,7 @@ async fn stats_and_probe_auth_and_unknown_channel() {
     let resp = client
         .post(format!("{admin}/channels/999999/test"))
         .bearer_auth(TEST_ADMIN_KEY)
+        .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
         .expect("应可探测渠道");
