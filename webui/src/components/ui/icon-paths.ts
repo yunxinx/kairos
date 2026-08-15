@@ -10,6 +10,7 @@ export type IconName =
   | 'check'
   | 'minus'
   | 'plus'
+  | 'plus-circle'
   | 'menu'
   | 'close'
   | 'sun'
@@ -78,6 +79,14 @@ export const iconDefs: Record<IconName, IconDef> = {
     paths: ['M5 12h14', 'M12 5v14'],
     strokeWidth: 2.5,
     strokeLinecap: 'round',
+  },
+  /** 筛选触发。路径来自 Lucide「plus-circle」(ISC)。 */
+  'plus-circle': {
+    circles: [{ cx: 12, cy: 12, r: 10 }],
+    paths: ['M8 12h8', 'M12 8v8'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
   },
   menu: {
     lines: [

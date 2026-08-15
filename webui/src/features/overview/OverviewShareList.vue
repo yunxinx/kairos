@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import EmptyState from '@/components/ui/EmptyState.vue';
+import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
 import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
 import { formatCount, formatPercent, formatUsdMicros } from '@/lib/format';
 
@@ -28,6 +29,11 @@ const props = withDefaults(
 
 const { t, locale } = useI18n();
 const shareTab = ref<ShareTab>('model');
+
+const shareTabOptions = computed((): SegmentPair<ShareTab> => [
+  { value: 'model', label: t('overview.byModel'), testId: 'overview-share-tab-model' },
+  { value: 'channel', label: t('overview.byChannel'), testId: 'overview-share-tab-channel' },
+]);
 
 const rankedAll = computed(() => {
   const items = shareTab.value === 'model' ? props.modelItems : props.channelItems;
@@ -74,31 +80,11 @@ function nameBinding(name: string): Record<string, string> {
       <h2 class="min-w-0 truncate font-serif text-base font-semibold">
         {{ t('overview.shareTabs') }}
       </h2>
-      <div
-        class="share-switch shrink-0"
-        :data-active="shareTab"
-        role="group"
+      <SegmentSwitch
+        v-model="shareTab"
+        :options="shareTabOptions"
         :aria-label="t('overview.shareTabs')"
-      >
-        <button
-          type="button"
-          class="share-switch-btn"
-          data-testid="overview-share-tab-model"
-          :aria-pressed="shareTab === 'model'"
-          @click="shareTab = 'model'"
-        >
-          {{ t('overview.byModel') }}
-        </button>
-        <button
-          type="button"
-          class="share-switch-btn"
-          data-testid="overview-share-tab-channel"
-          :aria-pressed="shareTab === 'channel'"
-          @click="shareTab = 'channel'"
-        >
-          {{ t('overview.byChannel') }}
-        </button>
-      </div>
+      />
     </div>
     <div class="card-body overview-panel-body overview-share-body">
       <ul

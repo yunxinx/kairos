@@ -186,6 +186,19 @@ export interface ChannelProbeResult {
   error: string | null;
 }
 
+/** 拉取上游模型列表的草稿请求：渠道无需已保存。 */
+export interface UpstreamModelsDraft {
+  protocol: Protocol;
+  base_url: string;
+  api_key: string;
+  timeout_ms: number;
+}
+
+/** 上游模型列表响应：模型 id 数组（上游顺序）。 */
+export interface UpstreamModelsView {
+  models: string[];
+}
+
 /** 管理 API 结构化错误体。 */
 export interface ApiErrorBody {
   error?: {

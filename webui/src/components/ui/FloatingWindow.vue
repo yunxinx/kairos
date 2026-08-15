@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 浮窗：就近锚定触发点打开、标题栏可拖拽、非模态；由调用方 v-if 挂载，随路由卸载。
+// 浮窗：就近锚定触发点打开、标题栏整行可拖拽（按钮区域除外）、非模态；由调用方 v-if 挂载，随路由卸载。
 import { onMounted, onScopeDispose, onUnmounted, reactive, ref, useId, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import UiIcon from '@/components/ui/UiIcon.vue';
@@ -34,6 +34,8 @@ const titleId = useId();
 const windowEl = ref<HTMLElement | null>(null);
 const position = reactive({ left: 0, top: 0 });
 const dragging = reactive({ active: false, offsetX: 0, offsetY: 0 });
+/** 内容视图切换时锁定窗口尺寸，避免两个视图内容高度不同造成窗口跳变。 */
+const lockedSize = ref<{ width: number; height: number } | null>(null);
 
 let restoreFocusEl: HTMLElement | null = null;
 
@@ -49,8 +51,21 @@ function clampTop(top: number, height: number): number {
   return Math.min(Math.max(top, VIEWPORT_MARGIN), max);
 }
 
+/** 以当前渲染尺寸锁定窗口，供内容视图切换时保持大小；`unlockSize` 恢复自适应。 */
+function lockSize() {
+  const el = windowEl.value;
+  if (!el) return;
+  lockedSize.value = { width: el.offsetWidth, height: el.offsetHeight };
+}
+
+function unlockSize() {
+  lockedSize.value = null;
+}
+
+defineExpose({ lockSize, unlockSize });
+
 function startDrag(event: PointerEvent): void {
-  // 点在标题栏内的关闭按钮上不发起拖拽。
+  // 标题栏整行可拖拽，但点在其中的按钮（关闭按钮、页签开关等）上不发起拖拽。
   if (event.button !== 0 || (event.target as HTMLElement).closest('button')) return;
   (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
   dragging.active = true;
@@ -148,24 +163,28 @@ onUnmounted(() => {
     role="dialog"
     :aria-labelledby="titleId"
     class="floating-window card flex max-h-[calc(100vh-1rem)] max-w-[calc(100vw-1rem)] flex-col"
-    :class="[wide ? 'w-[40rem]' : 'w-[28rem]', attention && 'floating-window-attention']"
+    :class="[wide ? 'w-[34rem]' : 'w-[28rem]', attention && 'floating-window-attention']"
     :style="{
       left: `${position.left}px`,
       top: `${position.top}px`,
       zIndex: `calc(var(--z-window) + ${stackOrder})`,
+      width: lockedSize ? `${lockedSize.width}px` : undefined,
+      height: lockedSize ? `${lockedSize.height}px` : undefined,
     }"
   >
-    <div class="card-header shrink-0">
-      <h2
-        :id="titleId"
-        class="min-w-0 flex-1 cursor-move touch-none truncate font-serif text-base font-semibold select-none"
-        @pointerdown="startDrag"
-        @pointermove="onDrag"
-        @pointerup="endDrag"
-        @pointercancel="endDrag"
-      >
-        {{ title }}
-      </h2>
+    <div
+      class="card-header shrink-0 cursor-move touch-none select-none"
+      @pointerdown="startDrag"
+      @pointermove="onDrag"
+      @pointerup="endDrag"
+      @pointercancel="endDrag"
+    >
+      <div class="flex min-w-0 flex-1 items-center gap-2">
+        <h2 :id="titleId" class="min-w-0 truncate font-serif text-base font-semibold">
+          {{ title }}
+        </h2>
+        <slot name="header-extra" />
+      </div>
       <button
         type="button"
         class="btn btn-ghost btn-sm"

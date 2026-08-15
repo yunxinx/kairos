@@ -16,6 +16,8 @@ import type {
   Token,
   TokenCreate,
   TokenView,
+  UpstreamModelsDraft,
+  UpstreamModelsView,
 } from '@/api/types';
 
 function buildQuery(params: object): string {
@@ -117,6 +119,11 @@ export const apiClient = {
 
   testChannel(id: number): Promise<ChannelProbeResult> {
     return apiFetch(`/channels/${id}/test`, { method: 'POST' });
+  },
+
+  /** 按渠道草稿拉取上游模型列表；渠道无需已保存。 */
+  listUpstreamModels(body: UpstreamModelsDraft): Promise<UpstreamModelsView> {
+    return apiFetch('/channels/models', { method: 'POST', body: JSON.stringify(body) });
   },
 
   listPrices(): Promise<Price[]> {

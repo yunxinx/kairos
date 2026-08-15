@@ -443,8 +443,8 @@ html[lang='zh-CN'] {
   gap: 8px;
 }
 
-/* 分段胶囊：高度对齐 card-header 内 text-base 行高，避免左右卡片分割线错位 */
-.share-switch {
+/* 分段胶囊（SegmentSwitch）：两项等分、滑块左右位移；高度对齐 card-header 内 text-base 行高 */
+.segment-switch {
   position: relative;
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -457,7 +457,7 @@ html[lang='zh-CN'] {
   border: 1px solid var(--seed-border);
   border-radius: 999px;
 }
-.share-switch::before {
+.segment-switch::before {
   content: '';
   position: absolute;
   top: 0;
@@ -471,10 +471,10 @@ html[lang='zh-CN'] {
   transition: transform 160ms ease;
   pointer-events: none;
 }
-.share-switch[data-active='channel']::before {
+.segment-switch[data-knob='right']::before {
   transform: translateX(100%);
 }
-.share-switch-btn {
+.segment-switch-btn {
   position: relative;
   z-index: 1;
   display: flex;
@@ -491,21 +491,128 @@ html[lang='zh-CN'] {
   cursor: pointer;
   white-space: nowrap;
 }
-.share-switch-btn:hover {
+.segment-switch-btn:hover {
   color: var(--seed-fg);
 }
-.share-switch-btn:focus-visible {
+.segment-switch-btn:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
   border-radius: 999px;
 }
-.share-switch-btn[aria-pressed='true'] {
+.segment-switch-btn[aria-pressed='true'] {
   color: var(--seed-fg);
 }
 @media (prefers-reduced-motion: reduce) {
-  .share-switch::before {
+  .segment-switch::before {
     transition: none;
   }
+}
+
+/* legend 小按钮：与相邻计数徽章严格同高（11px 字号 + 1.6 行高，垂直向由 1px 边框占位） */
+.legend-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: var(--seed-surface-alt);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+.legend-btn:hover:enabled {
+  border-color: var(--seed-border);
+  color: var(--seed-fg);
+}
+.legend-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.legend-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* 状态筛选触发按钮（参考 shadcn-admin faceted filter）：outline 细虚线、透明底、轻量小按钮 */
+.filter-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  box-sizing: border-box;
+  padding: 0 10px;
+  border: 1px dashed var(--seed-border);
+  border-radius: var(--seed-radius);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    color 150ms ease-in-out,
+    background 150ms ease-in-out,
+    border-color 150ms ease-in-out;
+}
+.filter-btn:hover {
+  background: var(--seed-surface-alt);
+  border-color: var(--fg-muted);
+  color: var(--seed-fg);
+}
+.filter-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* 同步视图状态筛选（参考 shadcn-admin faceted filter）：选项行 + 模拟复选框 + 右侧计数 */
+.sync-filter-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--seed-fg);
+  cursor: pointer;
+  text-align: left;
+}
+.sync-filter-option:hover {
+  background: var(--seed-surface-alt);
+}
+.sync-filter-option:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.sync-filter-box {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border: 2px solid var(--seed-border);
+  border-radius: 3px;
+  color: transparent;
+}
+.sync-filter-option:hover .sync-filter-box {
+  border-color: var(--seed-primary);
+}
+.sync-filter-box[data-active='true'] {
+  background: var(--seed-primary);
+  border-color: var(--seed-primary);
+  color: var(--fg-on-primary);
+}
+.sync-filter-count {
+  margin-left: auto;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--fg-muted);
 }
 
 /* 点阵：见 body:has(.dotted-bg)::before；组件保留 .dotted-bg 类名即可 */
@@ -740,6 +847,12 @@ html[lang='zh-CN'] {
 .btn-sm {
   padding: 4px 12px;
   font-size: 12px;
+}
+
+/* 紧凑按钮：叠加 btn-sm 收窄横向内边距（同特异性后置生效） */
+.btn-compact {
+  padding-left: 6px;
+  padding-right: 6px;
 }
 
 .btn-ghost {
