@@ -3,13 +3,24 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { Channel, ChannelProbeResult } from '@/api/types';
+import {
+  channelWriteBody,
+  type Channel,
+  type ChannelProbeResult,
+  type ChannelView,
+  type Protocol,
+} from '@/api/types';
+import anthropicIcon from '@lobehub/icons-static-svg/icons/anthropic.svg';
+import openaiIcon from '@lobehub/icons-static-svg/icons/openai.svg';
 import PageHeader from '@/app/layout/PageHeader.vue';
+import BrandIcon from '@/components/ui/BrandIcon.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
+import NumberStepper from '@/components/ui/NumberStepper.vue';
+import UiIcon from '@/components/ui/UiIcon.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
@@ -30,9 +41,22 @@ import ChannelEditorWindow from '@/features/channel/ChannelEditorWindow.vue';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type ChannelWindowPayload =
-  | { kind: 'editor'; channel: Channel | null }
-  | { kind: 'delete'; channel: Channel }
+  | { kind: 'editor'; channel: ChannelView | null }
+  | { kind: 'delete'; channel: ChannelView }
   | BulkDeletePayload;
+
+/** 协议徽章着色：三协议各自独立配色，见 globals.css 的 --proto-* 变量。 */
+const PROTOCOL_BADGE_CLASS: Record<Protocol, string> = {
+  openai_chat: 'badge-proto-chat',
+  openai_responses: 'badge-proto-responses',
+  anthropic_messages: 'badge-proto-anthropic',
+};
+
+const PROTOCOL_ICON_SRC: Record<Protocol, string> = {
+  openai_chat: openaiIcon,
+  openai_responses: openaiIcon,
+  anthropic_messages: anthropicIcon,
+};
 
 const { t } = useI18n();
 const queryClient = useQueryClient();
@@ -56,8 +80,8 @@ const {
 
 const actionError = ref('');
 const deleteErrors = ref<Record<number, string>>({});
-const probeByName = ref<Record<string, ChannelProbeResult>>({});
-const testingName = ref<string | null>(null);
+const probeById = ref<Record<number, ChannelProbeResult>>({});
+const testingId = ref<number | null>(null);
 const searchText = ref('');
 
 const channelsQuery = useQuery({
@@ -87,26 +111,26 @@ const selection = useRowSelection<string>();
 const allVisibleSelected = computed({
   get: () =>
     filteredChannels.value.length > 0 &&
-    filteredChannels.value.every((channel) => selection.isSelected(channel.name)),
+    filteredChannels.value.every((channel) => selection.isSelected(String(channel.id))),
   set: (value) =>
     selection.setMany(
-      filteredChannels.value.map((channel) => channel.name),
+      filteredChannels.value.map((channel) => String(channel.id)),
       value,
     ),
 });
 
 const someVisibleSelected = computed(() =>
-  filteredChannels.value.some((channel) => selection.isSelected(channel.name)),
+  filteredChannels.value.some((channel) => selection.isSelected(String(channel.id))),
 );
 
 // 删除或刷新后列表键变化，剔除幽灵选择。
-watch(channels, (rows) => selection.prune(rows.map((row) => row.name)));
+watch(channels, (rows) => selection.prune(rows.map((row) => String(row.id))));
 
 const bulkDelete = useBulkDelete<string>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['channels'],
-  deleteOne: (name) => apiClient.deleteChannel(name),
+  deleteOne: (id) => apiClient.deleteChannel(Number(id)),
 });
 
 function invalidateChannels() {
@@ -114,45 +138,85 @@ function invalidateChannels() {
 }
 
 const deleteMutation = useMutation({
-  mutationFn: (name: string) => apiClient.deleteChannel(name),
-  onSuccess: async (_data, name) => {
+  mutationFn: (id: number) => apiClient.deleteChannel(id),
+  onSuccess: async (_data, id) => {
     const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.channel.name === name,
+      (item) => item.payload.kind === 'delete' && item.payload.channel.id === id,
     );
     if (entry) closeWindow(entry.id);
     await invalidateChannels();
   },
-  onError: (err, name) => {
+  onError: (err, id) => {
     const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.channel.name === name,
+      (item) => item.payload.kind === 'delete' && item.payload.channel.id === id,
     );
     if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
   },
 });
 
-const deletingName = computed(() =>
+const deletingId = computed(() =>
   deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
 );
 
 const testMutation = useMutation({
-  mutationFn: (name: string) => apiClient.testChannel(name),
-  onSuccess: (result, name) => {
-    probeByName.value = { ...probeByName.value, [name]: result };
-    testingName.value = null;
+  mutationFn: (id: number) => apiClient.testChannel(id),
+  onSuccess: (result, id) => {
+    probeById.value = { ...probeById.value, [id]: result };
+    testingId.value = null;
   },
-  onError: (err, name) => {
-    testingName.value = null;
+  onError: (err, id) => {
+    testingId.value = null;
+    const name = channels.value.find((channel) => channel.id === id)?.name ?? String(id);
     actionError.value = `${name}: ${extractApiError(err).message}`;
   },
 });
+
+// 启用/禁用：整体替换写（PUT 携带完整定义），成功后重取列表。
+const toggleMutation = useMutation({
+  mutationFn: (channel: ChannelView) =>
+    apiClient.updateChannel(channel.id, {
+      ...channelWriteBody(channel),
+      enabled: !channel.enabled,
+    }),
+  onSuccess: async () => {
+    actionError.value = '';
+    await invalidateChannels();
+  },
+  onError: (err) => {
+    actionError.value = extractApiError(err).message;
+  },
+});
+
+const togglingId = computed(() =>
+  toggleMutation.isPending.value ? (toggleMutation.variables.value?.id ?? null) : null,
+);
+
+// 优先级/权重行内编辑：整体替换写（PUT 携带完整定义），成功后重取列表。
+type ChannelFieldPatch = Partial<Pick<Channel, 'priority' | 'weight'>>;
+
+const fieldMutation = useMutation({
+  mutationFn: ({ channel, patch }: { channel: ChannelView; patch: ChannelFieldPatch }) =>
+    apiClient.updateChannel(channel.id, { ...channelWriteBody(channel), ...patch }),
+  onSuccess: async () => {
+    actionError.value = '';
+    await invalidateChannels();
+  },
+  onError: (err) => {
+    actionError.value = extractApiError(err).message;
+  },
+});
+
+const savingId = computed(() =>
+  fieldMutation.isPending.value ? (fieldMutation.variables.value?.channel.id ?? null) : null,
+);
 
 function openCreate(event: Event) {
   openWindow(anchorFromEvent(event), { kind: 'editor', channel: null });
 }
 
-function openEdit(channel: Channel) {
+function openEdit(channel: ChannelView) {
   const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'editor' && entry.payload.channel?.name === channel.name,
+    (entry) => entry.payload.kind === 'editor' && entry.payload.channel?.id === channel.id,
   );
   if (existing) {
     bringToFront(existing.id);
@@ -161,9 +225,9 @@ function openEdit(channel: Channel) {
   openWindow(takePendingAnchor(), { kind: 'editor', channel });
 }
 
-function openDelete(channel: Channel) {
+function openDelete(channel: ChannelView) {
   const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'delete' && entry.payload.channel.name === channel.name,
+    (entry) => entry.payload.kind === 'delete' && entry.payload.channel.id === channel.id,
   );
   if (existing) {
     bringToFront(existing.id);
@@ -182,10 +246,10 @@ function openBulkDelete() {
   openWindow(takePendingAnchor(), { kind: 'bulk-delete' });
 }
 
-function handleTest(name: string) {
+function handleTest(id: number) {
   actionError.value = '';
-  testingName.value = name;
-  testMutation.mutate(name);
+  testingId.value = id;
+  testMutation.mutate(id);
 }
 
 function probeText(result: ChannelProbeResult): string {
@@ -257,61 +321,106 @@ function probeClass(result: ChannelProbeResult): string {
                 />
               </div>
             </TableHead>
-            <TableHead>{{ t('channel.name') }}</TableHead>
-            <TableHead>{{ t('channel.protocol') }}</TableHead>
-            <TableHead>{{ t('channel.baseUrl') }}</TableHead>
+            <TableHead class="min-w-44">{{ t('channel.name') }}</TableHead>
+            <TableHead>{{ t('channel.requestProtocol') }}</TableHead>
             <TableHead>{{ t('channel.models') }}</TableHead>
-            <TableHead align="center">{{ t('channel.priority') }}</TableHead>
+            <TableHead align="center" class="w-28 pr-1">{{ t('channel.priority') }}</TableHead>
+            <TableHead align="center" class="w-28 pl-1">{{ t('channel.weight') }}</TableHead>
+            <TableHead align="center">{{ t('channel.status') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="7" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"
-              :key="channel.name"
+              :key="channel.id"
               data-testid="channel-row"
               :data-channel-name="channel.name"
-              :data-state="selection.isSelected(channel.name) ? 'selected' : undefined"
+              :data-state="selection.isSelected(String(channel.id)) ? 'selected' : undefined"
             >
               <SelectCell
-                :checked="selection.isSelected(channel.name)"
+                :checked="selection.isSelected(String(channel.id))"
                 test-id="channel-select"
-                @toggle="selection.toggle(channel.name)"
+                @toggle="selection.toggle(String(channel.id))"
               />
               <TableCell class="font-medium">{{ channel.name }}</TableCell>
-              <TableCell>{{ t(`protocol.${channel.protocol}`) }}</TableCell>
-              <TableCell class="font-mono text-sm">{{ channel.base_url }}</TableCell>
+              <TableCell>
+                <span class="badge gap-1" :class="PROTOCOL_BADGE_CLASS[channel.protocol]">
+                  <BrandIcon :src="PROTOCOL_ICON_SRC[channel.protocol]" :size="12" />
+                  {{ t(`protocol.${channel.protocol}`) }}
+                </span>
+              </TableCell>
               <TableCell class="font-mono text-sm">
                 {{ channel.models.join(', ') }}
               </TableCell>
-              <TableCell align="center" class="font-mono">{{ channel.priority }}</TableCell>
+              <TableCell align="center" class="pr-1">
+                <NumberStepper
+                  v-model="channel.priority"
+                  data-testid="channel-priority-stepper"
+                  :min="0"
+                  :disabled="savingId === channel.id"
+                  :label="t('channel.priority')"
+                  @update:model-value="
+                    (value) => fieldMutation.mutate({ channel, patch: { priority: value } })
+                  "
+                />
+              </TableCell>
+              <TableCell align="center" class="pl-1">
+                <NumberStepper
+                  v-model="channel.weight"
+                  data-testid="channel-weight-stepper"
+                  :min="1"
+                  :disabled="savingId === channel.id"
+                  :label="t('channel.weight')"
+                  @update:model-value="
+                    (value) => fieldMutation.mutate({ channel, patch: { weight: value } })
+                  "
+                />
+              </TableCell>
+              <TableCell align="center">
+                <button
+                  type="button"
+                  class="badge cursor-pointer"
+                  :class="channel.enabled ? 'badge-success' : 'badge-danger'"
+                  data-testid="channel-toggle-enabled"
+                  :disabled="togglingId === channel.id"
+                  :aria-label="channel.enabled ? t('channel.disable') : t('channel.enable')"
+                  :title="channel.enabled ? t('channel.disable') : t('channel.enable')"
+                  @click="toggleMutation.mutate(channel)"
+                >
+                  {{ channel.enabled ? t('channel.statusEnabled') : t('channel.statusDisabled') }}
+                </button>
+              </TableCell>
               <TableCell align="center">
                 <span class="inline-flex items-center justify-center gap-1">
                   <span
-                    v-if="probeByName[channel.name]"
+                    v-if="probeById[channel.id]"
                     class="badge"
-                    :class="probeClass(probeByName[channel.name]!)"
+                    :class="probeClass(probeById[channel.id]!)"
                     data-testid="channel-probe-result"
                   >
-                    {{ probeText(probeByName[channel.name]!) }}
+                    {{ probeText(probeById[channel.id]!) }}
                   </span>
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon"
+                    data-testid="channel-edit"
+                    :aria-label="t('common.edit')"
+                    :title="t('common.edit')"
+                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                    @click="openEdit(channel)"
+                  >
+                    <UiIcon name="pencil" :size="16" />
+                  </button>
                   <DataTableRowActions>
                     <DataTableMenuItem
                       data-testid="channel-test"
-                      :disabled="testingName === channel.name"
-                      @select="handleTest(channel.name)"
+                      :disabled="testingId === channel.id"
+                      @select="handleTest(channel.id)"
                     >
-                      {{ testingName === channel.name ? t('channel.testing') : t('channel.test') }}
-                    </DataTableMenuItem>
-                    <DataTableMenuSeparator />
-                    <DataTableMenuItem
-                      data-testid="channel-edit"
-                      @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                      @select="openEdit(channel)"
-                    >
-                      {{ t('common.edit') }}
+                      {{ testingId === channel.id ? t('channel.testing') : t('channel.test') }}
                     </DataTableMenuItem>
                     <DataTableMenuSeparator />
                     <DataTableMenuItem
@@ -327,7 +436,7 @@ function probeClass(result: ChannelProbeResult): string {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="7" class="h-24 whitespace-normal">
+              <TableCell :colspan="8" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}
@@ -378,12 +487,12 @@ function probeClass(result: ChannelProbeResult): string {
         :attention="win.attention"
         :topmost="win.id === topmostId"
         :error="deleteErrors[win.id] ?? ''"
-        :busy="deletingName === win.payload.channel.name"
+        :busy="deletingId === win.payload.channel.id"
         confirm-test-id="channel-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
-        @confirm="deleteMutation.mutate(win.payload.channel.name)"
+        @confirm="deleteMutation.mutate(win.payload.channel.id)"
       />
       <ConfirmWindow
         v-else

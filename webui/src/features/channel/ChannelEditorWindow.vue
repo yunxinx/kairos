@@ -4,10 +4,11 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { Channel, Protocol } from '@/api/types';
+import { channelWriteBody, type Channel, type ChannelView, type Protocol } from '@/api/types';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
+import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import FormTextarea from '@/components/ui/FormTextarea.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
@@ -21,7 +22,7 @@ const PROTOCOLS: Protocol[] = ['openai_chat', 'openai_responses', 'anthropic_mes
 const props = withDefaults(
   defineProps<{
     /** 编辑对象；null 表示新建。 */
-    initial: Channel | null;
+    initial: ChannelView | null;
     anchor?: FloatingWindowAnchor | null;
     stackOrder?: number;
     /** 初始位置级联偏移序号。 */
@@ -47,10 +48,9 @@ const baseUrlInputId = `channel-editor-base-url-${uid}`;
 const apiKeyInputId = `channel-editor-api-key-${uid}`;
 const modelsInputId = `channel-editor-models-${uid}`;
 const aliasesInputId = `channel-editor-aliases-${uid}`;
-const priorityInputId = `channel-editor-priority-${uid}`;
-const weightInputId = `channel-editor-weight-${uid}`;
 const timeoutMsInputId = `channel-editor-timeout-ms-${uid}`;
 const maxRetriesInputId = `channel-editor-max-retries-${uid}`;
+const enabledInputId = `channel-editor-enabled-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
@@ -105,10 +105,9 @@ const initialValues = {
   apiKey: props.initial?.api_key ?? '',
   models: props.initial ? formatModelList(props.initial.models) : '',
   aliases: props.initial ? formatAliases(props.initial.model_aliases) : '',
-  priority: String(props.initial?.priority ?? '0'),
-  weight: String(props.initial?.weight ?? '1'),
   timeoutMs: String(props.initial?.timeout_ms ?? '30000'),
   maxRetries: String(props.initial?.max_retries ?? '0'),
+  enabled: props.initial?.enabled ?? true,
 };
 
 const editorName = ref(initialValues.name);
@@ -117,10 +116,9 @@ const editorBaseUrl = ref(initialValues.baseUrl);
 const editorApiKey = ref(initialValues.apiKey);
 const editorModels = ref(initialValues.models);
 const editorAliases = ref(initialValues.aliases);
-const editorPriority = ref(initialValues.priority);
-const editorWeight = ref(initialValues.weight);
 const editorTimeoutMs = ref(initialValues.timeoutMs);
 const editorMaxRetries = ref(initialValues.maxRetries);
+const editorEnabled = ref(initialValues.enabled);
 const editorError = ref('');
 
 const dirty = computed(
@@ -131,10 +129,9 @@ const dirty = computed(
     editorApiKey.value !== initialValues.apiKey ||
     editorModels.value !== initialValues.models ||
     editorAliases.value !== initialValues.aliases ||
-    editorPriority.value !== initialValues.priority ||
-    editorWeight.value !== initialValues.weight ||
     editorTimeoutMs.value !== initialValues.timeoutMs ||
-    editorMaxRetries.value !== initialValues.maxRetries,
+    editorMaxRetries.value !== initialValues.maxRetries ||
+    editorEnabled.value !== initialValues.enabled,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -142,7 +139,7 @@ const saveMutation = useMutation({
   mutationFn: (body: Channel) =>
     props.initial === null
       ? apiClient.createChannel(body)
-      : apiClient.updateChannel(initialValues.name, body),
+      : apiClient.updateChannel(props.initial.id, body),
   onSuccess: async () => {
     editorError.value = '';
     emit('close');
@@ -160,16 +157,6 @@ function handleSave() {
     { name: 'baseUrl', value: editorBaseUrl.value, rules: [{ kind: 'required' }] },
     { name: 'apiKey', value: editorApiKey.value, rules: [{ kind: 'required' }] },
     {
-      name: 'priority',
-      value: editorPriority.value,
-      rules: [{ kind: 'required' }, { kind: 'uint' }],
-    },
-    {
-      name: 'weight',
-      value: editorWeight.value,
-      rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
-    },
-    {
       name: 'timeoutMs',
       value: editorTimeoutMs.value,
       rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
@@ -186,24 +173,47 @@ function handleSave() {
     editorError.value = t('channel.aliasesGuide');
     return;
   }
-  const priority = parseOptionalUint(editorPriority.value);
-  const weight = parseOptionalUint(editorWeight.value);
   const timeoutMs = parseOptionalUint(editorTimeoutMs.value);
   const maxRetries = parseOptionalUint(editorMaxRetries.value);
-  if (priority === null || weight === null || timeoutMs === null || maxRetries === null) {
+  if (timeoutMs === null || maxRetries === null) {
+    return;
+  }
+  if (props.initial === null) {
+    saveMutation.mutate({
+      name: editorName.value.trim(),
+      protocol: editorProtocol.value,
+      base_url: editorBaseUrl.value.trim(),
+      api_key: editorApiKey.value,
+      models: parseModelList(editorModels.value),
+      model_aliases: aliases,
+      priority: 0,
+      weight: 1,
+      timeout_ms: timeoutMs,
+      max_retries: maxRetries,
+      enabled: editorEnabled.value,
+    });
+    return;
+  }
+  // 编辑以列表中最新定义为基底整体替换写：开窗期间行内改过的字段
+  // （如优先级/权重）不会被开窗时刻的旧快照覆盖。
+  const latest = queryClient
+    .getQueryData<ChannelView[]>(['channels'])
+    ?.find((item) => item.id === props.initial?.id);
+  if (!latest) {
+    editorError.value = t('channel.goneOnSave');
     return;
   }
   saveMutation.mutate({
+    ...channelWriteBody(latest),
     name: editorName.value.trim(),
     protocol: editorProtocol.value,
     base_url: editorBaseUrl.value.trim(),
     api_key: editorApiKey.value,
     models: parseModelList(editorModels.value),
     model_aliases: aliases,
-    priority,
-    weight,
     timeout_ms: timeoutMs,
     max_retries: maxRetries,
+    enabled: editorEnabled.value,
   });
 }
 </script>
@@ -233,7 +243,6 @@ function handleSave() {
               :id="nameInputId"
               v-model="editorName"
               type="text"
-              :disabled="initial !== null"
               :invalid="invalid"
               :hint-id="hintId"
               v-on="fieldInputHandlers('name')"
@@ -307,42 +316,6 @@ function handleSave() {
         </FormField>
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <FormField
-            field-name="priority"
-            :label="t('channel.priority')"
-            :input-id="priorityInputId"
-            :error="fieldError('priority')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormTextInput
-                :id="priorityInputId"
-                v-model="editorPriority"
-                type="text"
-                inputmode="numeric"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('priority')"
-              />
-            </template>
-          </FormField>
-          <FormField
-            field-name="weight"
-            :label="t('channel.weight')"
-            :input-id="weightInputId"
-            :error="fieldError('weight')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormTextInput
-                :id="weightInputId"
-                v-model="editorWeight"
-                type="text"
-                inputmode="numeric"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('weight')"
-              />
-            </template>
-          </FormField>
-          <FormField
             field-name="timeoutMs"
             :label="t('channel.timeoutMs')"
             :input-id="timeoutMsInputId"
@@ -379,6 +352,19 @@ function handleSave() {
             </template>
           </FormField>
         </div>
+        <FormField
+          field-name="enabled"
+          layout="inline"
+          :label="t('channel.enabled')"
+          :input-id="enabledInputId"
+          :guide="t('channel.enabledGuide')"
+        >
+          <FormSwitch
+            :id="enabledInputId"
+            v-model="editorEnabled"
+            data-testid="channel-enabled-switch"
+          />
+        </FormField>
         <p v-if="editorError" class="text-danger text-sm" data-testid="channel-editor-error">
           {{ editorError }}
         </p>

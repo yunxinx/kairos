@@ -94,7 +94,9 @@
     "selectAll": "全选",
     "selectRow": "选择行",
     "clearSelection": "清除选择",
-    "selectedCount": "已选 {count} 项"
+    "selectedCount": "已选 {count} 项",
+    "increment": "增加",
+    "decrement": "减少"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -149,6 +151,15 @@
     "editorEdit": "编辑渠道",
     "name": "名称",
     "protocol": "协议",
+    "requestProtocol": "请求协议",
+    "status": "状态",
+    "statusEnabled": "启用",
+    "statusDisabled": "禁用",
+    "enable": "启用",
+    "disable": "禁用",
+    "enabled": "启用",
+    "enabledGuide": "禁用后，该渠道不再参与路由与失败切换。",
+    "goneOnSave": "该渠道已被删除，无法保存。",
     "baseUrl": "Base URL",
     "apiKey": "上游 API key",
     "models": "模型清单",

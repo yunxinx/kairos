@@ -16,6 +16,7 @@
     "test:e2e:install": "playwright install chromium"
   },
   "dependencies": {
+    "@lobehub/icons-static-svg": "^1.94.0",
     "@tanstack/vue-query": "^5.101.0",
     "@tanstack/vue-router": "^1.170.15",
     "@tanstack/vue-table": "^8.21.3",

@@ -20,7 +20,7 @@ export interface TokenView extends Token {
   last_used_at: number | null;
 }
 
-/** 渠道：出站接入单元。 */
+/** 渠道：出站接入单元（写契约，不含库生成身份）。 */
 export interface Channel {
   name: string;
   protocol: Protocol;
@@ -32,6 +32,30 @@ export interface Channel {
   weight: number;
   timeout_ms: number;
   max_retries: number;
+  /** 是否启用：禁用的渠道不参与路由与失败切换。 */
+  enabled: boolean;
+}
+
+/** 渠道读响应：库生成的稳定身份 + 写契约字段。 */
+export interface ChannelView extends Channel {
+  id: number;
+}
+
+/** 读视图 → 写契约：剥离只读 id（后端 `deny_unknown_fields` 拒收未知字段）。 */
+export function channelWriteBody(view: ChannelView): Channel {
+  return {
+    name: view.name,
+    protocol: view.protocol,
+    base_url: view.base_url,
+    api_key: view.api_key,
+    models: view.models,
+    model_aliases: view.model_aliases,
+    priority: view.priority,
+    weight: view.weight,
+    timeout_ms: view.timeout_ms,
+    max_retries: view.max_retries,
+    enabled: view.enabled,
+  };
 }
 
 /** 单模型四档单价（micro-USD / 1M tokens）。 */

@@ -5,6 +5,7 @@ import type {
   BalanceView,
   Channel,
   ChannelProbeResult,
+  ChannelView,
   LogQuery,
   Page,
   LogEntry,
@@ -95,27 +96,27 @@ export const apiClient = {
     });
   },
 
-  listChannels(): Promise<Channel[]> {
+  listChannels(): Promise<ChannelView[]> {
     return apiFetch('/channels');
   },
 
-  createChannel(body: Channel): Promise<Channel> {
+  createChannel(body: Channel): Promise<ChannelView> {
     return apiFetch('/channels', { method: 'POST', body: JSON.stringify(body) });
   },
 
-  updateChannel(name: string, body: Channel): Promise<Channel> {
-    return apiFetch(`/channels/${encodeURIComponent(name)}`, {
+  updateChannel(id: number, body: Channel): Promise<ChannelView> {
+    return apiFetch(`/channels/${id}`, {
       method: 'PUT',
       body: JSON.stringify(body),
     });
   },
 
-  deleteChannel(name: string): Promise<Channel> {
-    return apiFetch(`/channels/${encodeURIComponent(name)}`, { method: 'DELETE' });
+  deleteChannel(id: number): Promise<ChannelView> {
+    return apiFetch(`/channels/${id}`, { method: 'DELETE' });
   },
 
-  testChannel(name: string): Promise<ChannelProbeResult> {
-    return apiFetch(`/channels/${encodeURIComponent(name)}/test`, { method: 'POST' });
+  testChannel(id: number): Promise<ChannelProbeResult> {
+    return apiFetch(`/channels/${id}/test`, { method: 'POST' });
   },
 
   listPrices(): Promise<Price[]> {

@@ -94,7 +94,9 @@
     "selectAll": "Select all",
     "selectRow": "Select row",
     "clearSelection": "Clear selection",
-    "selectedCount": "{count} selected"
+    "selectedCount": "{count} selected",
+    "increment": "Increase",
+    "decrement": "Decrease"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -149,6 +151,15 @@
     "editorEdit": "Edit channel",
     "name": "Name",
     "protocol": "Protocol",
+    "requestProtocol": "Request protocol",
+    "status": "Status",
+    "statusEnabled": "Enabled",
+    "statusDisabled": "Disabled",
+    "enable": "Enable",
+    "disable": "Disable",
+    "enabled": "Enabled",
+    "enabledGuide": "Disabled channels are excluded from routing and failover.",
+    "goneOnSave": "This channel has been deleted and can no longer be saved.",
     "baseUrl": "Base URL",
     "apiKey": "Upstream API key",
     "models": "Models",

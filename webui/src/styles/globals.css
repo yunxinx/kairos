@@ -41,6 +41,12 @@
   --warn-bg: #fefce8;
   --info: #3b82f6;
   --info-bg: #eff6ff;
+  --proto-chat: #0d9488;
+  --proto-chat-bg: #ccfbf1;
+  --proto-responses: #4f46e5;
+  --proto-responses-bg: #e0e7ff;
+  --proto-anthropic: #c2410c;
+  --proto-anthropic-bg: #ffedd5;
   --dot-color: #dce0eb;
   --primary-hover: #2563eb;
   --primary-shadow: #2563eb;
@@ -69,6 +75,12 @@
   --warn-bg: #713f12;
   --info: #93c5fd;
   --info-bg: #1e3a8a;
+  --proto-chat: #2dd4bf;
+  --proto-chat-bg: #134e4a;
+  --proto-responses: #a5b4fc;
+  --proto-responses-bg: #312e81;
+  --proto-anthropic: #fdba74;
+  --proto-anthropic-bg: #7c2d12;
   /* 点阵：略弱于边框，但仍可感知 */
   --dot-color: color-mix(in srgb, var(--seed-border) 28%, var(--seed-bg));
   --primary-hover: #60a5fa;
@@ -619,6 +631,18 @@ html[lang='zh-CN'] {
 .badge-neutral {
   background: var(--seed-surface-alt);
   color: var(--fg-muted);
+}
+.badge-proto-chat {
+  background: var(--proto-chat-bg);
+  color: var(--proto-chat);
+}
+.badge-proto-responses {
+  background: var(--proto-responses-bg);
+  color: var(--proto-responses);
+}
+.badge-proto-anthropic {
+  background: var(--proto-anthropic-bg);
+  color: var(--proto-anthropic);
 }
 
 /* ── Button ── */

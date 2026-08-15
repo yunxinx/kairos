@@ -9,6 +9,7 @@ export type IconName =
   | 'more-horizontal'
   | 'check'
   | 'minus'
+  | 'plus'
   | 'menu'
   | 'close'
   | 'sun'
@@ -69,6 +70,12 @@ export const iconDefs: Record<IconName, IconDef> = {
   /** 半选态。路径来自 Lucide「minus」(ISC)。 */
   minus: {
     paths: ['M5 12h14'],
+    strokeWidth: 2.5,
+    strokeLinecap: 'round',
+  },
+  /** 步进增加。路径来自 Lucide「plus」(ISC)。 */
+  plus: {
+    paths: ['M5 12h14', 'M12 5v14'],
     strokeWidth: 2.5,
     strokeLinecap: 'round',
   },
