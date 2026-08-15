@@ -8,8 +8,8 @@
 //! 资源 CRUD（令牌/渠道/价格）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
 //! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）、
-//! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）与渠道连通性探测
-//! （`/channels/{id}/test`）。
+//! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）、渠道连通性探测
+//! （`/channels/{id}/test`）与按渠道草稿拉取上游模型列表（`/channels/models`）。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::{
+    config::Protocol,
     core::ir::{ChatRequest, ContentPart, Message, Role},
     runtime, store,
     store::StoreError,
@@ -73,6 +74,7 @@ pub fn router(
         )
         .route("/tokens/{token_key}/balance", post(adjust_token_balance))
         .route("/channels", get(list_channels).post(create_channel))
+        .route("/channels/models", post(list_upstream_models))
         .route("/channels/{id}", put(update_channel).delete(delete_channel))
         .route("/channels/{id}/test", post(test_channel))
         .route("/prices", get(list_prices).post(create_price))
@@ -852,19 +854,12 @@ async fn test_channel(
                 error,
             }
         }
-        Err(err) => {
-            let error = if err.is_timeout() {
-                "请求超时".to_string()
-            } else {
-                format!("上游不可达: {err}")
-            };
-            ChannelProbeResult {
-                reachable: false,
-                status_code: None,
-                latency_ms: elapsed_ms(started),
-                error: Some(truncate_error(error)),
-            }
-        }
+        Err(err) => ChannelProbeResult {
+            reachable: false,
+            status_code: None,
+            latency_ms: elapsed_ms(started),
+            error: Some(truncate_error(upstream_unreachable_message(&err))),
+        },
     };
     Ok(Json(result))
 }
@@ -917,6 +912,118 @@ fn truncate_error(mut message: String) -> String {
 /// `Instant` 经过的毫秒，夹到 `u64`。
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+// --- 上游模型列表 ---
+
+/// 上游模型列表的路径段（相对 `base_url`）：OpenAI 与 Anthropic 均为 `{base}/models`。
+const UPSTREAM_MODELS_PATH: &str = "/models";
+
+/// 拉取上游模型列表的草稿请求：仅含出站相关字段，渠道无需已保存。
+///
+/// 管理面新建渠道向导可在保存前同步模型；`timeout_ms` 沿用为本次请求超时。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamModelsDraft {
+    protocol: Protocol,
+    base_url: String,
+    api_key: String,
+    timeout_ms: u64,
+}
+
+/// 上游模型列表响应：模型 id 数组，保持上游返回顺序，排序由调用方负责。
+#[derive(Debug, Serialize)]
+struct UpstreamModelsView {
+    models: Vec<String>,
+}
+
+/// 按渠道草稿拉取上游模型列表：GET `{base_url}/models`。
+///
+/// OpenAI（chat/responses）与 Anthropic（messages）的模型列表同为
+/// `{"data": [{"id": ...}]}` 形态，故统一解析；认证头按协议复用 `OutboundAuth`。
+/// 上游不可达/非 2xx/响应形态非法均映射为 502 `upstream_error`。
+async fn list_upstream_models(
+    State(deps): State<AdminDeps>,
+    body: Result<Json<UpstreamModelsDraft>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<UpstreamModelsView>, AdminError> {
+    let Json(draft) = body.map_err(AdminError::bad_body)?;
+    if draft.base_url.trim().is_empty() {
+        return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
+    }
+    if draft.api_key.trim().is_empty() {
+        return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
+    }
+    if draft.timeout_ms < 1 {
+        return Err(AdminError::InvalidBody("timeout_ms 不能小于 1".to_string()));
+    }
+    // 借临时 Channel 复用 OutboundAuth；与出站认证无关的字段取不影响认证的缺省值。
+    let channel = Channel {
+        name: String::new(),
+        protocol: draft.protocol,
+        base_url: draft.base_url,
+        api_key: draft.api_key,
+        models: Vec::new(),
+        model_aliases: HashMap::new(),
+        priority: 0,
+        weight: 1,
+        timeout_ms: draft.timeout_ms,
+        max_retries: 0,
+        enabled: true,
+    };
+    let url = format!(
+        "{}{}",
+        channel.base_url.trim_end_matches('/'),
+        UPSTREAM_MODELS_PATH
+    );
+    let send = deps
+        .client
+        .get(&url)
+        .timeout(Duration::from_millis(channel.timeout_ms))
+        .apply_outbound_auth(&channel)
+        .send()
+        .await;
+    let response = match send {
+        Ok(response) => response,
+        Err(err) => {
+            return Err(AdminError::Upstream(truncate_error(
+                upstream_unreachable_message(&err),
+            )));
+        }
+    };
+    let status_code = response.status().as_u16();
+    let body_text = response.text().await.unwrap_or_default();
+    if !(200..300).contains(&status_code) {
+        return Err(AdminError::Upstream(probe_error_summary(
+            &body_text,
+            status_code,
+        )));
+    }
+    let models = parse_upstream_models(&body_text)?;
+    Ok(Json(UpstreamModelsView { models }))
+}
+
+/// 从 `{"data": [{"id": ...}]}` 解析模型 id 数组；无 `id` 的条目跳过。
+fn parse_upstream_models(body: &str) -> Result<Vec<String>, AdminError> {
+    let parsed: Value = serde_json::from_str(body)
+        .map_err(|_| AdminError::Upstream("上游响应不是合法 JSON".to_string()))?;
+    let data = parsed
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| AdminError::Upstream("上游响应缺少 data 数组".to_string()))?;
+    Ok(data
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect())
+}
+
+/// 出站请求发送失败的错误摘要：超时与连接失败措辞与探测保持一致。
+fn upstream_unreachable_message(err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        "请求超时".to_string()
+    } else {
+        format!("上游不可达: {err}")
+    }
 }
 
 // --- 写库 + 换快照公共原语 ---
@@ -1038,6 +1145,8 @@ enum AdminError {
     NotFound(String),
     /// 新建时资源已存在（409）。
     Conflict(String),
+    /// 上游访问失败（502）：模型列表请求不可达、非 2xx 或响应形态非法。
+    Upstream(String),
     /// 存储层错误（500）。
     Store(StoreError),
 }
@@ -1055,6 +1164,7 @@ impl IntoResponse for AdminError {
             AdminError::InvalidBody(msg) => (StatusCode::BAD_REQUEST, "invalid_body", msg),
             AdminError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg),
             AdminError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg),
+            AdminError::Upstream(msg) => (StatusCode::BAD_GATEWAY, "upstream_error", msg),
             AdminError::Store(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "store_error",

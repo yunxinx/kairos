@@ -1878,6 +1878,104 @@ async fn channel_probe_timeout_is_unreachable() {
     );
 }
 
+/// 拉取上游模型列表：渠道草稿无需已保存，解析 `data[].id` 并保持上游顺序。
+#[tokio::test]
+async fn list_upstream_models_parses_draft_and_keeps_order() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "object": "list",
+        "data": [
+            { "id": "gpt-4o", "object": "model" },
+            { "id": "claude-3-5-sonnet", "type": "model" },
+            { "object": "model" }
+        ]
+    })));
+
+    let draft = json!({
+        "protocol": "openai_chat",
+        "base_url": gw.upstream.base_url(),
+        "api_key": "sk-upstream",
+        "timeout_ms": 1000
+    });
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels/models", draft).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("模型列表应可解析");
+    assert_eq!(
+        body["models"],
+        json!(["gpt-4o", "claude-3-5-sonnet"]),
+        "无 id 条目应跳过，顺序应保持上游返回顺序"
+    );
+
+    // Anthropic 协议的模型列表同为 data 数组形态，同样可解析。
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "data": [{ "type": "model", "id": "claude-opus-4", "display_name": "Claude Opus 4" }],
+        "has_more": false
+    })));
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels/models",
+        json!({
+            "protocol": "anthropic_messages",
+            "base_url": gw.upstream.base_url(),
+            "api_key": "sk-upstream",
+            "timeout_ms": 1000
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("模型列表应可解析");
+    assert_eq!(body["models"], json!(["claude-opus-4"]));
+}
+
+/// 拉取上游模型列表的错误语义：上游非 2xx/不可达映射 502；非法草稿与未知字段 400。
+#[tokio::test]
+async fn list_upstream_models_errors_are_structured() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let draft = json!({
+        "protocol": "openai_chat",
+        "base_url": gw.upstream.base_url(),
+        "api_key": "sk-upstream",
+        "timeout_ms": 1000
+    });
+
+    // 上游非 2xx → 502 upstream_error，错误摘要来自上游 body。
+    gw.upstream.set_behavior(UpstreamBehavior::Status(500));
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels/models",
+        draft.clone(),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "upstream_error");
+
+    // 上游不可达 → 502 upstream_error。
+    let mut unreachable = draft.clone();
+    unreachable["base_url"] = json!("http://127.0.0.1:1");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels/models", unreachable).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "upstream_error");
+
+    // api_key 为空 → 400 invalid_body。
+    let mut empty_key = draft.clone();
+    empty_key["api_key"] = json!("");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels/models", empty_key).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "invalid_body");
+
+    // 未知字段 → 400。
+    let mut unknown = draft.clone();
+    unknown["typo"] = json!(1);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels/models", unknown).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
 /// 探测未知渠道 404；两端点未认证 401。
 #[tokio::test]
 async fn stats_and_probe_auth_and_unknown_channel() {

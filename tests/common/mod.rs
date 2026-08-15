@@ -28,7 +28,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, Sse},
     },
-    routing::post,
+    routing::{get, post},
 };
 use futures_util::stream;
 use kairos::store::resources::{self, Channel, Price, Token};
@@ -92,6 +92,7 @@ impl MockUpstream {
             .route("/chat/completions", post(handle))
             .route("/messages", post(handle))
             .route("/responses", post(handle))
+            .route("/models", get(handle_models))
             // 禁用 axum 默认 2MB 上限：mock 上游需接收大请求体（模拟网关转发的多模态/base64）。
             .layer(DefaultBodyLimit::disable())
             .with_state(MockDeps {
@@ -158,13 +159,26 @@ async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Respon
         .requests
         .push(body);
 
-    // 从行为队列取出下一个；队列空时默认返回空 SSE（200）。
+    respond_next(&deps, UpstreamBehavior::Sse(vec![])).await
+}
+
+/// GET `/models` 无请求体；与 `handle` 共用行为队列，逐请求消费。
+async fn handle_models(State(deps): State<MockDeps>) -> Response {
+    respond_next(
+        &deps,
+        UpstreamBehavior::Json(serde_json::json!({ "data": [] })),
+    )
+    .await
+}
+
+/// 从行为队列取下一个行为响应；队列空时用给定缺省；`Hang` 挂起不响应。
+async fn respond_next(deps: &MockDeps, default: UpstreamBehavior) -> Response {
     let behavior = deps
         .behavior
         .lock()
         .expect("behavior 锁不应被污染")
         .pop_front()
-        .unwrap_or(UpstreamBehavior::Sse(vec![]));
+        .unwrap_or(default);
     if matches!(behavior, UpstreamBehavior::Hang) {
         std::future::pending::<()>().await;
     }
