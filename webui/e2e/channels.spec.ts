@@ -20,26 +20,48 @@ test.describe('channel resource page', () => {
       await page.locator('[id^="channel-editor-base-url"]').fill(okUpstream.baseUrl);
       await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
 
-      // 同步上游模型：勾选 gpt-4o-mini，返回即写回清单草稿。
+      // 同步视图进入后不自动请求：先为空，点「同步」才拉取上游模型。
       await page.getByTestId('channel-sync-models').click();
       await expect(page.getByTestId('channel-sync-view')).toBeVisible();
+      await expect(page.getByTestId('channel-sync-row')).toHaveCount(0);
+      await expect(
+        page.getByTestId('channel-sync-view').getByRole('columnheader', { name: 'Model' }),
+      ).toBeVisible();
+      await expect(page.getByTestId('channel-sync-view').getByText('Not synced yet')).toBeVisible();
+      await page.getByTestId('channel-sync-run').click();
       const miniRow = page.locator('[data-testid="channel-sync-row"][data-model="gpt-4o-mini"]');
       const fullRow = page.locator('[data-testid="channel-sync-row"][data-model="gpt-4o"]');
       await expect(miniRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
+
+      // 别名列常显输入：为 gpt-4o-mini 填别名，勾选后主名与别名一并入清单。
+      await miniRow.getByTestId('channel-sync-alias-input').fill('mini');
       await miniRow.getByTestId('channel-sync-checkbox').click();
       await expect(miniRow.getByTestId('channel-sync-status-willAdd')).toBeVisible();
       await page.getByTestId('channel-sync-back').click();
-      await expect(page.getByTestId('channel-model-chip')).toHaveCount(1);
-      await expect(page.getByTestId('channel-model-count')).toHaveText('1');
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
+      await expect(page.getByTestId('channel-model-count')).toHaveText('2');
+      // 带别名的主名与别名 chip 均染别名底色。
+      const canonicalChip = page.locator(
+        '[data-testid="channel-model-chip"][data-model="gpt-4o-mini"]',
+      );
+      const aliasChip = page.locator('[data-testid="channel-model-chip"][data-model="mini"]');
+      await expect(canonicalChip).toHaveClass(/model-chip-alias/);
+      await expect(aliasChip).toHaveClass(/model-chip-alias/);
+      // tooltip：悬浮主名显示别名，悬浮别名显示主名。
+      await canonicalChip.hover();
+      await expect(page.locator('.tooltip-content')).toContainText('mini');
+      await aliasChip.hover();
+      await expect(page.locator('.tooltip-content')).toContainText('gpt-4o-mini');
 
       await page.getByTestId('channel-editor-tab-advanced').click();
+      // 「模型别名」文本框已移除。
+      await expect(page.locator('[id^="channel-editor-aliases"]')).toHaveCount(0);
       await page.locator('[id^="channel-editor-timeout-ms"]').fill('5000');
       await page.locator('[id^="channel-editor-max-retries"]').fill('1');
       await page.getByTestId('channel-save').click();
 
       const okRow = page.locator('[data-testid="channel-row"][data-channel-name="ok-channel"]');
       await expect(okRow).toBeVisible();
-      await expect(okRow).toContainText('gpt-4o-mini');
       // 品牌图标以 mask 渲染：mask-image 为空会退化成纯色块。
       await expect(okRow.locator('.brand-icon')).toHaveCSS('mask-image', /url\(|image/);
 
@@ -63,46 +85,104 @@ test.describe('channel resource page', () => {
       await page.getByTestId('channels-search').fill('');
       await expect(okRow).toBeVisible();
 
-      // 二次同步：已入清单显示「已选择」；取消勾选变「将取消」；全选/反选作用于可见行。
+      // 二次同步：别名保留、主名已选择；别名维度筛选可用；搜索/反选作用于可见行。
       await okRow.getByTestId('channel-edit').click();
       await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
       await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();
+      await expect(miniRow.getByTestId('channel-sync-alias-input')).toHaveValue('mini');
       await expect(fullRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
-      await miniRow.click();
-      await expect(miniRow.getByTestId('channel-sync-status-willRemove')).toBeVisible();
-      await page.getByTestId('channel-sync-select-all').click();
-      await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();
-      await expect(fullRow.getByTestId('channel-sync-status-willAdd')).toBeVisible();
-      await page.getByTestId('channel-sync-invert').click();
-      await expect(miniRow.getByTestId('channel-sync-status-willRemove')).toBeVisible();
-      await expect(fullRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
-      // 状态筛选：勾「将取消」只剩 mini；清除筛选恢复，勾选即时生效。
+      // 别名筛选：存在别名仅 gpt-4o-mini；清除后恢复。
       await page.getByTestId('channel-sync-filter').click();
-      await page.getByTestId('channel-sync-filter-willRemove').click();
+      await expect(page.getByTestId('channel-sync-filter-menu')).toBeVisible();
+      await expect(page.getByTestId('channel-sync-filter-hasAlias')).toContainText('1');
+      await expect(page.getByTestId('channel-sync-filter-noAlias')).toContainText('1');
+      await page.getByTestId('channel-sync-filter-hasAlias').click();
       await expect(miniRow).toBeVisible();
       await expect(fullRow).toHaveCount(0);
       await page.getByTestId('channel-sync-filter-clear').click();
       await expect(fullRow).toBeVisible();
-      // 搜索过滤行；清空恢复。
-      await page.getByTestId('channel-sync-search').fill('mini');
+      await page.getByTestId('channel-sync-filter').click();
+      await expect(page.getByTestId('channel-sync-filter-menu')).toHaveCount(0);
+      // 搜索框聚焦时铺到行尾，动作按钮让位；Esc 只失焦不关窗；失焦后叉号清空且不展开。
+      const invertBtn = page.getByTestId('channel-sync-invert');
+      const syncSearch = page.getByTestId('channel-sync-search');
+      const collapsedSearch = await syncSearch.boundingBox();
+      await expect(invertBtn).toBeVisible();
+      await syncSearch.click();
+      await expect(invertBtn).toBeHidden();
+      const expandedSearch = await syncSearch.boundingBox();
+      expect(collapsedSearch).toBeTruthy();
+      expect(expandedSearch).toBeTruthy();
+      expect(expandedSearch!.width).toBeGreaterThan(collapsedSearch!.width);
+      await page.keyboard.press('Escape');
+      await expect(invertBtn).toBeVisible();
+      await expect(page.getByTestId('channel-sync-view')).toBeVisible();
+      // 搜索过滤行；失焦后点叉号清空，不进入输入态。
+      await syncSearch.fill('no-such-model');
+      await expect(page.getByTestId('channel-sync-row')).toHaveCount(0);
+      await expect(
+        page.getByTestId('channel-sync-view').getByRole('columnheader', { name: 'Model' }),
+      ).toBeVisible();
+      await expect(
+        page.getByTestId('channel-sync-view').getByText('No matching models'),
+      ).toBeVisible();
+      await syncSearch.fill('mini');
       await expect(fullRow).toHaveCount(0);
       await expect(miniRow).toBeVisible();
-      await page.getByTestId('channel-sync-search').fill('');
+      await syncSearch.blur();
+      await expect(invertBtn).toBeVisible();
+      await page.getByTestId('channel-sync-view').getByTestId('search-input-clear').click();
+      await expect(syncSearch).toHaveValue('');
+      await expect(invertBtn).toBeVisible();
       await expect(fullRow).toBeVisible();
-      // 表头复选框全选可见行，返回后清单为两个模型。
-      await page.getByTestId('channel-sync-select-all-head').click();
-      await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();
+      // 反选再反选：勾选状态往返，别名随主名勾选保留。
+      await invertBtn.click();
+      await expect(miniRow.getByTestId('channel-sync-status-willRemove')).toBeVisible();
       await expect(fullRow.getByTestId('channel-sync-status-willAdd')).toBeVisible();
+      await page.getByTestId('channel-sync-invert').click();
+      await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();
+      await expect(fullRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
       await page.getByTestId('channel-sync-back').click();
       await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
 
-      await page.getByTestId('channel-editor-tab-advanced').click();
-      await page.locator('[id^="channel-editor-aliases"]').fill('mini=gpt-4o-mini');
       await page.getByTestId('channel-save').click();
-      await expect(okRow).toContainText('gpt-4o');
 
       await clickRowAction(okRow, page, 'channel-test');
-      await expect(okRow.getByTestId('channel-probe-result')).toHaveText(/Success · 200 · \d+ ms/);
+      const probeView = page.getByTestId('channel-probe-view');
+      await expect(probeView).toBeVisible();
+      // 主名+别名去重：只显示主模型名一行。
+      await expect(page.getByTestId('channel-probe-row')).toHaveCount(1);
+      const probeMini = page.locator('[data-testid="channel-probe-row"][data-model="gpt-4o-mini"]');
+      await expect(probeMini.getByTestId('channel-probe-status-idle')).toBeVisible();
+      await page.getByTestId('channel-probe-search').fill('no-such-model');
+      await expect(page.getByTestId('channel-probe-row')).toHaveCount(0);
+      await expect(
+        page.getByTestId('channel-probe-view').getByRole('columnheader', { name: 'Model' }),
+      ).toBeVisible();
+      await expect(
+        page.getByTestId('channel-probe-view').getByText('No matching models'),
+      ).toBeVisible();
+      await page.getByTestId('channel-probe-search').fill('');
+      await expect(probeMini).toBeVisible();
+      await expect(page.getByTestId('channel-probe-test-selected')).toBeDisabled();
+      await probeMini.getByTestId('channel-probe-run').click();
+      await expect(probeMini.getByTestId('channel-probe-status-success')).toBeVisible();
+      await expect(probeMini.getByTestId('channel-probe-latency')).toHaveText(/ms|s/);
+      const probeDetail = page.getByTestId('channel-probe-detail');
+      await expect(probeDetail).toBeVisible();
+      await expect(probeDetail).toContainText('200');
+      await expect(probeDetail).toContainText('/chat/completions');
+      await probeDetail.hover();
+      await page.waitForTimeout(3_500);
+      await expect(probeDetail).toBeVisible();
+      await page.mouse.move(0, 0);
+      await expect(probeDetail).toBeHidden({ timeout: 5_000 });
+      await page
+        .getByRole('dialog', { name: /test channel/i })
+        .getByRole('button', { name: 'Close' })
+        .click();
+      await expect(probeView).toHaveCount(0);
 
       // 新建渠道缺省启用：禁用 → 状态徽章变更；再启用 → 恢复。
       await expect(okRow.getByTestId('channel-toggle-enabled')).toHaveText('Enabled');
@@ -111,11 +191,12 @@ test.describe('channel resource page', () => {
       await okRow.getByTestId('channel-toggle-enabled').click();
       await expect(okRow.getByTestId('channel-toggle-enabled')).toHaveText('Enabled');
 
-      // 同步错误以独立浮窗展示：3s 自动消失；鼠标悬浮暂停计时。
+      // 同步错误以独立浮窗展示：进入不自动请求，点「同步」触发；3s 自动消失、悬浮暂停。
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-base-url"]').fill(errUpstream.baseUrl);
       await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
       await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
       const syncError = page.getByTestId('channel-sync-error');
       await expect(syncError).toBeVisible();
       // 悬浮期间超过 3s 仍不消失；移开后按剩余时长消失。
@@ -132,33 +213,52 @@ test.describe('channel resource page', () => {
       await page.locator('[id^="channel-editor-base-url"]').fill(failUpstream.baseUrl);
       await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
       await page.getByTestId('channel-sync-models').click();
-      await page.locator('[data-testid="channel-sync-row"][data-model="gpt-4o-mini"]').click();
+      await page.getByTestId('channel-sync-run').click();
+      await page
+        .locator('[data-testid="channel-sync-row"][data-model="gpt-4o-mini"]')
+        .getByTestId('channel-sync-checkbox')
+        .click();
       await page.getByTestId('channel-sync-back').click();
       await page.getByTestId('channel-save').click();
 
       const failRow = page.locator('[data-testid="channel-row"][data-channel-name="fail-channel"]');
       await expect(failRow).toBeVisible();
       await clickRowAction(failRow, page, 'channel-test');
-      await expect(failRow.getByTestId('channel-probe-result')).toHaveText(/Failed · 500 · \d+ ms/);
+      const failProbeRow = page.locator(
+        '[data-testid="channel-probe-row"][data-model="gpt-4o-mini"]',
+      );
+      await failProbeRow.getByTestId('channel-probe-run').click();
+      await expect(failProbeRow.getByTestId('channel-probe-status-failure')).toBeVisible();
+      const failDetail = page.getByTestId('channel-probe-detail');
+      await expect(failDetail).toBeVisible();
+      await expect(failDetail).toContainText('500');
+      await page
+        .getByRole('dialog', { name: /test channel/i })
+        .getByRole('button', { name: 'Close' })
+        .click();
 
-      // 三开窗校验：chip 可点击复制、可删除；高级设置字段保持；改名保存。
+      // 三开窗校验：chip 复制、删主名保留别名（同步视图呈「仅别名生效」虚线态）。
       await okRow.getByTestId('channel-edit').click();
       await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
-      // 点击 chip 复制模型名到剪贴板。
-      await page.locator('[data-testid="channel-model-chip"][data-model="gpt-4o-mini"]').click();
-      await expect
-        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
-        .toBe('gpt-4o-mini');
-      await page
-        .locator('[data-testid="channel-model-chip"][data-model="gpt-4o"]')
-        .getByTestId('channel-model-remove')
-        .click();
-      await expect(page.getByTestId('channel-model-chip')).toHaveCount(1);
-      await expect(page.getByTestId('channel-model-count')).toHaveText('1');
+      // 点击 chip 复制别名到剪贴板。
+      await aliasChip.click();
+      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('mini');
       await expect(page.locator('[id^="channel-editor-priority"]')).toHaveCount(0);
       await expect(page.locator('[id^="channel-editor-weight"]')).toHaveCount(0);
+      // 删除主模型名 chip：别名保留在清单。
+      await canonicalChip.getByTestId('channel-model-remove').click();
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(1);
+      await expect(page.getByTestId('channel-model-count')).toHaveText('1');
+      // 同步视图中该主名「仅别名生效」：勾选保留、虚线边框、别名列仍在。
+      await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
+      await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();
+      await expect(miniRow.locator('.model-name-deleted')).toBeVisible();
+      await expect(miniRow).toHaveClass(/sync-row-alias-only/);
+      await expect(miniRow.getByTestId('channel-sync-alias-input')).toHaveValue('mini');
+      await page.getByTestId('channel-sync-back').click();
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(1);
       await page.getByTestId('channel-editor-tab-advanced').click();
-      await expect(page.locator('[id^="channel-editor-aliases"]')).toHaveValue('mini=gpt-4o-mini');
       await expect(page.locator('[id^="channel-editor-timeout-ms"]')).toHaveValue('5000');
       await expect(page.locator('[id^="channel-editor-max-retries"]')).toHaveValue('1');
 

@@ -47,6 +47,8 @@
   --proto-responses-bg: #e0e7ff;
   --proto-anthropic: #c2410c;
   --proto-anthropic-bg: #ffedd5;
+  --alias: var(--info);
+  --alias-bg: var(--info-bg);
   --dot-color: #dce0eb;
   --primary-hover: #2563eb;
   --primary-shadow: #2563eb;
@@ -508,23 +510,32 @@ html[lang='zh-CN'] {
   }
 }
 
+/* legend 拉满宽后会盖住 fieldset 顶边，中间用这条线接上 */
+.legend-rule {
+  flex: 1 1 auto;
+  align-self: center;
+  min-width: 8px;
+  height: 1px;
+  background: var(--seed-border);
+}
+
 /* legend 小按钮：与相邻计数徽章严格同高（11px 字号 + 1.6 行高，垂直向由 1px 边框占位） */
 .legend-btn {
   display: inline-flex;
   align-items: center;
   gap: 4px;
   padding: 0 8px;
-  border: 1px solid transparent;
+  border: 1px solid color-mix(in srgb, var(--info) 40%, transparent);
   border-radius: 4px;
-  background: var(--seed-surface-alt);
+  background: var(--info-bg);
   font-size: 11px;
   font-weight: 600;
   line-height: 1.6;
-  color: var(--fg-muted);
+  color: var(--info);
   cursor: pointer;
 }
 .legend-btn:hover:enabled {
-  border-color: var(--seed-border);
+  border-color: var(--info);
   color: var(--seed-fg);
 }
 .legend-btn:focus-visible {
@@ -613,6 +624,75 @@ html[lang='zh-CN'] {
   font-family: ui-monospace, monospace;
   font-size: 12px;
   color: var(--fg-muted);
+}
+
+/* 别名 chip：主模型带别名、或别名本体，均以别名色底 + 细描边区分普通 chip */
+.model-chip-alias {
+  background: var(--alias-bg);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--alias) 45%, transparent);
+}
+
+/* Tooltip 内容：浮于窗口层之上，描边卡片风格与主题一致 */
+.tooltip-content {
+  z-index: calc(var(--z-window) + 100);
+  max-width: 20rem;
+  padding: 4px 8px;
+  border: 1px solid var(--seed-border);
+  border-radius: var(--seed-radius);
+  background: var(--seed-surface);
+  color: var(--seed-fg);
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 1px 2px 0 0 var(--card-shadow);
+}
+.tooltip-arrow {
+  fill: var(--seed-surface);
+}
+
+/* 同步行「仅别名生效」：整行染别名底色，主模型名加虚线边框示意其已移出清单 */
+.sync-row-alias-only td {
+  background: color-mix(in srgb, var(--alias-bg) 55%, transparent);
+}
+.sync-row-alias-only:hover td {
+  background: color-mix(in srgb, var(--alias-bg) 75%, transparent);
+}
+.model-name-deleted {
+  border: 1px dashed var(--alias);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
+/* 同步表格别名列输入：常显、紧凑，行点击切换勾选时输入框自身不触发 */
+.sync-alias-input {
+  width: 100%;
+  padding: 3px 6px;
+  border: 1px solid var(--seed-border);
+  border-radius: 4px;
+  background: var(--seed-surface);
+  color: var(--seed-fg);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.sync-alias-input::placeholder {
+  color: var(--fg-subtle);
+}
+.sync-alias-input:focus {
+  outline: none;
+  border-color: var(--alias);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--alias) 25%, transparent);
+}
+
+/* 别名列略收、与状态列相邻内边距收紧，把宽度让给模型名称 */
+[data-slot='table-head'].sync-col-alias,
+[data-slot='table-cell'].sync-col-alias {
+  width: 9.5rem;
+  padding-right: 4px;
+}
+[data-slot='table-head'].sync-col-status,
+[data-slot='table-cell'].sync-col-status {
+  width: 7rem;
+  padding-left: 4px;
 }
 
 /* 点阵：见 body:has(.dotted-bg)::before；组件保留 .dotted-bg 类名即可 */
@@ -1040,6 +1120,12 @@ html[lang='zh-CN'] {
   height: 2rem;
   padding-left: 32px;
   padding-right: 30px;
+}
+/* 与 btn-sm / filter-btn 同高（30px），用于并排工具栏 */
+.search-input-sm .search-input-field {
+  height: 30px;
+  padding-top: 4px;
+  padding-bottom: 4px;
 }
 .search-input-icon {
   position: absolute;

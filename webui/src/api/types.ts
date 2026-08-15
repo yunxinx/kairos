@@ -1,6 +1,18 @@
 /** 渠道 wire 协议，与后端 `Protocol` serde rename 一致。 */
 export type Protocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
 
+/** 出站路径段，与网关 `protocol::upstream_path` 对齐。 */
+const UPSTREAM_PATH: Record<Protocol, string> = {
+  openai_chat: '/chat/completions',
+  openai_responses: '/responses',
+  anthropic_messages: '/messages',
+};
+
+/** 渠道出站 URL：去掉 base_url 尾斜杠后接协议路径。 */
+export function channelOutboundUrl(protocol: Protocol, baseUrl: string): string {
+  return `${baseUrl.replace(/\/+$/, '')}${UPSTREAM_PATH[protocol]}`;
+}
+
 /** 令牌写契约；余额与生命周期元数据不在其中。 */
 export interface Token {
   token_key: string;
@@ -181,9 +193,11 @@ export interface LifetimeStats {
 /** 渠道连通性探测结果。 */
 export interface ChannelProbeResult {
   reachable: boolean;
+  timed_out: boolean;
   status_code: number | null;
   latency_ms: number;
   error: string | null;
+  upstream_body: string | null;
 }
 
 /** 拉取上游模型列表的草稿请求：渠道无需已保存。 */

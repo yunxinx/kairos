@@ -3,13 +3,7 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import {
-  channelWriteBody,
-  type Channel,
-  type ChannelProbeResult,
-  type ChannelView,
-  type Protocol,
-} from '@/api/types';
+import { channelWriteBody, type Channel, type ChannelView, type Protocol } from '@/api/types';
 import anthropicIcon from '@lobehub/icons-static-svg/icons/anthropic.svg';
 import openaiIcon from '@lobehub/icons-static-svg/icons/openai.svg';
 import PageHeader from '@/app/layout/PageHeader.vue';
@@ -38,11 +32,13 @@ import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDele
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import ChannelEditorWindow from '@/features/channel/ChannelEditorWindow.vue';
+import ChannelProbeWindow from '@/features/channel/ChannelProbeWindow.vue';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type ChannelWindowPayload =
   | { kind: 'editor'; channel: ChannelView | null }
   | { kind: 'delete'; channel: ChannelView }
+  | { kind: 'probe'; channel: ChannelView }
   | BulkDeletePayload;
 
 /** 协议徽章着色：三协议各自独立配色，见 globals.css 的 --proto-* 变量。 */
@@ -80,8 +76,6 @@ const {
 
 const actionError = ref('');
 const deleteErrors = ref<Record<number, string>>({});
-const probeById = ref<Record<number, ChannelProbeResult>>({});
-const testingId = ref<number | null>(null);
 const searchText = ref('');
 
 const channelsQuery = useQuery({
@@ -158,19 +152,6 @@ const deletingId = computed(() =>
   deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
 );
 
-const testMutation = useMutation({
-  mutationFn: (id: number) => apiClient.testChannel(id),
-  onSuccess: (result, id) => {
-    probeById.value = { ...probeById.value, [id]: result };
-    testingId.value = null;
-  },
-  onError: (err, id) => {
-    testingId.value = null;
-    const name = channels.value.find((channel) => channel.id === id)?.name ?? String(id);
-    actionError.value = `${name}: ${extractApiError(err).message}`;
-  },
-});
-
 // 启用/禁用：整体替换写（PUT 携带完整定义），成功后重取列表。
 const toggleMutation = useMutation({
   mutationFn: (channel: ChannelView) =>
@@ -246,30 +227,15 @@ function openBulkDelete() {
   openWindow(takePendingAnchor(), { kind: 'bulk-delete' });
 }
 
-function handleTest(id: number) {
-  actionError.value = '';
-  testingId.value = id;
-  testMutation.mutate(id);
-}
-
-function probeText(result: ChannelProbeResult): string {
-  if (!result.reachable) {
-    return t('channel.probeUnreachable', { latency: result.latency_ms });
+function openProbe(channel: ChannelView) {
+  const existing = windows.value.find(
+    (entry) => entry.payload.kind === 'probe' && entry.payload.channel.id === channel.id,
+  );
+  if (existing) {
+    bringToFront(existing.id);
+    return;
   }
-  if (result.error) {
-    return t('channel.probeFailure', {
-      status: result.status_code ?? '—',
-      latency: result.latency_ms,
-    });
-  }
-  return t('channel.probeSuccess', {
-    status: result.status_code ?? '—',
-    latency: result.latency_ms,
-  });
-}
-
-function probeClass(result: ChannelProbeResult): string {
-  return result.reachable && result.error === null ? 'badge-success' : 'badge-danger';
+  openWindow(takePendingAnchor(), { kind: 'probe', channel });
 }
 </script>
 
@@ -323,7 +289,6 @@ function probeClass(result: ChannelProbeResult): string {
             </TableHead>
             <TableHead class="min-w-44">{{ t('channel.name') }}</TableHead>
             <TableHead>{{ t('channel.requestProtocol') }}</TableHead>
-            <TableHead>{{ t('channel.models') }}</TableHead>
             <TableHead align="center" class="w-28 pr-1">{{ t('channel.priority') }}</TableHead>
             <TableHead align="center" class="w-28 pl-1">{{ t('channel.weight') }}</TableHead>
             <TableHead align="center">{{ t('channel.status') }}</TableHead>
@@ -331,7 +296,7 @@ function probeClass(result: ChannelProbeResult): string {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="7" />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"
@@ -351,9 +316,6 @@ function probeClass(result: ChannelProbeResult): string {
                   <BrandIcon :src="PROTOCOL_ICON_SRC[channel.protocol]" :size="12" />
                   {{ t(`protocol.${channel.protocol}`) }}
                 </span>
-              </TableCell>
-              <TableCell class="font-mono text-sm">
-                {{ channel.models.join(', ') }}
               </TableCell>
               <TableCell align="center" class="pr-1">
                 <NumberStepper
@@ -395,14 +357,6 @@ function probeClass(result: ChannelProbeResult): string {
               </TableCell>
               <TableCell align="center">
                 <span class="inline-flex items-center justify-center gap-1">
-                  <span
-                    v-if="probeById[channel.id]"
-                    class="badge"
-                    :class="probeClass(probeById[channel.id]!)"
-                    data-testid="channel-probe-result"
-                  >
-                    {{ probeText(probeById[channel.id]!) }}
-                  </span>
                   <button
                     type="button"
                     class="btn btn-ghost btn-icon"
@@ -417,10 +371,11 @@ function probeClass(result: ChannelProbeResult): string {
                   <DataTableRowActions>
                     <DataTableMenuItem
                       data-testid="channel-test"
-                      :disabled="testingId === channel.id"
-                      @select="handleTest(channel.id)"
+                      :disabled="channel.models.length === 0"
+                      @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                      @select="openProbe(channel)"
                     >
-                      {{ testingId === channel.id ? t('channel.testing') : t('channel.test') }}
+                      {{ t('channel.test') }}
                     </DataTableMenuItem>
                     <DataTableMenuSeparator />
                     <DataTableMenuItem
@@ -436,7 +391,7 @@ function probeClass(result: ChannelProbeResult): string {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="8" class="h-24 whitespace-normal">
+              <TableCell :colspan="7" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}
@@ -476,6 +431,17 @@ function probeClass(result: ChannelProbeResult): string {
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
+      />
+      <ChannelProbeWindow
+        v-else-if="win.payload.kind === 'probe'"
+        :channel="win.payload.channel"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
       />
       <ConfirmWindow
         v-else-if="win.payload.kind === 'delete'"

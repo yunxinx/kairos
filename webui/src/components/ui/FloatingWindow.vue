@@ -87,7 +87,7 @@ function endDrag(event: PointerEvent): void {
   (event.currentTarget as HTMLElement).releasePointerCapture(event.pointerId);
 }
 
-function isEditable(el: Element): boolean {
+function isEditable(el: Element): el is HTMLElement {
   return (
     el instanceof HTMLInputElement ||
     el instanceof HTMLTextAreaElement ||
@@ -98,14 +98,14 @@ function isEditable(el: Element): boolean {
 
 function onKeydown(event: KeyboardEvent): void {
   if (event.key !== 'Escape') return;
-  // 焦点位于窗外可编辑控件（如搜索框）时不拦截，避免误关窗口。
   const active = document.activeElement;
-  if (
-    active &&
-    active !== document.body &&
-    isEditable(active) &&
-    !windowEl.value?.contains(active)
-  ) {
+  if (active && active !== document.body && isEditable(active)) {
+    if (windowEl.value?.contains(active)) {
+      // 窗内输入框：Esc 只取消焦点，等同点输入框外侧，不关窗口。
+      event.preventDefault();
+      active.blur();
+    }
+    // 窗外可编辑控件：不拦截，避免误关窗口。
     return;
   }
   event.preventDefault();

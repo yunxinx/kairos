@@ -1,8 +1,9 @@
 <script setup lang="ts">
-// 上游模型同步视图：挂载即按渠道草稿拉取上游模型列表，勾选表格 + 状态筛选，
-// 「返回」把勾选结果经 emit 写回父级草稿；失败以独立浮窗就近「刷新」按钮弹出，
-// 3s 自动消失（鼠标悬浮/键盘焦点暂停计时）。
-import { computed, onMounted, onUnmounted, ref, useId } from 'vue';
+// 上游模型同步视图：进入后不自动请求，由用户点「同步」拉取上游模型列表；
+// 勾选表格 + 别名列（常显输入、逗号分隔多个）+ 选择/别名两个维度的状态筛选，
+// 「保存并返回」把勾选结果与别名映射经 emit 写回父级草稿；失败以独立浮窗就近
+// 「同步」按钮弹出，3s 自动消失（鼠标悬浮/键盘焦点暂停计时）。
+import { computed, onUnmounted, ref, useId } from 'vue';
 import { useMutation } from '@tanstack/vue-query';
 import { PopoverContent, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
@@ -53,18 +54,29 @@ const SYNC_STATUS_KEY: Record<SyncStatus, string> = {
   unselected: 'channel.syncStatusUnselected',
 };
 
-/** 状态筛选分类：按「是否勾选 × 是否在清单」收敛为三档。 */
-type SyncStatusFilter = 'selected' | 'willRemove' | 'unselected';
+/** 选择状态筛选：按「是否勾选 × 是否在清单」收敛为三档。 */
+type SyncSelectionFilter = 'selected' | 'willRemove' | 'unselected';
 
-const SYNC_STATUS_FILTERS: { value: SyncStatusFilter; labelKey: string }[] = [
+const SELECTION_FILTERS: { value: SyncSelectionFilter; labelKey: string }[] = [
   { value: 'selected', labelKey: 'channel.syncStatusSelected' },
   { value: 'unselected', labelKey: 'channel.syncStatusUnselected' },
   { value: 'willRemove', labelKey: 'channel.syncStatusWillRemove' },
 ];
 
+/** 别名筛选：与选择状态正交的第二维度，按谓词匹配（一行可同时命中多项）。 */
+type SyncAliasFilter = 'hasAlias' | 'noAlias' | 'aliasOnly';
+
+const ALIAS_FILTERS: { value: SyncAliasFilter; labelKey: string }[] = [
+  { value: 'hasAlias', labelKey: 'channel.syncFilterHasAlias' },
+  { value: 'noAlias', labelKey: 'channel.syncFilterNoAlias' },
+  { value: 'aliasOnly', labelKey: 'channel.syncFilterAliasOnly' },
+];
+
 const props = defineProps<{
-  /** 进入视图时的模型清单：初始化勾选，且是「已在清单」的判定基准。 */
+  /** 进入视图时的模型清单（主模型名与别名混排）：初始化勾选与「已在清单」基准。 */
   models: string[];
+  /** 进入视图时的别名映射（别名 → 主模型名）：初始化别名列草稿。 */
+  aliases: Record<string, string>;
   protocol: Protocol;
   baseUrl: string;
   apiKey: string;
@@ -75,24 +87,27 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  /** 返回即提交勾选：写回模型清单草稿，保存仍由父级表单触发。 */
-  back: [models: string[]];
+  /** 保存并返回即提交：勾选模型（含别名）与别名映射一并写回草稿，保存仍由父级表单触发。 */
+  back: [models: string[], aliases: Record<string, string>];
 }>();
 
 const { t } = useI18n();
 const syncSearchId = `channel-sync-search-${useId()}`;
 
 const upstreamModels = ref<string[]>([]);
-/** 勾选集：进入时以当前清单初始化。 */
-const syncSelection = ref<Set<string>>(new Set(props.models));
+/** 是否已完成过一次同步：区分「尚未同步」与「上游未返回模型」两种空态。 */
+const hasSynced = ref(false);
 const syncSearch = ref('');
-/** 状态筛选集：空集不过滤。 */
-const syncStatusFilter = ref<Set<SyncStatusFilter>>(new Set());
+/** 仅当真正的输入框聚焦时铺满行尾；清除按钮聚焦不算。 */
+const searchFocused = ref(false);
+/** 两个筛选维度各自独立，空集不过滤。 */
+const selectionFilter = ref<Set<SyncSelectionFilter>>(new Set());
+const aliasFilter = ref<Set<SyncAliasFilter>>(new Set());
 
 const syncFailure = ref<SyncFailure | null>(null);
-/** 失败浮窗锚点：就近「刷新」按钮弹出，失败时取其位置。 */
+/** 失败浮窗锚点：就近「同步」按钮弹出，失败时取其位置。 */
 const syncFailureAnchor = ref<FloatingWindowAnchor | null>(null);
-const refreshBtnEl = ref<HTMLElement | null>(null);
+const syncBtnEl = ref<HTMLElement | null>(null);
 
 const syncMutation = useMutation({
   mutationFn: () =>
@@ -104,16 +119,13 @@ const syncMutation = useMutation({
     }),
   onSuccess: (data) => {
     dismissSyncFailure();
+    hasSynced.value = true;
     upstreamModels.value = data.models;
   },
   onError: (err) => {
     const { message, code } = extractApiError(err);
     showSyncFailure(code === undefined ? { message } : { message, code });
   },
-});
-
-onMounted(() => {
-  syncMutation.mutate();
 });
 
 // --- 失败浮窗计时 ---
@@ -123,7 +135,7 @@ let failureDismissRemaining = SYNC_ERROR_VISIBLE_MS;
 let failureDismissStarted = 0;
 
 function showSyncFailure(failure: SyncFailure) {
-  const rect = refreshBtnEl.value?.getBoundingClientRect();
+  const rect = syncBtnEl.value?.getBoundingClientRect();
   syncFailureAnchor.value = rect ? { x: rect.left, y: rect.bottom } : null;
   syncFailure.value = failure;
   failureDismissRemaining = SYNC_ERROR_VISIBLE_MS;
@@ -168,22 +180,87 @@ onUnmounted(() => {
   if (failureDismissTimer !== undefined) clearTimeout(failureDismissTimer);
 });
 
+// --- 进入时的草稿初始化 ---
+
+/** 清单条目对应的主模型名：别名取其指向的主模型名，主模型名取自身。 */
+function canonicalOf(name: string): string {
+  return props.aliases[name] ?? name;
+}
+
+/** 初始别名映射反查：主模型名 → 别名列表（props 为开窗快照，视图生命周期内不变）。 */
+const canonicalToInitialAliases = new Map<string, string[]>();
+for (const [alias, canonical] of Object.entries(props.aliases)) {
+  const list = canonicalToInitialAliases.get(canonical);
+  if (list) {
+    list.push(alias);
+  } else {
+    canonicalToInitialAliases.set(canonical, [alias]);
+  }
+}
+
+/** 勾选集：清单条目（主模型名或别名）一律归属其主模型名。 */
+const syncSelection = ref<Set<string>>(new Set(props.models.map(canonicalOf)));
+
+/** 别名列草稿：主模型名 → 逗号分隔文本。 */
+const aliasDrafts = ref<Record<string, string>>({});
+/** 「仅别名生效」：主模型名已移出清单、别名保留；重新勾选即恢复主模型名。 */
+const primaryDeleted = ref<Record<string, boolean>>({});
+/** 进入时是否已在清单（主模型名或任一别名在清单中）。 */
+const initialInList = new Map<string, boolean>();
+
+for (const canonical of new Set([
+  ...canonicalToInitialAliases.keys(),
+  ...props.models.map(canonicalOf),
+])) {
+  const initialAliases = canonicalToInitialAliases.get(canonical) ?? [];
+  aliasDrafts.value[canonical] = initialAliases.join(', ');
+  const canonicalInList = props.models.includes(canonical);
+  const aliasInList = initialAliases.some((alias) => props.models.includes(alias));
+  primaryDeleted.value[canonical] = !canonicalInList && aliasInList;
+  initialInList.set(canonical, canonicalInList || aliasInList);
+}
+
+/** 解析别名输入：按英文逗号拆分、裁剪、去空去重。 */
+function parseAliasText(text: string): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const part of text.split(',')) {
+    const alias = part.trim();
+    if (alias === '' || seen.has(alias)) continue;
+    seen.add(alias);
+    result.push(alias);
+  }
+  return result;
+}
+
+function setAliasDraft(name: string, value: string) {
+  aliasDrafts.value[name] = value;
+}
+
 // --- 行与筛选 ---
 
 interface SyncRow {
+  /** 主模型名（行键）。 */
   name: string;
-  /** 进入同步视图时已在模型清单中。 */
-  inList: boolean;
+  aliases: string[];
   selected: boolean;
+  /** 主模型名已移出清单但别名保留，且仍处于勾选态。 */
+  aliasOnly: boolean;
+  /** 进入视图时已在清单。 */
+  inList: boolean;
   status: SyncStatus;
 }
 
-/** 同步行：上游返回与进入时清单的并集，自然排序。 */
+/** 同步行：上游返回、清单归属的主模型名与初始别名涉及的主模型名三者并集，自然排序。 */
 const syncRows = computed((): SyncRow[] => {
-  const names = new Set([...upstreamModels.value, ...props.models]);
+  const names = new Set<string>(upstreamModels.value);
+  for (const model of props.models) names.add(canonicalOf(model));
+  for (const canonical of canonicalToInitialAliases.keys()) names.add(canonical);
   return [...names].sort(compareModels).map((name) => {
-    const inList = props.models.includes(name);
+    const aliases = parseAliasText(aliasDrafts.value[name] ?? '');
     const selected = syncSelection.value.has(name);
+    const aliasOnly = primaryDeleted.value[name] === true && selected && aliases.length > 0;
+    const inList = initialInList.get(name) ?? false;
     const status: SyncStatus = inList
       ? selected
         ? 'selected'
@@ -191,30 +268,57 @@ const syncRows = computed((): SyncRow[] => {
       : selected
         ? 'willAdd'
         : 'unselected';
-    return { name, inList, selected, status };
+    return { name, aliases, selected, aliasOnly, inList, status };
   });
 });
 
-/** 行归入的筛选分类：勾选即「已选择」，未勾选按是否在清单分「将取消/未选择」。 */
-function rowFilterKey(row: SyncRow): SyncStatusFilter {
+/** 行归入的选择筛选分类：勾选即「已选择」，未勾选按是否在清单分「将取消/未选择」。 */
+function rowSelectionKey(row: SyncRow): SyncSelectionFilter {
   if (row.selected) return 'selected';
   return row.inList ? 'willRemove' : 'unselected';
+}
+
+function aliasMatches(row: SyncRow, key: SyncAliasFilter): boolean {
+  switch (key) {
+    case 'hasAlias':
+      return row.aliases.length > 0;
+    case 'noAlias':
+      return row.aliases.length === 0;
+    case 'aliasOnly':
+      return row.aliasOnly;
+  }
 }
 
 const filteredSyncRows = computed(() => {
   const query = syncSearch.value.trim().toLowerCase();
   return syncRows.value.filter((row) => {
-    if (query !== '' && !row.name.toLowerCase().includes(query)) return false;
-    if (syncStatusFilter.value.size > 0 && !syncStatusFilter.value.has(rowFilterKey(row))) {
+    if (
+      query !== '' &&
+      !row.name.toLowerCase().includes(query) &&
+      !row.aliases.some((alias) => alias.toLowerCase().includes(query))
+    ) {
+      return false;
+    }
+    if (selectionFilter.value.size > 0 && !selectionFilter.value.has(rowSelectionKey(row))) {
+      return false;
+    }
+    if (
+      aliasFilter.value.size > 0 &&
+      !ALIAS_FILTERS.some(
+        (option) => aliasFilter.value.has(option.value) && aliasMatches(row, option.value),
+      )
+    ) {
       return false;
     }
     return true;
   });
 });
 
-const syncEmptyTitle = computed(() =>
-  syncSearch.value.trim() === '' ? t('channel.syncEmpty') : t('channel.syncEmptySearch'),
-);
+const syncEmptyTitle = computed(() => {
+  if (syncRows.value.length > 0) return t('channel.syncEmptySearch');
+  if (!hasSynced.value) return t('channel.syncNotSynced');
+  return syncSearch.value.trim() === '' ? t('channel.syncEmpty') : t('channel.syncEmptySearch');
+});
 
 // --- 勾选操作 ---
 
@@ -225,46 +329,74 @@ function updateSelection(mutate: (next: Set<string>) => void) {
   syncSelection.value = next;
 }
 
+/** 勾选一行：重新勾上「仅别名生效」的行时恢复其主模型名。 */
+function selectName(next: Set<string>, name: string) {
+  next.add(name);
+  if (primaryDeleted.value[name] === true) primaryDeleted.value[name] = false;
+}
+
 function toggleSyncRow(name: string) {
   updateSelection((next) => {
     if (next.has(name)) {
       next.delete(name);
     } else {
-      next.add(name);
+      selectName(next, name);
     }
   });
 }
 
-function toggleStatusFilter(key: SyncStatusFilter) {
-  const next = new Set(syncStatusFilter.value);
+function toggleSelectionFilter(key: SyncSelectionFilter) {
+  const next = new Set(selectionFilter.value);
   if (next.has(key)) {
     next.delete(key);
   } else {
     next.add(key);
   }
-  syncStatusFilter.value = next;
+  selectionFilter.value = next;
 }
 
-function clearStatusFilter() {
-  syncStatusFilter.value = new Set();
+function toggleAliasFilter(key: SyncAliasFilter) {
+  const next = new Set(aliasFilter.value);
+  if (next.has(key)) {
+    next.delete(key);
+  } else {
+    next.add(key);
+  }
+  aliasFilter.value = next;
 }
+
+function clearFilters() {
+  selectionFilter.value = new Set();
+  aliasFilter.value = new Set();
+}
+
+const hasActiveFilter = computed(
+  () => selectionFilter.value.size > 0 || aliasFilter.value.size > 0,
+);
 
 /** 各筛选分类在（未做状态筛选的）行中的数量。 */
-function filterCount(key: SyncStatusFilter): number {
-  return syncRows.value.filter((row) => rowFilterKey(row) === key).length;
+function selectionFilterCount(key: SyncSelectionFilter): number {
+  return syncRows.value.filter((row) => rowSelectionKey(row) === key).length;
+}
+
+function aliasFilterCount(key: SyncAliasFilter): number {
+  return syncRows.value.filter((row) => aliasMatches(row, key)).length;
 }
 
 /** 触发按钮上的已选筛选徽章文案。 */
-const activeFilterLabels = computed(() =>
-  SYNC_STATUS_FILTERS.filter((option) => syncStatusFilter.value.has(option.value)).map((option) =>
+const activeFilterLabels = computed(() => [
+  ...SELECTION_FILTERS.filter((option) => selectionFilter.value.has(option.value)).map((option) =>
     t(option.labelKey),
   ),
-);
+  ...ALIAS_FILTERS.filter((option) => aliasFilter.value.has(option.value)).map((option) =>
+    t(option.labelKey),
+  ),
+]);
 
 function selectAllVisible() {
   updateSelection((next) => {
     for (const row of filteredSyncRows.value) {
-      next.add(row.name);
+      selectName(next, row.name);
     }
   });
 }
@@ -275,7 +407,7 @@ function invertVisible() {
       if (next.has(row.name)) {
         next.delete(row.name);
       } else {
-        next.add(row.name);
+        selectName(next, row.name);
       }
     }
   });
@@ -292,7 +424,7 @@ function toggleAllVisible() {
   updateSelection((next) => {
     for (const row of filteredSyncRows.value) {
       if (selectAll) {
-        next.add(row.name);
+        selectName(next, row.name);
       } else {
         next.delete(row.name);
       }
@@ -300,13 +432,26 @@ function toggleAllVisible() {
   });
 }
 
+/** 保存并返回即提交：勾选行产出主模型名与别名入清单；「仅别名生效」行只产出别名。 */
 function closeSync() {
-  emit('back', [...syncSelection.value].sort(compareModels));
+  // 用 Set 去重：别名恰与某主模型名同名时不产生重复清单条目。
+  const models = new Set<string>();
+  const aliases: Record<string, string> = {};
+  for (const row of syncRows.value) {
+    if (!row.selected) continue;
+    if (!row.aliasOnly) models.add(row.name);
+    for (const alias of row.aliases) {
+      models.add(alias);
+      aliases[alias] = row.name;
+    }
+  }
+  emit('back', [...models].sort(compareModels), aliases);
 }
 </script>
 
 <template>
   <div class="card-body space-y-3" data-testid="channel-sync-view">
+    <!-- 搜索框聚焦时动作按钮让位，输入框铺到行尾；失焦后恢复。 -->
     <div class="flex items-center gap-2">
       <button
         type="button"
@@ -320,20 +465,22 @@ function closeSync() {
       <SearchInput
         :id="syncSearchId"
         v-model="syncSearch"
-        class="min-w-0 flex-1"
+        class="search-input-sm min-w-0 flex-1"
         :placeholder="t('channel.syncSearchPlaceholder')"
         data-testid="channel-sync-search"
+        @focus="searchFocused = true"
+        @blur="searchFocused = false"
       />
-      <div class="flex shrink-0 items-center gap-1.5">
+      <div class="flex shrink-0 items-center gap-1.5" :class="searchFocused && 'hidden'">
         <button
-          ref="refreshBtnEl"
+          ref="syncBtnEl"
           type="button"
           class="btn btn-sm"
-          data-testid="channel-sync-refresh"
+          data-testid="channel-sync-run"
           :disabled="syncMutation.isPending.value"
           @click="syncMutation.mutate()"
         >
-          {{ t('channel.syncRefresh') }}
+          {{ t('channel.syncAction') }}
         </button>
         <PopoverRoot>
           <PopoverTrigger
@@ -365,30 +512,49 @@ function closeSync() {
             data-testid="channel-sync-filter-menu"
           >
             <button
-              v-for="option in SYNC_STATUS_FILTERS"
+              v-for="option in SELECTION_FILTERS"
               :key="option.value"
               type="button"
               class="sync-filter-option"
               :data-testid="`channel-sync-filter-${option.value}`"
-              @click="toggleStatusFilter(option.value)"
+              @click="toggleSelectionFilter(option.value)"
             >
               <span
                 class="sync-filter-box"
-                :data-active="String(syncStatusFilter.has(option.value))"
+                :data-active="String(selectionFilter.has(option.value))"
                 aria-hidden="true"
               >
                 <UiIcon name="check" :size="10" />
               </span>
               <span class="min-w-0 flex-1">{{ t(option.labelKey) }}</span>
-              <span class="sync-filter-count">{{ filterCount(option.value) }}</span>
+              <span class="sync-filter-count">{{ selectionFilterCount(option.value) }}</span>
             </button>
-            <template v-if="syncStatusFilter.size > 0">
+            <div class="my-1 border-t border-[var(--seed-border)]" aria-hidden="true" />
+            <button
+              v-for="option in ALIAS_FILTERS"
+              :key="option.value"
+              type="button"
+              class="sync-filter-option"
+              :data-testid="`channel-sync-filter-${option.value}`"
+              @click="toggleAliasFilter(option.value)"
+            >
+              <span
+                class="sync-filter-box"
+                :data-active="String(aliasFilter.has(option.value))"
+                aria-hidden="true"
+              >
+                <UiIcon name="check" :size="10" />
+              </span>
+              <span class="min-w-0 flex-1">{{ t(option.labelKey) }}</span>
+              <span class="sync-filter-count">{{ aliasFilterCount(option.value) }}</span>
+            </button>
+            <template v-if="hasActiveFilter">
               <div class="my-1 border-t border-[var(--seed-border)]" aria-hidden="true" />
               <button
                 type="button"
                 class="sync-filter-option justify-center"
                 data-testid="channel-sync-filter-clear"
-                @click="clearStatusFilter"
+                @click="clearFilters"
               >
                 {{ t('channel.syncFilterClear') }}
               </button>
@@ -415,7 +581,7 @@ function closeSync() {
         </button>
       </div>
     </div>
-    <DataTablePanel v-if="filteredSyncRows.length > 0">
+    <DataTablePanel>
       <Table>
         <TableHeader>
           <TableRow>
@@ -432,7 +598,10 @@ function closeSync() {
             </TableHead>
             <TableHead class="w-12">{{ t('channel.syncColIndex') }}</TableHead>
             <TableHead>{{ t('channel.syncColModel') }}</TableHead>
-            <TableHead class="w-28" align="right">{{ t('channel.syncColStatus') }}</TableHead>
+            <TableHead class="sync-col-alias">{{ t('channel.syncColAlias') }}</TableHead>
+            <TableHead class="sync-col-status" align="right">{{
+              t('channel.syncColStatus')
+            }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -440,6 +609,7 @@ function closeSync() {
             v-for="(row, index) in filteredSyncRows"
             :key="row.name"
             class="cursor-pointer"
+            :class="row.aliasOnly && 'sync-row-alias-only'"
             :data-state="row.selected ? 'selected' : undefined"
             data-testid="channel-sync-row"
             :data-model="row.name"
@@ -452,8 +622,21 @@ function closeSync() {
               @click.stop
             />
             <TableCell class="text-fg-muted font-mono text-xs">{{ index + 1 }}</TableCell>
-            <TableCell class="font-mono text-xs">{{ row.name }}</TableCell>
-            <TableCell align="right">
+            <TableCell class="font-mono text-xs">
+              <span :class="row.aliasOnly ? 'model-name-deleted' : undefined">{{ row.name }}</span>
+            </TableCell>
+            <TableCell class="sync-col-alias" @click.stop>
+              <input
+                type="text"
+                class="sync-alias-input"
+                :value="aliasDrafts[row.name] ?? ''"
+                :placeholder="t('channel.syncAliasPlaceholder')"
+                data-testid="channel-sync-alias-input"
+                :aria-label="`${t('channel.syncColAlias')}: ${row.name}`"
+                @input="setAliasDraft(row.name, ($event.target as HTMLInputElement).value)"
+              />
+            </TableCell>
+            <TableCell class="sync-col-status" align="right">
               <span
                 class="badge"
                 :class="SYNC_STATUS_BADGE[row.status]"
@@ -463,17 +646,21 @@ function closeSync() {
               </span>
             </TableCell>
           </TableRow>
+          <TableRow v-if="filteredSyncRows.length === 0">
+            <TableCell :colspan="5" class="h-24 whitespace-normal">
+              <p
+                v-if="syncMutation.isPending.value"
+                class="text-fg-muted px-4 py-6 text-center text-sm"
+                role="status"
+              >
+                {{ t('common.loading') }}
+              </p>
+              <EmptyState v-else :title="syncEmptyTitle" />
+            </TableCell>
+          </TableRow>
         </TableBody>
       </Table>
     </DataTablePanel>
-    <p
-      v-else-if="syncMutation.isPending.value"
-      class="text-fg-muted px-4 py-6 text-center text-sm"
-      role="status"
-    >
-      {{ t('common.loading') }}
-    </p>
-    <EmptyState v-else :title="syncEmptyTitle" />
   </div>
 
   <!-- 失败浮窗：不响应 Esc（topmost=false），避免与编辑器浮窗同时关闭。 -->

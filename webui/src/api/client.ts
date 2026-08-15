@@ -117,8 +117,11 @@ export const apiClient = {
     return apiFetch(`/channels/${id}`, { method: 'DELETE' });
   },
 
-  testChannel(id: number): Promise<ChannelProbeResult> {
-    return apiFetch(`/channels/${id}/test`, { method: 'POST' });
+  testChannel(id: number, model: string): Promise<ChannelProbeResult> {
+    return apiFetch(`/channels/${id}/test`, {
+      method: 'POST',
+      body: JSON.stringify({ model }),
+    });
   },
 
   /** 按渠道草稿拉取上游模型列表；渠道无需已保存。 */

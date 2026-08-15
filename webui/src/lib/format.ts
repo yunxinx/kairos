@@ -179,3 +179,11 @@ export function parseMbToBytes(input: string): number | null {
   }
   return bytes;
 }
+
+/** 探测延迟展示：不足 1s 用整数毫秒，达到 1s 进位为秒（两位小数）。 */
+export function formatProbeLatency(ms: number): string {
+  if (ms >= 1_000) {
+    return `${(ms / 1_000).toFixed(2)} s`;
+  }
+  return `${ms} ms`;
+}
