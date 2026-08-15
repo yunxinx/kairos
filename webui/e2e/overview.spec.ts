@@ -4,7 +4,7 @@ import { E2E_ADMIN_KEY } from './helpers/gateway';
 import { MS_PER_DAY, seedRequestLogs, utcDayStart } from './helpers/seed-logs';
 import { usdLabel } from './helpers/usd';
 import type { LifetimeStats, StatsView } from '../src/api/types';
-import { HEATMAP_WEEK_COUNT } from '../src/features/overview/heatmap';
+import { HEATMAP_CHART_GRID, HEATMAP_WEEK_COUNT } from '../src/features/overview/heatmap';
 import { formatCount, formatTokensMillions } from '../src/lib/format';
 
 test.describe.configure({ mode: 'serial' });
@@ -124,6 +124,78 @@ async function expectCardsMatchStats(page: Page, stats: StatsView): Promise<void
   );
 }
 
+interface HeatmapCanvasBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface HeatmapCellIndex {
+  weekIndex: number;
+  dayIndex: number;
+  weekCount: number;
+}
+
+/** 与 `HEATMAP_CHART_GRID` 同源；y 轴 category 0 在底部。 */
+function heatmapCellCanvasPoint(
+  box: HeatmapCanvasBox,
+  cell: HeatmapCellIndex,
+): { x: number; y: number } {
+  const { left, right, top, bottom } = HEATMAP_CHART_GRID;
+  const innerWidth = box.width - left - right;
+  const innerHeight = box.height - top - bottom;
+  return {
+    x: box.x + left + ((cell.weekIndex + 0.5) / cell.weekCount) * innerWidth,
+    y: box.y + top + ((6 - cell.dayIndex + 0.5) / 7) * innerHeight,
+  };
+}
+
+async function heatmapCanvasBox(page: Page): Promise<HeatmapCanvasBox> {
+  const heatmap = page.getByTestId('overview-heatmap');
+  await heatmap.scrollIntoViewIfNeeded();
+  const canvas = heatmap.locator('canvas').first();
+  await expect(canvas).toBeVisible();
+  const box = await canvas.boundingBox();
+  expect(box).not.toBeNull();
+  return box!;
+}
+
+async function findHeatmapCellIndex(
+  page: Page,
+  prefer: 'filled' | 'empty',
+): Promise<HeatmapCellIndex> {
+  const target = await page.evaluate(
+    ({ weekCount, prefer: which }) => {
+      const cells = [...document.querySelectorAll('[data-testid="overview-heatmap-cell"]')];
+      const match =
+        which === 'filled'
+          ? [...cells].reverse().find((el) => Number(el.getAttribute('data-request-count')) > 0)
+          : cells.find((el) => Number(el.getAttribute('data-request-count')) === 0);
+      if (!(match instanceof HTMLElement)) return null;
+      const index = cells.indexOf(match);
+      return {
+        weekIndex: Math.floor(index / 7),
+        dayIndex: index % 7,
+        weekCount,
+      };
+    },
+    { weekCount: HEATMAP_WEEK_COUNT, prefer },
+  );
+  expect(target).not.toBeNull();
+  return target!;
+}
+
+async function showHeatmapTooltip(page: Page) {
+  const box = await heatmapCanvasBox(page);
+  const target = await findHeatmapCellIndex(page, 'filled');
+  const point = heatmapCellCanvasPoint(box, target);
+  const tooltip = page.locator('.overview-heatmap-tooltip');
+  await page.mouse.move(point.x, point.y);
+  await expect(tooltip).toBeVisible();
+  return tooltip;
+}
+
 test.describe('overview page', () => {
   test('renders summary cards, daily points, and shares matching /stats', async ({
     page,
@@ -208,6 +280,46 @@ test.describe('overview page', () => {
   test('hides the heatmap tooltip after the pointer leaves the chart', async ({ page }) => {
     seedOverviewLogs(Date.now());
     await page.goto('/overview');
+    const tooltip = await showHeatmapTooltip(page);
+
+    await page.getByRole('heading', { name: /overview/i }).hover();
+    await expect(tooltip).toBeHidden();
+  });
+
+  test('hides the heatmap tooltip when moving from a filled cell to an empty cell', async ({
+    page,
+  }) => {
+    seedOverviewLogs(Date.now());
+    await page.goto('/overview');
+    const tooltip = await showHeatmapTooltip(page);
+
+    const box = await heatmapCanvasBox(page);
+    const empty = await findHeatmapCellIndex(page, 'empty');
+    const point = heatmapCellCanvasPoint(box, empty);
+    await page.mouse.move(point.x, point.y);
+    await expect(tooltip).toBeHidden();
+  });
+
+  test('hides the heatmap tooltip after leaving even if the visualMap was clicked', async ({
+    page,
+  }) => {
+    const now = Date.now();
+    seedOverviewLogs(now);
+    const todayStart = utcDayStart(now);
+    seedRequestLogs(
+      Array.from({ length: 12 }, (_, index) => ({
+        created_at: todayStart + 10 + index,
+        token_key: 'sk-e2e-ov',
+        model: 'e2e-ov-gpt',
+        channel: 'e2e-ov-primary',
+        status_code: 200,
+        input_tokens: 1,
+        output_tokens: 1,
+        cost_usd_micros: 10,
+      })),
+    );
+
+    await page.goto('/overview');
     const heatmap = page.getByTestId('overview-heatmap');
     await heatmap.scrollIntoViewIfNeeded();
     const canvas = heatmap.locator('canvas').first();
@@ -215,24 +327,13 @@ test.describe('overview page', () => {
     const box = await canvas.boundingBox();
     expect(box).not.toBeNull();
 
-    const tooltip = page.locator('.overview-heatmap-tooltip');
-    const samplePoints: Array<[number, number]> = [
-      [0.9, 0.35],
-      [0.82, 0.42],
-      [0.7, 0.38],
-      [0.55, 0.5],
-    ];
-    let shown = false;
-    for (const [x, y] of samplePoints) {
-      await page.mouse.move(box!.x + box!.width * x, box!.y + box!.height * y);
-      if (await tooltip.isVisible()) {
-        shown = true;
-        break;
-      }
+    const visualMapY = box!.y + box!.height * 0.93;
+    for (const xRatio of [0.42, 0.46, 0.5, 0.54, 0.58]) {
+      await page.mouse.click(box!.x + box!.width * xRatio, visualMapY);
     }
-    expect(shown).toBe(true);
 
-    await page.getByRole('heading', { name: /overview/i }).hover();
+    const tooltip = await showHeatmapTooltip(page);
+    await page.mouse.move(box!.x - 8, box!.y - 8);
     await expect(tooltip).toBeHidden();
   });
 

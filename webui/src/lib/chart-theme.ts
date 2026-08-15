@@ -1,8 +1,11 @@
-import type { CalendarHeatmap } from '@/features/overview/heatmap';
 import {
   buildHeatmapTierScale,
   formatHeatmapMonth,
+  heatmapSeriesPoint,
+  HEATMAP_CHART_GRID,
   HEATMAP_TIER_MIN_REQUESTS,
+  type CalendarHeatmap,
+  type HeatmapSeriesDatum,
 } from '@/features/overview/heatmap';
 
 function readCssVar(name: string): string {
@@ -335,7 +338,7 @@ export interface HeatmapTooltipLabels {
 /** GitHub 式周列热力：顶栏月份、无左侧星期、底部 visualMap 联动高亮。 */
 export function buildHeatmapChartOption(
   heatmap: CalendarHeatmap,
-  seriesData: [number, number, number][],
+  seriesData: HeatmapSeriesDatum[],
   maxCount: number,
   locale: string,
   labels: HeatmapTooltipLabels,
@@ -361,15 +364,19 @@ export function buildHeatmapChartOption(
     animationDurationUpdate: 0,
     tooltip: {
       trigger: 'item',
+      // 默认还包含 click：点底部色条会走 _tryShow，随后 setOption 刷新时 _keepShow 会把浮窗钉住。
+      triggerOn: 'mousemove',
+      hideDelay: 0,
       position: heatmapTooltipPosition,
       className: 'overview-heatmap-tooltip',
       ...tooltipStyle(),
-      formatter: (params: { data?: [number, number, number] }) => {
-        const tuple = params.data;
+      formatter: (params: { data?: unknown; value?: unknown }) => {
+        const tuple = heatmapSeriesPoint(params.value ?? params.data);
         if (!tuple) return '';
-        const [weekIndex, dayIndex] = tuple;
+        const [weekIndex, dayIndex, requestCount] = tuple;
+        if (requestCount <= 0) return '';
         const cell = heatmap.weeks[weekIndex]?.[dayIndex];
-        if (!cell) return '';
+        if (!cell || cell.requestCount <= 0) return '';
         return `${tooltipTitleHtml(cell.date)}${joinTooltipLines([
           `${labels.requests}: ${formatters.count(cell.requestCount)}`,
           `${labels.tokenSpend}: ${formatters.tokens(cell.tokenCount)}`,
@@ -378,10 +385,7 @@ export function buildHeatmapChartOption(
       },
     },
     grid: {
-      left: 4,
-      right: 4,
-      top: 22,
-      bottom: 48,
+      ...HEATMAP_CHART_GRID,
       containLabel: false,
     },
     xAxis: {
@@ -439,15 +443,11 @@ export function buildHeatmapChartOption(
           borderWidth: 1,
         },
         emphasis: {
+          // 与官方 heatmap 示例一致：只给当前格加阴影，不要 focus/blur 遮罩其余格子。
           focus: 'none',
           itemStyle: {
             shadowBlur: 10,
             shadowColor: 'rgba(0, 0, 0, 0.5)',
-          },
-        },
-        blur: {
-          itemStyle: {
-            opacity: 0.12,
           },
         },
       },

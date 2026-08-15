@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, unref, useTemplateRef } from 'vue';
 import { use } from 'echarts/core';
 import { CanvasRenderer } from 'echarts/renderers';
 import { HeatmapChart } from 'echarts/charts';
@@ -24,18 +24,24 @@ const props = defineProps<{
 const { t, locale } = useI18n();
 const themeTick = useChartThemeTick();
 
-type ChartHandle = {
-  dispatchAction: (payload: Record<string, unknown>) => void;
-  setOption: (option: Record<string, unknown>, opts?: Record<string, unknown>) => void;
-};
-
-interface HighlightBatchItem {
-  highlightKey?: string;
-  seriesIndex?: number;
-  dataIndex?: number | number[];
+interface VisualMapEl {
+  type: string;
+  silent: boolean;
+  cursor?: string;
+  onclick?: ((event: unknown) => void) | null;
 }
 
-const chartRef = ref<ChartHandle | null>(null);
+type ChartHandle = {
+  dispatchAction: (payload: Record<string, unknown>) => void;
+  chart?: {
+    getModel: () => { getComponent: (mainType: string) => unknown };
+    getViewOfComponentModel: (
+      model: unknown,
+    ) => { group: { traverse: (callback: (el: VisualMapEl) => void) => void } } | undefined;
+  };
+};
+
+const chartRef = useTemplateRef<ChartHandle>('chartRef');
 
 const seriesData = computed(() => buildHeatmapSeriesData(props.heatmap));
 const maxCount = computed(() => heatmapMaxRequestCount(props.heatmap));
@@ -62,65 +68,31 @@ const chartOption = computed(() => {
   );
 });
 
-function isHighlightBatchItem(value: unknown): value is HighlightBatchItem {
-  return typeof value === 'object' && value !== null;
+function echartsInstance(): NonNullable<ChartHandle['chart']> | undefined {
+  return unref(chartRef.value?.chart);
 }
 
-function isVisualMapHighlight(batch: unknown): batch is HighlightBatchItem[] {
-  if (!Array.isArray(batch) || batch.length === 0) return false;
-  const [first] = batch as unknown[];
-  if (!isHighlightBatchItem(first)) return false;
-  const key = first.highlightKey;
-  return typeof key === 'string' && key.startsWith('visualMap');
+function hideHeatmapTip(): void {
+  chartRef.value?.dispatchAction({ type: 'hideTip' });
 }
 
-function enableVisualMapMask(batch: HighlightBatchItem[]): void {
-  const chart = chartRef.value;
-  if (!chart) return;
-  chart.setOption(
-    {
-      series: [
-        {
-          emphasis: { focus: 'self' },
-        },
-      ],
-    },
-    { lazyUpdate: false },
-  );
-  chart.dispatchAction({ type: 'downplay', seriesIndex: 0 });
-  chart.dispatchAction({ type: 'highlight', batch });
-}
-
-function disableVisualMapMask(): void {
-  const chart = chartRef.value;
-  if (!chart) return;
-  chart.setOption(
-    {
-      series: [
-        {
-          emphasis: { focus: 'none' },
-        },
-      ],
-    },
-    { lazyUpdate: false },
-  );
-  chart.dispatchAction({ type: 'downplay', seriesIndex: 0 });
-}
-
-function onHighlight(params: unknown): void {
-  const payload = params as { batch?: unknown };
-  if (!isVisualMapHighlight(payload.batch)) return;
-  enableVisualMapMask(payload.batch);
-}
-
-function onDownplay(params: unknown): void {
-  const payload = params as { batch?: unknown };
-  if (!isVisualMapHighlight(payload.batch)) return;
-  disableVisualMapMask();
-}
-
-function onGlobalOut(): void {
-  disableVisualMapMask();
+/**
+ * piecewise 两端「少/多」默认 cursor:pointer；色块 onclick 会选档。
+ * 文字保持标签，色块只走原生 hoverLink。
+ */
+function tuneVisualMapPointer(): void {
+  const instance = echartsInstance();
+  if (!instance) return;
+  const model = instance.getModel().getComponent('visualMap');
+  if (!model) return;
+  const view = instance.getViewOfComponentModel(model);
+  view?.group.traverse((el) => {
+    if (el.type === 'text') {
+      el.silent = true;
+      el.cursor = 'default';
+    }
+    el.onclick = null;
+  });
 }
 </script>
 
@@ -131,8 +103,8 @@ function onGlobalOut(): void {
     :option="chartOption"
     :update-options="{ notMerge: true }"
     autoresize
-    @highlight="onHighlight"
-    @downplay="onDownplay"
-    @globalout="onGlobalOut"
+    @globalout="hideHeatmapTip"
+    @native:mouseleave="hideHeatmapTip"
+    @finished="tuneVisualMapPointer"
   />
 </template>

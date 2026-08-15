@@ -18,6 +18,14 @@ export interface CalendarHeatmap {
 /** GitHub 贡献图：约一年、周日→周六。 */
 export const HEATMAP_WEEK_COUNT = 53;
 
+/** 热力图绘图区边距；与 `buildHeatmapChartOption` 的 grid、e2e 命中格子同源。 */
+export const HEATMAP_CHART_GRID = {
+  left: 4,
+  right: 4,
+  top: 22,
+  bottom: 48,
+} as const;
+
 const MS_PER_DAY = 86_400_000;
 
 /** 色条有效分档下限：低于此值的格子仅上色、不参与底部 5 档悬停联动。 */
@@ -189,12 +197,55 @@ export function flattenHeatmapCells(heatmap: CalendarHeatmap): HeatmapCell[] {
   return heatmap.weeks.flat();
 }
 
-/** ECharts 热力序列：`[weekIndex, weekdayIndex, requestCount]`。 */
-export function buildHeatmapSeriesData(heatmap: CalendarHeatmap): [number, number, number][] {
-  const data: [number, number, number][] = [];
+/** ECharts 热力点：`[weekIndex, weekdayIndex, requestCount]`。 */
+type HeatmapSeriesPoint = [number, number, number];
+
+/**
+ * 无请求日仍画灰格（GitHub 日历）。
+ * 官方 punch card 用 `0 || '-'` 跳过绘制，离开有内容的格子就会 hideTip；
+ * 这里要保留格子，所以不关 tooltip.show——formatter 返回空串时库会把浮窗 display:none。
+ */
+export type HeatmapSeriesDatum =
+  | HeatmapSeriesPoint
+  | {
+      value: HeatmapSeriesPoint;
+      emphasis: { disabled: true };
+    };
+
+export function heatmapSeriesPoint(data: unknown): HeatmapSeriesPoint | undefined {
+  if (Array.isArray(data)) {
+    const weekIndex: unknown = data[0];
+    const dayIndex: unknown = data[1];
+    const requestCount: unknown = data[2];
+    if (
+      typeof weekIndex === 'number' &&
+      typeof dayIndex === 'number' &&
+      typeof requestCount === 'number'
+    ) {
+      return [weekIndex, dayIndex, requestCount];
+    }
+    return undefined;
+  }
+  if (data && typeof data === 'object' && 'value' in data) {
+    return heatmapSeriesPoint(data.value);
+  }
+  return undefined;
+}
+
+/** ECharts 热力序列：有请求的日子用元组；空日关闭 emphasis，浮窗由 formatter 隐藏。 */
+export function buildHeatmapSeriesData(heatmap: CalendarHeatmap): HeatmapSeriesDatum[] {
+  const data: HeatmapSeriesDatum[] = [];
   heatmap.weeks.forEach((week, weekIndex) => {
     week.forEach((cell, dayIndex) => {
-      data.push([weekIndex, dayIndex, cell.requestCount]);
+      const point: HeatmapSeriesPoint = [weekIndex, dayIndex, cell.requestCount];
+      if (cell.requestCount > 0) {
+        data.push(point);
+      } else {
+        data.push({
+          value: point,
+          emphasis: { disabled: true },
+        });
+      }
     });
   });
   return data;
