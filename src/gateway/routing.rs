@@ -10,16 +10,68 @@ use rand::RngExt;
 
 use crate::store::resources::{Channel, ChannelRecord};
 
-/// 一次路由的结果：按 failover 顺序排列的候选渠道 + 出站模型名。
+/// 一次路由的结果：按 failover 顺序排列的候选渠道。
 ///
-/// 出站模型名：命中别名时取 alias 指向的真实模型名，否则原样。所有候选
-/// 渠道共享同一出站模型名（同一模型的不同渠道）。
+/// 出站模型名不在此共享：轮到某渠道时用 [`outbound_model`] 查该渠道自己的
+/// 别名表，禁止全体套用第一个候选的出站名。
 #[derive(Debug, Clone)]
 pub struct Route {
     /// 按尝试顺序排列的候选渠道（克隆自配置记录）。
     pub channels: Vec<Channel>,
-    /// 出站请求应使用的模型名（别名重写后）。
-    pub outbound_model: String,
+}
+
+/// 该渠道对入站模型名应发给上游的出站名：命中本渠道别名表则用 value，否则原样。
+pub fn outbound_model<'a>(channel: &'a Channel, inbound: &'a str) -> &'a str {
+    channel
+        .model_aliases
+        .get(inbound)
+        .map(String::as_str)
+        .unwrap_or(inbound)
+}
+
+/// 启用渠道之间同一别名 key 指向不同真名时的冲突。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasConflict {
+    /// 冲突的下游别名 key。
+    pub alias: String,
+    /// 已登记的真名。
+    pub existing: String,
+    /// 与已登记真名不一致的真名。
+    pub conflicting: String,
+}
+
+/// 在启用渠道集合中查找别名冲突：同一 key 指向不同 value 则返回第一处。
+///
+/// 禁用渠道不参与。同一 key 指向同一 value 允许（同模型多渠道 failover）。
+pub fn find_alias_conflict(channels: &[&Channel]) -> Option<AliasConflict> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for channel in channels {
+        if !channel.enabled {
+            continue;
+        }
+        let mut aliases: Vec<(&str, &str)> = channel
+            .model_aliases
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        aliases.sort_unstable();
+        for (key, value) in aliases {
+            match seen.get(key).copied() {
+                Some(existing) if existing != value => {
+                    return Some(AliasConflict {
+                        alias: key.to_string(),
+                        existing: existing.to_string(),
+                        conflicting: value.to_string(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(key, value);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 为 `model` 在 `channels` 中选出候选并按 failover 顺序排列。
@@ -40,13 +92,6 @@ pub fn route(channels: &[ChannelRecord], model: &str) -> Option<Route> {
     if candidates.is_empty() {
         return None;
     }
-
-    let outbound_model = candidates[0]
-        .channel
-        .model_aliases
-        .get(model)
-        .cloned()
-        .unwrap_or_else(|| model.to_string());
 
     // 按 priority 升序分组：数值越小优先级越高，先被尝试；组内按 weight 加权
     // 随机排序，作为 failover 顺序。全部候选都在结果里（低优先级渠道是兜底）。
@@ -76,10 +121,7 @@ pub fn route(channels: &[ChannelRecord], model: &str) -> Option<Route> {
         channels.extend(keys.into_iter().map(|(_, i)| group[i].channel.clone()));
     }
 
-    Some(Route {
-        channels,
-        outbound_model,
-    })
+    Some(Route { channels })
 }
 
 /// A-ExpJ 抽样 key：`-ln(U) / weight`，U 为 (0,1) 均匀随机数。
@@ -191,7 +233,7 @@ mod tests {
         c.model_aliases
             .insert("fast".to_string(), "gpt-4o-mini".to_string());
         let route = route(&[record(1, c)], "fast").expect("别名短名应命中");
-        assert_eq!(route.outbound_model, "gpt-4o-mini");
+        assert_eq!(outbound_model(&route.channels[0], "fast"), "gpt-4o-mini");
     }
 
     /// 未命中别名时出站模型名原样。
@@ -199,6 +241,65 @@ mod tests {
     fn outbound_model_unchanged_without_alias() {
         let channels = vec![record(1, channel("c", 1, 1, &["gpt-4o"]))];
         let route = route(&channels, "gpt-4o").expect("应有候选");
-        assert_eq!(route.outbound_model, "gpt-4o");
+        assert_eq!(outbound_model(&route.channels[0], "gpt-4o"), "gpt-4o");
+    }
+
+    /// 各候选渠道用自己的别名表得到出站名，不共用第一个候选。
+    #[test]
+    fn each_channel_rewrites_outbound_from_its_own_alias_table() {
+        let mut aliased = channel("aliased", 2, 1, &["gpt-4o"]);
+        aliased
+            .model_aliases
+            .insert("fast".to_string(), "gpt-4o-mini".to_string());
+        let plain = channel("plain", 1, 1, &["fast"]);
+        let route = route(&[record(1, aliased), record(2, plain)], "fast").expect("应有候选");
+        assert_eq!(route.channels[0].name, "plain");
+        assert_eq!(outbound_model(&route.channels[0], "fast"), "fast");
+        assert_eq!(route.channels[1].name, "aliased");
+        assert_eq!(outbound_model(&route.channels[1], "fast"), "gpt-4o-mini");
+    }
+
+    /// 两条启用渠道同一别名指向不同真名 → 冲突。
+    #[test]
+    fn enabled_channels_conflict_when_alias_values_differ() {
+        let mut a = channel("a", 1, 1, &["gpt-4o"]);
+        a.model_aliases
+            .insert("fast".to_string(), "gpt-4o-mini".to_string());
+        let mut b = channel("b", 1, 1, &["gpt-4o"]);
+        b.model_aliases
+            .insert("fast".to_string(), "gpt-4o".to_string());
+        let conflict = find_alias_conflict(&[&a, &b]).expect("应检出冲突");
+        assert_eq!(conflict.alias, "fast");
+        assert!(
+            (conflict.existing == "gpt-4o-mini" && conflict.conflicting == "gpt-4o")
+                || (conflict.existing == "gpt-4o" && conflict.conflicting == "gpt-4o-mini")
+        );
+    }
+
+    /// 同一别名指向同一真名：多渠道 failover 允许。
+    #[test]
+    fn same_alias_same_value_is_not_conflict() {
+        let mut a = channel("a", 1, 1, &["gpt-4o"]);
+        a.model_aliases
+            .insert("fast".to_string(), "gpt-4o-mini".to_string());
+        let mut b = channel("b", 1, 1, &["gpt-4o"]);
+        b.model_aliases
+            .insert("fast".to_string(), "gpt-4o-mini".to_string());
+        assert!(find_alias_conflict(&[&a, &b]).is_none());
+    }
+
+    /// 禁用渠道不参与别名冲突：与启用渠道指向不同真名仍允许。
+    #[test]
+    fn disabled_channel_does_not_participate_in_alias_conflict() {
+        let mut enabled = channel("on", 1, 1, &["gpt-4o"]);
+        enabled
+            .model_aliases
+            .insert("fast".to_string(), "gpt-4o-mini".to_string());
+        let mut disabled = channel("off", 1, 1, &["gpt-4o"]);
+        disabled.enabled = false;
+        disabled
+            .model_aliases
+            .insert("fast".to_string(), "gpt-4o".to_string());
+        assert!(find_alias_conflict(&[&enabled, &disabled]).is_none());
     }
 }

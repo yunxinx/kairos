@@ -316,6 +316,7 @@ async fn create_channel(
                 channel.name
             )));
         }
+        reject_alias_conflict(&snapshot.channels, &channel, None)?;
     }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     let id = crate::store::resources::insert_channel(&mut tx, &channel)
@@ -356,6 +357,7 @@ async fn update_channel(
                 channel.name
             )));
         }
+        reject_alias_conflict(&snapshot.channels, &channel, Some(id))?;
     }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::update_channel(&mut tx, id, &channel)
@@ -1167,6 +1169,28 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     Ok(())
 }
 
+/// 保存后的启用渠道集合若同一别名指向不同真名，拒绝并提示改用统一模型。
+fn reject_alias_conflict(
+    existing: &[ChannelRecord],
+    incoming: &Channel,
+    replace_id: Option<i64>,
+) -> Result<(), AdminError> {
+    let mut channels: Vec<&Channel> = Vec::with_capacity(existing.len() + 1);
+    for record in existing {
+        if replace_id != Some(record.id) {
+            channels.push(&record.channel);
+        }
+    }
+    channels.push(incoming);
+    match super::routing::find_alias_conflict(&channels) {
+        Some(conflict) => Err(AdminError::Conflict(format!(
+            "别名 {} 在启用渠道间指向不同真名（{} 与 {}）。一对多请到模型页「归一化」（Tab 2）用统一模型，不要用别名",
+            conflict.alias, conflict.existing, conflict.conflicting
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// 校验价格字段：四档单价均非负。
 fn validate_price(price: &Price) -> Result<(), AdminError> {
     if price.input_micros < 0 || price.output_micros < 0 {
@@ -1193,7 +1217,7 @@ enum AdminError {
     InvalidBody(String),
     /// 资源不存在（404）。
     NotFound(String),
-    /// 新建时资源已存在（409）。
+    /// 资源冲突（409）：同名已存在，或启用渠道间别名指向不同真名。
     Conflict(String),
     /// 上游访问失败（502）：模型列表请求不可达、非 2xx 或响应形态非法。
     Upstream(String),

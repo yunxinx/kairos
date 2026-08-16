@@ -2276,3 +2276,93 @@ async fn admin_root_never_5xx_and_api_still_works() {
         "管理 API 在 UI 缺失时仍应可用"
     );
 }
+
+/// 两条启用渠道将同一别名指到不同真名：创建/更新 409，文案提示用统一模型。
+/// 指向同一真名允许；禁用渠道不参与冲突，启用时再拦。
+#[tokio::test]
+async fn enabled_channels_reject_divergent_alias_values() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    // seed 渠道已有 fast → gpt-4o-mini。
+
+    let mut divergent = channel_body("divergent", gw.upstream.base_url(), json!([TEST_MODEL]));
+    divergent["model_aliases"] = json!({ "fast": TEST_MODEL });
+    let before: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", divergent.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: Value = resp.json().await.expect("冲突体应可解析");
+    assert_eq!(body["error"]["code"], "conflict");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("统一模型"),
+        "冲突文案应提示用统一模型，实际: {message}"
+    );
+    assert!(
+        message.contains("fast"),
+        "冲突文案应点名别名 key，实际: {message}"
+    );
+    let after: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    assert_eq!(before, after, "别名冲突写不应改变库与快照");
+
+    let mut same_value = channel_body("same-alias", gw.upstream.base_url(), json!([TEST_MODEL]));
+    same_value["model_aliases"] = json!({ "fast": "gpt-4o-mini" });
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", same_value.clone()).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "同一别名指向同一真名应允许（多渠道 failover）"
+    );
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let same_id = created["id"].as_i64().expect("创建应回传整数 id");
+
+    let mut disabled = channel_body(
+        "disabled-divergent",
+        gw.upstream.base_url(),
+        json!([TEST_MODEL]),
+    );
+    disabled["model_aliases"] = json!({ "fast": TEST_MODEL });
+    disabled["enabled"] = json!(false);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", disabled.clone()).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "禁用渠道不参与别名冲突"
+    );
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let disabled_id = created["id"].as_i64().expect("创建应回传整数 id");
+
+    disabled["enabled"] = json!(true);
+    let resp = admin_put(&gw, &format!("/channels/{disabled_id}"), disabled).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "启用后与已有别名冲突应拒绝"
+    );
+    let listed: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let still_disabled = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == disabled_id)
+        .expect("禁用渠道应仍在列表");
+    assert_eq!(still_disabled["enabled"], false, "冲突启用不应落地");
+
+    same_value["model_aliases"] = json!({ "fast": TEST_MODEL });
+    let resp = admin_put(&gw, &format!("/channels/{same_id}"), same_value).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "更新为不同真名应拒绝"
+    );
+}

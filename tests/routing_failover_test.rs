@@ -241,6 +241,56 @@ async fn alias_rewrites_outbound_and_response_model() {
     assert_eq!(body["model"], "fast");
 }
 
+/// 别名按渠道改写：各候选用自己的表，不共用切片里第一个候选的出站名。
+///
+/// 别名渠道排在切片最前（旧实现会拿它的出站名给全体），但优先级让无别名
+/// 渠道先试。无别名渠道应原样发送入站名；failover 后别名渠道发给自己的真名。
+#[tokio::test]
+async fn alias_rewrites_per_channel_not_shared_from_first_candidate() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = two_channel_seed(bases);
+        // channels[0] → ups[0]：别名渠道，低优先级，切片最前。
+        seed.channels[0].name = "alias-ch".to_string();
+        seed.channels[0].priority = 2;
+        seed.channels[0]
+            .model_aliases
+            .insert("fast".to_string(), "gpt-4o-mini".to_string());
+        // channels[1] → ups[1]：无别名，清单含短名，高优先级。
+        seed.channels[1].name = "plain-ch".to_string();
+        seed.channels[1].priority = 1;
+        seed.channels[1].models = vec!["fast".to_string()];
+        seed.channels[1].model_aliases.clear();
+        seed
+    })
+    .await;
+    ups[1].set_behavior(UpstreamBehavior::Status429);
+    ups[0].set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-per-ch", "object": "chat.completion", "model": "gpt-4o-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })));
+
+    let resp = send_completion(&gw.base_url(), "fast").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "无别名渠道 429 后应 failover 到别名渠道"
+    );
+    assert_eq!(
+        ups[1].received()[0]["model"],
+        "fast",
+        "无别名渠道应按入站名出站，不得套用其它渠道的别名"
+    );
+    assert_eq!(
+        ups[0].received()[0]["model"],
+        "gpt-4o-mini",
+        "轮到别名渠道时用该渠道自己的表改写"
+    );
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(body["model"], "fast", "响应模型名应回显入站短名");
+}
+
 /// 别名命中 + 遇 429 自动 failover 到另一渠道（同模型多渠道，别名在渠道级）。
 #[tokio::test]
 async fn alias_fails_over_across_channels() {

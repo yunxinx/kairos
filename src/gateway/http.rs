@@ -1,10 +1,10 @@
 //! HTTP 网关实现：入站路由 + 令牌认证 + 渠道选择 + 出站调用 + 请求日志。
 //!
 //! 本模块承载完整链路：下游以 OpenAI Chat Completions 或 Anthropic Messages 协议
-//! 带令牌发请求，网关认证与计费准入后出站到目标渠道。同协议且未命中别名时走
-//! 直通快路径（请求体仅目标性补丁、响应原始字节块直搬、旁路嗅探 usage 计费）；
-//! 跨协议或命中别名时经 IR 完整路径转换。协议转换由 `core` 各适配器承担，
-//! wire 类型不出适配器边界；本模块经 `protocol` 分派到对应适配器。
+//! 带令牌发请求，网关认证与计费准入后出站到目标渠道。同协议且所有候选都不
+//! 改写出站名时走直通快路径（请求体仅目标性补丁、响应原始字节块直搬、旁路嗅探
+//! usage 计费）；跨协议或任一候选命中别名时经 IR 完整路径转换。协议转换由 `core`
+//! 各适配器承担，wire 类型不出适配器边界；本模块经 `protocol` 分派到对应适配器。
 //!
 //! v2 起运行时资源（渠道/令牌/价格/开关）来自 [`crate::runtime::RuntimeSnapshot`]：
 //! 请求在准入时刻抓取一个快照引用，整个请求生命周期只读该引用，不受后续原子
@@ -340,14 +340,14 @@ async fn handle_request(
         .await;
     }
 
-    // 5. 出站：同协议且未命中别名时走直通快路径，否则经 IR 完整路径。
+    // 5. 出站：同协议且所有候选都不改写出站名时走直通快路径，否则经 IR 完整路径。
     // 快路径不免认证与计费（上面已准入），且 failover 同样只发生在首字节之前。
     // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
-    let passthrough = request.model == route.outbound_model
-        && route
-            .channels
-            .iter()
-            .all(|c| c.protocol == inbound_protocol);
+    // 任一渠道命中别名时也回落 IR：直通无法按渠道改写请求体里的模型名。
+    let passthrough = route.channels.iter().all(|channel| {
+        channel.protocol == inbound_protocol
+            && routing::outbound_model(channel, &request.model) == request.model
+    });
     if passthrough {
         let passthrough_ctx = PassthroughCtx {
             deps: &deps,
@@ -377,14 +377,13 @@ async fn handle_request(
     .await
 }
 
-/// 单次出站调用的请求侧上下文：入站请求、路由、认证令牌与计费/日志所需的
+/// 单次出站调用的请求侧上下文：入站请求、认证令牌与计费/日志所需的
 /// 请求级信息。作为 `*_completion` 的参数打包，避免过长参数列表。
 struct CallCtx<'a> {
     deps: &'a Deps,
     /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
     snapshot: &'a Arc<RuntimeSnapshot>,
     request: &'a ChatRequest,
-    route: &'a routing::Route,
     token: &'a Token,
     price: PriceSnapshot,
     started: i64,
@@ -420,7 +419,6 @@ async fn outbound_with_failover(
                     deps,
                     snapshot,
                     request,
-                    route,
                     token,
                     price,
                     started,
@@ -917,17 +915,17 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
     let deps = ctx.deps;
     let snapshot = ctx.snapshot;
     let request = ctx.request;
-    let route = ctx.route;
     let token = ctx.token;
     let price = ctx.price;
     let started = ctx.started;
     let inbound_protocol = ctx.inbound_protocol;
-    // 别名重写：请求模型用出站真实名。
+    // 别名重写：请求模型用该渠道自己的出站名。
     let mut request_warnings = Vec::new();
     let mut outbound_value =
         protocol::encode_request(request, channel.protocol, &mut request_warnings);
+    let outbound_model = routing::outbound_model(channel, &request.model);
     if let Value::Object(map) = &mut outbound_value {
-        map.insert("model".into(), Value::String(route.outbound_model.clone()));
+        map.insert("model".into(), Value::String(outbound_model.to_string()));
     }
 
     let upstream_url = format!(
@@ -966,7 +964,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
         // 命中别名时重写响应模型名为入站短名。
         match protocol::decode_response(&parsed, channel.protocol) {
             Ok(mut ir) => {
-                if request.model != route.outbound_model {
+                if request.model != outbound_model {
                     ir.model = request.model.clone();
                 }
                 // 请求侧转换的信息损失随响应回传，下游可感知而非莫名降级。
@@ -1045,15 +1043,15 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
 async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
     let deps = ctx.deps;
     let request = ctx.request;
-    let route = ctx.route;
     let token = ctx.token;
     let price = ctx.price;
     let started = ctx.started;
     let inbound_protocol = ctx.inbound_protocol;
     let mut request_warnings = Vec::new();
     let mut outbound = protocol::encode_request(request, channel.protocol, &mut request_warnings);
+    let outbound_model = routing::outbound_model(channel, &request.model);
     // 目标性 JSON 补丁：强制流式；OpenAI 另注入 stream_options.include_usage
-    // （Anthropic 流式自带 usage）。别名重写出站模型名。
+    // （Anthropic 流式自带 usage）。别名重写用该渠道自己的出站模型名。
     if let Value::Object(map) = &mut outbound {
         map.insert("stream".into(), Value::Bool(true));
         if channel.protocol == Protocol::OpenAiChat {
@@ -1062,7 +1060,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
                 serde_json::json!({ "include_usage": true }),
             );
         }
-        map.insert("model".into(), Value::String(route.outbound_model.clone()));
+        map.insert("model".into(), Value::String(outbound_model.to_string()));
     }
     let upstream_url = format!(
         "{}{}",
@@ -1130,7 +1128,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         token: token.clone(),
         request: request.clone(),
         channel: channel.clone(),
-        inbound_model: (request.model != route.outbound_model).then(|| request.model.clone()),
+        inbound_model: (request.model != outbound_model).then(|| request.model.clone()),
         request_warnings,
         status_code,
         started,
