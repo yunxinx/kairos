@@ -5,7 +5,7 @@
 //! 以静态 `admin_key`（Bearer）认证；`webui/dist` 静态资源与 SPA 回退挂在 fallback
 //! 上、免认证。产物缺失时管理面退化为纯 API。
 //!
-//! 资源 CRUD（令牌/渠道/价格/模型组）：写库（事务）→ 原子替换内存快照 → 返回变更后
+//! 资源 CRUD（令牌/渠道/价格/模型组/统一模型）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
 //! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）、
 //! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）、渠道连通性探测
@@ -32,7 +32,7 @@ use crate::{
     core::ir::{ChatRequest, ContentPart, Message, Role},
     runtime, store,
     store::StoreError,
-    store::resources::{Channel, ChannelRecord, ModelGroup, Price, Settings, Token},
+    store::resources::{Channel, ChannelRecord, ModelGroup, Price, Settings, Token, UnifiedModel},
 };
 
 use super::http::OutboundAuth;
@@ -86,6 +86,14 @@ pub fn router(
         .route(
             "/model-groups/{name}",
             put(update_model_group).delete(delete_model_group),
+        )
+        .route(
+            "/unified-models",
+            get(list_unified_models).post(create_unified_model),
+        )
+        .route(
+            "/unified-models/{id}",
+            put(update_unified_model).delete(delete_unified_model),
         )
         .route("/settings", get(get_settings).put(update_settings))
         .route("/logs", get(query_logs))
@@ -333,6 +341,13 @@ async fn create_channel(
             )));
         }
         reject_alias_conflict(&snapshot.channels, &channel, None)?;
+        reject_unhidden_unified_collision(
+            &snapshot.channels,
+            Some(&channel),
+            None,
+            snapshot.unified_models.values(),
+            None,
+        )?;
     }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     let id = crate::store::resources::insert_channel(&mut tx, &channel)
@@ -374,6 +389,13 @@ async fn update_channel(
             )));
         }
         reject_alias_conflict(&snapshot.channels, &channel, Some(id))?;
+        reject_unhidden_unified_collision(
+            &snapshot.channels,
+            Some(&channel),
+            Some(id),
+            snapshot.unified_models.values(),
+            None,
+        )?;
     }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::update_channel(&mut tx, id, &channel)
@@ -569,6 +591,101 @@ async fn delete_model_group(
             .map_err(AdminError::Store)?;
     }
     crate::store::resources::delete_model_group(&mut tx, &name)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(deleted))
+}
+
+// --- 统一模型 ---
+
+/// 列出全部统一模型（按 `id` 排序，保证确定性）。
+async fn list_unified_models(
+    State(deps): State<AdminDeps>,
+) -> Result<Json<Vec<UnifiedModel>>, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    let mut models: Vec<UnifiedModel> = snapshot.unified_models.values().cloned().collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(Json(models))
+}
+
+/// 新建统一模型：同 ID 已存在则冲突（409），否则写库 + 换快照 + 返回新资源。
+async fn create_unified_model(
+    State(deps): State<AdminDeps>,
+    body: Result<Json<UnifiedModel>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<UnifiedModel>), AdminError> {
+    let mut model = body.map_err(AdminError::bad_body)?;
+    {
+        let snapshot = deps.snapshot.read().await;
+        normalize_unified_model(&mut model, &snapshot)?;
+        if snapshot.unified_models.contains_key(&model.id) {
+            return Err(AdminError::Conflict(format!(
+                "统一模型 {} 已存在",
+                model.id
+            )));
+        }
+        reject_unhidden_unified_collision(
+            &snapshot.channels,
+            None,
+            None,
+            snapshot.unified_models.values(),
+            Some(&model),
+        )?;
+    }
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    crate::store::resources::upsert_unified_model(&mut tx, &model)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    let created = read_unified_model(&deps, &model.id).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// 整体替换统一模型（按路径 `id`，路径权威）：写库 + 换快照 + 返回新资源。
+async fn update_unified_model(
+    State(deps): State<AdminDeps>,
+    Path(id): Path<String>,
+    body: Result<Json<UnifiedModel>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<UnifiedModel>, AdminError> {
+    let mut model = body.map_err(AdminError::bad_body)?;
+    model.id = id;
+    {
+        let snapshot = deps.snapshot.read().await;
+        normalize_unified_model(&mut model, &snapshot)?;
+        if !snapshot.unified_models.contains_key(&model.id) {
+            return Err(AdminError::NotFound(format!(
+                "统一模型 {} 不存在",
+                model.id
+            )));
+        }
+        reject_unhidden_unified_collision(
+            &snapshot.channels,
+            None,
+            None,
+            snapshot.unified_models.values(),
+            Some(&model),
+        )?;
+    }
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    crate::store::resources::upsert_unified_model(&mut tx, &model)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    let updated = read_unified_model(&deps, &model.id).await?;
+    Ok(Json(updated))
+}
+
+/// 删除统一模型：不存在则 404，否则删除并返回被删资源。
+async fn delete_unified_model(
+    State(deps): State<AdminDeps>,
+    Path(id): Path<String>,
+) -> Result<Json<UnifiedModel>, AdminError> {
+    let deleted = read_unified_model(&deps, &id).await?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    crate::store::resources::delete_unified_model(&mut tx, &id)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
@@ -1268,6 +1385,16 @@ async fn read_model_group(deps: &AdminDeps, name: &str) -> Result<ModelGroup, Ad
         .ok_or_else(|| AdminError::NotFound(format!("模型组 {name} 不存在")))
 }
 
+/// 从当前快照读回一个统一模型；不存在返回 `NotFound`。
+async fn read_unified_model(deps: &AdminDeps, id: &str) -> Result<UnifiedModel, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    snapshot
+        .unified_models
+        .get(id)
+        .cloned()
+        .ok_or_else(|| AdminError::NotFound(format!("统一模型 {id} 不存在")))
+}
+
 /// 令牌绑定的组必须已存在。
 async fn reject_unknown_group(deps: &AdminDeps, group: &str) -> Result<(), AdminError> {
     let snapshot = deps.snapshot.read().await;
@@ -1308,6 +1435,34 @@ fn normalize_model_group(group: &mut ModelGroup) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody("name 不能为空".to_string()));
     }
     group.models = normalize_callable_names(std::mem::take(&mut group.models))?;
+    Ok(())
+}
+
+/// 规整统一模型：ID 去空白；成员须非空、为已登记模型、保序去重。
+fn normalize_unified_model(
+    model: &mut UnifiedModel,
+    snapshot: &crate::runtime::RuntimeSnapshot,
+) -> Result<(), AdminError> {
+    model.id = model.id.trim().to_string();
+    if model.id.is_empty() {
+        return Err(AdminError::InvalidBody("id 不能为空".to_string()));
+    }
+    model.models = normalize_callable_names(std::mem::take(&mut model.models))?;
+    if model.models.is_empty() {
+        return Err(AdminError::InvalidBody(
+            "统一模型至少要有一个已登记成员".to_string(),
+        ));
+    }
+    let registered = crate::store::resources::registered_callable_names(
+        snapshot.channels.iter().map(|record| &record.channel),
+    );
+    for member in &model.models {
+        if !registered.contains(member) {
+            return Err(AdminError::InvalidBody(format!(
+                "成员 {member} 不是已登记模型"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1364,6 +1519,49 @@ fn reject_alias_conflict(
         ))),
         None => Ok(()),
     }
+}
+
+/// 保存后若未隐藏的统一模型 ID 与已登记模型/别名同名，拒绝。
+///
+/// `incoming_channel` / `replace_id` 用于渠道保存：用新定义替换指定 id 后再算已登记名。
+/// `incoming_unified` 用于统一模型保存：用新定义替换同 id 后再检查。
+fn reject_unhidden_unified_collision<'a>(
+    existing: &'a [ChannelRecord],
+    incoming_channel: Option<&'a Channel>,
+    replace_id: Option<i64>,
+    unified_models: impl IntoIterator<Item = &'a UnifiedModel>,
+    incoming_unified: Option<&'a UnifiedModel>,
+) -> Result<(), AdminError> {
+    let mut channels: Vec<&Channel> = Vec::with_capacity(existing.len() + 1);
+    for record in existing {
+        if replace_id != Some(record.id) {
+            channels.push(&record.channel);
+        }
+    }
+    if let Some(channel) = incoming_channel {
+        channels.push(channel);
+    }
+    let registered = crate::store::resources::registered_callable_names(channels);
+
+    let mut models: Vec<&UnifiedModel> = Vec::new();
+    for model in unified_models {
+        if incoming_unified.is_none_or(|incoming| incoming.id != model.id) {
+            models.push(model);
+        }
+    }
+    if let Some(model) = incoming_unified {
+        models.push(model);
+    }
+    for model in models {
+        if crate::store::resources::unhidden_unified_id_collides(&model.id, model.hide, &registered)
+        {
+            return Err(AdminError::Conflict(format!(
+                "统一模型 {} 与已登记模型或别名同名且未隐藏。开隐藏则该名只表示统一模型，否则请换 ID",
+                model.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 校验价格字段：四档单价均非负。

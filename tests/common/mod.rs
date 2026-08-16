@@ -277,6 +277,8 @@ pub struct Seed {
     pub channels: Vec<Channel>,
     pub tokens: Vec<SeedToken>,
     pub prices: Vec<Price>,
+    /// 统一模型（可选；缺省空）。
+    pub unified_models: Vec<resources::UnifiedModel>,
     /// 运行时开关（键为 `full_body`/`max_request_bytes`，值为 JSON）。
     pub settings: HashMap<String, Value>,
 }
@@ -322,6 +324,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
                 cache_write_micros: None,
             },
         ],
+        unified_models: vec![],
         settings: HashMap::new(),
     }
 }
@@ -332,6 +335,7 @@ pub fn empty_seed(_upstream_base: &str) -> Seed {
         channels: vec![],
         tokens: vec![],
         prices: vec![],
+        unified_models: vec![],
         settings: HashMap::new(),
     }
 }
@@ -373,6 +377,11 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         resources::upsert_price(&mut conn, price)
             .await
             .expect("应能播种价格");
+    }
+    for model in &seed.unified_models {
+        resources::upsert_unified_model(&mut conn, model)
+            .await
+            .expect("应能播种统一模型");
     }
     for (key, value) in &seed.settings {
         resources::set_setting(&mut conn, key, value)

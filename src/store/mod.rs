@@ -902,6 +902,10 @@ mod tests {
                 "model_groups",
                 "INSERT INTO model_groups (name, models_json) VALUES ('k3', x'00')",
             ),
+            (
+                "unified_models",
+                "INSERT INTO unified_models (id, models_json, hide) VALUES ('k4', x'00', 0)",
+            ),
         ];
         for (table, sql) in probes {
             let result = sqlx::query(sql).execute(&pool).await;

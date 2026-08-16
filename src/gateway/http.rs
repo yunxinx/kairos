@@ -6,9 +6,10 @@
 //! usage 计费）；跨协议或任一候选命中别名时经 IR 完整路径转换。协议转换由 `core`
 //! 各适配器承担，wire 类型不出适配器边界；本模块经 `protocol` 分派到对应适配器。
 //!
-//! v2 起运行时资源（渠道/令牌/价格/开关）来自 [`crate::runtime::RuntimeSnapshot`]：
+//! v2 起运行时资源（渠道/令牌/价格/模型组/统一模型/开关）来自 [`crate::runtime::RuntimeSnapshot`]：
 //! 请求在准入时刻抓取一个快照引用，整个请求生命周期只读该引用，不受后续原子
-//! 替换影响。入站请求体上限与 full_body 开关同样来自快照设置。
+//! 替换影响。入站请求体上限与 full_body 开关同样来自快照设置。统一模型按成员
+//! 顺序一次只出站一条，该条再走渠道路由；计价按实际打到的成员。
 
 use std::{sync::Arc, time::Duration};
 
@@ -228,13 +229,12 @@ async fn handle_request(
         .await;
     }
 
-    // 4. 准入：模型必须有候选渠道（按 failover 顺序排列）。
-    let route = match routing::route(&snapshot.channels, &request.model) {
-        Some(route) => route,
-        None => {
-            let message = format!("模型 {} 未配置任何可用渠道", request.model);
+    // 4. 准入：解析出站跳（普通模型一条；统一模型按成员顺序，只收已定价可路由的）。
+    let hops = match resolve_route_hops(&snapshot, &request.model) {
+        Ok(hops) => hops,
+        Err((status, message)) => {
             return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
+                status,
                 &message,
                 &deps,
                 full_body,
@@ -248,25 +248,7 @@ async fn handle_request(
         }
     };
 
-    // 5. 计费准入：模型必须配置价格；令牌余额与累计上限须通过。
-    let price = match snapshot.prices.get(&request.model) {
-        Some(price) => PriceSnapshot::from_store_price(price),
-        None => {
-            let message = format!("模型 {} 未配置价格，无法计费", request.model);
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &message,
-                &deps,
-                full_body,
-                Some(token),
-                Some(&request.model),
-                started,
-                inbound_protocol,
-                request_body_for_log,
-            )
-            .await;
-        }
-    };
+    // 5. 计费准入：令牌余额与累计上限须通过（单价按实际跳在出站时选用）。
     let mut conn = match deps.pool.acquire().await {
         Ok(conn) => conn,
         Err(err) => {
@@ -357,41 +339,102 @@ async fn handle_request(
         .await;
     }
 
-    // 6. 出站：同协议且所有候选都不改写出站名时走直通快路径，否则经 IR 完整路径。
-    // 快路径不免认证与计费（上面已准入），且 failover 同样只发生在首字节之前。
-    // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
-    // 任一渠道命中别名时也回落 IR：直通无法按渠道改写请求体里的模型名。
-    let passthrough = route.channels.iter().all(|channel| {
-        channel.protocol == inbound_protocol
-            && routing::outbound_model(channel, &request.model) == request.model
-    });
-    if passthrough {
-        let passthrough_ctx = PassthroughCtx {
-            deps: &deps,
-            snapshot: &snapshot,
-            request: &request,
+    // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。失败再下一条，成功即停。
+    // 同协议且该跳所有候选都不改写出站名时走直通快路径，否则经 IR 完整路径。
+    let mut last_failure: Option<Response> = None;
+    for hop in &hops {
+        let response = dispatch_hop(
+            &deps,
+            &snapshot,
+            &request,
+            hop,
             token,
-            price,
             started,
-            raw_body: &body,
             inbound_protocol,
-            request_body: request_body_for_log,
-        };
-        return passthrough_with_failover(&passthrough_ctx, &route).await;
+            &body,
+            request_body_for_log.clone(),
+        )
+        .await;
+        if response.status().is_success() {
+            return response;
+        }
+        last_failure = Some(response);
     }
+    last_failure.expect("准入已保证至少一条可路由跳")
+}
 
-    outbound_with_failover(
-        &deps,
-        &snapshot,
-        &request,
-        &route,
-        token,
-        price,
-        started,
-        inbound_protocol,
-        request_body_for_log,
-    )
-    .await
+/// 一次出站跳：已登记模型名 + 该模型的渠道路由 + 该模型单价。
+///
+/// 普通请求只有一条；统一模型按成员顺序，跳过未定价或不可路由的成员。
+struct RouteHop {
+    routed_model: String,
+    route: routing::Route,
+    price: PriceSnapshot,
+}
+
+/// 单条已登记模型无法作为出站跳的原因。
+enum HopDeny {
+    NoRoute,
+    NoPrice,
+}
+
+/// 为可调用名构造一条出站跳：须有启用渠道且已定价。
+fn hop_for_callable(snapshot: &RuntimeSnapshot, model: &str) -> Result<RouteHop, HopDeny> {
+    let route = routing::route(&snapshot.channels, model).ok_or(HopDeny::NoRoute)?;
+    let price = snapshot.prices.get(model).ok_or(HopDeny::NoPrice)?;
+    Ok(RouteHop {
+        routed_model: model.to_string(),
+        route,
+        price: PriceSnapshot::from_store_price(price),
+    })
+}
+
+/// 解析本次请求的出站跳序列。
+///
+/// 命中统一模型时按成员顺序收集已定价可路由的跳；一条都没有则 503，文案说明
+/// 各成员失效原因（不是「模型不存在」）。普通模型保持原 503 文案。
+fn resolve_route_hops(
+    snapshot: &RuntimeSnapshot,
+    model: &str,
+) -> Result<Vec<RouteHop>, (StatusCode, String)> {
+    if let Some(unified) = snapshot.unified_models.get(model) {
+        let mut hops = Vec::new();
+        let mut reasons = Vec::new();
+        for member in &unified.models {
+            match hop_for_callable(snapshot, member) {
+                Ok(hop) => hops.push(hop),
+                Err(HopDeny::NoRoute) => {
+                    reasons.push(format!("成员 {member} 没有可用渠道"));
+                }
+                Err(HopDeny::NoPrice) => {
+                    reasons.push(format!("成员 {member} 未配置价格"));
+                }
+            }
+        }
+        if hops.is_empty() {
+            let detail = if reasons.is_empty() {
+                "成员列表为空".to_string()
+            } else {
+                reasons.join("；")
+            };
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("统一模型 {model} 没有已定价且可路由的成员：{detail}"),
+            ));
+        }
+        return Ok(hops);
+    }
+    match hop_for_callable(snapshot, model) {
+        Ok(hop) => Ok(vec![hop]),
+        Err(HopDeny::NoRoute) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("模型 {model} 未配置任何可用渠道"),
+        )),
+        Err(HopDeny::NoPrice) => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("模型 {model} 未配置价格，无法计费"),
+        )),
+    }
 }
 
 /// 单次出站调用的请求侧上下文：入站请求、认证令牌与计费/日志所需的
@@ -401,12 +444,63 @@ struct CallCtx<'a> {
     /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
     snapshot: &'a Arc<RuntimeSnapshot>,
     request: &'a ChatRequest,
+    /// 本跳出站用的已登记模型名（统一模型时为成员，否则同入站名）。
+    routed_model: &'a str,
     token: &'a Token,
     price: PriceSnapshot,
     started: i64,
     /// 入站 wire 协议：响应重编码与错误格式按此分派。
     inbound_protocol: Protocol,
     request_body: Option<Vec<u8>>,
+}
+
+/// 按一条跳的渠道路由发起出站：直通或 IR，遇可重试错误在该跳内 failover。
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_hop(
+    deps: &Deps,
+    snapshot: &Arc<RuntimeSnapshot>,
+    request: &ChatRequest,
+    hop: &RouteHop,
+    token: &Token,
+    started: i64,
+    inbound_protocol: Protocol,
+    raw_body: &[u8],
+    request_body_for_log: Option<Vec<u8>>,
+) -> Response {
+    // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
+    // 任一渠道命中别名、或统一模型成员名与入站名不同时也回落 IR：直通无法改写请求体模型名。
+    let passthrough = hop.route.channels.iter().all(|channel| {
+        channel.protocol == inbound_protocol
+            && routing::outbound_model(channel, &hop.routed_model) == request.model
+    });
+    if passthrough {
+        let passthrough_ctx = PassthroughCtx {
+            deps,
+            snapshot,
+            request,
+            routed_model: &hop.routed_model,
+            token,
+            price: hop.price,
+            started,
+            raw_body,
+            inbound_protocol,
+            request_body: request_body_for_log,
+        };
+        return passthrough_with_failover(&passthrough_ctx, &hop.route).await;
+    }
+    outbound_with_failover(
+        deps,
+        snapshot,
+        request,
+        &hop.routed_model,
+        &hop.route,
+        token,
+        hop.price,
+        started,
+        inbound_protocol,
+        request_body_for_log,
+    )
+    .await
 }
 
 /// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
@@ -419,6 +513,7 @@ async fn outbound_with_failover(
     deps: &Deps,
     snapshot: &Arc<RuntimeSnapshot>,
     request: &ChatRequest,
+    routed_model: &str,
     route: &routing::Route,
     token: &Token,
     price: PriceSnapshot,
@@ -436,6 +531,7 @@ async fn outbound_with_failover(
                     deps,
                     snapshot,
                     request,
+                    routed_model,
                     token,
                     price,
                     started,
@@ -451,7 +547,7 @@ async fn outbound_with_failover(
         },
         |channel, status, _failover, body_wire| {
             let outbound_model =
-                outbound_model_for_channel_name(route, channel, &request.model).map(str::to_string);
+                outbound_model_for_channel_name(route, channel, routed_model).map(str::to_string);
             let channel = channel.to_string();
             let request_body = request_body_for_log.clone();
             let response_body = snapshot.full_body.then(|| body_wire.to_vec());
@@ -488,6 +584,8 @@ struct PassthroughCtx<'a> {
     /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
     snapshot: &'a Arc<RuntimeSnapshot>,
     request: &'a ChatRequest,
+    /// 本跳出站用的已登记模型名（统一模型时为成员）。
+    routed_model: &'a str,
     token: &'a Token,
     price: PriceSnapshot,
     started: i64,
@@ -516,9 +614,8 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             })
         },
         |channel, status, _failover, body_wire| {
-            let outbound_model =
-                outbound_model_for_channel_name(route, channel, &ctx.request.model)
-                    .map(str::to_string);
+            let outbound_model = outbound_model_for_channel_name(route, channel, ctx.routed_model)
+                .map(str::to_string);
             let channel = channel.to_string();
             let request_body = ctx.request_body.clone();
             let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
@@ -609,6 +706,7 @@ async fn passthrough_stream_completion(ctx: &PassthroughCtx<'_>, channel: &Chann
         snapshot: ctx.snapshot.clone(),
         token: ctx.token.clone(),
         request: ctx.request.clone(),
+        routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
         status_code,
         started: ctx.started,
@@ -703,7 +801,7 @@ async fn passthrough_non_stream_completion(
             ctx.deps,
             ctx.token,
             &ctx.request.model,
-            outbound_model_for_log(channel, &ctx.request.model),
+            outbound_model_for_log(channel, ctx.routed_model),
             &channel.name,
             status_code,
             ctx.started,
@@ -775,6 +873,7 @@ struct PassthroughStreamTask {
     snapshot: Arc<RuntimeSnapshot>,
     token: Token,
     request: ChatRequest,
+    routed_model: String,
     channel: Channel,
     status_code: u16,
     started: i64,
@@ -887,7 +986,7 @@ async fn pipe_passthrough_stream<S>(
                     &ctx.deps,
                     &ctx.token,
                     &ctx.request.model,
-                    outbound_model_for_log(&ctx.channel, &ctx.request.model),
+                    outbound_model_for_log(&ctx.channel, &ctx.routed_model),
                     &ctx.channel.name,
                     ctx.status_code,
                     ctx.started,
@@ -949,7 +1048,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
     let mut request_warnings = Vec::new();
     let mut outbound_value =
         protocol::encode_request(request, channel.protocol, &mut request_warnings);
-    let outbound_model = routing::outbound_model(channel, &request.model);
+    let outbound_model = routing::outbound_model(channel, ctx.routed_model);
     if let Value::Object(map) = &mut outbound_value {
         map.insert("model".into(), Value::String(outbound_model.to_string()));
     }
@@ -1076,7 +1175,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
     let inbound_protocol = ctx.inbound_protocol;
     let mut request_warnings = Vec::new();
     let mut outbound = protocol::encode_request(request, channel.protocol, &mut request_warnings);
-    let outbound_model = routing::outbound_model(channel, &request.model);
+    let outbound_model = routing::outbound_model(channel, ctx.routed_model);
     // 目标性 JSON 补丁：强制流式；OpenAI 另注入 stream_options.include_usage
     // （Anthropic 流式自带 usage）。别名重写用该渠道自己的出站模型名。
     if let Value::Object(map) = &mut outbound {
@@ -1154,6 +1253,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         snapshot: ctx.snapshot.clone(),
         token: token.clone(),
         request: request.clone(),
+        routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
         inbound_model: (request.model != outbound_model).then(|| request.model.clone()),
         request_warnings,
@@ -1179,6 +1279,7 @@ struct StreamTask {
     snapshot: Arc<RuntimeSnapshot>,
     token: Token,
     request: ChatRequest,
+    routed_model: String,
     channel: Channel,
     /// 别名命中时入站模型名（用于重写响应模型名）；`None` 表示不覆盖。
     inbound_model: Option<String>,
@@ -1335,7 +1436,7 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
         &ctx.deps,
         &ctx.token,
         &ctx.request.model,
-        outbound_model_for_log(&ctx.channel, &ctx.request.model),
+        outbound_model_for_log(&ctx.channel, &ctx.routed_model),
         &ctx.channel.name,
         ctx.status_code,
         ctx.started,

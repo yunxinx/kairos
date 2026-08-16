@@ -1,9 +1,10 @@
 //! 运行时资源内存快照：网关请求路径读取的唯一资源视图。
 //!
-//! 启动时从 SQLite 加载渠道、令牌、价格、模型组与运行时开关进 `RuntimeSnapshot`（不可变
-//! 整体）。请求路径（认证、路由、计费准入、full_body、body 上限、模型组允许名单）全部读快照；
-//! 在途请求在准入时刻抓取一个 `Arc` 引用，不受后续原子替换影响。管理 API 写库
-//! 成功后原子替换快照（见 `SnapshotHandle`），是唯一动态入口。
+//! 启动时从 SQLite 加载渠道、令牌、价格、模型组、统一模型与运行时开关进
+//! `RuntimeSnapshot`（不可变整体）。请求路径（认证、路由、计费准入、full_body、
+//! body 上限、模型组允许名单、统一模型 failover）全部读快照；在途请求在准入时刻
+//! 抓取一个 `Arc` 引用，不受后续原子替换影响。管理 API 写库成功后原子替换快照
+//! （见 `SnapshotHandle`），是唯一动态入口。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +34,8 @@ pub struct RuntimeSnapshot {
     pub prices: HashMap<String, resources::Price>,
     /// 模型组，按组名索引（令牌允许名单）。
     pub model_groups: HashMap<String, resources::ModelGroup>,
+    /// 统一模型，按可调用名索引（有序 failover）。
+    pub unified_models: HashMap<String, resources::UnifiedModel>,
     /// 是否落完整请求/响应 body（来自 `full_body` 开关）。
     pub full_body: bool,
     /// 入站请求体大小上限（字节，来自 `max_request_bytes` 开关）。
@@ -54,6 +57,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
     let token_rows = resources::list_tokens(pool).await?;
     let price_rows = resources::list_prices(pool).await?;
     let group_rows = resources::list_model_groups(pool).await?;
+    let unified_rows = resources::list_unified_models(pool).await?;
     let settings = resources::list_settings(pool).await?;
 
     let tokens = token_rows
@@ -68,12 +72,17 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         .into_iter()
         .map(|group| (group.name.clone(), group))
         .collect();
+    let unified_models = unified_rows
+        .into_iter()
+        .map(|model| (model.id.clone(), model))
+        .collect();
 
     Ok(RuntimeSnapshot {
         channels,
         tokens,
         prices,
         model_groups,
+        unified_models,
         full_body: load_full_body(&settings),
         max_request_bytes: load_max_request_bytes(&settings),
     })
@@ -131,6 +140,7 @@ mod tests {
         assert!(snap.tokens.is_empty());
         assert!(snap.prices.is_empty());
         assert_eq!(snap.model_groups.len(), 1, "空库应有内置 default 组");
+        assert!(snap.unified_models.is_empty());
         assert!(
             snap.model_groups
                 .contains_key(resources::DEFAULT_MODEL_GROUP)
@@ -191,6 +201,16 @@ mod tests {
         )
         .await
         .expect("应能写价格");
+        resources::upsert_unified_model(
+            &mut conn,
+            &resources::UnifiedModel {
+                id: "coding".to_string(),
+                models: vec!["gpt-4o".to_string()],
+                hide: false,
+            },
+        )
+        .await
+        .expect("应能写统一模型");
         resources::set_setting(&mut conn, SETTING_FULL_BODY, &Value::Bool(true))
             .await
             .expect("应能写开关");
@@ -216,6 +236,7 @@ mod tests {
             snap.model_groups
                 .contains_key(resources::DEFAULT_MODEL_GROUP)
         );
+        assert_eq!(snap.unified_models["coding"].models, vec!["gpt-4o"]);
         assert!(snap.full_body, "开关应生效");
         assert_eq!(snap.max_request_bytes, 8_000_000);
     }

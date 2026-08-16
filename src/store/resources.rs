@@ -1,10 +1,10 @@
-//! 运行时资源存储：渠道、令牌、价格、模型组与运行时开关的读写原语。
+//! 运行时资源存储：渠道、令牌、价格、模型组、统一模型与运行时开关的读写原语。
 //!
 //! 资源 CRUD 写操作接受 `&mut SqliteConnection`，可组合进事务；读操作接受
 //! `&SqlitePool`。金额一律整数 micro-USD（ADR-0002）。wire 协议类型复用
 //! `crate::config::Protocol`，落库为其 serde rename 字符串。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -77,6 +77,42 @@ pub struct Token {
 pub struct ModelGroup {
     pub name: String,
     pub models: Vec<String>,
+}
+
+/// 统一模型：一个下游可调用名，按顺序尝试若干已登记模型（ADR-0004）。
+///
+/// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
+/// 错误直接报错而非静默忽略。统一 ID 本身没有价格行。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnifiedModel {
+    /// 下游请求的可调用名。
+    pub id: String,
+    /// 有序的已登记模型列表（渠道 `models` 或别名 key）；一次请求只出站一条。
+    pub models: Vec<String>,
+    /// 开隐藏则同名已登记模型在组内只表示本统一模型；默认影响下游列表。
+    #[serde(default)]
+    pub hide: bool,
+}
+
+/// 渠道已登记的可调用名：各渠道 `models` ∪ 别名 key（含禁用渠道）。
+///
+/// 禁用渠道的名字仍算已登记：统一模型保存时可以引用；请求时再按启用渠道路由，
+/// 没有启用候选才视为该成员失效。
+pub fn registered_callable_names<'a>(
+    channels: impl IntoIterator<Item = &'a Channel>,
+) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for channel in channels {
+        names.extend(channel.models.iter().cloned());
+        names.extend(channel.model_aliases.keys().cloned());
+    }
+    names
+}
+
+/// 未隐藏的统一模型 ID 与已登记模型/别名同名时无法在同组并存。
+pub fn unhidden_unified_id_collides(id: &str, hide: bool, registered: &HashSet<String>) -> bool {
+    !hide && registered.contains(id)
 }
 
 /// 令牌绑定组是否允许调用该名。
@@ -463,6 +499,61 @@ pub async fn count_tokens_in_group(
     Ok(count.max(0) as u64)
 }
 
+/// 读出全部统一模型。
+pub async fn list_unified_models(pool: &SqlitePool) -> Result<Vec<UnifiedModel>, StoreError> {
+    let rows = sqlx::query("SELECT id, models_json, hide FROM unified_models")
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+
+    rows.iter().map(map_unified_model).collect()
+}
+
+/// 把统一模型行映射为 `UnifiedModel`；`hide` 以 0/1 整数落库，非 0 视为开启。
+fn map_unified_model(row: &sqlx::sqlite::SqliteRow) -> Result<UnifiedModel, StoreError> {
+    let id: String = row.try_get("id").map_err(StoreError::Query)?;
+    let hide: i64 = row.try_get("hide").map_err(StoreError::Query)?;
+    let models: Vec<String> = serde_json::from_str(
+        &row.try_get::<String, _>("models_json")
+            .map_err(StoreError::Query)?,
+    )
+    .map_err(|_| StoreError::InvalidResource(format!("统一模型 {id} 的 models_json 非法")))?;
+    Ok(UnifiedModel {
+        id,
+        models,
+        hide: hide != 0,
+    })
+}
+
+/// 新增或整体替换一个统一模型（按 `id`），同一事务内幂等。
+pub async fn upsert_unified_model(
+    conn: &mut SqliteConnection,
+    model: &UnifiedModel,
+) -> Result<(), StoreError> {
+    let models_json = serde_json::to_string(&model.models).map_err(serde_error)?;
+    sqlx::query(
+        "INSERT INTO unified_models (id, models_json, hide) VALUES (?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET models_json = excluded.models_json, hide = excluded.hide",
+    )
+    .bind(&model.id)
+    .bind(&models_json)
+    .bind(model.hide)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 按 `id` 删除统一模型；不存在视为成功（幂等）。
+pub async fn delete_unified_model(conn: &mut SqliteConnection, id: &str) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM unified_models WHERE id = ?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
+}
+
 /// 把绑定到 `from_group` 的令牌改回内置 `default`。
 pub async fn rebind_tokens_to_default(
     conn: &mut SqliteConnection,
@@ -627,7 +718,7 @@ fn serde_error(err: serde_json::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     /// 建一个内存外的临时 SQLite 连接池，并跑完全部迁移。
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
@@ -975,6 +1066,60 @@ mod tests {
             "also-in-default"
         ));
         assert!(!group_allows(&groups, "ghost", "fast"));
+    }
+
+    /// 已登记名 = 各渠道 models ∪ 别名 key；禁用渠道仍计入。
+    #[test]
+    fn registered_callable_names_includes_disabled_and_aliases() {
+        let mut enabled = sample_channel();
+        let mut disabled = sample_channel();
+        disabled.name = "off".to_string();
+        disabled.enabled = false;
+        disabled.models = vec!["only-on-disabled".to_string()];
+        disabled.model_aliases.clear();
+        enabled.models = vec!["gpt-4o".to_string()];
+        let names = registered_callable_names([&enabled, &disabled]);
+        assert!(names.contains("gpt-4o"));
+        assert!(names.contains("fast"), "别名 key 应计入");
+        assert!(
+            names.contains("only-on-disabled"),
+            "禁用渠道的模型仍算已登记"
+        );
+        assert!(!names.contains("gpt-4o-mini"), "别名 value 不参与匹配");
+    }
+
+    /// 未隐藏且 ID 已登记 → 撞名；开隐藏或 ID 未登记则否。
+    #[test]
+    fn unhidden_unified_id_collides_only_when_registered_and_visible() {
+        let registered = HashSet::from(["gpt-4o".to_string()]);
+        assert!(unhidden_unified_id_collides("gpt-4o", false, &registered));
+        assert!(!unhidden_unified_id_collides("gpt-4o", true, &registered));
+        assert!(!unhidden_unified_id_collides("coding", false, &registered));
+    }
+
+    /// 统一模型 CRUD 往返；删除幂等；hide 以 0/1 落库。
+    #[tokio::test]
+    async fn unified_model_upsert_then_list_roundtrip() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let model = UnifiedModel {
+            id: "coding".to_string(),
+            models: vec!["gpt-4o".to_string(), "fast".to_string()],
+            hide: true,
+        };
+        upsert_unified_model(&mut conn, &model)
+            .await
+            .expect("应能写统一模型");
+        let listed = list_unified_models(&pool).await.expect("应能读");
+        assert_eq!(listed, vec![model.clone()]);
+
+        delete_unified_model(&mut conn, "coding")
+            .await
+            .expect("应能删");
+        delete_unified_model(&mut conn, "coding")
+            .await
+            .expect("重复删除应幂等");
+        assert!(list_unified_models(&pool).await.expect("应能读").is_empty());
     }
 
     /// 价格播种 → 读回往返一致；缓存档 NULL 保留。
