@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 定价编辑器浮窗：每个实例自持草稿，向窗口栈上报脏状态以供淘汰判定。
+// 定价编辑器：模型名由清单行带入，禁止手打新建价格行。
 import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
@@ -15,11 +15,12 @@ import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
 const props = withDefaults(
   defineProps<{
-    /** 编辑对象；null 表示新建。 */
+    /** 可调用名，始终锁定。 */
+    model: string;
+    /** 已有价格；null 表示未定价、本次为创建。 */
     initial: Price | null;
     anchor?: FloatingWindowAnchor | null;
     stackOrder?: number;
-    /** 初始位置级联偏移序号。 */
     cascade?: number;
     attention?: boolean;
     topmost?: boolean;
@@ -50,14 +51,12 @@ function formatOptional(micros: number | null): string {
 }
 
 const initialValues = {
-  model: props.initial?.model ?? '',
   input: props.initial ? formatUsdAmount(props.initial.input_micros) : '',
   output: props.initial ? formatUsdAmount(props.initial.output_micros) : '',
   cacheRead: props.initial ? formatOptional(props.initial.cache_read_micros) : '',
   cacheWrite: props.initial ? formatOptional(props.initial.cache_write_micros) : '',
 };
 
-const editorModel = ref(initialValues.model);
 const editorInput = ref(initialValues.input);
 const editorOutput = ref(initialValues.output);
 const editorCacheRead = ref(initialValues.cacheRead);
@@ -66,7 +65,6 @@ const editorError = ref('');
 
 const dirty = computed(
   () =>
-    editorModel.value !== initialValues.model ||
     editorInput.value !== initialValues.input ||
     editorOutput.value !== initialValues.output ||
     editorCacheRead.value !== initialValues.cacheRead ||
@@ -76,9 +74,7 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const saveMutation = useMutation({
   mutationFn: (body: Price) =>
-    props.initial === null
-      ? apiClient.createPrice(body)
-      : apiClient.updatePrice(initialValues.model, body),
+    props.initial === null ? apiClient.createPrice(body) : apiClient.updatePrice(props.model, body),
   onSuccess: async () => {
     editorError.value = '';
     emit('close');
@@ -98,7 +94,6 @@ function optionalMicros(value: string): number | null {
 function handleSave() {
   editorError.value = '';
   const specs: FieldValidationSpec[] = [
-    { name: 'model', value: editorModel.value, rules: [{ kind: 'required' }] },
     {
       name: 'input',
       value: editorInput.value,
@@ -119,7 +114,7 @@ function handleSave() {
     return;
   }
   saveMutation.mutate({
-    model: editorModel.value.trim(),
+    model: props.model,
     input_micros: inputMicros,
     output_micros: outputMicros,
     cache_read_micros: optionalMicros(editorCacheRead.value),
@@ -141,22 +136,9 @@ function handleSave() {
   >
     <form novalidate @submit.prevent="handleSave">
       <div class="card-body space-y-3">
-        <FormField
-          field-name="model"
-          :label="t('pricing.model')"
-          :input-id="modelInputId"
-          :error="fieldError('model')"
-        >
-          <template #default="{ hintId, invalid }">
-            <FormTextInput
-              :id="modelInputId"
-              v-model="editorModel"
-              type="text"
-              :disabled="initial !== null"
-              :invalid="invalid"
-              :hint-id="hintId"
-              v-on="fieldInputHandlers('model')"
-            />
+        <FormField field-name="model" :label="t('pricing.model')" :input-id="modelInputId">
+          <template #default>
+            <FormTextInput :id="modelInputId" :model-value="model" type="text" disabled />
           </template>
         </FormField>
         <FormField

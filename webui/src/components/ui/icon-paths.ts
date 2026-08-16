@@ -23,7 +23,8 @@ export type IconName =
   | 'calendar'
   | 'search'
   | 'copy'
-  | 'pencil';
+  | 'pencil'
+  | 'grip-vertical';
 
 export type IconDef = {
   viewBox?: string;
@@ -192,5 +193,16 @@ export const iconDefs: Record<IconName, IconDef> = {
     strokeWidth: 2,
     strokeLinecap: 'round',
     strokeLinejoin: 'round',
+  },
+  /** 拖拽手柄。路径来自 Lucide「grip-vertical」(ISC)。 */
+  'grip-vertical': {
+    circles: [
+      { cx: 9, cy: 5, r: 1 },
+      { cx: 9, cy: 12, r: 1 },
+      { cx: 9, cy: 19, r: 1 },
+      { cx: 15, cy: 5, r: 1 },
+      { cx: 15, cy: 12, r: 1 },
+      { cx: 15, cy: 19, r: 1 },
+    ],
   },
 };

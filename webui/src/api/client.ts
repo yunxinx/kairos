@@ -9,6 +9,7 @@ import type {
   LogQuery,
   Page,
   LogEntry,
+  ModelGroup,
   Price,
   Settings,
   StatsView,
@@ -16,6 +17,7 @@ import type {
   Token,
   TokenCreate,
   TokenView,
+  UnifiedModel,
   UpstreamModelsDraft,
   UpstreamModelsView,
 } from '@/api/types';
@@ -146,6 +148,45 @@ export const apiClient = {
 
   deletePrice(model: string): Promise<Price> {
     return apiFetch(`/prices/${encodeURIComponent(model)}`, { method: 'DELETE' });
+  },
+
+  listModelGroups(): Promise<ModelGroup[]> {
+    return apiFetch('/model-groups');
+  },
+
+  createModelGroup(body: ModelGroup): Promise<ModelGroup> {
+    return apiFetch('/model-groups', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  updateModelGroup(name: string, body: ModelGroup): Promise<ModelGroup> {
+    return apiFetch(`/model-groups/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  deleteModelGroup(name: string, force = false): Promise<ModelGroup> {
+    const query = force ? '?force=true' : '';
+    return apiFetch(`/model-groups/${encodeURIComponent(name)}${query}`, { method: 'DELETE' });
+  },
+
+  listUnifiedModels(): Promise<UnifiedModel[]> {
+    return apiFetch('/unified-models');
+  },
+
+  createUnifiedModel(body: UnifiedModel): Promise<UnifiedModel> {
+    return apiFetch('/unified-models', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  updateUnifiedModel(id: string, body: UnifiedModel): Promise<UnifiedModel> {
+    return apiFetch(`/unified-models/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  deleteUnifiedModel(id: string): Promise<UnifiedModel> {
+    return apiFetch(`/unified-models/${encodeURIComponent(id)}`, { method: 'DELETE' });
   },
 
   getSettings(): Promise<Settings> {

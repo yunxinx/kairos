@@ -2097,3 +2097,44 @@ html[lang='zh-CN'] {
   padding: 0;
   border-radius: 9999px;
 }
+
+/* ── 模型页平行 tab（非向导；样式对齐顶栏 tab-link）── */
+.page-tabs-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  border-bottom: 1px solid var(--seed-border);
+  margin-bottom: 1rem;
+}
+.page-tabs-trigger {
+  display: inline-flex;
+  align-items: center;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+.page-tabs-trigger:hover {
+  color: var(--seed-fg);
+}
+.page-tabs-trigger:focus-visible {
+  outline: none;
+  box-shadow: inset var(--focus-ring);
+}
+.page-tabs-trigger[data-state='active'] {
+  color: var(--seed-fg);
+  border-bottom-color: var(--seed-primary);
+}
+
+[data-slot='table-row'].inventory-row-unpriced {
+  background: var(--warn-bg);
+}
+[data-slot='table-row'].inventory-row-unpriced:hover,
+[data-slot='table-row'].inventory-row-unpriced[data-state='selected'] {
+  background: color-mix(in srgb, var(--warn) 18%, var(--warn-bg));
+}

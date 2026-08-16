@@ -33,10 +33,22 @@ export function prefetchAdminRoute(to: string): void {
         queryFn: () => apiClient.listChannels(),
       });
       return;
-    case '/pricing':
+    case '/models':
+      void queryClient.prefetchQuery({
+        queryKey: ['channels'],
+        queryFn: () => apiClient.listChannels(),
+      });
       void queryClient.prefetchQuery({
         queryKey: ['prices'],
         queryFn: () => apiClient.listPrices(),
+      });
+      void queryClient.prefetchQuery({
+        queryKey: ['unified-models'],
+        queryFn: () => apiClient.listUnifiedModels(),
+      });
+      void queryClient.prefetchQuery({
+        queryKey: ['model-groups'],
+        queryFn: () => apiClient.listModelGroups(),
       });
       return;
     case '/config':

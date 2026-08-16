@@ -202,9 +202,9 @@ const busy = computed(() => testingModel.value !== null);
 const canTestSelected = computed(() => selection.value.size > 0 && !busy.value);
 
 function markClientUnreachable(probeModel: string) {
-  const nextResults = { ...results.value };
-  delete nextResults[probeModel];
-  results.value = nextResults;
+  results.value = Object.fromEntries(
+    Object.entries(results.value).filter(([model]) => model !== probeModel),
+  );
   const next = new Set(clientUnreachable.value);
   next.add(probeModel);
   clientUnreachable.value = next;

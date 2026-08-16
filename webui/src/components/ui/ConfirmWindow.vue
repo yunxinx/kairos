@@ -20,6 +20,8 @@ const props = withDefaults(
     busy?: boolean;
     /** 确认按钮 data-testid，保持各资源页既有选择器契约。 */
     confirmTestId?: string | undefined;
+    /** 确认按钮文案；缺省为删除确认。 */
+    confirmLabel?: string | undefined;
   }>(),
   {
     anchor: null,
@@ -30,6 +32,7 @@ const props = withDefaults(
     error: '',
     busy: false,
     confirmTestId: undefined,
+    confirmLabel: undefined,
   },
 );
 
@@ -73,7 +76,7 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
         :disabled="busy"
         @click="emit('confirm')"
       >
-        {{ t('common.confirmDelete') }}
+        {{ confirmLabel ?? t('common.confirmDelete') }}
       </button>
     </div>
   </FloatingWindow>

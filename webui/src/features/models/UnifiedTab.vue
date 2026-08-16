@@ -3,8 +3,7 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { Price } from '@/api/types';
-import PageHeader from '@/app/layout/PageHeader.vue';
+import type { UnifiedModel } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
@@ -26,16 +25,17 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
-import PriceEditorWindow from '@/features/pricing/PriceEditorWindow.vue';
-import { formatUsdMicros } from '@/lib/format';
+import UnifiedEditorWindow from '@/features/models/UnifiedEditorWindow.vue';
+import { buildInventory } from '@/lib/inventory';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
-type PriceWindowPayload =
-  { kind: 'editor'; price: Price | null } | { kind: 'delete'; price: Price } | BulkDeletePayload;
+type UnifiedWindowPayload =
+  | { kind: 'editor'; model: UnifiedModel | null }
+  | { kind: 'delete'; model: UnifiedModel }
+  | BulkDeletePayload;
 
 const { t } = useI18n();
 const queryClient = useQueryClient();
-
 const searchText = ref('');
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
@@ -52,97 +52,109 @@ const {
   close: closeWindow,
   setDirty,
   bringToFront,
-} = useWindowStack<PriceWindowPayload>();
+} = useWindowStack<UnifiedWindowPayload>();
 
 const deleteErrors = ref<Record<number, string>>({});
 
+const unifiedQuery = useQuery({
+  queryKey: ['unified-models'],
+  queryFn: () => apiClient.listUnifiedModels(),
+});
+const channelsQuery = useQuery({
+  queryKey: ['channels'],
+  queryFn: () => apiClient.listChannels(),
+});
 const pricesQuery = useQuery({
   queryKey: ['prices'],
   queryFn: () => apiClient.listPrices(),
 });
 
-const prices = computed(() => pricesQuery.data.value ?? []);
-const showTableSkeleton = computed(() => pricesQuery.isPending.value && !pricesQuery.data.value);
+const memberOptions = computed(() =>
+  buildInventory(channelsQuery.data.value ?? [], pricesQuery.data.value ?? []).map(
+    (row) => row.name,
+  ),
+);
 
-const filteredPrices = computed(() => {
+const models = computed(() => unifiedQuery.data.value ?? []);
+const showTableSkeleton = computed(() => unifiedQuery.isPending.value && !unifiedQuery.data.value);
+
+const filtered = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  if (!q) return prices.value;
-  return prices.value.filter((price) => price.model.toLowerCase().includes(q));
+  if (!q) return models.value;
+  return models.value.filter(
+    (model) =>
+      model.id.toLowerCase().includes(q) ||
+      model.models.some((member) => member.toLowerCase().includes(q)),
+  );
 });
 
-// 行选择：全选只作用于当前可见行；被筛掉的已选行保留选择但不计入全选。
 const selection = useRowSelection<string>();
-
 const allVisibleSelected = computed({
   get: () =>
-    filteredPrices.value.length > 0 &&
-    filteredPrices.value.every((price) => selection.isSelected(price.model)),
+    filtered.value.length > 0 && filtered.value.every((model) => selection.isSelected(model.id)),
   set: (value) =>
     selection.setMany(
-      filteredPrices.value.map((price) => price.model),
+      filtered.value.map((model) => model.id),
       value,
     ),
 });
-
 const someVisibleSelected = computed(() =>
-  filteredPrices.value.some((price) => selection.isSelected(price.model)),
+  filtered.value.some((model) => selection.isSelected(model.id)),
 );
-
-// 删除或刷新后列表键变化，剔除幽灵选择。
-watch(prices, (rows) => selection.prune(rows.map((row) => row.model)));
+watch(models, (rows) => selection.prune(rows.map((row) => row.id)));
 
 const bulkDelete = useBulkDelete<string>({
   selection,
   windowStack: { windows, close: closeWindow },
-  queryKey: ['prices'],
-  deleteOne: (model) => apiClient.deletePrice(model),
+  queryKey: ['unified-models'],
+  deleteOne: (id) => apiClient.deleteUnifiedModel(id),
 });
 
 const deleteMutation = useMutation({
-  mutationFn: (model: string) => apiClient.deletePrice(model),
-  onSuccess: async (_data, model) => {
+  mutationFn: (id: string) => apiClient.deleteUnifiedModel(id),
+  onSuccess: async (_data, id) => {
     const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.price.model === model,
+      (item) => item.payload.kind === 'delete' && item.payload.model.id === id,
     );
     if (entry) closeWindow(entry.id);
-    await queryClient.invalidateQueries({ queryKey: ['prices'] });
+    await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },
-  onError: (err, model) => {
+  onError: (err, id) => {
     const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.price.model === model,
+      (item) => item.payload.kind === 'delete' && item.payload.model.id === id,
     );
     if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
   },
 });
 
-const deletingModel = computed(() =>
+const deletingId = computed(() =>
   deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
 );
 
 function openCreate(event: Event) {
-  openWindow(anchorFromEvent(event), { kind: 'editor', price: null });
+  openWindow(anchorFromEvent(event), { kind: 'editor', model: null });
 }
 
-function openEdit(price: Price) {
+function openEdit(model: UnifiedModel) {
   const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'editor' && entry.payload.price?.model === price.model,
+    (entry) => entry.payload.kind === 'editor' && entry.payload.model?.id === model.id,
   );
   if (existing) {
     bringToFront(existing.id);
     return;
   }
-  openWindow(takePendingAnchor(), { kind: 'editor', price });
+  openWindow(takePendingAnchor(), { kind: 'editor', model });
 }
 
-function openDelete(price: Price) {
+function openDelete(model: UnifiedModel) {
   const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'delete' && entry.payload.price.model === price.model,
+    (entry) => entry.payload.kind === 'delete' && entry.payload.model.id === model.id,
   );
   if (existing) {
     bringToFront(existing.id);
     return;
   }
-  const entry = openWindow(takePendingAnchor(), { kind: 'delete', price });
+  const entry = openWindow(takePendingAnchor(), { kind: 'delete', model });
   if (entry) deleteErrors.value[entry.id] = '';
 }
 
@@ -154,42 +166,35 @@ function openBulkDelete() {
   }
   openWindow(takePendingAnchor(), { kind: 'bulk-delete' });
 }
-
-function formatOptionalMicros(value: number | null): string {
-  return value === null ? '—' : formatUsdMicros(value);
-}
 </script>
 
 <template>
   <div class="flex flex-col">
-    <PageHeader :title="t('nav.pricing')" />
-
     <InlineError
-      v-if="pricesQuery.isError.value && !pricesQuery.data.value"
-      :message="extractApiError(pricesQuery.error.value).message"
-      @retry="() => pricesQuery.refetch()"
+      v-if="unifiedQuery.isError.value && !unifiedQuery.data.value"
+      :message="extractApiError(unifiedQuery.error.value).message"
+      @retry="() => unifiedQuery.refetch()"
     />
-
     <div v-else class="flex flex-col">
       <DataTable :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
             <SearchInput
-              id="pricing-search"
+              id="unified-search"
               v-model="searchText"
               class="max-w-sm"
-              data-testid="pricing-search"
-              :placeholder="t('pricing.search')"
-              :aria-label="t('pricing.search')"
+              data-testid="unified-search"
+              :placeholder="t('models.search')"
+              :aria-label="t('models.search')"
             />
             <template #actions>
               <button
                 type="button"
                 class="btn btn-primary"
-                data-testid="pricing-create-entry"
+                data-testid="unified-create"
                 @click="openCreate"
               >
-                {{ t('pricing.createEntry') }}
+                {{ t('models.unifiedCreate') }}
               </button>
             </template>
           </DataTableToolbar>
@@ -201,73 +206,67 @@ function formatOptionalMicros(value: number | null): string {
                 <Checkbox
                   v-model="allVisibleSelected"
                   :indeterminate="someVisibleSelected && !allVisibleSelected"
-                  data-testid="pricing-select-all"
+                  data-testid="unified-select-all"
                   :aria-label="t('common.selectAll')"
                 />
               </div>
             </TableHead>
-            <TableHead>{{ t('pricing.model') }}</TableHead>
-            <TableHead>{{ t('pricing.input') }}</TableHead>
-            <TableHead>{{ t('pricing.output') }}</TableHead>
-            <TableHead>{{ t('pricing.cacheRead') }}</TableHead>
-            <TableHead>{{ t('pricing.cacheWrite') }}</TableHead>
+            <TableHead>{{ t('models.unifiedId') }}</TableHead>
+            <TableHead>{{ t('models.unifiedMembers') }}</TableHead>
+            <TableHead>{{ t('models.unifiedHide') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="7" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="5" />
           <template v-else>
             <TableRow
-              v-for="price in filteredPrices"
-              :key="price.model"
-              data-testid="price-row"
-              :data-price-model="price.model"
-              :data-state="selection.isSelected(price.model) ? 'selected' : undefined"
+              v-for="model in filtered"
+              :key="model.id"
+              data-testid="unified-row"
+              :data-unified-id="model.id"
+              :data-state="selection.isSelected(model.id) ? 'selected' : undefined"
             >
               <SelectCell
-                :checked="selection.isSelected(price.model)"
-                test-id="price-select"
-                @toggle="selection.toggle(price.model)"
+                :checked="selection.isSelected(model.id)"
+                test-id="unified-select"
+                @toggle="selection.toggle(model.id)"
               />
-              <TableCell class="font-medium">{{ price.model }}</TableCell>
-              <TableCell class="font-mono" data-testid="price-input">
-                {{ formatUsdMicros(price.input_micros) }}
+              <TableCell class="font-mono font-medium">{{ model.id }}</TableCell>
+              <TableCell class="font-mono text-sm" data-testid="unified-members">
+                {{ model.models.join(' → ') }}
               </TableCell>
-              <TableCell class="font-mono" data-testid="price-output">
-                {{ formatUsdMicros(price.output_micros) }}
-              </TableCell>
-              <TableCell class="font-mono" data-testid="price-cache-read">
-                {{ formatOptionalMicros(price.cache_read_micros) }}
-              </TableCell>
-              <TableCell class="font-mono" data-testid="price-cache-write">
-                {{ formatOptionalMicros(price.cache_write_micros) }}
+              <TableCell>
+                <span class="badge" :class="model.hide ? 'badge-warn' : 'badge-neutral'">
+                  {{ model.hide ? t('models.unifiedHideOn') : t('models.unifiedHideOff') }}
+                </span>
               </TableCell>
               <TableCell align="center">
                 <DataTableRowActions>
                   <DataTableMenuItem
-                    data-testid="pricing-edit-entry"
+                    data-testid="unified-edit"
                     @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                    @select="openEdit(price)"
+                    @select="openEdit(model)"
                   >
                     {{ t('common.edit') }}
                   </DataTableMenuItem>
                   <DataTableMenuSeparator />
                   <DataTableMenuItem
                     danger
-                    data-testid="pricing-delete-entry"
+                    data-testid="unified-delete"
                     @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                    @select="openDelete(price)"
+                    @select="openDelete(model)"
                   >
                     {{ t('common.delete') }}
                   </DataTableMenuItem>
                 </DataTableRowActions>
               </TableCell>
             </TableRow>
-            <TableRow v-if="filteredPrices.length === 0">
-              <TableCell :colspan="7" class="h-24 whitespace-normal">
-                <EmptyState :title="t('common.emptyList')">
+            <TableRow v-if="filtered.length === 0">
+              <TableCell :colspan="5" class="h-24 whitespace-normal">
+                <EmptyState :title="t('models.unifiedEmpty')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
-                    {{ t('pricing.createEntry') }}
+                    {{ t('models.unifiedCreate') }}
                   </button>
                 </EmptyState>
               </TableCell>
@@ -277,13 +276,13 @@ function formatOptionalMicros(value: number | null): string {
       </DataTable>
       <DataTableBulkBar
         :count="selection.count.value"
-        data-testid="pricing-bulk-bar"
+        data-testid="unified-bulk-bar"
         @clear="selection.clear"
       >
         <button
           type="button"
           class="btn btn-danger-filled bulk-bar__delete"
-          data-testid="pricing-bulk-delete"
+          data-testid="unified-bulk-delete"
           @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
           @click="openBulkDelete"
         >
@@ -293,9 +292,10 @@ function formatOptionalMicros(value: number | null): string {
     </div>
 
     <template v-for="(win, index) in windows" :key="win.id">
-      <PriceEditorWindow
+      <UnifiedEditorWindow
         v-if="win.payload.kind === 'editor'"
-        :initial="win.payload.price"
+        :initial="win.payload.model"
+        :member-options="memberOptions"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"
@@ -307,25 +307,25 @@ function formatOptionalMicros(value: number | null): string {
       />
       <ConfirmWindow
         v-else-if="win.payload.kind === 'delete'"
-        :title="t('pricing.deleteTitle')"
-        :message="t('pricing.deleteMessage', { name: win.payload.price.model })"
+        :title="t('models.unifiedDeleteTitle')"
+        :message="t('models.unifiedDeleteMessage', { name: win.payload.model.id })"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"
         :attention="win.attention"
         :topmost="win.id === topmostId"
         :error="deleteErrors[win.id] ?? ''"
-        :busy="deletingModel === win.payload.price.model"
-        confirm-test-id="pricing-delete-confirm"
+        :busy="deletingId === win.payload.model.id"
+        confirm-test-id="unified-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
-        @confirm="deleteMutation.mutate(win.payload.price.model)"
+        @confirm="deleteMutation.mutate(win.payload.model.id)"
       />
       <ConfirmWindow
         v-else
-        :title="t('pricing.bulkDeleteTitle')"
-        :message="t('pricing.bulkDeleteMessage', { count: selection.count.value })"
+        :title="t('models.unifiedBulkDeleteTitle')"
+        :message="t('models.unifiedBulkDeleteMessage', { count: selection.count.value })"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"
@@ -333,7 +333,7 @@ function formatOptionalMicros(value: number | null): string {
         :topmost="win.id === topmostId"
         :error="bulkDelete.error.value"
         :busy="bulkDelete.isPending.value"
-        confirm-test-id="pricing-bulk-delete-confirm"
+        confirm-test-id="unified-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"

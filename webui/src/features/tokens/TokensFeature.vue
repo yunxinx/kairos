@@ -315,6 +315,7 @@ function openBulkDelete() {
               </div>
             </TableHead>
             <TableHead class="min-w-44">{{ t('tokens.name') }}</TableHead>
+            <TableHead>{{ t('tokens.modelGroup') }}</TableHead>
             <TableHead class="min-w-56">{{ t('tokens.key') }}</TableHead>
             <TableHead>{{ t('tokens.quota') }}</TableHead>
             <TableHead align="center">{{ t('tokens.status') }}</TableHead>
@@ -324,7 +325,7 @@ function openBulkDelete() {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="9" />
           <template v-else>
             <TableRow
               v-for="token in filteredTokens"
@@ -339,6 +340,9 @@ function openBulkDelete() {
                 @toggle="selection.toggle(token.token_key)"
               />
               <TableCell class="font-medium">{{ token.name }}</TableCell>
+              <TableCell class="font-mono text-sm" data-testid="token-model-group">
+                {{ token.model_group }}
+              </TableCell>
               <TableCell>
                 <span class="inline-flex items-center gap-1">
                   <code class="code-chip rounded px-2 py-0.5 font-mono text-xs">
@@ -434,7 +438,7 @@ function openBulkDelete() {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredTokens.length === 0">
-              <TableCell :colspan="8" class="h-24 whitespace-normal">
+              <TableCell :colspan="9" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('tokens.create') }}

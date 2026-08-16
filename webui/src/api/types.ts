@@ -81,6 +81,19 @@ export interface Price {
   cache_write_micros: number | null;
 }
 
+/** 模型组：令牌的可调用名允许名单。 */
+export interface ModelGroup {
+  name: string;
+  models: string[];
+}
+
+/** 统一模型：一个下游可调用名，按顺序尝试若干已登记模型。 */
+export interface UnifiedModel {
+  id: string;
+  models: string[];
+  hide: boolean;
+}
+
 /** 运行时设置。 */
 export interface Settings {
   full_body: boolean;

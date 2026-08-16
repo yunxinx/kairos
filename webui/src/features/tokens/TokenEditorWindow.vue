@@ -2,7 +2,7 @@
 // 令牌编辑器浮窗：定义字段 + 启用开关 + 余额调整（充值/扣减并入编辑）。
 // 每个实例自持草稿，向窗口栈上报脏状态以供淘汰判定。
 import { useId, computed, ref, watch } from 'vue';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { Token, TokenCreate } from '@/api/types';
@@ -12,8 +12,10 @@ import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
+import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { formatUsdAmount, parseUsdToMicros } from '@/lib/format';
+import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -44,12 +46,18 @@ const { t } = useI18n();
 
 const uid = useId();
 const nameInputId = `token-editor-name-${uid}`;
+const groupInputId = `token-editor-group-${uid}`;
 const limitInputId = `token-editor-limit-${uid}`;
 const enabledInputId = `token-editor-enabled-${uid}`;
 const amountInputId = `token-editor-amount-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
+
+const groupsQuery = useQuery({
+  queryKey: ['model-groups'],
+  queryFn: () => apiClient.listModelGroups(),
+});
 
 const initialKey = props.initial ? props.initial.token_key : '';
 const initialName = props.initial ? props.initial.name : '';
@@ -58,11 +66,24 @@ const initialLimit =
     ? formatUsdAmount(props.initial.limit_usd_micros)
     : '';
 const initialEnabled = props.initial ? props.initial.enabled : true;
+const initialGroup = props.initial ? props.initial.model_group : DEFAULT_MODEL_GROUP;
 
 const editorName = ref(initialName);
 const editorLimit = ref(initialLimit);
 const editorEnabled = ref(initialEnabled);
+const editorGroup = ref(initialGroup);
 const editorError = ref('');
+
+const groupOptions = computed(() => {
+  const listed = groupsQuery.data.value ?? [];
+  const names = listed.map((group) => group.name);
+  if (!names.includes(editorGroup.value)) {
+    return [{ value: editorGroup.value, label: editorGroup.value }].concat(
+      names.map((name) => ({ value: name, label: name })),
+    );
+  }
+  return names.map((name) => ({ value: name, label: name }));
+});
 
 // 余额编辑：仅编辑已有令牌时可用。计算器语义——输入框是基数（可直接改为目标余额），
 // 快捷档位累计成右侧差额，`=` 后预览结果，保存时一并生效。
@@ -76,6 +97,7 @@ const dirty = computed(
     editorName.value !== initialName ||
     editorLimit.value !== initialLimit ||
     editorEnabled.value !== initialEnabled ||
+    editorGroup.value !== initialGroup ||
     editorAmount.value !== formatUsdAmount(displayedBalance.value) ||
     quickDelta.value !== 0,
 );
@@ -156,7 +178,7 @@ function handleSave() {
   if (props.initial === null) {
     saveMutation.mutate({
       kind: 'create',
-      body: { name, limit_usd_micros: limit, enabled, model_group: 'default' },
+      body: { name, limit_usd_micros: limit, enabled, model_group: editorGroup.value },
     });
   } else {
     saveMutation.mutate({
@@ -166,7 +188,7 @@ function handleSave() {
         name,
         limit_usd_micros: limit,
         enabled,
-        model_group: props.initial.model_group,
+        model_group: editorGroup.value,
       },
     });
   }
@@ -208,6 +230,19 @@ function applyQuick(deltaUsd: number) {
               v-on="fieldInputHandlers('name')"
             />
           </template>
+        </FormField>
+        <FormField
+          field-name="modelGroup"
+          :label="t('tokens.modelGroup')"
+          :input-id="groupInputId"
+          :guide="t('tokens.modelGroupGuide')"
+        >
+          <UiSelect
+            :id="groupInputId"
+            v-model="editorGroup"
+            :options="groupOptions"
+            data-testid="token-editor-group"
+          />
         </FormField>
         <FormField
           field-name="limit"

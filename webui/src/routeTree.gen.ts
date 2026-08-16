@@ -14,6 +14,7 @@ import { Route as SplatRouteImport } from './routes/$'
 import { Route as ChannelRouteImport } from './routes/channel'
 import { Route as ConfigRouteImport } from './routes/config'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as ModelsRouteImport } from './routes/models'
 import { Route as OverviewRouteImport } from './routes/overview'
 import { Route as PricingRouteImport } from './routes/pricing'
 import { Route as RequestsRouteImport } from './routes/requests'
@@ -44,6 +45,11 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ModelsRoute = ModelsRouteImport.update({
+  id: '/models',
+  path: '/models',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const OverviewRoute = OverviewRouteImport.update({
   id: '/overview',
   path: '/overview',
@@ -71,6 +77,7 @@ export interface FileRoutesByFullPath {
   '/channel': typeof ChannelRoute
   '/config': typeof ConfigRoute
   '/login': typeof LoginRoute
+  '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
   '/pricing': typeof PricingRoute
   '/requests': typeof RequestsRoute
@@ -82,6 +89,7 @@ export interface FileRoutesByTo {
   '/channel': typeof ChannelRoute
   '/config': typeof ConfigRoute
   '/login': typeof LoginRoute
+  '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
   '/pricing': typeof PricingRoute
   '/requests': typeof RequestsRoute
@@ -94,6 +102,7 @@ export interface FileRoutesById {
   '/channel': typeof ChannelRoute
   '/config': typeof ConfigRoute
   '/login': typeof LoginRoute
+  '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
   '/pricing': typeof PricingRoute
   '/requests': typeof RequestsRoute
@@ -107,6 +116,7 @@ export interface FileRouteTypes {
     | '/channel'
     | '/config'
     | '/login'
+    | '/models'
     | '/overview'
     | '/pricing'
     | '/requests'
@@ -118,6 +128,7 @@ export interface FileRouteTypes {
     | '/channel'
     | '/config'
     | '/login'
+    | '/models'
     | '/overview'
     | '/pricing'
     | '/requests'
@@ -129,6 +140,7 @@ export interface FileRouteTypes {
     | '/channel'
     | '/config'
     | '/login'
+    | '/models'
     | '/overview'
     | '/pricing'
     | '/requests'
@@ -141,6 +153,7 @@ export interface RootRouteChildren {
   ChannelRoute: typeof ChannelRoute
   ConfigRoute: typeof ConfigRoute
   LoginRoute: typeof LoginRoute
+  ModelsRoute: typeof ModelsRoute
   OverviewRoute: typeof OverviewRoute
   PricingRoute: typeof PricingRoute
   RequestsRoute: typeof RequestsRoute
@@ -184,6 +197,13 @@ declare module '@tanstack/vue-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/models': {
+      id: '/models'
+      path: '/models'
+      fullPath: '/models'
+      preLoaderRoute: typeof ModelsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/overview': {
       id: '/overview'
       path: '/overview'
@@ -221,6 +241,7 @@ const rootRouteChildren: RootRouteChildren = {
   ChannelRoute: ChannelRoute,
   ConfigRoute: ConfigRoute,
   LoginRoute: LoginRoute,
+  ModelsRoute: ModelsRoute,
   OverviewRoute: OverviewRoute,
   PricingRoute: PricingRoute,
   RequestsRoute: RequestsRoute,

@@ -8,7 +8,16 @@ const adminPort = process.env.KAIROS_E2E_ADMIN_PORT ?? '8788';
 const adminTarget = `http://127.0.0.1:${adminPort}`;
 
 /** 管理 API 路径（无 `/api` 前缀）；dev server 代理到本地管理监听。 */
-const adminApiPrefixes = ['/tokens', '/channels', '/prices', '/settings', '/logs', '/stats'];
+const adminApiPrefixes = [
+  '/tokens',
+  '/channels',
+  '/prices',
+  '/model-groups',
+  '/unified-models',
+  '/settings',
+  '/logs',
+  '/stats',
+];
 
 export default defineConfig({
   plugins: [

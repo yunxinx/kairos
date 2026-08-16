@@ -374,9 +374,9 @@ test.describe('channel manual model add', () => {
       expect(beforeSave.status).toBe(503);
       expect(beforeSave.message).toContain('渠道');
 
-      await page.goto('/pricing');
+      await page.goto('/models');
       await expect(
-        page.locator(`[data-testid="price-row"][data-price-model="${manualId}"]`),
+        page.locator(`[data-testid="inventory-row"][data-model="${manualId}"]`),
       ).toHaveCount(0);
 
       await page.goto('/channel');
@@ -418,9 +418,10 @@ test.describe('channel manual model add', () => {
       expect(stillDraft.message).toContain('渠道');
 
       await page.getByTestId('channel-save').click();
-      expect(await savedChannelModels(page, channelName)).toEqual(
-        expect.arrayContaining([manualId]),
-      );
+      await expect(page.getByTestId('channel-form')).toHaveCount(0);
+      await expect
+        .poll(() => savedChannelModels(page, channelName))
+        .toEqual(expect.arrayContaining([manualId]));
       const afterSave = await chatCompletionsStatus(page, token.token_key, manualId);
       expect(afterSave.status).toBe(503);
       expect(afterSave.message).toContain('价格');
@@ -443,10 +444,10 @@ test.describe('channel manual model add', () => {
       ).toBeVisible();
       await page.getByTestId('channel-save').click();
 
-      await page.goto('/pricing');
-      await expect(
-        page.locator(`[data-testid="price-row"][data-price-model="${manualId}"]`),
-      ).toHaveCount(0);
+      await page.goto('/models');
+      const unpriced = page.locator(`[data-testid="inventory-row"][data-model="${manualId}"]`);
+      await expect(unpriced).toBeVisible();
+      await expect(unpriced.getByTestId('inventory-unpriced')).toBeVisible();
 
       await page.goto('/channel');
       await page.getByRole('button', { name: '中 / EN' }).click();
