@@ -1,8 +1,8 @@
 //! 计费：四档价格快照与费用计算，全程整数 micro-USD（ADR-0002）。
 //!
 //! 价格表经管理 API 维护，库内以「每 1M tokens 的 micro-USD」整数存储；费用
-//! 计算只做整数乘除。缓存档缺省时回退 `input` 价；reasoning tokens 不单独计价
-//! （计入 output，已在 usage 折算）。不为媒体内容引入新计价维度。
+//! 计算只做整数乘除。缓存档缺省时该档为 0，不回退 `input`；reasoning tokens
+//! 不单独计价（计入 output，已在 usage 折算）。不为媒体内容引入新计价维度。
 
 use crate::core::ir::Usage;
 use crate::store::resources::Price;
@@ -17,13 +17,13 @@ pub struct PriceSnapshot {
 }
 
 impl PriceSnapshot {
-    /// 从库加载的价格行构造快照；缓存档 `None`（未配置）时回退 `input` 价。
+    /// 从库加载的价格行构造快照；缓存档 `None`（未配置）时该档为 0。
     pub fn from_store_price(price: &Price) -> Self {
         Self {
             input_micros: price.input_micros,
             output_micros: price.output_micros,
-            cache_read_micros: price.cache_read_micros.unwrap_or(price.input_micros),
-            cache_write_micros: price.cache_write_micros.unwrap_or(price.input_micros),
+            cache_read_micros: price.cache_read_micros.unwrap_or(0),
+            cache_write_micros: price.cache_write_micros.unwrap_or(0),
         }
     }
 }
@@ -83,15 +83,18 @@ mod tests {
         );
     }
 
-    /// 缓存档缺省时回退 input 价。
+    /// 缓存档缺省时该档为 0，有 cache token 也不按 input 计价。
     #[test]
-    fn cache_tier_falls_back_to_input_price() {
+    fn unconfigured_cache_tier_is_zero() {
         let price = PriceSnapshot::from_store_price(&price(2_500_000, 10_000_000, None, None));
-        assert_eq!(price.cache_read_micros, price.input_micros);
-        assert_eq!(price.cache_write_micros, price.input_micros);
-        // 只计 cache_read：1M cache tokens × input 价 2.5 → 2.5M 微元。
+        assert_eq!(price.cache_read_micros, 0);
+        assert_eq!(price.cache_write_micros, 0);
+        // 1M cache_read tokens × 未配置档 0 → 0 微元，不按 input 2.5 计价。
         let u = usage(0, 0, 1_000_000, 0);
-        assert_eq!(cost_micros(&u, &price), 2_500_000);
+        assert_eq!(cost_micros(&u, &price), 0);
+        // cache_write 同样：有 token 也不按 input 计价。
+        let u = usage(0, 0, 0, 1_000_000);
+        assert_eq!(cost_micros(&u, &price), 0);
     }
 
     /// 混合用量按各自档位累加，结果精确为整数微元。
@@ -123,7 +126,7 @@ mod tests {
         assert_eq!(cost_micros(&u, &price), 150_000);
     }
 
-    /// 快照构造不依赖 JSON 序列化，且缓存档回退确定。
+    /// 快照构造不依赖 JSON 序列化，且缓存档缺省为 0 确定。
     #[test]
     fn snapshot_is_deterministic() {
         let a = PriceSnapshot::from_store_price(&price(

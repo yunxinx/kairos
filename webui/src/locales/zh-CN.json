@@ -249,7 +249,7 @@
     "cacheRead": "缓存读",
     "cacheWrite": "缓存写",
     "usdGuide": "每 1M tokens 的美元单价，最多六位小数。",
-    "optionalUsdGuide": "可选。留空则回退到输入单价。",
+    "optionalUsdGuide": "可选。留空则该档不计价。",
     "deleteTitle": "删除价格",
     "deleteMessage": "确定删除「{name}」的价格？删除后不可恢复。",
     "bulkDeleteTitle": "删除价格",

@@ -126,9 +126,9 @@ async fn failed_request_is_not_charged() {
     assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
 }
 
-/// 缓存档缺省时回退 input 价（用仅配置 input/output 的价格）。
+/// 缓存档缺省时该档不计费（用仅配置 input/output 的价格）。
 #[tokio::test]
-async fn cache_tier_falls_back_to_input_price() {
+async fn unconfigured_cache_tier_is_not_charged() {
     let mut gw = TestGateway::start_with(|base| {
         let mut seed = common::test_seed(base);
         seed.prices = vec![Price {
@@ -141,7 +141,7 @@ async fn cache_tier_falls_back_to_input_price() {
         seed
     })
     .await;
-    // 只计 cache_read：1M cache tokens × input 价 2.5 → 2.5M 微元。
+    // 有 cache token 也不按 input 计价：input=0（prompt 全是 cached），cache_read=1M → 费用 0。
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(ok_response(json!({
             "prompt_tokens": 1_000_000, "completion_tokens": 0, "total_tokens": 1_000_000,
@@ -151,11 +151,22 @@ async fn cache_tier_falls_back_to_input_price() {
     let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    assert_eq!(
-        balance_micros(&gw, TEST_TOKEN_KEY).await,
-        5_000_000 - 2_500_000
-    );
-    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 2_500_000);
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
+    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
+
+    let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT cache_read_tokens, cost_usd_micros, \
+                cache_read_price_usd_micros, cache_write_price_usd_micros, input_price_usd_micros \
+         FROM request_log",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应落一条日志");
+    assert_eq!(row.0, 1_000_000);
+    assert_eq!(row.1, 0);
+    assert_eq!(row.2, 0);
+    assert_eq!(row.3, 0);
+    assert_eq!(row.4, 2_500_000);
 }
 
 /// 余额不足（初始余额 0）准入时被拒绝：402 + OpenAI 错误格式。

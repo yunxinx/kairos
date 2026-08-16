@@ -69,7 +69,7 @@ pub struct TokenRecord {
     pub last_used_at: Option<i64>,
 }
 
-/// 单模型四档单价（micro-USD / 1M tokens）；缓存档 `None` 表示回退 input 价。
+/// 单模型四档单价（micro-USD / 1M tokens）；缓存档 `None` 表示该档不计价。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Price {
