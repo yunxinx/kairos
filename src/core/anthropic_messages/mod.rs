@@ -1794,6 +1794,30 @@ pub fn encode_error(status: u16, message: &str) -> Value {
     })
 }
 
+/// 编码为 Anthropic `GET /v1/models` 列表。
+///
+/// `display_name` 与 `id` 相同；`created_at` 未知时用 epoch（官方允许）。
+/// 本网关一次返回全部可见 ID，`has_more` 恒为 false。
+pub fn encode_model_list(ids: &[String]) -> Value {
+    let data: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "type": "model",
+                "display_name": id,
+                "created_at": "1970-01-01T00:00:00Z",
+            })
+        })
+        .collect();
+    json!({
+        "data": data,
+        "has_more": false,
+        "first_id": ids.first(),
+        "last_id": ids.last(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2385,5 +2409,14 @@ mod tests {
 
         let err = encode_error(500, "boom");
         assert_eq!(err["error"]["type"], "api_error");
+    }
+
+    /// 模型列表编码对齐官方 `GET /v1/models` 黄金样例。
+    #[test]
+    fn model_list_fixture_matches_wire() {
+        let raw = include_str!("__fixtures__/model_list.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let encoded = encode_model_list(&["fast".to_string(), "gpt-4o".to_string()]);
+        assert_eq!(encoded, wire, "列表编码应与黄金样例一致");
     }
 }

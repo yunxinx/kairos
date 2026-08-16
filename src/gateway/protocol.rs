@@ -88,6 +88,15 @@ pub fn encode_error(status: u16, message: &str, protocol: Protocol) -> Value {
     }
 }
 
+/// 编码下游模型列表为入站协议的标准列出模型响应。
+pub fn encode_model_list(ids: &[String], protocol: Protocol) -> Value {
+    match protocol {
+        Protocol::OpenAiChat => crate::core::openai_chat::encode_model_list(ids),
+        Protocol::AnthropicMessages => crate::core::anthropic_messages::encode_model_list(ids),
+        Protocol::OpenAiResponses => crate::core::openai_responses::encode_model_list(ids),
+    }
+}
+
 /// 出站渠道的 upstream 路径段（相对 base_url）。
 pub fn upstream_path(protocol: Protocol) -> &'static str {
     match protocol {

@@ -9,7 +9,8 @@
 //! v2 起运行时资源（渠道/令牌/价格/模型组/统一模型/开关）来自 [`crate::runtime::RuntimeSnapshot`]：
 //! 请求在准入时刻抓取一个快照引用，整个请求生命周期只读该引用，不受后续原子
 //! 替换影响。入站请求体上限与 full_body 开关同样来自快照设置。统一模型按成员
-//! 顺序一次只出站一条，该条再走渠道路由；计价按实际打到的成员。
+//! 顺序一次只出站一条，该条再走渠道路由；计价按实际打到的成员。三种入站协议
+//! 的标准模型列表（`GET /v1/models`）按令牌分组与统一模型隐藏过滤。
 
 use std::{sync::Arc, time::Duration};
 
@@ -22,7 +23,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event as SseEvent, Sse},
     },
-    routing::post,
+    routing::{get, post},
 };
 use futures_util::Stream;
 use serde_json::{Value, json};
@@ -79,6 +80,7 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
+        .route("/v1/models", get(list_models))
         .fallback(not_found)
         .layer(DefaultBodyLimit::disable())
         .with_state(deps)
@@ -114,6 +116,51 @@ async fn responses(
     body: axum::body::Bytes,
 ) -> Response {
     handle_request(deps, Protocol::OpenAiResponses, headers, body).await
+}
+
+/// 下游标准模型列表：`GET /v1/models`。
+///
+/// OpenAI Chat Completions 与 Responses 共用官方 Models API（无 `anthropic-version`
+/// 时按 OpenAI list 编码）。带 `anthropic-version` 时按 Anthropic list 编码。
+/// 认证与现有入站协议一致；成功体至少含各可见模型的 `id`。
+async fn list_models(State(deps): State<Deps>, headers: HeaderMap) -> Response {
+    let snapshot = deps.snapshot.read().await.clone();
+    let inbound_protocol = list_models_protocol(&headers);
+    let token = match authenticate(&snapshot, &headers) {
+        Ok(token) => token,
+        Err(err) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                &err.to_string(),
+                &deps,
+                snapshot.full_body,
+                None,
+                None,
+                unix_millis(),
+                inbound_protocol,
+                None,
+            )
+            .await;
+        }
+    };
+    let ids = store::resources::visible_model_ids(
+        &snapshot.model_groups,
+        &snapshot.unified_models,
+        snapshot.channels.iter().map(|record| &record.channel),
+        &token.model_group,
+    );
+    let body = protocol::encode_model_list(&ids, inbound_protocol);
+    Json(body).into_response()
+}
+
+/// 列表接口的入站协议：Anthropic 客户端必带 `anthropic-version`；其余走 OpenAI
+/// Models API（Chat Completions 与 Responses 形状相同）。
+fn list_models_protocol(headers: &HeaderMap) -> Protocol {
+    if headers.contains_key("anthropic-version") {
+        Protocol::AnthropicMessages
+    } else {
+        Protocol::OpenAiChat
+    }
 }
 
 /// 入站端点公共处理：认证 → 解码 → 准入 →（直通快路径 | IR 完整路径）。

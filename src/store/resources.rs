@@ -133,6 +133,42 @@ pub fn group_allows(groups: &HashMap<String, ModelGroup>, group_name: &str, mode
     false
 }
 
+/// 当前令牌在其模型组与统一模型隐藏规则下可见的可调用名（排序后）。
+///
+/// 候选为渠道已登记名、统一模型 ID，以及该组显式名单。隐藏开启且该统一 ID
+/// 对本组可见时，被收进的成员（与统一 ID 同名者除外）从列表拿掉；调用准入
+/// 仍只看 [`group_allows`]，隐藏不额外拦调用。
+pub fn visible_model_ids<'a>(
+    groups: &HashMap<String, ModelGroup>,
+    unified_models: &HashMap<String, UnifiedModel>,
+    channels: impl IntoIterator<Item = &'a Channel>,
+    group_name: &str,
+) -> Vec<String> {
+    let mut names = registered_callable_names(channels);
+    names.extend(unified_models.keys().cloned());
+    if let Some(group) = groups.get(group_name) {
+        names.extend(group.models.iter().cloned());
+    }
+    names.retain(|name| group_allows(groups, group_name, name));
+
+    let hidden_members: HashSet<String> = unified_models
+        .values()
+        .filter(|model| model.hide && names.contains(&model.id))
+        .flat_map(|model| {
+            model
+                .models
+                .iter()
+                .filter(|member| *member != &model.id)
+                .cloned()
+        })
+        .collect();
+    names.retain(|name| !hidden_members.contains(name));
+
+    let mut ids: Vec<String> = names.into_iter().collect();
+    ids.sort();
+    ids
+}
+
 /// 令牌的完整只读视图：定义字段 + 生命周期元数据（创建/最后使用时间）。
 ///
 /// 生命周期字段由存储层维护，不属于可写契约，故不派生 serde。
@@ -1066,6 +1102,50 @@ mod tests {
             "also-in-default"
         ));
         assert!(!group_allows(&groups, "ghost", "fast"));
+    }
+
+    /// 列表随组过滤；隐藏拿掉被收进成员、保留统一 ID；组外名字不出现。
+    #[test]
+    fn visible_model_ids_filters_group_and_hide() {
+        let channel = sample_channel();
+        let mut groups = HashMap::new();
+        groups.insert(
+            DEFAULT_MODEL_GROUP.to_string(),
+            ModelGroup {
+                name: DEFAULT_MODEL_GROUP.to_string(),
+                models: vec![],
+            },
+        );
+        groups.insert(
+            "coding".to_string(),
+            ModelGroup {
+                name: "coding".to_string(),
+                models: vec!["gpt-4o".to_string(), "coding".to_string()],
+            },
+        );
+        let mut unified = HashMap::new();
+        unified.insert(
+            "coding".to_string(),
+            UnifiedModel {
+                id: "coding".to_string(),
+                models: vec!["gpt-4o".to_string()],
+                hide: true,
+            },
+        );
+
+        let default_ids = visible_model_ids(&groups, &unified, [&channel], DEFAULT_MODEL_GROUP);
+        assert_eq!(default_ids, vec!["fast", "gpt-4o-mini"]);
+
+        let coding_ids = visible_model_ids(&groups, &unified, [&channel], "coding");
+        assert_eq!(coding_ids, vec!["coding"]);
+        assert!(
+            !coding_ids.iter().any(|id| id == "gpt-4o"),
+            "隐藏后被收进模型不出现在列表"
+        );
+        assert!(
+            !coding_ids.iter().any(|id| id == "fast"),
+            "组外模型不出现在列表"
+        );
     }
 
     /// 已登记名 = 各渠道 models ∪ 别名 key；禁用渠道仍计入。

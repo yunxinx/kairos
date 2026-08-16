@@ -2147,6 +2147,21 @@ pub fn encode_error(status: u16, message: &str) -> Value {
         }
     })
 }
+
+/// 编码为 OpenAI `GET /v1/models` 列表（Responses 与 Chat Completions 共用 Models API）。
+/// `created` 未知时为 0。
+pub fn encode_model_list(ids: &[String]) -> Value {
+    json!({
+        "object": "list",
+        "data": ids.iter().map(|id| json!({
+            "id": id,
+            "object": "model",
+            "created": 0,
+            "owned_by": "kairos",
+        })).collect::<Vec<_>>(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2581,5 +2596,14 @@ mod tests {
                 "{feature} 丢弃应记 warning"
             );
         }
+    }
+
+    /// 模型列表编码对齐官方 `GET /v1/models` 黄金样例。
+    #[test]
+    fn model_list_fixture_matches_wire() {
+        let raw = include_str!("__fixtures__/model_list.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let encoded = encode_model_list(&["fast".to_string(), "gpt-4o".to_string()]);
+        assert_eq!(encoded, wire, "列表编码应与黄金样例一致");
     }
 }
