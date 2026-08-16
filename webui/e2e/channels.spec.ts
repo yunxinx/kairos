@@ -1,6 +1,36 @@
 import { authedTest as test, expect } from './fixtures';
+import { E2E_ADMIN_KEY, E2E_PROTOCOL_PORT } from './helpers/gateway';
 import { clickRowAction } from './helpers/table';
 import { startProbeUpstream } from './helpers/upstream';
+
+/** 读已保存渠道的模型清单；渠道不存在时返回 undefined。 */
+async function savedChannelModels(
+  page: import('@playwright/test').Page,
+  name: string,
+): Promise<string[] | undefined> {
+  const resp = await page.request.get('/channels', {
+    headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+  });
+  const channels = (await resp.json()) as Array<{ name: string; models: string[] }>;
+  return channels.find((item) => item.name === name)?.models;
+}
+
+/** 用指定令牌请求协议面；未定价/无渠道时网关返回 503。 */
+async function chatCompletionsStatus(
+  page: import('@playwright/test').Page,
+  tokenKey: string,
+  model: string,
+): Promise<{ status: number; message: string }> {
+  const resp = await page.request.post(
+    `http://127.0.0.1:${E2E_PROTOCOL_PORT}/v1/chat/completions`,
+    {
+      headers: { Authorization: `Bearer ${tokenKey}` },
+      data: { model, messages: [{ role: 'user', content: 'hi' }] },
+    },
+  );
+  const body = (await resp.json()) as { error?: { message?: string } };
+  return { status: resp.status(), message: body.error?.message ?? '' };
+}
 
 test.describe.configure({ mode: 'serial' });
 
@@ -279,6 +309,159 @@ test.describe('channel resource page', () => {
       await okUpstream.close();
       await failUpstream.close();
       await errUpstream.close();
+    }
+  });
+});
+
+test.describe('channel manual model add', () => {
+  test('adds a trimmed id to the draft, rejects empty/duplicate/alias, and keeps it across sync', async ({
+    page,
+  }) => {
+    const upstream = await startProbeUpstream(200, { models: ['gpt-4o-mini'] });
+    const channelName = 'manual-add-channel';
+    const manualId = 'manual-only-id';
+    try {
+      const tokenResp = await page.request.post('/tokens', {
+        headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+        data: { name: 'manual-add-token', limit_usd_micros: null, enabled: true },
+      });
+      expect(tokenResp.ok()).toBeTruthy();
+      const token = (await tokenResp.json()) as { token_key: string };
+
+      await page.goto('/channel');
+      await page.getByTestId('create-channel').click();
+      await page.locator('[id^="channel-editor-name"]').fill(channelName);
+      await page.locator('[id^="channel-editor-base-url"]').fill(upstream.baseUrl);
+      await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
+
+      await expect(page.getByTestId('channel-add-model')).toBeVisible();
+      await expect(page.getByTestId('channel-add-model')).toHaveText('Add');
+      await expect(page.getByTestId('channel-models-empty')).toBeVisible();
+      await expect(page.getByTestId('channel-add-model-clear')).toHaveCount(0);
+      await page.getByTestId('channel-add-model-input').fill(manualId);
+      await page.getByTestId('channel-add-model-clear').click();
+      await expect(page.getByTestId('channel-add-model-input')).toHaveValue('');
+      await expect(page.getByTestId('channel-add-model-clear')).toHaveCount(0);
+      await page.getByTestId('channel-add-model-input').fill(manualId);
+      await page.getByTestId('channel-add-model').click();
+      await expect(
+        page.locator(`[data-testid="channel-model-chip"][data-model="${manualId}"]`),
+      ).toBeVisible();
+      await page
+        .locator(`[data-testid="channel-model-chip"][data-model="${manualId}"]`)
+        .getByTestId('channel-model-remove')
+        .click();
+      await expect(page.getByTestId('channel-models-empty')).toBeVisible();
+
+      await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
+      const miniRow = page.locator('[data-testid="channel-sync-row"][data-model="gpt-4o-mini"]');
+      await miniRow.getByTestId('channel-sync-alias-input').fill('mini');
+      await miniRow.getByTestId('channel-sync-checkbox').click();
+      await page.getByTestId('channel-sync-back').click();
+      await page.getByTestId('channel-save').click();
+
+      const channelRow = page.locator(
+        `[data-testid="channel-row"][data-channel-name="${channelName}"]`,
+      );
+      await expect(channelRow).toBeVisible();
+      expect(await savedChannelModels(page, channelName)).toEqual(
+        expect.arrayContaining(['gpt-4o-mini', 'mini']),
+      );
+      expect(await savedChannelModels(page, channelName)).not.toContain(manualId);
+
+      const beforeSave = await chatCompletionsStatus(page, token.token_key, manualId);
+      expect(beforeSave.status).toBe(503);
+      expect(beforeSave.message).toContain('渠道');
+
+      await page.goto('/pricing');
+      await expect(
+        page.locator(`[data-testid="price-row"][data-price-model="${manualId}"]`),
+      ).toHaveCount(0);
+
+      await page.goto('/channel');
+      await channelRow.getByTestId('channel-edit').click();
+
+      await page.getByTestId('channel-add-model').click();
+      await expect(page.locator('[data-form-field="addModel"]')).toContainText('Enter a model ID');
+
+      await page.getByTestId('channel-add-model-input').fill('   ');
+      await page.getByTestId('channel-add-model').click();
+      await expect(page.locator('[data-form-field="addModel"]')).toContainText('Enter a model ID');
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
+
+      await page.getByTestId('channel-add-model-input').fill('gpt-4o-mini');
+      await page.getByTestId('channel-add-model').click();
+      await expect(page.locator('[data-form-field="addModel"]')).toContainText(
+        'Already in the list',
+      );
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
+
+      await page.getByTestId('channel-add-model-input').fill('mini');
+      await page.getByTestId('channel-add-model').click();
+      await expect(page.locator('[data-form-field="addModel"]')).toContainText(
+        'This ID is already an alias',
+      );
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
+
+      await page.getByTestId('channel-add-model-input').fill(`  ${manualId}  `);
+      await page.getByTestId('channel-add-model').click();
+      await expect(
+        page.locator(`[data-testid="channel-model-chip"][data-model="${manualId}"]`),
+      ).toBeVisible();
+      await expect(page.getByTestId('channel-model-count')).toHaveText('3');
+      await expect(page.getByTestId('channel-add-model-input')).toHaveValue('');
+
+      expect(await savedChannelModels(page, channelName)).not.toContain(manualId);
+      const stillDraft = await chatCompletionsStatus(page, token.token_key, manualId);
+      expect(stillDraft.status).toBe(503);
+      expect(stillDraft.message).toContain('渠道');
+
+      await page.getByTestId('channel-save').click();
+      expect(await savedChannelModels(page, channelName)).toEqual(
+        expect.arrayContaining([manualId]),
+      );
+      const afterSave = await chatCompletionsStatus(page, token.token_key, manualId);
+      expect(afterSave.status).toBe(503);
+      expect(afterSave.message).toContain('价格');
+
+      await channelRow.getByTestId('channel-edit').click();
+      await expect(
+        page.locator(`[data-testid="channel-model-chip"][data-model="${manualId}"]`),
+      ).toBeVisible();
+
+      await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
+      const manualSyncRow = page.locator(
+        `[data-testid="channel-sync-row"][data-model="${manualId}"]`,
+      );
+      await expect(manualSyncRow).toBeVisible();
+      await expect(manualSyncRow.getByTestId('channel-sync-status-selected')).toBeVisible();
+      await page.getByTestId('channel-sync-back').click();
+      await expect(
+        page.locator(`[data-testid="channel-model-chip"][data-model="${manualId}"]`),
+      ).toBeVisible();
+      await page.getByTestId('channel-save').click();
+
+      await page.goto('/pricing');
+      await expect(
+        page.locator(`[data-testid="price-row"][data-price-model="${manualId}"]`),
+      ).toHaveCount(0);
+
+      await page.goto('/channel');
+      await page.getByRole('button', { name: '中 / EN' }).click();
+      await channelRow.getByTestId('channel-edit').click();
+      await expect(page.getByTestId('channel-add-model')).toHaveText('添加');
+      await page.getByTestId('channel-add-model').click();
+      await expect(page.locator('[data-form-field="addModel"]')).toContainText('请输入模型 ID');
+      await page.getByTestId('channel-add-model-input').fill(manualId);
+      await page.getByTestId('channel-add-model').click();
+      await expect(page.locator('[data-form-field="addModel"]')).toContainText('已在清单中');
+      await page.getByTestId('channel-add-model-input').fill('mini');
+      await page.getByTestId('channel-add-model').click();
+      await expect(page.locator('[data-form-field="addModel"]')).toContainText('已是别名');
+    } finally {
+      await upstream.close();
     }
   });
 });

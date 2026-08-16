@@ -2,8 +2,9 @@
 // 渠道编辑器浮窗：每个实例自持草稿，向窗口栈上报脏状态以供淘汰判定。
 // 模型清单以 chip 呈现（点击复制、可删除、自然排序）：带别名的主模型与别名本体
 // 以别名色底区分，悬浮提示互指；删别名清空映射，删主模型名保留别名（同步视图
-// 以「仅别名生效」呈现）。「设置模型」切换到 ChannelModelSync 表格视图，
-// 点「保存并返回」把勾选模型与别名映射写回草稿，保存仍走表单页签的既有流程。
+// 以「仅别名生效」呈现）。清单下方可手动输入模型 ID 追加进草稿；「设置模型」
+// 切换到 ChannelModelSync 表格视图，点「保存并返回」把勾选模型与别名映射写回
+// 草稿，保存仍走表单页签的既有流程。
 import { useId, computed, onUnmounted, ref, useTemplateRef, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
@@ -78,9 +79,11 @@ const apiKeyInputId = `channel-editor-api-key-${uid}`;
 const timeoutMsInputId = `channel-editor-timeout-ms-${uid}`;
 const maxRetriesInputId = `channel-editor-max-retries-${uid}`;
 const enabledInputId = `channel-editor-enabled-${uid}`;
+const addModelInputId = `channel-editor-add-model-${uid}`;
 
 const queryClient = useQueryClient();
-const { activeError, fieldError, fieldInputHandlers, validate } = useFormValidation();
+const { activeError, fieldError, fieldInputHandlers, showFieldError, dismissError, validate } =
+  useFormValidation();
 
 const protocolOptions = computed(() =>
   PROTOCOLS.map((value) => ({
@@ -112,6 +115,8 @@ const editorTimeoutMs = ref(initialValues.timeoutMs);
 const editorMaxRetries = ref(initialValues.maxRetries);
 const editorEnabled = ref(initialValues.enabled);
 const editorError = ref('');
+/** 手动添加模型 ID 的输入草稿；点添加后 trim 写入 `editorModels`。 */
+const addModelDraft = ref('');
 
 const dirty = computed(
   () =>
@@ -186,6 +191,31 @@ function removeChip(chip: ModelChip) {
   editorAliasesMap.value = Object.fromEntries(
     Object.entries(editorAliasesMap.value).filter(([alias]) => alias !== chip.name),
   );
+}
+
+/** 把 trim 后的 ID 追加进草稿清单。别名 key 同时在 `models` 里，先判「已是别名」。 */
+function addModel() {
+  const id = addModelDraft.value.trim();
+  if (id === '') {
+    showFieldError('addModel', t('channel.addModelEmpty'));
+    return;
+  }
+  if (Object.hasOwn(editorAliasesMap.value, id)) {
+    showFieldError('addModel', t('channel.addModelIsAlias'));
+    return;
+  }
+  if (editorModels.value.includes(id)) {
+    showFieldError('addModel', t('channel.addModelDuplicate'));
+    return;
+  }
+  dismissError();
+  editorModels.value = [...editorModels.value, id];
+  addModelDraft.value = '';
+}
+
+/** 有内容时才显示叉号；mousedown.prevent 避免抢焦点，与搜索框清除同一套交互。 */
+function clearAddModelDraft() {
+  addModelDraft.value = '';
 }
 
 // --- chip 点击复制模型名 ---
@@ -483,6 +513,51 @@ function handleSave() {
               <p v-else class="text-fg-muted text-xs" data-testid="channel-models-empty">
                 {{ t('channel.modelsEmpty') }}
               </p>
+              <div class="relative mt-1.5" data-form-field="addModel">
+                <div class="flex items-center gap-1.5">
+                  <div class="relative min-w-0 flex-1">
+                    <FormTextInput
+                      :id="addModelInputId"
+                      v-model="addModelDraft"
+                      type="text"
+                      class="input-with-clear font-mono text-xs"
+                      :placeholder="t('channel.addModelPlaceholder')"
+                      :invalid="Boolean(fieldError('addModel'))"
+                      :hint-id="`${addModelInputId}-error`"
+                      :aria-label="t('channel.addModelPlaceholder')"
+                      data-testid="channel-add-model-input"
+                      v-on="fieldInputHandlers('addModel')"
+                      @keydown.enter.prevent="addModel"
+                    />
+                    <button
+                      v-if="addModelDraft"
+                      type="button"
+                      class="search-input-clear top-1/2 -translate-y-1/2"
+                      :aria-label="t('common.clearInput')"
+                      data-testid="channel-add-model-clear"
+                      @mousedown.prevent="clearAddModelDraft"
+                    >
+                      <UiIcon name="close" :size="12" />
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn shrink-0"
+                    data-testid="channel-add-model"
+                    @click="addModel"
+                  >
+                    {{ t('channel.addModel') }}
+                  </button>
+                </div>
+                <p
+                  v-if="fieldError('addModel')"
+                  :id="`${addModelInputId}-error`"
+                  class="form-field-hint"
+                  role="alert"
+                >
+                  {{ fieldError('addModel') }}
+                </p>
+              </div>
             </fieldset>
             <FormField
               field-name="enabled"

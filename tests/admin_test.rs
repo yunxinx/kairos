@@ -515,6 +515,83 @@ async fn channel_and_price_immediate_effect() {
     );
 }
 
+/// 渠道 PUT 追加模型 ID（对应编辑器手动添加并保存）：保存前该 ID 不可路由；
+/// 保存后未定价仍 503；补价后可调。
+#[tokio::test]
+async fn channel_appended_model_unpriced_is_503_then_callable() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body("manual-add", gw.upstream.base_url(), json!(["gpt-4o-mini"])),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let channel_id = created["id"].as_i64().expect("创建应回传库生成的 id");
+
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "manual-only").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "未写入渠道的模型应 503"
+    );
+    let body: Value = resp.json().await.expect("503 响应应可解析");
+    let msg = body["error"]["message"].as_str().expect("消息应为字符串");
+    assert!(msg.contains("渠道"), "保存前应按无渠道拒绝，实际 {msg}");
+
+    let resp = admin_put(
+        &gw,
+        &format!("/channels/{channel_id}"),
+        channel_body(
+            "manual-add",
+            gw.upstream.base_url(),
+            json!(["gpt-4o-mini", "manual-only"]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "manual-only").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "有渠道但无价格应 503"
+    );
+    let body: Value = resp.json().await.expect("503 响应应可解析");
+    let msg = body["error"]["message"].as_str().expect("消息应为字符串");
+    assert!(
+        msg.contains("价格"),
+        "保存后未定价应按无价格拒绝，实际 {msg}"
+    );
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/prices",
+        json!({
+            "model": "manual-only",
+            "input_micros": 150_000,
+            "output_micros": 600_000,
+            "cache_read_micros": null,
+            "cache_write_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "manual-only").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "定价后请求应立即可用"
+    );
+}
+
 /// 渠道改名：按 id 定位的 PUT 携带新 name 即改名，id 保持稳定、即时可路由；
 /// 新名已被占用返回 409，id 不存在返回 404。
 #[tokio::test]

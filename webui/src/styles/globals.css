@@ -1157,6 +1157,10 @@ html[lang='zh-CN'] {
   outline: none;
   box-shadow: var(--focus-ring);
 }
+/* 常规输入框右侧预留清除按钮，与 .search-input-field 的 padding-right 对齐。 */
+.input-with-clear {
+  padding-right: 30px;
+}
 
 /* ── Form field + hint bubble ── */
 .form-field {
