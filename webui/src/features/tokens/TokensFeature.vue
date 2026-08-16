@@ -215,6 +215,7 @@ const toggleMutation = useMutation({
       name: token.name,
       limit_usd_micros: token.limit_usd_micros,
       enabled: !token.enabled,
+      model_group: token.model_group,
     }),
   onSuccess: async () => {
     actionError.value = '';

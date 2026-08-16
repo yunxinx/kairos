@@ -5,13 +5,13 @@
 //! 以静态 `admin_key`（Bearer）认证；`webui/dist` 静态资源与 SPA 回退挂在 fallback
 //! 上、免认证。产物缺失时管理面退化为纯 API。
 //!
-//! 资源 CRUD（令牌/渠道/价格）：写库（事务）→ 原子替换内存快照 → 返回变更后
+//! 资源 CRUD（令牌/渠道/价格/模型组）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
 //! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）、
 //! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）、渠道连通性探测
 //! （`/channels/{id}/test`）与按渠道草稿拉取上游模型列表（`/channels/models`）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -32,7 +32,7 @@ use crate::{
     core::ir::{ChatRequest, ContentPart, Message, Role},
     runtime, store,
     store::StoreError,
-    store::resources::{Channel, ChannelRecord, Price, Settings, Token},
+    store::resources::{Channel, ChannelRecord, ModelGroup, Price, Settings, Token},
 };
 
 use super::http::OutboundAuth;
@@ -79,6 +79,14 @@ pub fn router(
         .route("/channels/{id}/test", post(test_channel))
         .route("/prices", get(list_prices).post(create_price))
         .route("/prices/{model}", put(update_price).delete(delete_price))
+        .route(
+            "/model-groups",
+            get(list_model_groups).post(create_model_group),
+        )
+        .route(
+            "/model-groups/{name}",
+            put(update_model_group).delete(delete_model_group),
+        )
         .route("/settings", get(get_settings).put(update_settings))
         .route("/logs", get(query_logs))
         .route("/stats", get(get_stats))
@@ -122,6 +130,7 @@ struct TokenView {
     name: String,
     limit_usd_micros: Option<i64>,
     enabled: bool,
+    model_group: String,
     created_at: i64,
     last_used_at: Option<i64>,
 }
@@ -134,6 +143,7 @@ impl TokenView {
             name: record.token.name,
             limit_usd_micros: record.token.limit_usd_micros,
             enabled: record.token.enabled,
+            model_group: record.token.model_group,
             created_at: record.created_at,
             last_used_at: record.last_used_at,
         }
@@ -160,6 +170,8 @@ struct TokenCreate {
     name: String,
     limit_usd_micros: Option<i64>,
     enabled: bool,
+    #[serde(default = "crate::store::resources::default_model_group")]
+    model_group: String,
 }
 
 /// 系统生成的令牌 key 前缀。
@@ -193,8 +205,10 @@ async fn create_token(
         name: create.name,
         limit_usd_micros: create.limit_usd_micros,
         enabled: create.enabled,
+        model_group: create.model_group.trim().to_string(),
     };
     validate_token(&token)?;
+    reject_unknown_group(&deps, &token.model_group).await?;
     let now = super::logging::unix_millis();
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_token(&mut tx, &token, now)
@@ -222,7 +236,9 @@ async fn update_token(
 ) -> Result<Json<TokenView>, AdminError> {
     let mut token = body.map_err(AdminError::bad_body)?;
     token.token_key = token_key;
+    token.model_group = token.model_group.trim().to_string();
     validate_token(&token)?;
+    reject_unknown_group(&deps, &token.model_group).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_token(&mut tx, &token, super::logging::unix_millis())
         .await
@@ -445,6 +461,114 @@ async fn delete_price(
     let deleted = read_price(&deps, &model).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::delete_price(&mut tx, &model)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(deleted))
+}
+
+// --- 模型组 ---
+
+/// 列出全部模型组（按 `name` 排序，保证确定性）。
+async fn list_model_groups(
+    State(deps): State<AdminDeps>,
+) -> Result<Json<Vec<ModelGroup>>, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    let mut groups: Vec<ModelGroup> = snapshot.model_groups.values().cloned().collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(groups))
+}
+
+/// 新建模型组：同名已存在则冲突（409），否则写库 + 换快照 + 返回新组。
+async fn create_model_group(
+    State(deps): State<AdminDeps>,
+    body: Result<Json<ModelGroup>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<ModelGroup>), AdminError> {
+    let mut group = body.map_err(AdminError::bad_body)?;
+    normalize_model_group(&mut group)?;
+    {
+        let snapshot = deps.snapshot.read().await;
+        if snapshot.model_groups.contains_key(&group.name) {
+            return Err(AdminError::Conflict(format!(
+                "模型组 {} 已存在",
+                group.name
+            )));
+        }
+    }
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    crate::store::resources::upsert_model_group(&mut tx, &group)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    let created = read_model_group(&deps, &group.name).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+/// 整体替换模型组（按路径 `name`，路径权威）：写库 + 换快照 + 返回新组。
+async fn update_model_group(
+    State(deps): State<AdminDeps>,
+    Path(name): Path<String>,
+    body: Result<Json<ModelGroup>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ModelGroup>, AdminError> {
+    let mut group = body.map_err(AdminError::bad_body)?;
+    group.name = name;
+    normalize_model_group(&mut group)?;
+    {
+        let snapshot = deps.snapshot.read().await;
+        if !snapshot.model_groups.contains_key(&group.name) {
+            return Err(AdminError::NotFound(format!(
+                "模型组 {} 不存在",
+                group.name
+            )));
+        }
+    }
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    crate::store::resources::upsert_model_group(&mut tx, &group)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    let updated = read_model_group(&deps, &group.name).await?;
+    Ok(Json(updated))
+}
+
+/// 删除查询：`force=true` 时把仍绑定的令牌改回 `default` 再删组。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelGroupDeleteQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+/// 删除模型组：内置 `default` 拒绝；仍有令牌且未强制则 409；强制则令牌回 `default`。
+async fn delete_model_group(
+    State(deps): State<AdminDeps>,
+    Path(name): Path<String>,
+    query: Result<Query<ModelGroupDeleteQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<ModelGroup>, AdminError> {
+    let force = query
+        .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
+        .0
+        .force;
+    if name == crate::store::resources::DEFAULT_MODEL_GROUP {
+        return Err(AdminError::Conflict("内置组 default 不能删除".to_string()));
+    }
+    let deleted = read_model_group(&deps, &name).await?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let bound = crate::store::resources::count_tokens_in_group(&mut tx, &name)
+        .await
+        .map_err(AdminError::Store)?;
+    if bound > 0 && !force {
+        return Err(AdminError::Conflict(format!("模型组 {name} 仍有令牌绑定")));
+    }
+    if bound > 0 {
+        crate::store::resources::rebind_tokens_to_default(&mut tx, &name)
+            .await
+            .map_err(AdminError::Store)?;
+    }
+    crate::store::resources::delete_model_group(&mut tx, &name)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
@@ -1134,6 +1258,26 @@ async fn read_price(deps: &AdminDeps, model: &str) -> Result<Price, AdminError> 
         .ok_or_else(|| AdminError::NotFound(format!("价格 {model} 不存在")))
 }
 
+/// 从当前快照读回一个模型组；不存在返回 `NotFound`。
+async fn read_model_group(deps: &AdminDeps, name: &str) -> Result<ModelGroup, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    snapshot
+        .model_groups
+        .get(name)
+        .cloned()
+        .ok_or_else(|| AdminError::NotFound(format!("模型组 {name} 不存在")))
+}
+
+/// 令牌绑定的组必须已存在。
+async fn reject_unknown_group(deps: &AdminDeps, group: &str) -> Result<(), AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    if snapshot.model_groups.contains_key(group) {
+        Ok(())
+    } else {
+        Err(AdminError::NotFound(format!("模型组 {group} 不存在")))
+    }
+}
+
 // --- 输入校验 ---
 
 /// 校验令牌字段：键/名非空、累计上限非负。
@@ -1151,7 +1295,36 @@ fn validate_token(token: &Token) -> Result<(), AdminError> {
             "limit_usd_micros 不能为负".to_string(),
         ));
     }
+    if token.model_group.trim().is_empty() {
+        return Err(AdminError::InvalidBody("model_group 不能为空".to_string()));
+    }
     Ok(())
+}
+
+/// 规整模型组：名字去空白；可调用名去空白、拒空串、保序去重。
+fn normalize_model_group(group: &mut ModelGroup) -> Result<(), AdminError> {
+    group.name = group.name.trim().to_string();
+    if group.name.is_empty() {
+        return Err(AdminError::InvalidBody("name 不能为空".to_string()));
+    }
+    group.models = normalize_callable_names(std::mem::take(&mut group.models))?;
+    Ok(())
+}
+
+/// 规整可调用名列表：trim、拒绝空名、保序去重。
+fn normalize_callable_names(models: Vec<String>) -> Result<Vec<String>, AdminError> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(models.len());
+    for raw in models {
+        let name = raw.trim();
+        if name.is_empty() {
+            return Err(AdminError::InvalidBody("models 不能含空名".to_string()));
+        }
+        if seen.insert(name.to_string()) {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// 校验渠道字段：名/上游地址/密钥非空，权重至少为 1。

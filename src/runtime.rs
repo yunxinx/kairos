@@ -1,7 +1,7 @@
 //! 运行时资源内存快照：网关请求路径读取的唯一资源视图。
 //!
-//! 启动时从 SQLite 加载渠道、令牌、价格与运行时开关进 `RuntimeSnapshot`（不可变
-//! 整体）。请求路径（认证、路由、计费准入、full_body、body 上限）全部读快照；
+//! 启动时从 SQLite 加载渠道、令牌、价格、模型组与运行时开关进 `RuntimeSnapshot`（不可变
+//! 整体）。请求路径（认证、路由、计费准入、full_body、body 上限、模型组允许名单）全部读快照；
 //! 在途请求在准入时刻抓取一个 `Arc` 引用，不受后续原子替换影响。管理 API 写库
 //! 成功后原子替换快照（见 `SnapshotHandle`），是唯一动态入口。
 
@@ -31,6 +31,8 @@ pub struct RuntimeSnapshot {
     pub tokens: HashMap<String, resources::Token>,
     /// 价格表，按模型名索引（计费准入）。
     pub prices: HashMap<String, resources::Price>,
+    /// 模型组，按组名索引（令牌允许名单）。
+    pub model_groups: HashMap<String, resources::ModelGroup>,
     /// 是否落完整请求/响应 body（来自 `full_body` 开关）。
     pub full_body: bool,
     /// 入站请求体大小上限（字节，来自 `max_request_bytes` 开关）。
@@ -51,6 +53,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
     let channels = resources::list_channel_records(pool).await?;
     let token_rows = resources::list_tokens(pool).await?;
     let price_rows = resources::list_prices(pool).await?;
+    let group_rows = resources::list_model_groups(pool).await?;
     let settings = resources::list_settings(pool).await?;
 
     let tokens = token_rows
@@ -61,11 +64,16 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         .into_iter()
         .map(|price| (price.model.clone(), price))
         .collect();
+    let model_groups = group_rows
+        .into_iter()
+        .map(|group| (group.name.clone(), group))
+        .collect();
 
     Ok(RuntimeSnapshot {
         channels,
         tokens,
         prices,
+        model_groups,
         full_body: load_full_body(&settings),
         max_request_bytes: load_max_request_bytes(&settings),
     })
@@ -122,6 +130,11 @@ mod tests {
         assert!(snap.channels.is_empty());
         assert!(snap.tokens.is_empty());
         assert!(snap.prices.is_empty());
+        assert_eq!(snap.model_groups.len(), 1, "空库应有内置 default 组");
+        assert!(
+            snap.model_groups
+                .contains_key(resources::DEFAULT_MODEL_GROUP)
+        );
         assert!(!snap.full_body, "full_body 缺省关闭");
         assert_eq!(
             snap.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES,
@@ -160,6 +173,7 @@ mod tests {
                 name: "dev".to_string(),
                 limit_usd_micros: None,
                 enabled: true,
+                model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
             },
             1,
         )
@@ -193,7 +207,15 @@ mod tests {
         assert_eq!(snap.channels.len(), 1);
         assert_eq!(snap.channels[0].channel.name, "c1");
         assert!(snap.tokens.contains_key("sk-a"));
+        assert_eq!(
+            snap.tokens["sk-a"].model_group,
+            resources::DEFAULT_MODEL_GROUP
+        );
         assert!(snap.prices.contains_key("gpt-4o"));
+        assert!(
+            snap.model_groups
+                .contains_key(resources::DEFAULT_MODEL_GROUP)
+        );
         assert!(snap.full_body, "开关应生效");
         assert_eq!(snap.max_request_bytes, 8_000_000);
     }

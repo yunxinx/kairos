@@ -1,0 +1,482 @@
+//! 模型组与令牌绑定：管理 API 黑盒 + 组外调用「找不到模型」。
+//!
+//! 主接缝：独立管理监听上的 `/model-groups` CRUD 与令牌 `model_group`；
+//! 协议面组外请求须 404（非 503），文案不提分组。
+
+mod common;
+
+use common::{TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use serde_json::{Value, json};
+
+/// 带 `TEST_ADMIN_KEY` 认证的 GET。
+async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{}{path}", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("管理请求应可达")
+}
+
+/// 带认证的 JSON 请求。
+async fn admin_json(
+    gw: &TestGateway,
+    method: reqwest::Method,
+    path: &str,
+    body: Value,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .request(method, format!("{}{path}", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .json(&body)
+        .send()
+        .await
+        .expect("管理请求应可达")
+}
+
+/// 带认证、无 body 的请求（删除等）。
+async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .request(method, format!("{}{path}", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("管理请求应可达")
+}
+
+/// 以指定令牌向网关发一条 Chat Completions 请求。
+async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(token)
+        .json(&json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("下游请求应能到达网关")
+}
+
+/// mock 上游返回的合法 Chat Completions 成功体。
+fn completion_body() -> Value {
+    json!({
+        "id": "chatcmpl-123",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hello!" },
+            "logprobs": null,
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3 }
+    })
+}
+
+/// 从列表里按名取出一组。
+fn group_named<'a>(list: &'a Value, name: &str) -> &'a Value {
+    list.as_array()
+        .expect("组列表应为数组")
+        .iter()
+        .find(|g| g["name"] == name)
+        .unwrap_or_else(|| panic!("列表应含组 {name}"))
+}
+
+/// 空库即有内置 `default`，且不能删除。
+#[tokio::test]
+async fn default_group_always_exists_and_cannot_be_deleted() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    let groups = list.as_array().expect("应为数组");
+    assert_eq!(groups.len(), 1, "空库只有内置 default");
+    assert_eq!(groups[0]["name"], "default");
+    assert_eq!(groups[0]["models"], json!([]));
+
+    let resp = admin_send(&gw, reqwest::Method::DELETE, "/model-groups/default").await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "default 不能删"
+    );
+    let body: Value = resp.json().await.expect("错误体应可解析");
+    let msg = body["error"]["message"].as_str().expect("应有消息");
+    assert!(msg.contains("default"), "应点名 default，实际 {msg}");
+    assert!(
+        !msg.to_lowercase().contains("force"),
+        "普通删除文案不必提 force"
+    );
+
+    let forced = admin_send(
+        &gw,
+        reqwest::Method::DELETE,
+        "/model-groups/default?force=true",
+    )
+    .await;
+    assert_eq!(
+        forced.status(),
+        reqwest::StatusCode::CONFLICT,
+        "强制也不能删 default"
+    );
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    assert_eq!(list.as_array().expect("应为数组").len(), 1);
+}
+
+/// CRUD：新建、列出、更新、删除无令牌的组；重名 409。
+#[tokio::test]
+async fn model_group_crud_roundtrip() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": ["gpt-4o", "fast"] }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let body: Value = created.json().await.expect("创建响应应可解析");
+    assert_eq!(body["name"], "coding");
+    assert_eq!(body["models"], json!(["gpt-4o", "fast"]));
+
+    let dup = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": ["other"] }),
+    )
+    .await;
+    assert_eq!(dup.status(), reqwest::StatusCode::CONFLICT);
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    assert!(
+        group_named(&list, "default")["models"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        group_named(&list, "coding")["models"],
+        json!(["gpt-4o", "fast"])
+    );
+
+    let updated = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        "/model-groups/coding",
+        json!({ "name": "coding", "models": ["gpt-4o"] }),
+    )
+    .await;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let body: Value = updated.json().await.expect("更新响应应可解析");
+    assert_eq!(body["models"], json!(["gpt-4o"]));
+
+    let missing = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        "/model-groups/nope",
+        json!({ "name": "nope", "models": [] }),
+    )
+    .await;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let deleted = admin_send(&gw, reqwest::Method::DELETE, "/model-groups/coding").await;
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+    let body: Value = deleted.json().await.expect("删除响应应可解析");
+    assert_eq!(body["name"], "coding");
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["default"]);
+}
+
+/// 新建令牌未指定组则绑 `default`；可改绑到已有组；不存在的组拒绝。
+#[tokio::test]
+async fn token_binds_exactly_one_group() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": ["gpt-4o"] }),
+    )
+    .await;
+
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({ "name": "anon", "limit_usd_micros": null, "enabled": true }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let token: Value = created.json().await.expect("令牌应可解析");
+    assert_eq!(token["model_group"], "default", "未指定则 default");
+    let default_key = token["token_key"].as_str().expect("应有 key");
+
+    let coded = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+    )
+    .await;
+    assert_eq!(coded.status(), reqwest::StatusCode::CREATED);
+    let token: Value = coded.json().await.expect("令牌应可解析");
+    assert_eq!(token["model_group"], "coding");
+    let coding_key = token["token_key"].as_str().expect("应有 key").to_string();
+
+    let rebound = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        &format!("/tokens/{default_key}"),
+        json!({
+            "token_key": default_key,
+            "name": "anon",
+            "limit_usd_micros": null,
+            "enabled": true,
+            "model_group": "coding"
+        }),
+    )
+    .await;
+    assert_eq!(rebound.status(), reqwest::StatusCode::OK);
+    let token: Value = rebound.json().await.expect("令牌应可解析");
+    assert_eq!(token["model_group"], "coding");
+
+    let missing = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        &format!("/tokens/{coding_key}"),
+        json!({
+            "token_key": coding_key,
+            "name": "coder",
+            "limit_usd_micros": null,
+            "enabled": true,
+            "model_group": "ghost"
+        }),
+    )
+    .await;
+    assert_eq!(
+        missing.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "绑不存在的组应 404"
+    );
+
+    let listed: Value = admin_get(&gw, "/tokens")
+        .await
+        .json()
+        .await
+        .expect("令牌列表应可解析");
+    let coder = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["token_key"] == coding_key)
+        .expect("coder 应仍在列表");
+    assert_eq!(coder["model_group"], "coding", "失败的改绑不应落库");
+}
+
+/// 删除仍有令牌的组被拒；强制删除把那些令牌改回 `default`。
+#[tokio::test]
+async fn delete_group_with_tokens_is_blocked_until_forced() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": ["gpt-4o"] }),
+    )
+    .await;
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+    )
+    .await;
+    let token: Value = created.json().await.expect("令牌应可解析");
+    let key = token["token_key"].as_str().expect("应有 key").to_string();
+
+    let blocked = admin_send(&gw, reqwest::Method::DELETE, "/model-groups/coding").await;
+    assert_eq!(blocked.status(), reqwest::StatusCode::CONFLICT);
+    let body: Value = blocked.json().await.expect("错误体应可解析");
+    let msg = body["error"]["message"].as_str().expect("应有消息");
+    assert!(
+        msg.contains("令牌") || msg.contains("绑定"),
+        "应说明仍有令牌，实际 {msg}"
+    );
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    group_named(&list, "coding");
+
+    let forced = admin_send(
+        &gw,
+        reqwest::Method::DELETE,
+        "/model-groups/coding?force=true",
+    )
+    .await;
+    assert_eq!(forced.status(), reqwest::StatusCode::OK);
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["default"]);
+
+    let tokens: Value = admin_get(&gw, "/tokens")
+        .await
+        .json()
+        .await
+        .expect("令牌列表应可解析");
+    let rebound = tokens
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["token_key"] == key)
+        .expect("令牌应仍在");
+    assert_eq!(rebound["model_group"], "default");
+}
+
+/// 组外调用：404「不存在该模型」，不提分组，不是 503；组内仍可调。
+#[tokio::test]
+async fn out_of_group_model_is_not_found_not_503() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+
+    admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": [TEST_MODEL] }),
+    )
+    .await;
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+    )
+    .await;
+    let token: Value = created.json().await.expect("令牌应可解析");
+    let coding_key = token["token_key"].as_str().expect("应有 key");
+    admin_json(
+        &gw,
+        reqwest::Method::POST,
+        &format!("/tokens/{coding_key}/balance"),
+        json!({ "delta_usd_micros": 5_000_000 }),
+    )
+    .await;
+
+    // 组内已登记模型可调。
+    let ok = chat_request(&gw, coding_key, TEST_MODEL).await;
+    assert_eq!(ok.status(), reqwest::StatusCode::OK, "组内模型应可调");
+
+    // 渠道上有别名 `fast` 但不在 coding 组：404，不是无渠道 503。
+    let denied = chat_request(&gw, coding_key, "fast").await;
+    assert_eq!(
+        denied.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "组外应 404 而非 503，实际 {}",
+        denied.status()
+    );
+    let body: Value = denied.json().await.expect("错误体应可解析");
+    let msg = body["error"]["message"].as_str().expect("应有消息");
+    assert!(msg.contains("fast"), "应含模型名，实际 {msg}");
+    assert!(
+        msg.contains("不存在") || msg.contains("找不到"),
+        "文案应为找不到/不存在，实际 {msg}"
+    );
+    assert!(
+        !msg.contains("组") && !msg.contains("分组") && !msg.contains("coding"),
+        "不得泄露分组细节，实际 {msg}"
+    );
+
+    // 默认令牌：`fast` 未放入其他组，仍视为 default，可调。
+    let default_ok = chat_request(&gw, TEST_TOKEN_KEY, "fast").await;
+    assert_eq!(
+        default_ok.status(),
+        reqwest::StatusCode::OK,
+        "未放入其他组的可调用名对 default 令牌仍可用"
+    );
+}
+
+/// 可调用名只放入自定义组后，不再隐式属于 default。
+#[tokio::test]
+async fn name_only_in_custom_group_leaves_default() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": [TEST_MODEL] }),
+    )
+    .await;
+
+    let denied = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        denied.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "只在 coding 的模型对 default 令牌应找不到"
+    );
+    let body: Value = denied.json().await.expect("错误体应可解析");
+    let msg = body["error"]["message"].as_str().expect("应有消息");
+    assert!(
+        msg.contains("不存在") || msg.contains("找不到"),
+        "文案应为找不到/不存在，实际 {msg}"
+    );
+    assert!(!msg.contains("组"), "不得提分组，实际 {msg}");
+
+    // 显式放进 default 后两边都能调。
+    admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        "/model-groups/default",
+        json!({ "name": "default", "models": [TEST_MODEL] }),
+    )
+    .await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let ok = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        ok.status(),
+        reqwest::StatusCode::OK,
+        "显式列入 default 后应可调"
+    );
+}

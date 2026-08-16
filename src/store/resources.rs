@@ -1,4 +1,4 @@
-//! 运行时资源存储：渠道、令牌、价格与运行时开关四类资源的读写原语。
+//! 运行时资源存储：渠道、令牌、价格、模型组与运行时开关的读写原语。
 //!
 //! 资源 CRUD 写操作接受 `&mut SqliteConnection`，可组合进事务；读操作接受
 //! `&SqlitePool`。金额一律整数 micro-USD（ADR-0002）。wire 协议类型复用
@@ -12,6 +12,14 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::config::Protocol;
 use crate::store::StoreError;
+
+/// 内置模型组名：未指定分组的令牌与未放入其他组的可调用名落在此组。
+pub const DEFAULT_MODEL_GROUP: &str = "default";
+
+/// serde 缺省：令牌未写 `model_group` 时绑到内置 `default`。
+pub fn default_model_group() -> String {
+    DEFAULT_MODEL_GROUP.to_string()
+}
 
 /// 渠道：指向一个上游端点的出站接入单元。
 ///
@@ -55,6 +63,38 @@ pub struct Token {
     pub limit_usd_micros: Option<i64>,
     /// 是否启用：禁用的令牌在网关认证阶段被拒绝。
     pub enabled: bool,
+    /// 绑定的模型组名；缺省为 [`DEFAULT_MODEL_GROUP`]。
+    #[serde(default = "default_model_group")]
+    pub model_group: String,
+}
+
+/// 模型组：令牌的可调用名允许名单（渠道模型、别名 key、统一模型 ID）。
+///
+/// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
+/// 错误直接报错而非静默忽略。不对渠道分组。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelGroup {
+    pub name: String,
+    pub models: Vec<String>,
+}
+
+/// 令牌绑定组是否允许调用该名。
+///
+/// 自定义组只看显式名单。`default` 另含未出现在任何其他组名单中的名字
+/// （未指定分组的可调用名视为 default）。
+pub fn group_allows(groups: &HashMap<String, ModelGroup>, group_name: &str, model: &str) -> bool {
+    if let Some(group) = groups.get(group_name)
+        && group.models.iter().any(|name| name == model)
+    {
+        return true;
+    }
+    if group_name == DEFAULT_MODEL_GROUP {
+        return !groups.iter().any(|(name, group)| {
+            name != DEFAULT_MODEL_GROUP && group.models.iter().any(|item| item == model)
+        });
+    }
+    false
 }
 
 /// 令牌的完整只读视图：定义字段 + 生命周期元数据（创建/最后使用时间）。
@@ -263,7 +303,7 @@ pub async fn list_tokens(pool: &SqlitePool) -> Result<Vec<Token>, StoreError> {
 /// 读出全部令牌记录（含创建/最后使用时间等生命周期元数据）。
 pub async fn list_token_records(pool: &SqlitePool) -> Result<Vec<TokenRecord>, StoreError> {
     let rows = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at \
+        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at, model_group \
          FROM tokens",
     )
     .fetch_all(pool)
@@ -279,7 +319,7 @@ pub async fn get_token_record(
     token_key: &str,
 ) -> Result<Option<TokenRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at \
+        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at, model_group \
          FROM tokens WHERE token_key = ?",
     )
     .bind(token_key)
@@ -299,6 +339,7 @@ fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreE
             name: row.try_get("name").map_err(StoreError::Query)?,
             limit_usd_micros: row.try_get("limit_usd_micros").map_err(StoreError::Query)?,
             enabled: enabled != 0,
+            model_group: row.try_get("model_group").map_err(StoreError::Query)?,
         },
         created_at: row.try_get("created_at").map_err(StoreError::Query)?,
         last_used_at: row.try_get("last_used_at").map_err(StoreError::Query)?,
@@ -315,17 +356,18 @@ pub async fn upsert_token(
     created_at: i64,
 ) -> Result<(), StoreError> {
     sqlx::query(
-        "INSERT INTO tokens (token_key, name, limit_usd_micros, enabled, created_at) \
-         VALUES (?, ?, ?, ?, ?) \
+        "INSERT INTO tokens (token_key, name, limit_usd_micros, enabled, created_at, model_group) \
+         VALUES (?, ?, ?, ?, ?, ?) \
          ON CONFLICT(token_key) DO UPDATE SET \
            name = excluded.name, limit_usd_micros = excluded.limit_usd_micros, \
-           enabled = excluded.enabled",
+           enabled = excluded.enabled, model_group = excluded.model_group",
     )
     .bind(&token.token_key)
     .bind(&token.name)
     .bind(token.limit_usd_micros)
     .bind(token.enabled)
     .bind(created_at)
+    .bind(&token.model_group)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -351,6 +393,84 @@ pub async fn touch_token_used(
 pub async fn delete_token(conn: &mut SqliteConnection, token_key: &str) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM tokens WHERE token_key = ?")
         .bind(token_key)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 读出全部模型组。
+pub async fn list_model_groups(pool: &SqlitePool) -> Result<Vec<ModelGroup>, StoreError> {
+    let rows = sqlx::query("SELECT name, models_json FROM model_groups")
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+
+    rows.iter().map(map_model_group).collect()
+}
+
+/// 把模型组行映射为 `ModelGroup`。
+fn map_model_group(row: &sqlx::sqlite::SqliteRow) -> Result<ModelGroup, StoreError> {
+    let name: String = row.try_get("name").map_err(StoreError::Query)?;
+    let models: Vec<String> = serde_json::from_str(
+        &row.try_get::<String, _>("models_json")
+            .map_err(StoreError::Query)?,
+    )
+    .map_err(|_| StoreError::InvalidResource(format!("模型组 {name} 的 models_json 非法")))?;
+    Ok(ModelGroup { name, models })
+}
+
+/// 新增或整体替换一个模型组（按 `name`），同一事务内幂等。
+pub async fn upsert_model_group(
+    conn: &mut SqliteConnection,
+    group: &ModelGroup,
+) -> Result<(), StoreError> {
+    let models_json = serde_json::to_string(&group.models).map_err(serde_error)?;
+    sqlx::query(
+        "INSERT INTO model_groups (name, models_json) VALUES (?, ?) \
+         ON CONFLICT(name) DO UPDATE SET models_json = excluded.models_json",
+    )
+    .bind(&group.name)
+    .bind(&models_json)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 按 `name` 删除模型组；不存在视为成功（幂等）。
+///
+/// 调用方须先处理令牌绑定：内置 `default` 与仍有令牌的组不应走到这里。
+pub async fn delete_model_group(conn: &mut SqliteConnection, name: &str) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM model_groups WHERE name = ?")
+        .bind(name)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 统计绑定到指定模型组的令牌数。
+pub async fn count_tokens_in_group(
+    conn: &mut SqliteConnection,
+    group: &str,
+) -> Result<u64, StoreError> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE model_group = ?")
+        .bind(group)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(count.max(0) as u64)
+}
+
+/// 把绑定到 `from_group` 的令牌改回内置 `default`。
+pub async fn rebind_tokens_to_default(
+    conn: &mut SqliteConnection,
+    from_group: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE tokens SET model_group = ? WHERE model_group = ?")
+        .bind(DEFAULT_MODEL_GROUP)
+        .bind(from_group)
         .execute(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
@@ -603,6 +723,7 @@ mod tests {
             name: "dev".to_string(),
             limit_usd_micros: Some(5_000_000),
             enabled: true,
+            model_group: DEFAULT_MODEL_GROUP.to_string(),
         };
         upsert_token(&mut conn, &token, 1_700_000_000_000)
             .await
@@ -622,6 +743,7 @@ mod tests {
             name: "dev".to_string(),
             limit_usd_micros: None,
             enabled: true,
+            model_group: DEFAULT_MODEL_GROUP.to_string(),
         };
         upsert_token(&mut conn, &token, 1_000)
             .await
@@ -679,6 +801,7 @@ mod tests {
                 name: "dev".to_string(),
                 limit_usd_micros: None,
                 enabled: true,
+                model_group: DEFAULT_MODEL_GROUP.to_string(),
             },
             1,
         )
@@ -703,6 +826,7 @@ mod tests {
                 name: "v1".to_string(),
                 limit_usd_micros: None,
                 enabled: true,
+                model_group: DEFAULT_MODEL_GROUP.to_string(),
             },
             1,
         )
@@ -721,6 +845,7 @@ mod tests {
                 name: "v2".to_string(),
                 limit_usd_micros: Some(9_000_000),
                 enabled: true,
+                model_group: DEFAULT_MODEL_GROUP.to_string(),
             },
             2,
         )
@@ -735,6 +860,121 @@ mod tests {
         let after = list_tokens(&pool).await.expect("应能读令牌");
         assert_eq!(after[0].name, "v2");
         assert_eq!(after[0].limit_usd_micros, Some(9_000_000));
+        assert_eq!(after[0].model_group, DEFAULT_MODEL_GROUP);
+    }
+
+    /// 空库即有内置 default；CRUD 往返；删除幂等。
+    #[tokio::test]
+    async fn model_group_default_exists_and_roundtrips() {
+        let (_dir, pool) = test_pool().await;
+        let groups = list_model_groups(&pool).await.expect("应能读组");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, DEFAULT_MODEL_GROUP);
+        assert!(groups[0].models.is_empty());
+
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let coding = ModelGroup {
+            name: "coding".to_string(),
+            models: vec!["gpt-4o".to_string(), "fast".to_string()],
+        };
+        upsert_model_group(&mut conn, &coding)
+            .await
+            .expect("应能写组");
+        let groups = list_model_groups(&pool).await.expect("应能读组");
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().any(|g| g == &coding));
+
+        delete_model_group(&mut conn, "coding")
+            .await
+            .expect("应能删组");
+        delete_model_group(&mut conn, "coding")
+            .await
+            .expect("重复删除应幂等");
+        let groups = list_model_groups(&pool).await.expect("应能读组");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, DEFAULT_MODEL_GROUP);
+    }
+
+    /// 令牌改绑后计数变化；改回 default 后原组计数为 0。
+    #[tokio::test]
+    async fn rebind_tokens_to_default_clears_group_membership() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        upsert_model_group(
+            &mut conn,
+            &ModelGroup {
+                name: "coding".to_string(),
+                models: vec!["gpt-4o".to_string()],
+            },
+        )
+        .await
+        .expect("应能写组");
+        upsert_token(
+            &mut conn,
+            &Token {
+                token_key: "sk-a".to_string(),
+                name: "dev".to_string(),
+                limit_usd_micros: None,
+                enabled: true,
+                model_group: "coding".to_string(),
+            },
+            1,
+        )
+        .await
+        .expect("应能写令牌");
+        assert_eq!(
+            count_tokens_in_group(&mut conn, "coding")
+                .await
+                .expect("应能计数"),
+            1
+        );
+        rebind_tokens_to_default(&mut conn, "coding")
+            .await
+            .expect("应能改绑");
+        assert_eq!(
+            count_tokens_in_group(&mut conn, "coding")
+                .await
+                .expect("应能计数"),
+            0
+        );
+        let tokens = list_tokens(&pool).await.expect("应能读令牌");
+        assert_eq!(tokens[0].model_group, DEFAULT_MODEL_GROUP);
+    }
+
+    /// default 含未放入其他组的名字；只出现在自定义组的名字对 default 不允许。
+    #[test]
+    fn group_allows_implicit_default_and_explicit_lists() {
+        let mut groups = HashMap::new();
+        groups.insert(
+            DEFAULT_MODEL_GROUP.to_string(),
+            ModelGroup {
+                name: DEFAULT_MODEL_GROUP.to_string(),
+                models: vec!["also-in-default".to_string()],
+            },
+        );
+        groups.insert(
+            "coding".to_string(),
+            ModelGroup {
+                name: "coding".to_string(),
+                models: vec!["gpt-4o".to_string(), "also-in-default".to_string()],
+            },
+        );
+        assert!(group_allows(&groups, "coding", "gpt-4o"));
+        assert!(!group_allows(&groups, "coding", "fast"));
+        assert!(
+            group_allows(&groups, DEFAULT_MODEL_GROUP, "fast"),
+            "未放入其他组的名字视为 default"
+        );
+        assert!(
+            !group_allows(&groups, DEFAULT_MODEL_GROUP, "gpt-4o"),
+            "只在 coding 的名字不隐式属于 default"
+        );
+        assert!(group_allows(
+            &groups,
+            DEFAULT_MODEL_GROUP,
+            "also-in-default"
+        ));
+        assert!(!group_allows(&groups, "ghost", "fast"));
     }
 
     /// 价格播种 → 读回往返一致；缓存档 NULL 保留。

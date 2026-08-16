@@ -211,7 +211,24 @@ async fn handle_request(
         }
     };
 
-    // 3. 准入：模型必须有候选渠道（按 failover 顺序排列）。
+    // 3. 模型组允许名单：组外名字按「不存在」拒绝，不提分组、不用 503。
+    if !store::resources::group_allows(&snapshot.model_groups, &token.model_group, &request.model) {
+        let message = format!("模型 {} 不存在", request.model);
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &message,
+            &deps,
+            full_body,
+            Some(token),
+            Some(&request.model),
+            started,
+            inbound_protocol,
+            request_body_for_log,
+        )
+        .await;
+    }
+
+    // 4. 准入：模型必须有候选渠道（按 failover 顺序排列）。
     let route = match routing::route(&snapshot.channels, &request.model) {
         Some(route) => route,
         None => {
@@ -231,7 +248,7 @@ async fn handle_request(
         }
     };
 
-    // 4. 计费准入：模型必须配置价格；令牌余额与累计上限须通过。
+    // 5. 计费准入：模型必须配置价格；令牌余额与累计上限须通过。
     let price = match snapshot.prices.get(&request.model) {
         Some(price) => PriceSnapshot::from_store_price(price),
         None => {
@@ -340,7 +357,7 @@ async fn handle_request(
         .await;
     }
 
-    // 5. 出站：同协议且所有候选都不改写出站名时走直通快路径，否则经 IR 完整路径。
+    // 6. 出站：同协议且所有候选都不改写出站名时走直通快路径，否则经 IR 完整路径。
     // 快路径不免认证与计费（上面已准入），且 failover 同样只发生在首字节之前。
     // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
     // 任一渠道命中别名时也回落 IR：直通无法按渠道改写请求体里的模型名。

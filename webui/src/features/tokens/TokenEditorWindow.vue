@@ -154,11 +154,20 @@ function handleSave() {
   const limit = parseUsdToMicros(editorLimit.value);
   const enabled = editorEnabled.value;
   if (props.initial === null) {
-    saveMutation.mutate({ kind: 'create', body: { name, limit_usd_micros: limit, enabled } });
+    saveMutation.mutate({
+      kind: 'create',
+      body: { name, limit_usd_micros: limit, enabled, model_group: 'default' },
+    });
   } else {
     saveMutation.mutate({
       kind: 'update',
-      body: { token_key: initialKey, name, limit_usd_micros: limit, enabled },
+      body: {
+        token_key: initialKey,
+        name,
+        limit_usd_micros: limit,
+        enabled,
+        model_group: props.initial.model_group,
+      },
     });
   }
 }

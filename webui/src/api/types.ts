@@ -19,6 +19,8 @@ export interface Token {
   name: string;
   limit_usd_micros: number | null;
   enabled: boolean;
+  /** 绑定的模型组名；未指定时为内置 `default`。 */
+  model_group: string;
 }
 
 /** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */

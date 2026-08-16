@@ -354,6 +354,7 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
                     .limit_usd
                     .map(|usd| (usd * 1_000_000.0).round() as i64),
                 enabled: true,
+                model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
             },
             unix_millis(),
         )
