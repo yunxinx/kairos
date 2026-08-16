@@ -77,3 +77,35 @@ export function previewVisibleModels(
 
   return { visibleIds, unified: unifiedInGroup };
 }
+
+/** 下游可见按分组排版的一段。 */
+export interface VisibleSection {
+  groupName: string;
+  visibleIds: string[];
+  unified: VisibleUnified[];
+}
+
+/**
+ * 未选分组时展示全部非空组（类似清单「按渠道分组」）；
+ * 勾选后只保留这些组，空组也留下便于对照。
+ */
+export function previewVisibleSections(
+  groups: ModelGroup[],
+  unifiedModels: UnifiedModel[],
+  channels: ChannelView[],
+  selectedGroupNames: string[],
+): VisibleSection[] {
+  const selected = new Set(selectedGroupNames);
+  const names = selected.size > 0 ? [...selected] : groups.map((group) => group.name);
+  names.sort((left, right) => {
+    if (left === DEFAULT_MODEL_GROUP) return -1;
+    if (right === DEFAULT_MODEL_GROUP) return 1;
+    return left.localeCompare(right);
+  });
+  return names
+    .map((groupName) => {
+      const preview = previewVisibleModels(groups, unifiedModels, channels, groupName);
+      return { groupName, visibleIds: preview.visibleIds, unified: preview.unified };
+    })
+    .filter((section) => selected.size > 0 || section.visibleIds.length > 0);
+}

@@ -13,6 +13,8 @@ const props = withDefaults(
     anchor?: FloatingWindowAnchor | null;
     /** 字段较多的表单用更宽面板。 */
     wide?: boolean;
+    /** 多列表格预览用更宽面板（对照目录填价）。 */
+    extraWide?: boolean;
     /** 窗口栈层叠序号，叠加在 --z-window 之上；越大越靠前。 */
     stackOrder?: number;
     /** 初始位置级联偏移序号，避免多个窗口完全重叠。 */
@@ -22,7 +24,15 @@ const props = withDefaults(
     /** 是否最前窗口；仅最前窗口响应 Esc 关闭。 */
     topmost?: boolean;
   }>(),
-  { anchor: null, wide: false, stackOrder: 0, cascade: 0, attention: false, topmost: true },
+  {
+    anchor: null,
+    wide: false,
+    extraWide: false,
+    stackOrder: 0,
+    cascade: 0,
+    attention: false,
+    topmost: true,
+  },
 );
 
 const emit = defineEmits<{
@@ -49,6 +59,14 @@ function clampLeft(left: number, width: number): number {
 function clampTop(top: number, height: number): number {
   const max = Math.max(VIEWPORT_MARGIN, window.innerHeight - height - VIEWPORT_MARGIN);
   return Math.min(Math.max(top, VIEWPORT_MARGIN), max);
+}
+
+/** 内容变高或视口缩小后，把窗口重新夹进可视区域（例如从底部批量条打开后预览表展开）。 */
+function keepInViewport() {
+  const el = windowEl.value;
+  if (!el) return;
+  position.left = clampLeft(position.left, el.offsetWidth);
+  position.top = clampTop(position.top, el.offsetHeight);
 }
 
 /** 以当前渲染尺寸锁定窗口，供内容视图切换时保持大小；`unlockSize` 恢复自适应。 */
@@ -125,6 +143,8 @@ onScopeDispose(() => {
   document.removeEventListener('keydown', onKeydown);
 });
 
+let resizeObserver: ResizeObserver | undefined;
+
 onMounted(() => {
   restoreFocusEl = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   const el = windowEl.value;
@@ -143,10 +163,16 @@ onMounted(() => {
         el.offsetHeight,
       );
     }
+    resizeObserver = new ResizeObserver(() => keepInViewport());
+    resizeObserver.observe(el);
   }
+  window.addEventListener('resize', keepInViewport);
 });
 
 onUnmounted(() => {
+  resizeObserver?.disconnect();
+  resizeObserver = undefined;
+  window.removeEventListener('resize', keepInViewport);
   const target = restoreFocusEl;
   restoreFocusEl = null;
   if (!target || !target.isConnected || !document.hasFocus()) return;
@@ -163,7 +189,10 @@ onUnmounted(() => {
     role="dialog"
     :aria-labelledby="titleId"
     class="floating-window card flex max-h-[calc(100vh-1rem)] max-w-[calc(100vw-1rem)] flex-col"
-    :class="[wide ? 'w-[34rem]' : 'w-[28rem]', attention && 'floating-window-attention']"
+    :class="[
+      extraWide ? 'w-[56rem]' : wide ? 'w-[34rem]' : 'w-[28rem]',
+      attention && 'floating-window-attention',
+    ]"
     :style="{
       left: `${position.left}px`,
       top: `${position.top}px`,

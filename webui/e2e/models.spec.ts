@@ -13,7 +13,6 @@ test.describe('models page', () => {
   }) => {
     await seedChannel(page, { name: 'e2e-tab-channel', models: ['e2e-tab-model'] });
     await page.goto('/models');
-    await expect(page.getByRole('heading', { name: /^models$/i })).toBeVisible();
     await expect(page.getByTestId('models-tab-inventory')).toHaveAttribute('data-state', 'active');
     await expect(page.getByTestId('pricing-create-entry')).toHaveCount(0);
 
@@ -45,14 +44,56 @@ test.describe('models page', () => {
     await page.goto('/models');
 
     const canonical = page.locator('[data-testid="inventory-row"][data-model="e2e-inv-mini"]');
-    const alias = page.locator('[data-testid="inventory-row"][data-model="e2e-inv-fast"]');
     await expect(canonical).toBeVisible();
     await expect(canonical.getByTestId('inventory-unpriced')).toBeVisible();
-    await expect(canonical.getByTestId('inventory-channel-chip')).toHaveText('e2e-inv-channel');
-    await expect(alias.getByTestId('inventory-alias')).toContainText('e2e-inv-fast → e2e-inv-mini');
-    await expect(alias.getByTestId('inventory-unpriced')).toBeVisible();
+    await expect(
+      page.locator('[data-testid="inventory-section"][data-channel="e2e-inv-channel"]'),
+    ).toBeVisible();
+    await expect(page.getByTestId('inventory-channels-head')).toHaveCount(0);
+    await expect(canonical.getByTestId('inventory-alias')).toContainText('e2e-inv-fast');
+    await expect(
+      canonical.locator('[data-testid="inventory-alias-chip"][data-canonical="true"]'),
+    ).toHaveCount(0);
+    await canonical.getByTestId('inventory-model-name').click();
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe('e2e-inv-mini');
+    await expect(
+      page.locator('[data-testid="inventory-row"][data-model="e2e-inv-fast"]'),
+    ).toHaveCount(0);
 
-    await clickRowAction(canonical, page, 'pricing-edit-entry');
+    await seedChannel(page, {
+      name: 'e2e-alias-only-channel',
+      models: ['e2e-alias-gpt', 'e2e-alias-mini'],
+      model_aliases: { 'e2e-alias-gpt': 'e2e-alias-upstream' },
+    });
+    await page.reload();
+    const aliasOnly = page.locator('[data-testid="inventory-row"][data-model="e2e-alias-gpt"]');
+    await expect(aliasOnly).toBeVisible();
+    await expect(
+      aliasOnly.locator('[data-testid="inventory-alias-chip"][data-canonical="true"]'),
+    ).toHaveText('e2e-alias-upstream');
+    await expect(
+      page.locator('[data-testid="inventory-row"][data-model="e2e-alias-upstream"]'),
+    ).toHaveCount(0);
+    await expect(
+      page.locator('[data-testid="inventory-row"][data-model="e2e-alias-mini"]'),
+    ).toBeVisible();
+
+    await seedChannel(page, {
+      name: 'e2e-fold-channel',
+      models: ['e2e-fold-canon', 'e2e-fold-nick'],
+      model_aliases: { 'e2e-fold-nick': 'e2e-fold-canon' },
+    });
+    await page.reload();
+    const folded = page.locator('[data-testid="inventory-row"][data-model="e2e-fold-canon"]');
+    await expect(folded).toBeVisible();
+    await expect(folded.getByTestId('inventory-alias')).toContainText('e2e-fold-nick');
+    await expect(
+      page.locator('[data-testid="inventory-row"][data-model="e2e-fold-nick"]'),
+    ).toHaveCount(0);
+
+    await canonical.getByTestId('pricing-edit-entry').click();
     await expect(page.locator('[id^="pricing-editor-model"]')).toHaveValue('e2e-inv-mini');
     await expect(page.locator('[id^="pricing-editor-model"]')).toBeDisabled();
     await page.locator('[id^="pricing-editor-input"]').fill('1.000001');
@@ -62,9 +103,9 @@ test.describe('models page', () => {
     await page.getByTestId('pricing-save-entry').click();
 
     await expect(canonical.getByTestId('inventory-unpriced')).toHaveCount(0);
-    await expect(canonical.getByTestId('price-input')).toHaveText('$1.000001');
-    await expect(canonical.getByTestId('price-output')).toHaveText('$2.5');
-    await expect(canonical.getByTestId('price-cache-read')).toHaveText('$0.000001');
+    await expect(canonical.getByTestId('price-input')).toHaveText('1.000001');
+    await expect(canonical.getByTestId('price-output')).toHaveText('2.5');
+    await expect(canonical.getByTestId('price-cache-read')).toHaveText('0.000001');
     await expect(canonical.getByTestId('price-cache-write')).toHaveText('—');
 
     const listed = await page.request.get('/prices', {
@@ -83,19 +124,59 @@ test.describe('models page', () => {
     expect(saved?.cache_read_micros).toBe(1);
     expect(saved?.cache_write_micros).toBeNull();
 
-    await clickRowAction(canonical, page, 'pricing-edit-entry');
+    await canonical.getByTestId('pricing-edit-entry').click();
     await expect(page.locator('[id^="pricing-editor-input"]')).toHaveValue('1.000001');
     await page.locator('[id^="pricing-editor-output"]').fill('3.25');
     await page.getByTestId('pricing-save-entry').click();
-    await expect(canonical.getByTestId('price-output')).toHaveText('$3.25');
+    await expect(canonical.getByTestId('price-output')).toHaveText('3.25');
 
-    await clickRowAction(canonical, page, 'pricing-delete-entry');
-    await page.getByRole('dialog').getByTestId('pricing-delete-confirm').click();
+    await page.getByTestId('inventory-status-filter').click();
+    await page
+      .locator('[data-testid="inventory-status-filter-option"][data-value="unpriced"]')
+      .click();
+    await expect(canonical).toHaveCount(0);
+    await page.getByTestId('inventory-status-filter-clear').click();
     await expect(canonical).toBeVisible();
-    await expect(canonical.getByTestId('inventory-unpriced')).toBeVisible();
+
+    await clickRowAction(canonical, page, 'inventory-delete');
+    await page.getByRole('dialog').getByTestId('inventory-delete-confirm').click();
+    await expect(canonical).toHaveCount(0);
   });
 
-  test('catalog fill previews, requires a host pick, and only writes empty tiers', async ({
+  test('deleting an alias-only inventory row does not strip the canonical from another channel', async ({
+    page,
+  }) => {
+    await seedChannel(page, {
+      name: 'e2e-del-alias-ch',
+      models: ['e2e-del-alias'],
+      model_aliases: { 'e2e-del-alias': 'e2e-del-canonical' },
+    });
+    await seedChannel(page, {
+      name: 'e2e-del-canon-ch',
+      models: ['e2e-del-canonical'],
+    });
+    await seedPrice(page, {
+      model: 'e2e-del-canonical',
+      input_micros: 1_000_000,
+      output_micros: 2_000_000,
+      cache_read_micros: null,
+      cache_write_micros: null,
+    });
+    await page.goto('/models');
+    const aliasRow = page.locator(
+      '[data-testid="inventory-row"][data-model="e2e-del-alias"][data-section-channel="e2e-del-alias-ch"]',
+    );
+    await clickRowAction(aliasRow, page, 'inventory-delete');
+    await page.getByRole('dialog').getByTestId('inventory-delete-confirm').click();
+    await expect(aliasRow).toHaveCount(0);
+    const canonRow = page.locator(
+      '[data-testid="inventory-row"][data-model="e2e-del-canonical"][data-section-channel="e2e-del-canon-ch"]',
+    );
+    await expect(canonRow).toBeVisible();
+    await expect(canonRow.getByTestId('inventory-unpriced')).toHaveCount(0);
+  });
+
+  test('catalog fill previews, requires a provider pick, overwrites selected tiers, and keeps unchecked ones', async ({
     page,
   }) => {
     await seedChannel(page, { name: 'e2e-cat-channel', models: ['e2e-cat-mini'] });
@@ -138,19 +219,20 @@ test.describe('models page', () => {
     await page.goto('/models');
     const row = page.locator('[data-testid="inventory-row"][data-model="e2e-cat-mini"]');
     await row.getByTestId('inventory-select').click();
-    await page.getByTestId('inventory-catalog-fill').click();
+    await page.getByTestId('inventory-bulk-catalog').click();
     await expect(page.getByTestId('catalog-preview')).toBeVisible();
-    await expect(page.getByTestId('catalog-preview-status')).toHaveText(/pick a host/i);
+    await expect(page.getByTestId('catalog-preview-status')).toHaveText(/pick a provider/i);
     await expect(page.getByTestId('catalog-confirm')).toBeDisabled();
 
+    await page.getByTestId('catalog-tier-input').click();
     await page.getByTestId('catalog-host-select').click();
     await page.getByRole('option', { name: 'OpenAI', exact: true }).click();
     await expect(page.getByTestId('catalog-preview-status')).toHaveText(/will write/i);
     await page.getByTestId('catalog-confirm').click();
 
-    await expect(row.getByTestId('price-input')).toHaveText('$9');
-    await expect(row.getByTestId('price-output')).toHaveText('$8');
-    await expect(row.getByTestId('price-cache-read')).toHaveText('$0.075');
+    await expect(row.getByTestId('price-input')).toHaveText('9');
+    await expect(row.getByTestId('price-output')).toHaveText('0.6');
+    await expect(row.getByTestId('price-cache-read')).toHaveText('0.075');
     await expect(row.getByTestId('price-cache-write')).toHaveText('—');
   });
 
@@ -194,25 +276,38 @@ test.describe('models page', () => {
     await expect(unifiedRow.getByTestId('unified-members')).toHaveText(
       'e2e-code-haiku → e2e-code-mini',
     );
+    await unifiedRow.getByTestId('unified-model-name').click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('coding');
+
+    await unifiedRow.getByTestId('unified-edit').click();
+    await expect(page.getByTestId('unified-editor-id')).toHaveValue('coding');
+    await expect(page.getByTestId('unified-editor-id')).toBeDisabled();
+    await page.getByRole('button', { name: /^cancel$/i }).click();
 
     await page.getByTestId('models-tab-visible').click();
-    await expect(page.locator('[data-testid="visible-model"][data-model="coding"]')).toBeVisible();
+    await expect(page.getByTestId('visible-model-count')).toHaveText(/^\d+$/);
+    const visibleRow = page.locator('[data-testid="visible-model"][data-model="coding"]');
+    await expect(visibleRow).toBeVisible();
+    await visibleRow.getByTestId('visible-model-name').click();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('coding');
     await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-haiku');
     await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-mini');
 
     await page.getByTestId('models-tab-groups').click();
     await page.getByTestId('group-create').click();
     await page.getByTestId('group-editor-name').fill('coding');
-    await page
-      .locator('[data-testid="group-model-option"][data-model="coding"]')
-      .getByTestId('group-model-check')
-      .click();
+    await page.getByTestId('group-add-select').click();
+    await page.getByRole('option', { name: 'coding', exact: true }).click();
+    await page.getByTestId('group-add-member').click();
+    await expect(
+      page.locator('[data-testid="group-model-option"][data-model="coding"]'),
+    ).toBeVisible();
     await page.getByTestId('group-save').click();
     await expect(page.locator('[data-testid="group-row"][data-group-name="coding"]')).toBeVisible();
 
     await page.getByTestId('models-tab-visible').click();
-    await page.getByTestId('visible-group-select').click();
-    await page.getByRole('option', { name: 'coding', exact: true }).click();
+    await page.getByTestId('visible-group-filter').click();
+    await page.locator('[data-testid="visible-group-filter-option"][data-value="coding"]').click();
     await expect(page.getByTestId('visible-model')).toHaveCount(1);
     await expect(page.locator('[data-testid="visible-model"][data-model="coding"]')).toBeVisible();
     await expect(page.getByTestId('visible-unified-order')).toContainText('e2e-code-haiku');
@@ -247,7 +342,7 @@ test.describe('models page', () => {
     await expect(page.getByTestId('log-detail-channel')).toHaveText('e2e-coding-channel');
   });
 
-  test('by-channel layout lists a shared model under every member channel', async ({ page }) => {
+  test('inventory groups a shared model under every member channel', async ({ page }) => {
     await seedChannel(page, {
       name: 'e2e-layout-a',
       models: ['e2e-shared', 'e2e-only-a'],
@@ -257,7 +352,8 @@ test.describe('models page', () => {
       models: ['e2e-shared', 'e2e-only-b'],
     });
     await page.goto('/models');
-    await page.getByTestId('inventory-layout-by-channel').click();
+    await expect(page.getByTestId('inventory-channels-head')).toHaveCount(0);
+    await expect(page.getByTestId('inventory-channel-chip')).toHaveCount(0);
     await expect(
       page.locator('[data-testid="inventory-section"][data-channel="e2e-layout-a"]'),
     ).toBeVisible();
@@ -274,6 +370,27 @@ test.describe('models page', () => {
     await expect(
       page.locator(
         '[data-testid="inventory-row"][data-model="e2e-only-a"][data-section-channel="e2e-layout-b"]',
+      ),
+    ).toHaveCount(0);
+
+    await page.getByTestId('inventory-channel-filter').click();
+    await page
+      .locator('[data-testid="inventory-channel-filter-option"][data-value="e2e-layout-a"]')
+      .click();
+    await expect(
+      page.locator('[data-testid="inventory-section"][data-channel="e2e-layout-a"]'),
+    ).toBeVisible();
+    await expect(
+      page.locator('[data-testid="inventory-section"][data-channel="e2e-layout-b"]'),
+    ).toHaveCount(0);
+    await expect(
+      page.locator(
+        '[data-testid="inventory-row"][data-model="e2e-shared"][data-section-channel="e2e-layout-a"]',
+      ),
+    ).toBeVisible();
+    await expect(
+      page.locator(
+        '[data-testid="inventory-row"][data-model="e2e-shared"][data-section-channel="e2e-layout-b"]',
       ),
     ).toHaveCount(0);
   });

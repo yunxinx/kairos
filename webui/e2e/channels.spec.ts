@@ -92,6 +92,14 @@ test.describe('channel resource page', () => {
 
       const okRow = page.locator('[data-testid="channel-row"][data-channel-name="ok-channel"]');
       await expect(okRow).toBeVisible();
+      await expect(
+        okRow.locator('[data-testid="channel-models-chip"][data-model="gpt-4o-mini"]'),
+      ).toBeVisible();
+      await expect(
+        okRow.locator(
+          '[data-testid="channel-models-chip"][data-model="mini"][data-canonical="true"]',
+        ),
+      ).toBeVisible();
       // 品牌图标以 mask 渲染：mask-image 为空会退化成纯色块。
       await expect(okRow.locator('.brand-icon')).toHaveCSS('mask-image', /url\(|image/);
 
@@ -422,6 +430,13 @@ test.describe('channel manual model add', () => {
       await expect
         .poll(() => savedChannelModels(page, channelName))
         .toEqual(expect.arrayContaining([manualId]));
+      await channelRow.getByTestId('overflow-more').click();
+      await expect(
+        page
+          .getByTestId('overflow-chip-menu')
+          .locator('[data-testid="channel-models-chip"][data-model="mini"][data-canonical="true"]'),
+      ).toBeVisible();
+      await page.keyboard.press('Escape');
       const afterSave = await chatCompletionsStatus(page, token.token_key, manualId);
       expect(afterSave.status).toBe(503);
       expect(afterSave.message).toContain('价格');

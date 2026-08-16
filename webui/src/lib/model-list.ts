@@ -13,6 +13,38 @@ export function sameModelSet(left: string[], right: string[]): boolean {
   return sortedLeft.every((model, index) => model === sortedRight[index]);
 }
 
+/** 渠道表格「模型清单」列的一条：清单里的可调用名，附带别名关系。 */
+export interface ListedModelChip {
+  name: string;
+  /** 该名是别名 key 时的出站主模型。 */
+  actualRequest?: string;
+  /** 该名是主模型时，指向它的下游别名。 */
+  aliases: string[];
+}
+
+/**
+ * 渠道 `models` 的展示 chip：不折叠，清单里有的都列出。
+ * 别名 key 带出站主模型；主模型带其别名列表（别名本身不在清单时仍挂在主模型上）。
+ */
+export function listedModelChips(
+  models: string[],
+  aliases: Record<string, string>,
+): ListedModelChip[] {
+  const canonicalAliases = new Map<string, string[]>();
+  for (const [alias, canonical] of Object.entries(aliases)) {
+    const list = canonicalAliases.get(canonical);
+    if (list) list.push(alias);
+    else canonicalAliases.set(canonical, [alias]);
+  }
+  return [...models].sort(compareModels).map((name) => {
+    const canonical = aliases[name];
+    if (canonical !== undefined) {
+      return { name, actualRequest: canonical, aliases: [] };
+    }
+    return { name, aliases: canonicalAliases.get(name) ?? [] };
+  });
+}
+
 /** 两个别名映射是否相同（不看键序），用于脏状态判定。 */
 export function sameAliasMap(left: Record<string, string>, right: Record<string, string>): boolean {
   const leftKeys = Object.keys(left);

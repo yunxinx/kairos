@@ -3,17 +3,18 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { Price } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
+import CopyableName from '@/components/ui/CopyableName.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
-import SearchInput from '@/components/ui/SearchInput.vue';
+import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import InlineError from '@/components/ui/InlineError.vue';
-import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
+import OverflowChips from '@/components/ui/OverflowChips.vue';
+import SearchInput from '@/components/ui/SearchInput.vue';
+import UiIcon from '@/components/ui/UiIcon.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
-import DataTableMenuSeparator from '@/components/ui/data-table/DataTableMenuSeparator.vue';
 import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
 import SelectCell from '@/components/ui/data-table/SelectCell.vue';
@@ -23,24 +24,32 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
-import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
+import { type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import CatalogFillWindow from '@/features/models/CatalogFillWindow.vue';
 import PriceEditorWindow from '@/features/models/PriceEditorWindow.vue';
-import { formatUsdMicros } from '@/lib/format';
+import { formatUsdAmount } from '@/lib/format';
 import {
+  aliasChips,
   buildInventory,
+  channelChangedByStrip,
+  listedNamesOnChannel,
   sectionInventory,
   sortInventory,
-  type InventoryLayout,
+  stripNamesFromChannel,
+  type AliasChip,
   type InventoryRow,
+  type InventorySection,
 } from '@/lib/inventory';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
+type InventoryDeleteTarget = { name: string; channelName: string };
+type InventorySectionRow = InventoryRow & { aliasChipItems: AliasChip[] };
+
 type InventoryWindowPayload =
   | { kind: 'editor'; row: InventoryRow }
-  | { kind: 'delete'; row: InventoryRow }
+  | { kind: 'delete'; row: InventoryRow; channelName: string }
   | { kind: 'catalog'; rows: InventoryRow[] }
   | BulkDeletePayload;
 
@@ -48,8 +57,10 @@ const { t } = useI18n();
 const queryClient = useQueryClient();
 
 const searchText = ref('');
-const layout = ref<InventoryLayout>('unified');
+const statusFilter = ref<string[]>([]);
+const selectedChannels = ref<string[]>([]);
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
+const tableColumnCount = 8;
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
   const anchor = pendingAnchor.value;
@@ -90,31 +101,72 @@ const inventory = computed(() =>
 
 const filteredRows = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  const rows = q
-    ? inventory.value.filter(
-        (row) =>
-          row.name.toLowerCase().includes(q) ||
-          row.channelNames.some((name) => name.toLowerCase().includes(q)) ||
-          row.aliases.some((alias) => alias.canonical.toLowerCase().includes(q)),
-      )
-    : inventory.value;
+  const statuses = new Set(statusFilter.value);
+  const channels = new Set(selectedChannels.value);
+  const rows = inventory.value.filter((row) => {
+    if (channels.size > 0 && !row.channelNames.some((name) => channels.has(name))) {
+      return false;
+    }
+    if (statuses.size > 0) {
+      const priced = row.price !== null;
+      if (priced && !statuses.has('priced')) return false;
+      if (!priced && !statuses.has('unpriced')) return false;
+    }
+    if (!q) return true;
+    return (
+      row.name.toLowerCase().includes(q) ||
+      row.channelNames.some((name) => name.toLowerCase().includes(q)) ||
+      row.aliases.some((item) => item.alias.toLowerCase().includes(q)) ||
+      row.outbound.some((item) => item.alias.toLowerCase().includes(q))
+    );
+  });
   return sortInventory(rows);
 });
 
-const sections = computed(() => sectionInventory(filteredRows.value, layout.value));
+const statusOptions = computed(() => {
+  const unpriced = inventory.value.filter((row) => row.price === null).length;
+  const priced = inventory.value.length - unpriced;
+  return [
+    { value: 'unpriced', label: t('models.unpriced'), count: unpriced },
+    { value: 'priced', label: t('models.priced'), count: priced },
+  ];
+});
 
-const layoutOptions = computed((): SegmentPair<InventoryLayout> => [
-  {
-    value: 'unified',
-    label: t('models.layoutUnified'),
-    testId: 'inventory-layout-unified',
-  },
-  {
-    value: 'by-channel',
-    label: t('models.layoutByChannel'),
-    testId: 'inventory-layout-by-channel',
-  },
-]);
+const channelOptions = computed(() => {
+  const counts = new Map<string, number>();
+  for (const row of inventory.value) {
+    for (const name of row.channelNames) {
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+  }
+  return [...(channelsQuery.data.value ?? [])]
+    .map((channel) => ({
+      value: channel.name,
+      label: channel.name,
+      count: counts.get(channel.name) ?? 0,
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label));
+});
+
+const sections = computed(() => {
+  const grouped = sectionInventory(filteredRows.value);
+  const byName = new Map(grouped.map((section) => [section.channelName, section]));
+  const selected = selectedChannels.value;
+  const names =
+    selected.length > 0
+      ? [...selected].sort((left, right) => left.localeCompare(right))
+      : grouped.map((section) => section.channelName);
+  return names.map((name): InventorySection & { rows: InventorySectionRow[] } => {
+    const section = byName.get(name) ?? { channelName: name, rows: [] };
+    return {
+      channelName: section.channelName,
+      rows: section.rows.map((row) => ({
+        ...row,
+        aliasChipItems: aliasChips(row, section.channelName),
+      })),
+    };
+  });
+});
 
 const selection = useRowSelection<string>();
 
@@ -139,35 +191,96 @@ const selectedRows = computed(() =>
   inventory.value.filter((row) => selection.isSelected(row.name)),
 );
 
-const pricedSelected = computed(() => selectedRows.value.filter((row) => row.price !== null));
+async function removeInventoryTargets(targets: InventoryDeleteTarget[]) {
+  const channels = channelsQuery.data.value ?? [];
+  const rowByName = new Map(inventory.value.map((row) => [row.name, row]));
+  const dropByChannel = new Map<string, Set<string>>();
+  const droppedListed = new Set<string>();
+  for (const target of targets) {
+    const row = rowByName.get(target.name);
+    if (!row) continue;
+    let drop = dropByChannel.get(target.channelName);
+    if (!drop) {
+      drop = new Set();
+      dropByChannel.set(target.channelName, drop);
+    }
+    for (const name of listedNamesOnChannel(row, target.channelName)) {
+      drop.add(name);
+      droppedListed.add(name);
+    }
+  }
 
-const bulkDelete = useBulkDelete<string>({
-  selection,
-  windowStack: { windows, close: closeWindow },
-  queryKey: ['prices'],
-  deleteOne: (model) => apiClient.deletePrice(model),
-});
+  const remainingModels = new Set<string>();
+  for (const channel of channels) {
+    const drop = dropByChannel.get(channel.name);
+    const next = drop ? stripNamesFromChannel(channel, drop) : channel;
+    for (const name of next.models) remainingModels.add(name);
+    if (drop && channelChangedByStrip(channel, next)) {
+      await apiClient.updateChannel(channel.id, next);
+    }
+  }
+
+  const prices = pricesQuery.data.value ?? [];
+  for (const price of prices) {
+    if (droppedListed.has(price.model) && !remainingModels.has(price.model)) {
+      await apiClient.deletePrice(price.model);
+    }
+  }
+}
 
 const deleteMutation = useMutation({
-  mutationFn: (model: string) => apiClient.deletePrice(model),
-  onSuccess: async (_data, model) => {
-    const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.row.name === model,
-    );
-    if (entry) closeWindow(entry.id);
+  mutationFn: (targets: InventoryDeleteTarget[]) => removeInventoryTargets(targets),
+  onSuccess: async (_data, targets) => {
+    const names = new Set(targets.map((target) => target.name));
+    const keys = new Set(targets.map((target) => `${target.channelName}:${target.name}`));
+    for (const item of [...windows.value]) {
+      if (item.payload.kind === 'bulk-delete') closeWindow(item.id);
+      if (
+        item.payload.kind === 'delete' &&
+        keys.has(`${item.payload.channelName}:${item.payload.row.name}`)
+      ) {
+        closeWindow(item.id);
+      }
+    }
+    selection.setMany([...names], false);
+    await queryClient.invalidateQueries({ queryKey: ['channels'] });
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
   },
-  onError: (err, model) => {
-    const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.row.name === model,
-    );
-    if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
+  onError: (err, targets) => {
+    const message = extractApiError(err).message;
+    const keys = new Set(targets.map((target) => `${target.channelName}:${target.name}`));
+    for (const item of windows.value) {
+      const matchDelete =
+        item.payload.kind === 'delete' &&
+        targets.length === 1 &&
+        keys.has(`${item.payload.channelName}:${item.payload.row.name}`);
+      if (item.payload.kind === 'bulk-delete' || matchDelete) {
+        deleteErrors.value[item.id] = message;
+      }
+    }
   },
 });
 
-const deletingModel = computed(() =>
-  deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
+const deletingTarget = computed(() => {
+  const targets = deleteMutation.variables.value;
+  return deleteMutation.isPending.value && targets?.length === 1 ? (targets[0] ?? null) : null;
+});
+
+const bulkDeleting = computed(
+  () => deleteMutation.isPending.value && (deleteMutation.variables.value?.length ?? 0) > 1,
 );
+
+function visibleDeleteTargets(): InventoryDeleteTarget[] {
+  const targets: InventoryDeleteTarget[] = [];
+  for (const section of sections.value) {
+    for (const row of section.rows) {
+      if (selection.isSelected(row.name)) {
+        targets.push({ name: row.name, channelName: section.channelName });
+      }
+    }
+  }
+  return targets;
+}
 
 function openEdit(row: InventoryRow) {
   const existing = windows.value.find(
@@ -180,16 +293,18 @@ function openEdit(row: InventoryRow) {
   openWindow(takePendingAnchor(), { kind: 'editor', row });
 }
 
-function openDelete(row: InventoryRow) {
-  if (row.price === null) return;
+function openDelete(row: InventoryRow, channelName: string) {
   const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'delete' && entry.payload.row.name === row.name,
+    (entry) =>
+      entry.payload.kind === 'delete' &&
+      entry.payload.row.name === row.name &&
+      entry.payload.channelName === channelName,
   );
   if (existing) {
     bringToFront(existing.id);
     return;
   }
-  const entry = openWindow(takePendingAnchor(), { kind: 'delete', row });
+  const entry = openWindow(takePendingAnchor(), { kind: 'delete', row, channelName });
   if (entry) deleteErrors.value[entry.id] = '';
 }
 
@@ -199,7 +314,8 @@ function openBulkDelete() {
     bringToFront(existing.id);
     return;
   }
-  openWindow(takePendingAnchor(), { kind: 'bulk-delete' });
+  const entry = openWindow(takePendingAnchor(), { kind: 'bulk-delete' });
+  if (entry) deleteErrors.value[entry.id] = '';
 }
 
 function openCatalog() {
@@ -211,14 +327,8 @@ function openCatalog() {
   openWindow(takePendingAnchor(), { kind: 'catalog', rows: selectedRows.value });
 }
 
-function formatOptionalMicros(value: number | null): string {
-  return value === null ? '—' : formatUsdMicros(value);
-}
-
-function aliasLabel(row: InventoryRow): string {
-  return row.aliases
-    .map((alias) => `${row.name} → ${alias.canonical} (${alias.channelName})`)
-    .join(', ');
+function formatOptionalAmount(value: number | null): string {
+  return value === null ? t('common.emptyCell') : formatUsdAmount(value);
 }
 
 function refetchAll() {
@@ -229,13 +339,6 @@ function refetchAll() {
 function loadErrorMessage(): string {
   if (channelsQuery.isError.value) return extractApiError(channelsQuery.error.value).message;
   return extractApiError(pricesQuery.error.value).message;
-}
-
-function bulkDeleteKeys(): string[] {
-  return pricedSelected.value
-    .map((row) => row.price)
-    .filter((price): price is Price => price !== null)
-    .map((price) => price.model);
 }
 </script>
 
@@ -259,23 +362,18 @@ function bulkDeleteKeys(): string[] {
               :placeholder="t('models.search')"
               :aria-label="t('models.search')"
             />
-            <SegmentSwitch
-              v-model="layout"
-              :options="layoutOptions"
-              :aria-label="t('models.layoutLabel')"
+            <FacetedFilter
+              v-model="statusFilter"
+              :title="t('models.statusFilter')"
+              :options="statusOptions"
+              test-id="inventory-status-filter"
             />
-            <template #actions>
-              <button
-                type="button"
-                class="btn btn-primary"
-                data-testid="inventory-catalog-fill"
-                :disabled="selection.count.value === 0"
-                @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                @click="openCatalog"
-              >
-                {{ t('models.catalogFill') }}
-              </button>
-            </template>
+            <FacetedFilter
+              v-model="selectedChannels"
+              :title="t('models.channels')"
+              :options="channelOptions"
+              test-id="inventory-channel-filter"
+            />
           </DataTableToolbar>
         </template>
         <TableHeader>
@@ -291,35 +389,34 @@ function bulkDeleteKeys(): string[] {
               </div>
             </TableHead>
             <TableHead>{{ t('pricing.model') }}</TableHead>
-            <TableHead>{{ t('models.channels') }}</TableHead>
             <TableHead>{{ t('models.alias') }}</TableHead>
-            <TableHead>{{ t('pricing.input') }}</TableHead>
-            <TableHead>{{ t('pricing.output') }}</TableHead>
-            <TableHead>{{ t('pricing.cacheRead') }}</TableHead>
-            <TableHead>{{ t('pricing.cacheWrite') }}</TableHead>
+            <TableHead>{{ t('pricing.inputUsd') }}</TableHead>
+            <TableHead>{{ t('pricing.outputUsd') }}</TableHead>
+            <TableHead>{{ t('pricing.cacheReadUsd') }}</TableHead>
+            <TableHead>{{ t('pricing.cacheWriteUsd') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="9" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="tableColumnCount" />
           <template v-else>
-            <template v-for="section in sections" :key="section.channelName ?? 'all'">
+            <template v-for="section in sections" :key="section.channelName">
               <TableRow
-                v-if="section.channelName !== null"
+                class="inventory-section-row"
                 data-testid="inventory-section"
                 :data-channel="section.channelName"
               >
-                <TableCell :colspan="9" class="text-fg-muted bg-surface-alt text-xs font-medium">
-                  {{ t('models.sectionChannel', { name: section.channelName }) }}
+                <TableCell :colspan="tableColumnCount" class="inventory-section-cell">
+                  {{ section.channelName }}
                 </TableCell>
               </TableRow>
               <TableRow
                 v-for="row in section.rows"
-                :key="row.name"
+                :key="`${section.channelName}:${row.name}`"
                 data-testid="inventory-row"
                 :data-model="row.name"
                 :data-price-model="row.name"
-                :data-section-channel="section.channelName ?? undefined"
+                :data-section-channel="section.channelName"
                 :data-unpriced="row.price === null ? 'true' : 'false'"
                 :class="row.price === null ? 'inventory-row-unpriced' : undefined"
                 :data-state="selection.isSelected(row.name) ? 'selected' : undefined"
@@ -331,7 +428,7 @@ function bulkDeleteKeys(): string[] {
                 />
                 <TableCell class="font-medium">
                   <span class="inline-flex items-center gap-2">
-                    {{ row.name }}
+                    <CopyableName :text="row.name" test-id="inventory-model-name" />
                     <span
                       v-if="row.price === null"
                       class="badge badge-warn"
@@ -341,59 +438,50 @@ function bulkDeleteKeys(): string[] {
                     </span>
                   </span>
                 </TableCell>
-                <TableCell>
-                  <span class="flex flex-wrap gap-1">
-                    <span
-                      v-for="channelName in row.channelNames"
-                      :key="channelName"
-                      class="badge badge-info"
-                      data-testid="inventory-channel-chip"
-                    >
-                      {{ channelName }}
-                    </span>
-                  </span>
-                </TableCell>
-                <TableCell class="text-sm" data-testid="inventory-alias">
-                  {{ aliasLabel(row) || '—' }}
+                <TableCell data-testid="inventory-alias">
+                  <OverflowChips :items="row.aliasChipItems" chip-test-id="inventory-alias-chip" />
                 </TableCell>
                 <TableCell class="font-mono" data-testid="price-input">
-                  {{ row.price ? formatUsdMicros(row.price.input_micros) : '—' }}
+                  {{ row.price ? formatUsdAmount(row.price.input_micros) : t('common.emptyCell') }}
                 </TableCell>
                 <TableCell class="font-mono" data-testid="price-output">
-                  {{ row.price ? formatUsdMicros(row.price.output_micros) : '—' }}
+                  {{ row.price ? formatUsdAmount(row.price.output_micros) : t('common.emptyCell') }}
                 </TableCell>
                 <TableCell class="font-mono" data-testid="price-cache-read">
-                  {{ row.price ? formatOptionalMicros(row.price.cache_read_micros) : '—' }}
+                  {{ row.price ? formatOptionalAmount(row.price.cache_read_micros) : '—' }}
                 </TableCell>
                 <TableCell class="font-mono" data-testid="price-cache-write">
-                  {{ row.price ? formatOptionalMicros(row.price.cache_write_micros) : '—' }}
+                  {{ row.price ? formatOptionalAmount(row.price.cache_write_micros) : '—' }}
                 </TableCell>
                 <TableCell align="center">
-                  <DataTableRowActions>
-                    <DataTableMenuItem
+                  <span class="inline-flex items-center justify-center gap-1">
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-icon"
                       data-testid="pricing-edit-entry"
+                      :aria-label="t('pricing.editPrice')"
+                      :title="t('pricing.editPrice')"
                       @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                      @select="openEdit(row)"
+                      @click="openEdit(row)"
                     >
-                      {{ t('pricing.editPrice') }}
-                    </DataTableMenuItem>
-                    <template v-if="row.price !== null">
-                      <DataTableMenuSeparator />
+                      <UiIcon name="pencil" :size="16" />
+                    </button>
+                    <DataTableRowActions>
                       <DataTableMenuItem
                         danger
-                        data-testid="pricing-delete-entry"
+                        data-testid="inventory-delete"
                         @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                        @select="openDelete(row)"
+                        @select="openDelete(row, section.channelName)"
                       >
-                        {{ t('common.delete') }}
+                        {{ t('models.deleteModel') }}
                       </DataTableMenuItem>
-                    </template>
-                  </DataTableRowActions>
+                    </DataTableRowActions>
+                  </span>
                 </TableCell>
               </TableRow>
             </template>
-            <TableRow v-if="filteredRows.length === 0">
-              <TableCell :colspan="9" class="h-24 whitespace-normal">
+            <TableRow v-if="sections.length === 0">
+              <TableCell :colspan="tableColumnCount" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.emptyInventory')" />
               </TableCell>
             </TableRow>
@@ -407,22 +495,22 @@ function bulkDeleteKeys(): string[] {
       >
         <button
           type="button"
-          class="btn"
+          class="btn bulk-bar__action"
           data-testid="inventory-bulk-catalog"
           @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
           @click="openCatalog"
         >
           {{ t('models.catalogFill') }}
         </button>
+        <span class="bulk-bar__divider" aria-hidden="true" />
         <button
-          v-if="pricedSelected.length > 0"
           type="button"
           class="btn btn-danger-filled bulk-bar__delete"
-          data-testid="pricing-bulk-delete"
+          data-testid="inventory-bulk-delete"
           @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
           @click="openBulkDelete"
         >
-          {{ t('common.delete') }}
+          {{ t('models.deleteModel') }}
         </button>
       </DataTableBulkBar>
     </div>
@@ -456,36 +544,48 @@ function bulkDeleteKeys(): string[] {
       <ConfirmWindow
         v-else-if="win.payload.kind === 'delete'"
         :title="t('pricing.deleteTitle')"
-        :message="t('pricing.deleteMessage', { name: win.payload.row.name })"
+        :message="
+          t('pricing.deleteMessage', {
+            name: win.payload.row.name,
+            channel: win.payload.channelName,
+          })
+        "
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"
         :attention="win.attention"
         :topmost="win.id === topmostId"
         :error="deleteErrors[win.id] ?? ''"
-        :busy="deletingModel === win.payload.row.name"
-        confirm-test-id="pricing-delete-confirm"
+        :busy="
+          deletingTarget?.name === win.payload.row.name &&
+          deletingTarget?.channelName === win.payload.channelName
+        "
+        confirm-test-id="inventory-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
-        @confirm="deleteMutation.mutate(win.payload.row.name)"
+        @confirm="
+          deleteMutation.mutate([
+            { name: win.payload.row.name, channelName: win.payload.channelName },
+          ])
+        "
       />
       <ConfirmWindow
         v-else
         :title="t('pricing.bulkDeleteTitle')"
-        :message="t('pricing.bulkDeleteMessage', { count: pricedSelected.length })"
+        :message="t('pricing.bulkDeleteMessage', { count: selection.count.value })"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"
         :attention="win.attention"
         :topmost="win.id === topmostId"
-        :error="bulkDelete.error.value"
-        :busy="bulkDelete.isPending.value"
-        confirm-test-id="pricing-bulk-delete-confirm"
+        :error="deleteErrors[win.id] ?? ''"
+        :busy="bulkDeleting"
+        confirm-test-id="inventory-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
-        @confirm="bulkDelete.mutate(bulkDeleteKeys())"
+        @confirm="deleteMutation.mutate(visibleDeleteTargets())"
       />
     </template>
   </div>

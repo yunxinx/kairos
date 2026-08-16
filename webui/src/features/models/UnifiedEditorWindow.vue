@@ -4,12 +4,20 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { UnifiedModel } from '@/api/types';
+import DataTablePanel from '@/components/ui/DataTablePanel.vue';
+import EmptyState from '@/components/ui/EmptyState.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
+import Table from '@/components/ui/table/Table.vue';
+import TableBody from '@/components/ui/table/TableBody.vue';
+import TableCell from '@/components/ui/table/TableCell.vue';
+import TableHead from '@/components/ui/table/TableHead.vue';
+import TableHeader from '@/components/ui/table/TableHeader.vue';
+import TableRow from '@/components/ui/table/TableRow.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import { moveItem } from '@/lib/move-item';
@@ -173,60 +181,86 @@ function onDrop(index: number) {
 
         <div>
           <p class="form-field-label mb-2">{{ t('models.unifiedMembers') }}</p>
-          <ol class="space-y-1" data-testid="unified-member-list">
-            <!-- HTML5 拖拽落点在行上；键盘重排由上/下按钮承担。 -->
-            <!-- eslint-disable vuejs-accessibility/no-static-element-interactions -->
-            <li
-              v-for="(member, index) in editorMembers"
-              :key="member"
-              class="border-seed flex items-center gap-2 rounded-md border px-2 py-1"
-              draggable="true"
-              data-testid="unified-member"
-              :data-member="member"
-              @dragstart="onDragStart(index, $event)"
-              @dragover.prevent
-              @drop.prevent="onDrop(index)"
-            >
-              <button
-                type="button"
-                class="text-fg-muted cursor-grab"
-                :aria-label="t('models.unifiedDragHandle')"
-              >
-                <UiIcon name="grip-vertical" :size="14" />
-              </button>
-              <span class="min-w-0 flex-1 font-mono text-sm">{{ member }}</span>
-              <button
-                type="button"
-                class="btn btn-ghost btn-icon"
-                data-testid="unified-member-up"
-                :disabled="index === 0"
-                :aria-label="t('models.unifiedMoveUp')"
-                @click="moveMember(index, index - 1)"
-              >
-                <UiIcon name="chevron-up" :size="14" />
-              </button>
-              <button
-                type="button"
-                class="btn btn-ghost btn-icon"
-                data-testid="unified-member-down"
-                :disabled="index === editorMembers.length - 1"
-                :aria-label="t('models.unifiedMoveDown')"
-                @click="moveMember(index, index + 1)"
-              >
-                <UiIcon name="chevron-down" :size="14" />
-              </button>
-              <button
-                type="button"
-                class="btn btn-ghost btn-icon"
-                data-testid="unified-member-remove"
-                :aria-label="t('models.unifiedRemoveMember', { name: member })"
-                @click="removeMember(member)"
-              >
-                <UiIcon name="close" :size="14" />
-              </button>
-            </li>
-            <!-- eslint-enable vuejs-accessibility/no-static-element-interactions -->
-          </ol>
+          <DataTablePanel>
+            <div class="seed-scrollbar max-h-56 overflow-y-auto">
+              <Table data-testid="unified-member-list">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead class="w-10">{{ t('models.memberIndex') }}</TableHead>
+                    <TableHead>{{ t('pricing.model') }}</TableHead>
+                    <TableHead align="center">{{ t('common.actions') }}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <!-- HTML5 拖拽落点在行上；键盘重排由上/下按钮承担。 -->
+                  <!-- eslint-disable vuejs-accessibility/no-static-element-interactions -->
+                  <TableRow
+                    v-for="(member, index) in editorMembers"
+                    :key="member"
+                    draggable="true"
+                    data-testid="unified-member"
+                    :data-member="member"
+                    @dragstart="onDragStart(index, $event)"
+                    @dragover.prevent
+                    @drop.prevent="onDrop(index)"
+                  >
+                    <TableCell class="text-fg-muted font-mono text-xs">
+                      <span class="inline-flex items-center gap-1">
+                        <button
+                          type="button"
+                          class="text-fg-muted cursor-grab"
+                          :aria-label="t('models.unifiedDragHandle')"
+                        >
+                          <UiIcon name="grip-vertical" :size="14" />
+                        </button>
+                        {{ index + 1 }}
+                      </span>
+                    </TableCell>
+                    <TableCell class="font-mono text-sm">{{ member }}</TableCell>
+                    <TableCell align="center">
+                      <span class="inline-flex items-center justify-center gap-0.5">
+                        <button
+                          type="button"
+                          class="btn btn-ghost btn-icon"
+                          data-testid="unified-member-up"
+                          :disabled="index === 0"
+                          :aria-label="t('models.unifiedMoveUp')"
+                          @click="moveMember(index, index - 1)"
+                        >
+                          <UiIcon name="chevron-up" :size="14" />
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost btn-icon"
+                          data-testid="unified-member-down"
+                          :disabled="index === editorMembers.length - 1"
+                          :aria-label="t('models.unifiedMoveDown')"
+                          @click="moveMember(index, index + 1)"
+                        >
+                          <UiIcon name="chevron-down" :size="14" />
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-ghost btn-icon"
+                          data-testid="unified-member-remove"
+                          :aria-label="t('models.unifiedRemoveMember', { name: member })"
+                          @click="removeMember(member)"
+                        >
+                          <UiIcon name="close" :size="14" />
+                        </button>
+                      </span>
+                    </TableCell>
+                  </TableRow>
+                  <!-- eslint-enable vuejs-accessibility/no-static-element-interactions -->
+                  <TableRow v-if="editorMembers.length === 0">
+                    <TableCell :colspan="3" class="h-20 whitespace-normal">
+                      <EmptyState :title="t('models.unifiedMembersEmpty')" />
+                    </TableCell>
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </div>
+          </DataTablePanel>
           <div v-if="addOptions.length > 0" class="mt-2 flex items-end gap-2">
             <FormField
               class="min-w-0 flex-1"

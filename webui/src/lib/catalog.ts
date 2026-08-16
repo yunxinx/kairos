@@ -1,7 +1,7 @@
 import type { Price } from '@/api/types';
 import { parseUsdToMicros } from '@/lib/format';
 
-/** models.dev 公开目录；匹配必须带 providerId，禁止只按裸 ID 跨宿主写入。 */
+/** models.dev 公开目录；匹配必须带 providerId，禁止只按裸 ID 跨提供方写入。 */
 export const MODELS_DEV_CATALOG_URL = 'https://models.dev/api.json';
 
 export interface CatalogCost {
@@ -40,7 +40,7 @@ export async function fetchModelsDevCatalog(): Promise<CatalogFile> {
   return (await response.json()) as CatalogFile;
 }
 
-/** 按 modelId 收集全部宿主命中；多宿主必须由运营者人选。 */
+/** 按 modelId 收集全部提供方命中；多个提供方必须由运营者人选。 */
 export function findCatalogHits(catalog: CatalogFile, modelId: string): CatalogHit[] {
   const hits: CatalogHit[] = [];
   for (const [providerKey, provider] of Object.entries(catalog)) {
@@ -64,31 +64,59 @@ export function catalogDollarsToMicros(value: number | undefined): number | null
 }
 
 /**
- * 只填空档：已有价格行的 input/output 不改；缓存 `null` 视为空档可填。
- * 无价格行时用目录创建；缺少 input/output 则无法写入。
+ * 按勾选档位写入目录价，允许覆盖已填单价。
+ * 未勾选的档位保持现状；目录缺该项时也保持现状。
+ * 新建价格行仍需要 input/output：未勾选且无现价则无法写入。
  */
-export function fillEmptyTiers(
+export function applyCatalogTiers(
   model: string,
   existing: Price | null,
   cost: CatalogCost,
+  tiers: ReadonlySet<CatalogTier>,
 ): Price | null {
-  const inputMicros = existing?.input_micros ?? catalogDollarsToMicros(cost.input);
-  const outputMicros = existing?.output_micros ?? catalogDollarsToMicros(cost.output);
+  const inputMicros = pickRequiredTier(tiers.has('input'), cost.input, existing?.input_micros);
+  const outputMicros = pickRequiredTier(tiers.has('output'), cost.output, existing?.output_micros);
   if (inputMicros === null || outputMicros === null) return null;
   return {
     model,
     input_micros: inputMicros,
     output_micros: outputMicros,
-    cache_read_micros:
-      existing && existing.cache_read_micros !== null
-        ? existing.cache_read_micros
-        : catalogDollarsToMicros(cost.cache_read),
-    cache_write_micros:
-      existing && existing.cache_write_micros !== null
-        ? existing.cache_write_micros
-        : catalogDollarsToMicros(cost.cache_write),
+    cache_read_micros: pickOptionalTier(
+      tiers.has('cacheRead'),
+      cost.cache_read,
+      existing?.cache_read_micros ?? null,
+    ),
+    cache_write_micros: pickOptionalTier(
+      tiers.has('cacheWrite'),
+      cost.cache_write,
+      existing?.cache_write_micros ?? null,
+    ),
   };
 }
+
+function pickRequiredTier(
+  selected: boolean,
+  catalog: number | undefined,
+  current: number | undefined,
+): number | null {
+  if (selected) {
+    return catalogDollarsToMicros(catalog) ?? current ?? null;
+  }
+  return current ?? null;
+}
+
+function pickOptionalTier(
+  selected: boolean,
+  catalog: number | undefined,
+  current: number | null,
+): number | null {
+  if (!selected) return current;
+  const fromCatalog = catalogDollarsToMicros(catalog);
+  return fromCatalog !== null ? fromCatalog : current;
+}
+
+export const CATALOG_TIERS = ['input', 'output', 'cacheRead', 'cacheWrite'] as const;
+export type CatalogTier = (typeof CATALOG_TIERS)[number];
 
 export interface CatalogFillSource {
   model: string;
@@ -108,7 +136,7 @@ export interface CatalogFillPreview {
   lookupId: string;
   hits: CatalogHit[];
   hostOptions: CatalogHostOption[];
-  /** 唯一宿主时的展示名；多宿主或未命中为 null。 */
+  /** 唯一提供方时的展示名；多个提供方或未命中为 null。 */
   hostName: string | null;
   selectedProviderId: string | null;
   nextPrice: Price | null;
@@ -138,11 +166,12 @@ function pricesEqual(left: Price, right: Price): boolean {
   );
 }
 
-/** 为勾选的清单行生成目录填价预览；多宿主未选则标 `need-host`。 */
+/** 为勾选的清单行生成目录填价预览；多个提供方未选则标 `need-host`。勾选档位允许覆盖已填单价。 */
 export function buildCatalogFillPreview(
   sources: CatalogFillSource[],
   catalog: CatalogFile,
   hostPicks: Record<string, string>,
+  tiers: ReadonlySet<CatalogTier>,
 ): CatalogFillPreview[] {
   return sources.map((source) => {
     const hits = findCatalogHits(catalog, source.lookupId);
@@ -171,7 +200,18 @@ export function buildCatalogFillPreview(
         status: 'need-host',
       };
     }
-    const nextPrice = fillEmptyTiers(source.model, source.price, picked.cost);
+    if (tiers.size === 0) {
+      return {
+        model: source.model,
+        lookupId: source.lookupId,
+        hits,
+        ...hosts,
+        selectedProviderId: picked.providerId,
+        nextPrice: source.price,
+        status: source.price ? 'unchanged' : 'no-match',
+      };
+    }
+    const nextPrice = applyCatalogTiers(source.model, source.price, picked.cost, tiers);
     const unchanged =
       nextPrice !== null && source.price !== null && pricesEqual(source.price, nextPrice);
     return {

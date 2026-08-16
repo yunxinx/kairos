@@ -1,18 +1,29 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { Price } from '@/api/types';
+import Checkbox from '@/components/ui/Checkbox.vue';
+import DataTablePanel from '@/components/ui/DataTablePanel.vue';
+import EmptyState from '@/components/ui/EmptyState.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
+import Table from '@/components/ui/table/Table.vue';
+import TableBody from '@/components/ui/table/TableBody.vue';
+import TableCell from '@/components/ui/table/TableCell.vue';
+import TableHead from '@/components/ui/table/TableHead.vue';
+import TableHeader from '@/components/ui/table/TableHeader.vue';
+import TableRow from '@/components/ui/table/TableRow.vue';
 import {
+  CATALOG_TIERS,
   buildCatalogFillPreview,
   fetchModelsDevCatalog,
   type CatalogFillPreview,
+  type CatalogTier,
 } from '@/lib/catalog';
-import { formatUsdMicros } from '@/lib/format';
+import { formatUsdAmount } from '@/lib/format';
 import { catalogLookupId, type InventoryRow } from '@/lib/inventory';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -35,12 +46,29 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const uid = useId();
 const queryClient = useQueryClient();
 const hostPicks = ref<Record<string, string>>({});
 const writeError = ref('');
-watch(hostPicks, (picks) => emit('dirty-change', Object.keys(picks).length > 0), {
-  immediate: true,
+const TIER_UI = [
+  { id: 'input', testId: 'catalog-tier-input', labelKey: 'pricing.input' },
+  { id: 'output', testId: 'catalog-tier-output', labelKey: 'pricing.output' },
+  { id: 'cacheRead', testId: 'catalog-tier-cache-read', labelKey: 'pricing.cacheRead' },
+  { id: 'cacheWrite', testId: 'catalog-tier-cache-write', labelKey: 'pricing.cacheWrite' },
+] as const;
+const tierFlags = ref<Record<CatalogTier, boolean>>(
+  Object.fromEntries(CATALOG_TIERS.map((tier) => [tier, true])) as Record<CatalogTier, boolean>,
+);
+
+const selectedTiers = computed((): Set<CatalogTier> => {
+  return new Set(CATALOG_TIERS.filter((tier) => tierFlags.value[tier]));
 });
+
+const dirty = computed(
+  () =>
+    Object.keys(hostPicks.value).length > 0 || CATALOG_TIERS.some((tier) => !tierFlags.value[tier]),
+);
+watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const catalogQuery = useQuery({
   queryKey: ['models-dev-catalog'],
@@ -59,11 +87,13 @@ const preview = computed((): CatalogFillPreview[] => {
     })),
     catalog,
     hostPicks.value,
+    selectedTiers.value,
   );
 });
 
 const canConfirm = computed(
   () =>
+    selectedTiers.value.size > 0 &&
     preview.value.some((row) => row.status === 'will-write') &&
     preview.value.every((row) => row.status !== 'need-host'),
 );
@@ -76,8 +106,8 @@ function statusLabel(row: CatalogFillPreview): string {
 }
 
 function formatTier(value: number | null | undefined): string {
-  if (value === null || value === undefined) return '—';
-  return formatUsdMicros(value);
+  if (value === null || value === undefined) return t('common.emptyCell');
+  return formatUsdAmount(value);
 }
 
 const writeMutation = useMutation({
@@ -116,7 +146,7 @@ function pickHost(model: string, providerId: string) {
 <template>
   <FloatingWindow
     :title="t('models.catalogTitle')"
-    wide
+    extra-wide
     :anchor="anchor"
     :stack-order="stackOrder"
     :cascade="cascade"
@@ -126,7 +156,24 @@ function pickHost(model: string, providerId: string) {
     @pointerdown="emit('raise')"
   >
     <div class="card-body space-y-3">
-      <p class="text-fg-muted text-sm">{{ t('models.catalogLead') }}</p>
+      <fieldset>
+        <legend class="form-field-label mb-2">{{ t('models.catalogTiers') }}</legend>
+        <div class="flex flex-wrap gap-x-4 gap-y-2">
+          <label
+            v-for="tier in TIER_UI"
+            :key="tier.id"
+            class="inline-flex items-center gap-2 text-sm"
+            :for="`catalog-tier-${tier.id}-${uid}`"
+          >
+            <Checkbox
+              :id="`catalog-tier-${tier.id}-${uid}`"
+              v-model="tierFlags[tier.id]"
+              :data-testid="tier.testId"
+            />
+            {{ t(tier.labelKey) }}
+          </label>
+        </div>
+      </fieldset>
       <InlineError
         v-if="catalogQuery.isError.value"
         :message="t('models.catalogError')"
@@ -135,30 +182,30 @@ function pickHost(model: string, providerId: string) {
       <p v-else-if="catalogQuery.isPending.value" class="text-fg-muted text-sm">
         {{ t('common.loading') }}
       </p>
-      <div v-else class="overflow-x-auto" data-testid="catalog-preview">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="text-fg-muted text-left">
-              <th class="pr-3 pb-2 font-medium">{{ t('pricing.model') }}</th>
-              <th class="pr-3 pb-2 font-medium">{{ t('models.catalogLookup') }}</th>
-              <th class="pr-3 pb-2 font-medium">{{ t('models.catalogHost') }}</th>
-              <th class="pr-3 pb-2 font-medium">{{ t('pricing.input') }}</th>
-              <th class="pr-3 pb-2 font-medium">{{ t('pricing.output') }}</th>
-              <th class="pr-3 pb-2 font-medium">{{ t('pricing.cacheRead') }}</th>
-              <th class="pr-3 pb-2 font-medium">{{ t('pricing.cacheWrite') }}</th>
-              <th class="pb-2 font-medium">{{ t('channel.status') }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
+      <DataTablePanel v-else data-testid="catalog-preview">
+        <Table class="min-w-max">
+          <TableHeader>
+            <TableRow>
+              <TableHead>{{ t('pricing.model') }}</TableHead>
+              <TableHead>{{ t('models.catalogLookup') }}</TableHead>
+              <TableHead>{{ t('models.catalogHost') }}</TableHead>
+              <TableHead>{{ t('pricing.inputUsd') }}</TableHead>
+              <TableHead>{{ t('pricing.outputUsd') }}</TableHead>
+              <TableHead>{{ t('pricing.cacheReadUsd') }}</TableHead>
+              <TableHead>{{ t('pricing.cacheWriteUsd') }}</TableHead>
+              <TableHead>{{ t('channel.status') }}</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            <TableRow
               v-for="row in preview"
               :key="row.model"
-              :data-testid="'catalog-preview-row'"
+              data-testid="catalog-preview-row"
               :data-model="row.model"
             >
-              <td class="py-1 pr-3 font-medium">{{ row.model }}</td>
-              <td class="py-1 pr-3 font-mono text-xs">{{ row.lookupId }}</td>
-              <td class="py-1 pr-3">
+              <TableCell class="font-medium">{{ row.model }}</TableCell>
+              <TableCell class="font-mono text-xs">{{ row.lookupId }}</TableCell>
+              <TableCell>
                 <UiSelect
                   v-if="row.hits.length > 1"
                   :id="`catalog-host-${row.model}`"
@@ -168,21 +215,28 @@ function pickHost(model: string, providerId: string) {
                   @update:model-value="(value) => pickHost(row.model, value)"
                 />
                 <span v-else-if="row.hostName" class="text-xs">{{ row.hostName }}</span>
-                <span v-else class="text-fg-muted text-xs">—</span>
-              </td>
-              <td class="py-1 pr-3 font-mono">{{ formatTier(row.nextPrice?.input_micros) }}</td>
-              <td class="py-1 pr-3 font-mono">{{ formatTier(row.nextPrice?.output_micros) }}</td>
-              <td class="py-1 pr-3 font-mono">
+                <span v-else class="text-fg-muted text-xs">{{ t('common.emptyCell') }}</span>
+              </TableCell>
+              <TableCell class="font-mono">{{ formatTier(row.nextPrice?.input_micros) }}</TableCell>
+              <TableCell class="font-mono">{{
+                formatTier(row.nextPrice?.output_micros)
+              }}</TableCell>
+              <TableCell class="font-mono">
                 {{ formatTier(row.nextPrice?.cache_read_micros) }}
-              </td>
-              <td class="py-1 pr-3 font-mono">
+              </TableCell>
+              <TableCell class="font-mono">
                 {{ formatTier(row.nextPrice?.cache_write_micros) }}
-              </td>
-              <td class="py-1" data-testid="catalog-preview-status">{{ statusLabel(row) }}</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+              </TableCell>
+              <TableCell data-testid="catalog-preview-status">{{ statusLabel(row) }}</TableCell>
+            </TableRow>
+            <TableRow v-if="preview.length === 0">
+              <TableCell :colspan="8" class="h-24 whitespace-normal">
+                <EmptyState :title="t('models.catalogEmpty')" />
+              </TableCell>
+            </TableRow>
+          </TableBody>
+        </Table>
+      </DataTablePanel>
       <p v-if="writeError" class="text-danger text-sm" data-testid="catalog-fill-error">
         {{ writeError }}
       </p>

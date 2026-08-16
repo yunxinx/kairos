@@ -33,6 +33,8 @@ import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import ChannelEditorWindow from '@/features/channel/ChannelEditorWindow.vue';
 import ChannelProbeWindow from '@/features/channel/ChannelProbeWindow.vue';
+import OverflowChips from '@/components/ui/OverflowChips.vue';
+import { listedModelChips } from '@/lib/model-list';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type ChannelWindowPayload =
@@ -195,6 +197,24 @@ function openCreate(event: Event) {
   openWindow(anchorFromEvent(event), { kind: 'editor', channel: null });
 }
 
+function modelListItems(channel: ChannelView) {
+  return listedModelChips(channel.models, channel.model_aliases).map((chip) => ({
+    name: chip.name,
+    ...(chip.actualRequest !== undefined ? { actualRequest: chip.actualRequest } : {}),
+    ...(chip.aliases.length > 0
+      ? { tooltip: t('channel.chipCanonicalTooltip', { aliases: chip.aliases.join(', ') }) }
+      : {}),
+  }));
+}
+
+const channelModelChips = computed(() => {
+  const map = new Map<number, ReturnType<typeof modelListItems>>();
+  for (const channel of filteredChannels.value) {
+    map.set(channel.id, modelListItems(channel));
+  }
+  return map;
+});
+
 function openEdit(channel: ChannelView) {
   const existing = windows.value.find(
     (entry) => entry.payload.kind === 'editor' && entry.payload.channel?.id === channel.id,
@@ -289,6 +309,7 @@ function openProbe(channel: ChannelView) {
             </TableHead>
             <TableHead class="min-w-44">{{ t('channel.name') }}</TableHead>
             <TableHead>{{ t('channel.requestProtocol') }}</TableHead>
+            <TableHead>{{ t('channel.models') }}</TableHead>
             <TableHead align="center" class="w-28 pr-1">{{ t('channel.priority') }}</TableHead>
             <TableHead align="center" class="w-28 pl-1">{{ t('channel.weight') }}</TableHead>
             <TableHead align="center">{{ t('channel.status') }}</TableHead>
@@ -296,7 +317,7 @@ function openProbe(channel: ChannelView) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="7" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"
@@ -316,6 +337,12 @@ function openProbe(channel: ChannelView) {
                   <BrandIcon :src="PROTOCOL_ICON_SRC[channel.protocol]" :size="12" />
                   {{ t(`protocol.${channel.protocol}`) }}
                 </span>
+              </TableCell>
+              <TableCell data-testid="channel-models">
+                <OverflowChips
+                  :items="channelModelChips.get(channel.id) ?? []"
+                  chip-test-id="channel-models-chip"
+                />
               </TableCell>
               <TableCell align="center" class="pr-1">
                 <NumberStepper
@@ -391,7 +418,7 @@ function openProbe(channel: ChannelView) {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="7" class="h-24 whitespace-normal">
+              <TableCell :colspan="8" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}

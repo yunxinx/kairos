@@ -6,16 +6,17 @@ import { apiClient, extractApiError } from '@/api/client';
 import type { UnifiedModel } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
+import CopyableName from '@/components/ui/CopyableName.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
-import DataTableMenuSeparator from '@/components/ui/data-table/DataTableMenuSeparator.vue';
 import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
 import SelectCell from '@/components/ui/data-table/SelectCell.vue';
+import UiIcon from '@/components/ui/UiIcon.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
@@ -232,7 +233,9 @@ function openBulkDelete() {
                 test-id="unified-select"
                 @toggle="selection.toggle(model.id)"
               />
-              <TableCell class="font-mono font-medium">{{ model.id }}</TableCell>
+              <TableCell class="font-mono font-medium">
+                <CopyableName :text="model.id" test-id="unified-model-name" />
+              </TableCell>
               <TableCell class="font-mono text-sm" data-testid="unified-members">
                 {{ model.models.join(' → ') }}
               </TableCell>
@@ -242,24 +245,29 @@ function openBulkDelete() {
                 </span>
               </TableCell>
               <TableCell align="center">
-                <DataTableRowActions>
-                  <DataTableMenuItem
+                <span class="inline-flex items-center justify-center gap-1">
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon"
                     data-testid="unified-edit"
+                    :aria-label="t('common.edit')"
+                    :title="t('common.edit')"
                     @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                    @select="openEdit(model)"
+                    @click="openEdit(model)"
                   >
-                    {{ t('common.edit') }}
-                  </DataTableMenuItem>
-                  <DataTableMenuSeparator />
-                  <DataTableMenuItem
-                    danger
-                    data-testid="unified-delete"
-                    @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                    @select="openDelete(model)"
-                  >
-                    {{ t('common.delete') }}
-                  </DataTableMenuItem>
-                </DataTableRowActions>
+                    <UiIcon name="pencil" :size="16" />
+                  </button>
+                  <DataTableRowActions>
+                    <DataTableMenuItem
+                      danger
+                      data-testid="unified-delete"
+                      @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                      @select="openDelete(model)"
+                    >
+                      {{ t('common.delete') }}
+                    </DataTableMenuItem>
+                  </DataTableRowActions>
+                </span>
               </TableCell>
             </TableRow>
             <TableRow v-if="filtered.length === 0">

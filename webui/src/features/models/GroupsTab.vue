@@ -12,10 +12,10 @@ import InlineError from '@/components/ui/InlineError.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
-import DataTableMenuSeparator from '@/components/ui/data-table/DataTableMenuSeparator.vue';
 import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
 import SelectCell from '@/components/ui/data-table/SelectCell.vue';
+import UiIcon from '@/components/ui/UiIcon.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
@@ -26,6 +26,7 @@ import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDele
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import GroupEditorWindow from '@/features/models/GroupEditorWindow.vue';
+import OverflowChips from '@/components/ui/OverflowChips.vue';
 import { DEFAULT_MODEL_GROUP, registeredCallableNames } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -273,20 +274,23 @@ function openBulkDelete() {
                   </span>
                 </span>
               </TableCell>
-              <TableCell class="font-mono text-sm" data-testid="group-models">
-                {{ group.models.length === 0 ? '—' : group.models.join(', ') }}
+              <TableCell data-testid="group-models">
+                <OverflowChips :items="group.models" />
               </TableCell>
               <TableCell align="center">
-                <DataTableRowActions>
-                  <DataTableMenuItem
+                <span class="inline-flex items-center justify-center gap-1">
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon"
                     data-testid="group-edit"
+                    :aria-label="t('common.edit')"
+                    :title="t('common.edit')"
                     @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                    @select="openEdit(group)"
+                    @click="openEdit(group)"
                   >
-                    {{ t('common.edit') }}
-                  </DataTableMenuItem>
-                  <template v-if="group.name !== DEFAULT_MODEL_GROUP">
-                    <DataTableMenuSeparator />
+                    <UiIcon name="pencil" :size="16" />
+                  </button>
+                  <DataTableRowActions v-if="group.name !== DEFAULT_MODEL_GROUP">
                     <DataTableMenuItem
                       danger
                       data-testid="group-delete"
@@ -295,8 +299,8 @@ function openBulkDelete() {
                     >
                       {{ t('common.delete') }}
                     </DataTableMenuItem>
-                  </template>
-                </DataTableRowActions>
+                  </DataTableRowActions>
+                </span>
               </TableCell>
             </TableRow>
             <TableRow v-if="filtered.length === 0">

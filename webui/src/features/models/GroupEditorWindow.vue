@@ -4,11 +4,20 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { ModelGroup } from '@/api/types';
-import Checkbox from '@/components/ui/Checkbox.vue';
+import DataTablePanel from '@/components/ui/DataTablePanel.vue';
+import EmptyState from '@/components/ui/EmptyState.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
+import UiIcon from '@/components/ui/UiIcon.vue';
+import UiSelect from '@/components/ui/UiSelect.vue';
+import Table from '@/components/ui/table/Table.vue';
+import TableBody from '@/components/ui/table/TableBody.vue';
+import TableCell from '@/components/ui/table/TableCell.vue';
+import TableHead from '@/components/ui/table/TableHead.vue';
+import TableHeader from '@/components/ui/table/TableHeader.vue';
+import TableRow from '@/components/ui/table/TableRow.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
@@ -36,6 +45,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const uid = useId();
 const nameInputId = `group-editor-name-${uid}`;
+const addInputId = `group-editor-add-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
@@ -51,6 +61,7 @@ const editorName = ref(initialName);
 const editorModels = ref([...initialModels]);
 const editorError = ref('');
 const searchText = ref('');
+const editorAdd = ref('');
 
 const dirty = computed(
   () =>
@@ -59,23 +70,40 @@ const dirty = computed(
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
-const filteredNames = computed(() => {
+const filteredMembers = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  const names = [...props.callableNames].sort((left, right) => left.localeCompare(right));
+  const names = [...editorModels.value];
   if (!q) return names;
   return names.filter((name) => name.toLowerCase().includes(q));
 });
 
-function isChecked(name: string): boolean {
-  return editorModels.value.includes(name);
+const addOptions = computed(() =>
+  props.callableNames
+    .filter((name) => !editorModels.value.includes(name))
+    .sort((left, right) => left.localeCompare(right))
+    .map((name) => ({ value: name, label: name })),
+);
+
+const addSelection = computed({
+  get: () => {
+    const options = addOptions.value;
+    if (options.some((item) => item.value === editorAdd.value)) return editorAdd.value;
+    return options[0]?.value ?? '';
+  },
+  set: (value: string) => {
+    editorAdd.value = value;
+  },
+});
+
+function addModel() {
+  const name = addSelection.value.trim();
+  if (!name || editorModels.value.includes(name)) return;
+  editorModels.value = [...editorModels.value, name];
+  editorAdd.value = '';
 }
 
-function toggleModel(name: string) {
-  if (editorModels.value.includes(name)) {
-    editorModels.value = editorModels.value.filter((item) => item !== name);
-  } else {
-    editorModels.value = [...editorModels.value, name];
-  }
+function removeModel(name: string) {
+  editorModels.value = editorModels.value.filter((item) => item !== name);
 }
 
 const saveMutation = useMutation({
@@ -152,23 +180,67 @@ function handleSave() {
             :placeholder="t('models.groupSearch')"
             :aria-label="t('models.groupSearch')"
           />
-          <ul class="max-h-64 space-y-1 overflow-y-auto" data-testid="group-model-list">
-            <li
-              v-for="name in filteredNames"
-              :key="name"
-              class="flex items-center gap-2 py-0.5"
-              data-testid="group-model-option"
-              :data-model="name"
+          <DataTablePanel>
+            <div class="seed-scrollbar max-h-56 overflow-y-auto">
+              <Table data-testid="group-model-list">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{{ t('pricing.model') }}</TableHead>
+                    <TableHead align="center">{{ t('common.actions') }}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  <TableRow
+                    v-for="name in filteredMembers"
+                    :key="name"
+                    data-testid="group-model-option"
+                    :data-model="name"
+                  >
+                    <TableCell class="font-mono text-sm">{{ name }}</TableCell>
+                    <TableCell align="center">
+                      <button
+                        type="button"
+                        class="btn btn-ghost btn-icon"
+                        data-testid="group-model-remove"
+                        :aria-label="t('models.groupRemoveModel', { name })"
+                        @click="removeModel(name)"
+                      >
+                        <UiIcon name="close" :size="14" />
+                      </button>
+                    </TableCell>
+                  </TableRow>
+                  <TableRow v-if="filteredMembers.length === 0">
+                    <TableCell :colspan="2" class="h-20 whitespace-normal">
+                      <EmptyState :title="t('models.groupModelsEmpty')" />
+                    </TableCell>
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </div>
+          </DataTablePanel>
+          <div v-if="addOptions.length > 0" class="mt-2 flex items-end gap-2">
+            <FormField
+              class="min-w-0 flex-1"
+              field-name="addModel"
+              :label="t('models.groupAddModel')"
+              :input-id="addInputId"
             >
-              <Checkbox
-                :model-value="isChecked(name)"
-                :data-testid="'group-model-check'"
-                :aria-label="name"
-                @update:model-value="() => toggleModel(name)"
+              <UiSelect
+                :id="addInputId"
+                v-model="addSelection"
+                :options="addOptions"
+                data-testid="group-add-select"
               />
-              <span class="font-mono text-sm">{{ name }}</span>
-            </li>
-          </ul>
+            </FormField>
+            <button
+              type="button"
+              class="btn mb-0.5"
+              data-testid="group-add-member"
+              @click="addModel"
+            >
+              {{ t('models.groupAdd') }}
+            </button>
+          </div>
         </div>
 
         <p v-if="editorError" class="text-danger text-sm" data-testid="group-editor-error">

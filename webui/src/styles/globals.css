@@ -200,12 +200,12 @@ html[lang='zh-CN'] {
   letter-spacing: -0.025em;
 }
 
-.font-serif:is(h1, h2, .home-title) {
+.font-serif:is(h1, h2, .home-title, .page-header-title) {
   text-wrap: balance;
 }
 
 @supports (text-wrap: pretty) {
-  .font-serif:is(h1, h2, .home-title) {
+  .font-serif:is(h1, h2, .home-title, .page-header-title) {
     text-wrap: pretty;
   }
 }
@@ -626,6 +626,47 @@ html[lang='zh-CN'] {
   color: var(--fg-muted);
 }
 
+/* 分面筛选浮层：shadcn-admin Command 结构（顶栏搜索 + 选项列表） */
+.faceted-filter-menu {
+  z-index: var(--z-popover);
+  box-sizing: border-box;
+  width: 12.5rem;
+  overflow: hidden;
+  border: 1px solid var(--seed-border);
+  border-radius: var(--seed-radius);
+  background: var(--seed-surface);
+  box-shadow: 2px 3px 0 0 var(--card-shadow);
+  padding: 0;
+  outline: none;
+}
+.faceted-filter-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--seed-border);
+}
+.faceted-filter-search-field {
+  min-width: 0;
+  flex: 1;
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 13px;
+  color: var(--seed-fg);
+  outline: none;
+}
+.faceted-filter-search-field::placeholder {
+  color: var(--fg-muted);
+}
+.faceted-filter-sep {
+  width: 1px;
+  height: 16px;
+  flex: 0 0 1px;
+  background: var(--seed-border);
+}
+
 /* 别名 chip：主模型带别名、或别名本体，均以别名色底 + 细描边区分普通 chip */
 .model-chip-alias {
   background: var(--alias-bg);
@@ -794,6 +835,7 @@ html[lang='zh-CN'] {
   display: inline-flex;
   align-items: center;
   padding: 1px 8px;
+  border: 1px solid transparent;
   border-radius: 4px;
   font-size: 11px;
   font-weight: 600;
@@ -808,12 +850,18 @@ html[lang='zh-CN'] {
   color: var(--danger);
 }
 .badge-warn {
-  background: var(--warn-bg);
+  background: color-mix(in srgb, var(--warn) 42%, var(--seed-surface));
   color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 80%, transparent);
 }
 .badge-info {
   background: var(--info-bg);
   color: var(--info);
+}
+.badge-canonical {
+  background: var(--alias-bg);
+  color: var(--alias);
+  border: 1px dashed var(--alias);
 }
 .badge-neutral {
   background: var(--seed-surface-alt);
@@ -1080,6 +1128,29 @@ html[lang='zh-CN'] {
   height: 1px;
   margin: 4px 0;
   background: var(--seed-border);
+}
+
+/* +N 完整名单：两栏提高密度，列距留给截断 chip 呼吸 */
+.data-table-menu.overflow-chip-menu {
+  width: 22rem;
+  max-width: min(22rem, calc(100vw - 24px));
+  max-height: 16rem;
+  overflow-y: auto;
+}
+.overflow-chip-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  column-gap: 12px;
+  row-gap: 6px;
+  padding: 2px 4px;
+  margin: 0;
+  list-style: none;
+}
+.overflow-chip-grid li {
+  min-width: 0;
+}
+.overflow-chip-grid .badge {
+  max-width: 100%;
 }
 
 /* ── Form Controls ── */
@@ -2085,7 +2156,8 @@ html[lang='zh-CN'] {
   background: var(--seed-border);
 }
 /* utilities 位于 @layer utilities，恒被 layer 外的 .btn 压制；尺寸类必须写在 layer 外。 */
-.bulk-bar__delete {
+.bulk-bar__delete,
+.bulk-bar__action {
   height: 24px;
   padding: 0 8px;
   font-size: 12px;
@@ -2098,43 +2170,139 @@ html[lang='zh-CN'] {
   border-radius: 9999px;
 }
 
-/* ── 模型页平行 tab（非向导；样式对齐顶栏 tab-link）── */
-.page-tabs-list {
+/* 页头左侧：标题与 Tab 组锁死同一行高，路由切换时表格不上下跳 */
+.page-header-leading {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0;
-  border-bottom: 1px solid var(--seed-border);
-  margin-bottom: 1rem;
-}
-.page-tabs-trigger {
-  display: inline-flex;
   align-items: center;
-  padding: 10px 12px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--fg-muted);
-  background: transparent;
-  border: none;
-  border-bottom: 2px solid transparent;
-  cursor: pointer;
-  margin-bottom: -1px;
+  height: 2rem;
+  min-height: 2rem;
+  overflow: hidden;
 }
-.page-tabs-trigger:hover {
-  color: var(--seed-fg);
-}
-.page-tabs-trigger:focus-visible {
-  outline: none;
-  box-shadow: inset var(--focus-ring);
-}
-.page-tabs-trigger[data-state='active'] {
-  color: var(--seed-fg);
-  border-bottom-color: var(--seed-primary);
+.page-header-title {
+  margin: 0;
+  font-size: 1.5rem;
+  line-height: 2rem;
 }
 
-[data-slot='table-row'].inventory-row-unpriced {
-  background: var(--warn-bg);
+/* 工具栏锁死与主按钮同高，避免「有/无右上角按钮」的 Tab 切换把表格顶动 */
+[data-slot='data-table-toolbar'] {
+  min-height: 2.25rem;
 }
-[data-slot='table-row'].inventory-row-unpriced:hover,
-[data-slot='table-row'].inventory-row-unpriced[data-state='selected'] {
-  background: color-mix(in srgb, var(--warn) 18%, var(--warn-bg));
+[data-slot='data-table-toolbar'] .btn-primary {
+  height: 2.25rem;
+  box-sizing: border-box;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.page-tab-switch {
+  position: relative;
+  display: inline-flex;
+  isolation: isolate;
+  align-items: stretch;
+  overflow: hidden;
+  height: 2rem;
+  box-sizing: border-box;
+  padding: 0;
+  background: var(--seed-surface-alt);
+  border: 1px solid var(--seed-border);
+  border-radius: var(--seed-radius);
+}
+.page-tab-switch-knob {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  z-index: 0;
+  width: var(--reka-tabs-indicator-size);
+  height: 100%;
+  box-sizing: border-box;
+  transform: translateX(var(--reka-tabs-indicator-position));
+  background: var(--seed-surface);
+  border: 1px solid var(--seed-border);
+  border-radius: calc(var(--seed-radius) - 1px);
+  box-shadow: 1px 1px 0 0 var(--card-shadow);
+  transition:
+    transform 180ms ease,
+    width 180ms ease;
+  pointer-events: none;
+}
+.page-tab-switch-btn {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  background: transparent;
+  border: none;
+  height: 100%;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--fg-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.page-tab-switch-btn:hover {
+  color: var(--seed-fg);
+}
+.page-tab-switch-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: calc(var(--seed-radius) - 1px);
+}
+.page-tab-switch-btn[data-state='active'] {
+  color: var(--seed-fg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .page-tab-switch-knob {
+    transition: none;
+  }
+}
+
+/* 表格模型名：悬停描边表示可点复制 */
+.copyable-name {
+  appearance: none;
+  display: inline-block;
+  max-width: 100%;
+  margin: 0;
+  padding: 1px 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  text-align: start;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+.copyable-name:hover {
+  border-color: var(--seed-border);
+}
+.copyable-name:focus-visible {
+  outline: none;
+  border-color: var(--seed-border);
+  box-shadow: var(--focus-ring);
+}
+
+[data-slot='table-row'].inventory-row-unpriced > [data-slot='table-cell'] {
+  background: color-mix(in srgb, var(--warn) 14%, var(--seed-surface));
+}
+[data-slot='table-row'].inventory-row-unpriced:hover > [data-slot='table-cell'],
+[data-slot='table-row'].inventory-row-unpriced[data-state='selected'] > [data-slot='table-cell'] {
+  background: color-mix(in srgb, var(--warn) 22%, var(--seed-surface));
+}
+
+[data-slot='table-row'].inventory-section-row {
+  background: color-mix(in srgb, var(--seed-primary) 10%, var(--seed-surface-alt));
+}
+[data-slot='table-row'].inventory-section-row:hover {
+  background: color-mix(in srgb, var(--seed-primary) 14%, var(--seed-surface-alt));
+}
+[data-slot='table-cell'].inventory-section-cell {
+  color: var(--seed-fg);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
