@@ -22,11 +22,15 @@ pub(super) struct Billing {
 }
 
 /// 落一条请求日志。await 以保证响应返回时日志已落库。
+///
+/// `model` 为入站名（下游请求的模型 ID）；`outbound_model` 为实际发给上游的
+/// 模型名。尚未出站（准入失败）时出站名为 `None`。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn log_request(
     deps: &Deps,
     token: &Token,
     model: &str,
+    outbound_model: Option<&str>,
     channel: &str,
     status: u16,
     started: i64,
@@ -41,6 +45,7 @@ pub(super) async fn log_request(
         token_key: token.token_key.clone(),
         inbound_protocol: protocol_name(inbound_protocol).to_string(),
         model: model.to_string(),
+        outbound_model: outbound_model.map(str::to_string),
         channel: channel.to_string(),
         status_code: status as i64,
         latency_ms: now - started,

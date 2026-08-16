@@ -105,6 +105,8 @@ export interface LogEntry {
   token_key: string;
   inbound_protocol: string;
   model: string;
+  /** 实际出站模型名；旧行可能为 null。 */
+  outbound_model: string | null;
   channel: string;
   status_code: number;
   latency_ms: number;

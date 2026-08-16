@@ -8,6 +8,8 @@ export interface SeedLogInput {
   created_at: number;
   token_key: string;
   model: string;
+  /** 实际出站模型名；缺省为 null（等于入站）。 */
+  outbound_model?: string | null;
   channel: string;
   token_name?: string;
   inbound_protocol?: string;
@@ -38,12 +40,12 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
     db.exec('PRAGMA busy_timeout = 5000');
     const stmt = db.prepare(
       `INSERT INTO request_log (
-         created_at, token_name, token_key, inbound_protocol, model, channel,
+         created_at, token_name, token_key, inbound_protocol, model, outbound_model, channel,
          status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens,
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros,
          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros,
          request_body, response_body
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?)`,
     );
     const ids: number[] = [];
     db.exec('BEGIN');
@@ -55,6 +57,7 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
           log.token_key,
           log.inbound_protocol ?? 'openai_chat',
           log.model,
+          log.outbound_model ?? null,
           log.channel,
           log.status_code ?? 200,
           log.latency_ms ?? 12,

@@ -1389,6 +1389,10 @@ async fn logs_paginate_and_filter() {
     assert_eq!(page["total"], 3);
     assert_eq!(page["items"].as_array().unwrap().len(), 3);
     assert_eq!(page["items"][0]["model"], TEST_MODEL);
+    assert_eq!(
+        page["items"][0]["outbound_model"], TEST_MODEL,
+        "无别名时出站名等于入站名"
+    );
 
     // 按模型过滤：命中全部 3 条。
     let resp = client
@@ -1467,6 +1471,39 @@ async fn logs_paginate_and_filter() {
         .expect("应可过滤日志");
     let page: Value = resp.json().await.expect("日志应可解析");
     assert_eq!(page["total"], 3);
+}
+
+/// 别名请求：协议响应回显入站短名；管理日志列表=入站、出站字段=上游真名。
+#[tokio::test]
+async fn alias_logs_inbound_and_outbound_model() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-alias-log",
+        "object": "chat.completion",
+        "model": "gpt-4o-mini",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "ok" },
+            "logprobs": null,
+            "finish_reason": "stop"
+        }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    })));
+
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "fast").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(body["model"], "fast", "协议响应 model 应回显入站名");
+
+    let page: Value = admin_get(&gw, "/logs?page_size=1")
+        .await
+        .json()
+        .await
+        .expect("日志应可解析");
+    let entry = &page["items"][0];
+    assert_eq!(entry["model"], "fast", "列表字段为入站别名");
+    assert_eq!(entry["outbound_model"], "gpt-4o-mini", "详情字段为出站真名");
+    assert_eq!(entry["channel"], "test-channel");
 }
 
 /// 新端点的非法输入返回结构化错误：设置上限为 0、未知设置字段、余额调不存在令牌、
@@ -1554,6 +1591,7 @@ async fn seed_log(pool: &sqlx::SqlitePool, log: SeededLog) {
             token_key: TEST_TOKEN_KEY.to_string(),
             inbound_protocol: "openai_chat".to_string(),
             model: log.model.to_string(),
+            outbound_model: None,
             channel: log.channel.to_string(),
             status_code: log.status_code,
             latency_ms: 10,

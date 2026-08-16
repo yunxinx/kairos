@@ -88,7 +88,12 @@ pub struct RequestLog {
     pub token_name: String,
     pub token_key: String,
     pub inbound_protocol: String,
+    /// 入站模型名（下游请求的 `model`，别名或统一模型 ID 原样保留）。
     pub model: String,
+    /// 实际出站模型名（别名改写后或统一模型落到的已登记模型）。
+    ///
+    /// 存量行或尚未出站的失败请求为 `None`。
+    pub outbound_model: Option<String>,
     pub channel: String,
     pub status_code: i64,
     pub latency_ms: i64,
@@ -113,17 +118,19 @@ pub struct RequestLog {
 pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i64, StoreError> {
     let result = sqlx::query(
         "INSERT INTO request_log \
-         (created_at, token_name, token_key, inbound_protocol, model, channel, status_code, \
-          latency_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
-          input_price_usd_micros, output_price_usd_micros, cache_read_price_usd_micros, \
-          cache_write_price_usd_micros, cost_usd_micros, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (created_at, token_name, token_key, inbound_protocol, model, outbound_model, channel, \
+          status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
+          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+          request_body, response_body) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.created_at)
     .bind(&log.token_name)
     .bind(&log.token_key)
     .bind(&log.inbound_protocol)
     .bind(&log.model)
+    .bind(&log.outbound_model)
     .bind(&log.channel)
     .bind(log.status_code)
     .bind(log.latency_ms)
@@ -302,8 +309,8 @@ pub async fn query_request_logs(
     filter: &RequestLogQuery,
 ) -> Result<Vec<RequestLog>, StoreError> {
     let mut qb = sqlx::QueryBuilder::new(
-        "SELECT id, created_at, token_name, token_key, inbound_protocol, model, channel, \
-         status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+        "SELECT id, created_at, token_name, token_key, inbound_protocol, model, outbound_model, \
+         channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
          request_body, response_body FROM request_log",
@@ -741,6 +748,7 @@ fn map_request_log_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestLog, Stor
         token_key: row.try_get("token_key").map_err(StoreError::Query)?,
         inbound_protocol: row.try_get("inbound_protocol").map_err(StoreError::Query)?,
         model: row.try_get("model").map_err(StoreError::Query)?,
+        outbound_model: row.try_get("outbound_model").map_err(StoreError::Query)?,
         channel: row.try_get("channel").map_err(StoreError::Query)?,
         status_code: row.try_get("status_code").map_err(StoreError::Query)?,
         latency_ms: row.try_get("latency_ms").map_err(StoreError::Query)?,
@@ -1128,6 +1136,7 @@ mod tests {
                     token_key: "sk-a".to_string(),
                     inbound_protocol: "openai_chat".to_string(),
                     model: model.to_string(),
+                    outbound_model: None,
                     channel: "c1".to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -1207,6 +1216,7 @@ mod tests {
                     token_key: (*token_key).to_string(),
                     inbound_protocol: "openai_chat".to_string(),
                     model: (*model).to_string(),
+                    outbound_model: None,
                     channel: (*channel).to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -1282,6 +1292,7 @@ mod tests {
                 token_key: "sk-a".to_string(),
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
+                outbound_model: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -1310,5 +1321,58 @@ mod tests {
             .await
             .expect("超大页码不应触发负 OFFSET 报错");
         assert!(rows.is_empty(), "超大页码应返回空页而非报错");
+    }
+
+    /// 出站模型列可空：存量行不写出站名；新行写入后原样读回。
+    #[tokio::test]
+    async fn request_log_outbound_model_nullable_and_roundtrips() {
+        let (_dir, pool) = test_pool().await;
+        sqlx::query(
+            "INSERT INTO request_log (created_at, token_name, inbound_protocol, model, channel, \
+                 status_code, latency_ms) \
+             VALUES (1, 't', 'openai_chat', 'fast', 'c1', 200, 10)",
+        )
+        .execute(&pool)
+        .await
+        .expect("缺 outbound_model 的存量行应能写入");
+
+        let rows = query_request_logs(&pool, &RequestLogQuery::new(1, 10))
+            .await
+            .expect("应能查询");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "fast");
+        assert_eq!(rows[0].outbound_model, None, "旧行出站名可空");
+
+        insert_request_log(
+            &pool,
+            &RequestLog {
+                id: 0,
+                created_at: 2,
+                token_name: "t".to_string(),
+                token_key: "sk-a".to_string(),
+                inbound_protocol: "openai_chat".to_string(),
+                model: "fast".to_string(),
+                outbound_model: Some("gpt-4o-mini".to_string()),
+                channel: "c1".to_string(),
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                price: PriceSnapshot::default(),
+                cost_usd_micros: 0,
+                request_body: None,
+                response_body: None,
+            },
+        )
+        .await
+        .expect("应能写出站模型");
+
+        let rows = query_request_logs(&pool, &RequestLogQuery::new(1, 10))
+            .await
+            .expect("应能查询");
+        assert_eq!(rows[0].outbound_model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(rows[1].outbound_model, None);
     }
 }

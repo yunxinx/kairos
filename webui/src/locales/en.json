@@ -285,6 +285,7 @@
     "search": "Search",
     "searchPlaceholder": "Token, name, model or channel",
     "model": "Model",
+    "outboundModel": "Outbound model",
     "clearFilters": "Clear",
     "created": "Time",
     "token": "Token",

@@ -114,4 +114,28 @@ test.describe('request logs page', () => {
     await page.getByTestId('date-range-confirm').click();
     await expect(page.getByTestId('logs-empty')).toBeVisible();
   });
+
+  test('list shows inbound model; details show outbound model and channel', async ({ page }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-logs-alias',
+        token_name: 'Alias token',
+        model: 'fast',
+        outbound_model: 'gpt-4o-mini',
+        channel: 'alias-channel',
+        status_code: 200,
+      },
+    ]);
+
+    await page.goto('/requests');
+    await page.locator('#logs-search').fill('sk-e2e-logs-alias');
+    const row = page.locator('[data-testid="log-row"][data-model="fast"]');
+    await expect(row.getByTestId('log-model')).toHaveText('fast');
+    await expect(row.getByTestId('log-channel')).toHaveText('alias-channel');
+
+    await row.getByTestId('log-expand').click();
+    await expect(page.getByTestId('log-outbound-model')).toHaveText('gpt-4o-mini');
+    await expect(page.getByTestId('log-detail-channel')).toHaveText('alias-channel');
+  });
 });

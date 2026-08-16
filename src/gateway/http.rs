@@ -433,6 +433,8 @@ async fn outbound_with_failover(
             })
         },
         |channel, status, _failover, body_wire| {
+            let outbound_model =
+                outbound_model_for_channel_name(route, channel, &request.model).map(str::to_string);
             let channel = channel.to_string();
             let request_body = request_body_for_log.clone();
             let response_body = snapshot.full_body.then(|| body_wire.to_vec());
@@ -441,6 +443,7 @@ async fn outbound_with_failover(
                     deps,
                     token,
                     &request.model,
+                    outbound_model.as_deref(),
                     &channel,
                     status,
                     started,
@@ -496,6 +499,9 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             })
         },
         |channel, status, _failover, body_wire| {
+            let outbound_model =
+                outbound_model_for_channel_name(route, channel, &ctx.request.model)
+                    .map(str::to_string);
             let channel = channel.to_string();
             let request_body = ctx.request_body.clone();
             let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
@@ -504,6 +510,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                     ctx.deps,
                     ctx.token,
                     &ctx.request.model,
+                    outbound_model.as_deref(),
                     &channel,
                     status,
                     ctx.started,
@@ -679,6 +686,7 @@ async fn passthrough_non_stream_completion(
             ctx.deps,
             ctx.token,
             &ctx.request.model,
+            outbound_model_for_log(channel, &ctx.request.model),
             &channel.name,
             status_code,
             ctx.started,
@@ -862,6 +870,7 @@ async fn pipe_passthrough_stream<S>(
                     &ctx.deps,
                     &ctx.token,
                     &ctx.request.model,
+                    outbound_model_for_log(&ctx.channel, &ctx.request.model),
                     &ctx.channel.name,
                     ctx.status_code,
                     ctx.started,
@@ -994,6 +1003,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                     deps,
                     token,
                     &request.model,
+                    Some(outbound_model),
                     &channel.name,
                     status_code,
                     started,
@@ -1308,6 +1318,7 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
         &ctx.deps,
         &ctx.token,
         &ctx.request.model,
+        outbound_model_for_log(&ctx.channel, &ctx.request.model),
         &ctx.channel.name,
         ctx.status_code,
         ctx.started,
@@ -1358,6 +1369,24 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 /// 判断上游 HTTP 状态码是否可重试：网络错误与 429/5xx 允许 failover。
 fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
+}
+
+/// 日志用的出站模型名：按该渠道自己的别名表改写。
+fn outbound_model_for_log<'a>(channel: &'a Channel, inbound: &'a str) -> Option<&'a str> {
+    Some(routing::outbound_model(channel, inbound))
+}
+
+/// 按渠道名从本次路由结果取出发给上游的模型名；未知渠道则尚未出站。
+fn outbound_model_for_channel_name<'a>(
+    route: &'a routing::Route,
+    channel_name: &str,
+    inbound: &'a str,
+) -> Option<&'a str> {
+    route
+        .channels
+        .iter()
+        .find(|c| c.name == channel_name)
+        .map(|c| routing::outbound_model(c, inbound))
 }
 
 /// 按渠道协议设置出站认证头。
@@ -1413,6 +1442,7 @@ async fn error_response(
             deps,
             token,
             model,
+            None,
             "",
             status.as_u16(),
             started,

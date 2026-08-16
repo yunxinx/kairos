@@ -65,6 +65,20 @@ function statusBadgeClass(statusCode: number): string {
   </TableRow>
   <TableRow v-if="expanded" data-testid="log-detail-row" class="hover:bg-transparent">
     <TableCell :colspan="detailColSpan" class="align-top whitespace-normal">
+      <dl class="mb-4 grid gap-3 sm:grid-cols-2" data-testid="log-detail-meta">
+        <div>
+          <dt class="text-fg-muted text-xs">{{ t('logs.outboundModel') }}</dt>
+          <dd class="font-mono text-sm" data-testid="log-outbound-model">
+            {{ entry.outbound_model ?? entry.model }}
+          </dd>
+        </div>
+        <div>
+          <dt class="text-fg-muted text-xs">{{ t('logs.channel') }}</dt>
+          <dd class="font-mono text-sm" data-testid="log-detail-channel">
+            {{ entry.channel }}
+          </dd>
+        </div>
+      </dl>
       <LogBodyPanel :entry="entry" />
     </TableCell>
   </TableRow>
