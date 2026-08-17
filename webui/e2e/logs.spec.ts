@@ -19,7 +19,7 @@ test.describe('request logs page', () => {
     const binaryBody = new Uint8Array([0xff, 0xfe, 0x00, 0x01]);
 
     seedRequestLogs([
-      ...Array.from({ length: 11 }, (_, index) => ({
+      ...Array.from({ length: 24 }, (_, index) => ({
         created_at: now - (index + 1) * 1_000,
         token_key: 'sk-e2e-logs-page',
         token_name: 'Pager',
@@ -59,15 +59,12 @@ test.describe('request logs page', () => {
 
     await page.locator('#logs-search').fill('sk-e2e-logs-page');
 
-    await page.locator('#logs-page-size').click();
-    await page.getByRole('option', { name: '10', exact: true }).click();
-
-    await expect(page.getByTestId('log-row')).toHaveCount(10);
-    await expect(page.getByTestId('logs-pagination-summary')).toContainText('12');
+    await expect(page.getByTestId('log-row')).toHaveCount(20);
+    await expect(page.getByTestId('logs-pagination-summary')).toContainText('25');
     await page.getByTestId('logs-next').click();
-    await expect(page.getByTestId('log-row')).toHaveCount(2);
+    await expect(page.getByTestId('log-row')).toHaveCount(5);
     await page.getByTestId('logs-prev').click();
-    await expect(page.getByTestId('log-row')).toHaveCount(10);
+    await expect(page.getByTestId('log-row')).toHaveCount(20);
 
     const jsonRow = page.locator('[data-testid="log-row"][data-model="e2e-json-model"]');
     await expect(jsonRow.getByTestId('log-status')).toHaveText('200');
@@ -104,7 +101,7 @@ test.describe('request logs page', () => {
     await page.getByTestId('date-range-confirm').click();
     await page.locator('#logs-search').fill('sk-e2e-logs-page');
     await expect(page.getByTestId('log-row').first()).toBeVisible();
-    await expect(page.getByTestId('log-row')).toHaveCount(10);
+    await expect(page.getByTestId('log-row')).toHaveCount(20);
 
     await page.getByTestId('logs-clear-filters').click();
     await page.locator('#logs-search').fill('sk-e2e-logs-filter');

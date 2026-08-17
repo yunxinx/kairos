@@ -23,7 +23,7 @@ import { LOGS_INITIAL_PAGE, LOGS_INITIAL_PAGE_SIZE } from '@/lib/admin-query-def
 import type { DateRange } from '@/lib/date-range';
 import { scrollMainToTop } from '@/lib/main-scroll';
 
-const PAGE_SIZE_OPTIONS = [10, 20, 50, 100, 200] as const;
+const PAGE_SIZE_OPTIONS = [20, 50, 100, 200] as const;
 
 const { t } = useI18n();
 
