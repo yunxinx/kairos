@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// 上游模型同步视图：进入后不自动请求，由用户点「同步」拉取上游模型列表；
+// 上游模型同步视图：进入后不自动请求，由用户点「同步模型」拉取上游模型列表；
 // 勾选表格 + 别名列（常显输入、逗号分隔多个）+ 选择/别名两个维度的状态筛选，
 // 「保存并返回」把勾选结果与别名映射经 emit 写回父级草稿；别名占用另一已勾选
 // 主模型名或同一别名指向两个主模型时拒绝提交。失败以独立浮窗就近
-// 「同步」按钮弹出，3s 自动消失（鼠标悬浮/键盘焦点暂停计时）。
+// 「同步模型」按钮弹出，3s 自动消失（鼠标悬浮/键盘焦点暂停计时）。
 import { computed, onUnmounted, ref, useId } from 'vue';
 import { useMutation } from '@tanstack/vue-query';
 import { PopoverContent, PopoverRoot, PopoverTrigger } from 'reka-ui';
@@ -106,7 +106,7 @@ const selectionFilter = ref<Set<SyncSelectionFilter>>(new Set());
 const aliasFilter = ref<Set<SyncAliasFilter>>(new Set());
 
 const syncFailure = ref<SyncFailure | null>(null);
-/** 失败浮窗锚点：就近「同步」按钮弹出，失败时取其位置。 */
+/** 失败浮窗锚点：就近「同步模型」按钮弹出，失败时取其位置。 */
 const syncFailureAnchor = ref<FloatingWindowAnchor | null>(null);
 const syncBtnEl = ref<HTMLElement | null>(null);
 
@@ -470,7 +470,7 @@ function closeSync() {
 
 <template>
   <div class="card-body space-y-3" data-testid="channel-sync-view">
-    <!-- 搜索框聚焦时动作按钮让位，输入框铺到行尾；失焦后恢复。 -->
+    <!-- 未聚焦保持短宽，给同步模型/筛选/全选留位；聚焦后铺开以便输入长模型名。 -->
     <div class="flex items-center gap-2">
       <button
         type="button"
@@ -484,13 +484,14 @@ function closeSync() {
       <SearchInput
         :id="syncSearchId"
         v-model="syncSearch"
-        class="search-input-sm min-w-0 flex-1"
+        class="search-input-sm min-w-0"
+        :class="searchFocused ? 'flex-1' : 'w-48'"
         :placeholder="t('channel.syncSearchPlaceholder')"
         data-testid="channel-sync-search"
         @focus="searchFocused = true"
         @blur="searchFocused = false"
       />
-      <div class="flex shrink-0 items-center gap-1.5" :class="searchFocused && 'hidden'">
+      <div class="flex shrink-0 items-center gap-1.5" :class="searchFocused ? 'hidden' : 'ml-auto'">
         <button
           ref="syncBtnEl"
           type="button"
@@ -623,8 +624,18 @@ function closeSync() {
                 />
               </div>
             </TableHead>
-            <TableHead class="w-12">{{ t('channel.syncColIndex') }}</TableHead>
-            <TableHead>{{ t('channel.syncColModel') }}</TableHead>
+            <TableHead>
+              <span class="inline-flex items-center gap-1.5">
+                {{ t('channel.syncColModel') }}
+                <span
+                  class="badge badge-neutral font-mono"
+                  data-testid="channel-sync-model-count"
+                  :aria-label="t('channel.syncColModel')"
+                >
+                  {{ filteredSyncRows.length }}
+                </span>
+              </span>
+            </TableHead>
             <TableHead class="sync-col-alias">{{ t('channel.syncColAlias') }}</TableHead>
             <TableHead class="sync-col-status" align="right">{{
               t('channel.syncColStatus')
@@ -633,26 +644,22 @@ function closeSync() {
         </TableHeader>
         <TableBody>
           <TableRow
-            v-for="(row, index) in filteredSyncRows"
+            v-for="row in filteredSyncRows"
             :key="row.name"
-            class="cursor-pointer"
             :class="row.aliasOnly && 'sync-row-alias-only'"
             :data-state="row.selected ? 'selected' : undefined"
             data-testid="channel-sync-row"
             :data-model="row.name"
-            @click="toggleSyncRow(row.name)"
           >
             <SelectCell
               :checked="row.selected"
               test-id="channel-sync-checkbox"
               @toggle="toggleSyncRow(row.name)"
-              @click.stop
             />
-            <TableCell class="text-fg-muted font-mono text-xs">{{ index + 1 }}</TableCell>
-            <TableCell class="font-mono text-xs">
+            <TableCell class="font-mono text-xs" data-testid="channel-sync-model-name">
               <span :class="row.aliasOnly ? 'model-name-deleted' : undefined">{{ row.name }}</span>
             </TableCell>
-            <TableCell class="sync-col-alias" @click.stop>
+            <TableCell class="sync-col-alias">
               <input
                 type="text"
                 class="sync-alias-input"
@@ -665,7 +672,11 @@ function closeSync() {
                 @input="setAliasDraft(row.name, ($event.target as HTMLInputElement).value)"
               />
             </TableCell>
-            <TableCell class="sync-col-status" align="right">
+            <TableCell
+              class="sync-col-status cursor-pointer"
+              align="right"
+              @click="toggleSyncRow(row.name)"
+            >
               <span
                 class="badge"
                 :class="SYNC_STATUS_BADGE[row.status]"
@@ -676,7 +687,7 @@ function closeSync() {
             </TableCell>
           </TableRow>
           <TableRow v-if="filteredSyncRows.length === 0">
-            <TableCell :colspan="5" class="h-24 whitespace-normal">
+            <TableCell :colspan="4" class="h-24 whitespace-normal">
               <p
                 v-if="syncMutation.isPending.value"
                 class="text-fg-muted px-4 py-6 text-center text-sm"

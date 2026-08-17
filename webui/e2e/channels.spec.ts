@@ -50,7 +50,7 @@ test.describe('channel resource page', () => {
       await page.locator('[id^="channel-editor-base-url"]').fill(okUpstream.baseUrl);
       await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
 
-      // 同步视图进入后不自动请求：先为空，点「同步」才拉取上游模型。
+      // 同步视图进入后不自动请求：先为空，点「同步模型」才拉取上游模型。
       await page.getByTestId('channel-sync-models').click();
       await expect(page.getByTestId('channel-sync-view')).toBeVisible();
       await expect(page.getByTestId('channel-sync-row')).toHaveCount(0);
@@ -58,9 +58,23 @@ test.describe('channel resource page', () => {
         page.getByTestId('channel-sync-view').getByRole('columnheader', { name: 'Model' }),
       ).toBeVisible();
       await expect(page.getByTestId('channel-sync-view').getByText('Not synced yet')).toBeVisible();
+      await expect(page.getByTestId('channel-sync-run')).toHaveText('Sync models');
+      await expect(page.getByTestId('channel-sync-model-count')).toHaveText('0');
+      await expect(
+        page.getByTestId('channel-sync-view').getByRole('columnheader', { name: 'ID' }),
+      ).toHaveCount(0);
       await page.getByTestId('channel-sync-run').click();
       const miniRow = page.locator('[data-testid="channel-sync-row"][data-model="gpt-4o-mini"]');
       const fullRow = page.locator('[data-testid="channel-sync-row"][data-model="gpt-4o"]');
+      await expect(miniRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
+      await expect(page.getByTestId('channel-sync-model-count')).toHaveText('2');
+
+      // 勾选只由复选框与「选择状态」列触发：点模型名称不切换。
+      await miniRow.getByTestId('channel-sync-model-name').click();
+      await expect(miniRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
+      await miniRow.getByTestId('channel-sync-status-unselected').click();
+      await expect(miniRow.getByTestId('channel-sync-status-willAdd')).toBeVisible();
+      await miniRow.getByTestId('channel-sync-status-willAdd').click();
       await expect(miniRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
 
       // 别名列常显输入：为 gpt-4o-mini 填别名，勾选后主名与别名一并入清单。
@@ -123,12 +137,25 @@ test.describe('channel resource page', () => {
       await page.getByTestId('channels-search').fill('');
       await expect(okRow).toBeVisible();
 
-      // 二次同步：别名保留、主名已选择；别名维度筛选可用；搜索/反选作用于可见行。
+      // 二次同步：别名保留、主名已选择；关闭按钮不保存并返回；别名维度筛选可用；搜索/反选作用于可见行。
       await okRow.getByTestId('channel-edit').click();
       await page.getByTestId('channel-sync-models').click();
       await page.getByTestId('channel-sync-run').click();
       await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();
       await expect(miniRow.getByTestId('channel-sync-alias-input')).toHaveValue('mini');
+      await expect(fullRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
+      // 右上角关闭：丢弃本次勾选，回到表单且清单不变。
+      await fullRow.getByTestId('channel-sync-checkbox').click();
+      await expect(fullRow.getByTestId('channel-sync-status-willAdd')).toBeVisible();
+      await page
+        .getByRole('dialog', { name: /edit channel/i })
+        .getByRole('button', { name: 'Discard and return' })
+        .click();
+      await expect(page.getByTestId('channel-sync-view')).toHaveCount(0);
+      await expect(page.getByTestId('channel-form')).toBeVisible();
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
+      await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
       await expect(fullRow.getByTestId('channel-sync-status-unselected')).toBeVisible();
       // 别名筛选：存在别名仅 gpt-4o-mini；清除后恢复。
       await page.getByTestId('channel-sync-filter').click();
@@ -229,7 +256,7 @@ test.describe('channel resource page', () => {
       await okRow.getByTestId('channel-toggle-enabled').click();
       await expect(okRow.getByTestId('channel-toggle-enabled')).toHaveText('Enabled');
 
-      // 同步错误以独立浮窗展示：进入不自动请求，点「同步」触发；3s 自动消失、悬浮暂停。
+      // 同步错误以独立浮窗展示：进入不自动请求，点「同步模型」触发；3s 自动消失、悬浮暂停。
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-base-url"]').fill(errUpstream.baseUrl);
       await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
@@ -569,5 +596,44 @@ test.describe('channel alias occupancy', () => {
     } finally {
       await upstream.close();
     }
+  });
+});
+
+test.describe('channel editor model overflow', () => {
+  test('shows 9 chips then +N, and the popover lists only the overflowed models', async ({
+    page,
+  }) => {
+    await page.goto('/channel');
+    await page.getByTestId('create-channel').click();
+    const form = page.getByTestId('channel-form');
+    for (let i = 1; i <= 10; i += 1) {
+      await form.getByTestId('channel-add-model-input').fill(`overflow-${i}`);
+      await form.getByTestId('channel-add-model').click();
+    }
+    await expect(form.getByTestId('channel-model-count')).toHaveText('10');
+    await expect(form.getByTestId('channel-model-chip')).toHaveCount(9);
+    await expect(form.getByTestId('overflow-more')).toHaveText('+1');
+    await expect(
+      form.locator('[data-testid="channel-model-chip"][data-model="overflow-10"]'),
+    ).toHaveCount(0);
+
+    await form.getByTestId('overflow-more').click();
+    const menu = page.getByTestId('overflow-chip-menu');
+    await expect(menu).toBeVisible();
+    await expect(menu.getByTestId('channel-model-chip')).toHaveCount(1);
+    await expect(
+      menu.locator('[data-testid="channel-model-chip"][data-model="overflow-10"]'),
+    ).toBeVisible();
+    await expect(
+      menu.locator('[data-testid="channel-model-chip"][data-model="overflow-1"]'),
+    ).toHaveCount(0);
+
+    await menu
+      .locator('[data-testid="channel-model-chip"][data-model="overflow-10"]')
+      .getByTestId('channel-model-remove')
+      .click();
+    await expect(form.getByTestId('channel-model-count')).toHaveText('9');
+    await expect(form.getByTestId('overflow-more')).toHaveCount(0);
+    await expect(form.getByTestId('channel-model-chip')).toHaveCount(9);
   });
 });

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 表格单元格里的多名列表：先露出若干 chip，其余收进 +N，点开浮层看完整名单。
+// 表格单元格里的多名列表：先露出若干 chip，其余收进 +N，点开浮层只看被收起的那些。
 import { computed } from 'vue';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
@@ -28,7 +28,8 @@ const chips = computed(() =>
   props.items.map((item) => (typeof item === 'string' ? { name: item } : item)),
 );
 const visible = computed(() => chips.value.slice(0, VISIBLE_COUNT));
-const hiddenCount = computed(() => Math.max(0, chips.value.length - VISIBLE_COUNT));
+const hidden = computed(() => chips.value.slice(VISIBLE_COUNT));
+const hiddenCount = computed(() => hidden.value.length);
 
 function isActualRequest(chip: OverflowChip): boolean {
   return Boolean(chip.canonical || chip.actualRequest);
@@ -79,7 +80,7 @@ function chipTooltip(chip: OverflowChip): string {
           data-testid="overflow-chip-menu"
         >
           <ul class="overflow-chip-grid">
-            <li v-for="chip in chips" :key="chip.name" class="min-w-0">
+            <li v-for="chip in hidden" :key="chip.name" class="min-w-0">
               <Tooltip :text="chipTooltip(chip)">
                 <span
                   class="badge max-w-full min-w-0 truncate"

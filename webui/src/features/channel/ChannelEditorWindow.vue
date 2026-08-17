@@ -1,12 +1,14 @@
 <script setup lang="ts">
 // 渠道编辑器浮窗：每个实例自持草稿，向窗口栈上报脏状态以供淘汰判定。
-// 模型清单以 chip 呈现（点击复制、可删除、自然排序）：带别名的主模型与别名本体
-// 以别名色底区分，悬浮提示互指；删别名清空映射，删主模型名保留别名（同步视图
-// 以「仅别名生效」呈现）。清单下方可手动输入模型 ID 追加进草稿；「设置模型」
-// 切换到 ChannelModelSync 表格视图，点「保存并返回」把勾选模型与别名映射写回
-// 草稿，保存仍走表单页签的既有流程。
+// 模型清单以 chip 呈现（点击复制、可删除、自然排序，最多露出 9 个、其余收进 +N）：
+// 带别名的主模型与别名本体以别名色底区分，悬浮提示互指；删别名清空映射，删主
+// 模型名保留别名（同步视图以「仅别名生效」呈现）。清单下方可手动输入模型 ID
+// 追加进草稿；「设置模型」切换到 ChannelModelSync 表格视图，点「保存并返回」把
+// 勾选模型与别名映射写回草稿，右上角关闭为「不保存并返回」；保存仍走表单页签
+// 的既有流程。
 import { useId, computed, onUnmounted, ref, useTemplateRef, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import { channelWriteBody, type Channel, type ChannelView, type Protocol } from '@/api/types';
@@ -16,10 +18,10 @@ import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
-import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import ChannelEditorChip from '@/features/channel/ChannelEditorChip.vue';
 import ChannelModelSync from '@/features/channel/ChannelModelSync.vue';
 import { compareModels, sameAliasMap, sameModelSet } from '@/lib/model-list';
 import { parseOptionalUint } from '@/lib/uint-parse';
@@ -35,6 +37,9 @@ const ADVANCED_FIELDS: ReadonlySet<string> = new Set(['timeoutMs', 'maxRetries']
 
 /** chip 点击复制后「已复制」图标的展示时长。 */
 const COPIED_HINT_MS = 1_500;
+
+/** 两列网格末格留给 +N；露出奇数个 chip，避免把编辑器撑高。 */
+const EDITOR_MODEL_VISIBLE_COUNT = 9;
 
 /** 编辑器两个视图：表单（含页签）与上游模型同步表格。 */
 type EditorView = 'form' | 'sync';
@@ -153,6 +158,8 @@ const saveMutation = useMutation({
 interface ModelChip {
   name: string;
   isAlias: boolean;
+  /** 别名本体与带别名的主模型共用别名色底；无别名关系的主模型用普通底。 */
+  hasAliasRelation: boolean;
   /** tooltip 文案：主模型名列出其别名，别名列出其主模型名；空串表示无 tooltip。 */
   tooltip: string;
 }
@@ -171,16 +178,22 @@ const modelChips = computed((): ModelChip[] => {
   const chips: ModelChip[] = editorModels.value.map((name) => {
     const canonical = editorAliasesMap.value[name];
     if (canonical !== undefined) {
-      return { name, isAlias: true, tooltip: t('channel.chipAliasTooltip', { canonical }) };
+      return {
+        name,
+        isAlias: true,
+        hasAliasRelation: true,
+        tooltip: t('channel.chipAliasTooltip', { canonical }),
+      };
     }
     const aliases = canonicalAliases.get(name) ?? [];
+    const hasAliasRelation = aliases.length > 0;
     return {
       name,
       isAlias: false,
-      tooltip:
-        aliases.length > 0
-          ? t('channel.chipCanonicalTooltip', { aliases: aliases.join(', ') })
-          : '',
+      hasAliasRelation,
+      tooltip: hasAliasRelation
+        ? t('channel.chipCanonicalTooltip', { aliases: aliases.join(', ') })
+        : '',
     };
   });
   for (const [alias, canonical] of Object.entries(editorAliasesMap.value)) {
@@ -188,12 +201,17 @@ const modelChips = computed((): ModelChip[] => {
     chips.push({
       name: alias,
       isAlias: true,
+      hasAliasRelation: true,
       tooltip: t('channel.chipAliasTooltip', { canonical }),
     });
   }
   chips.sort((left, right) => compareModels(left.name, right.name));
   return chips;
 });
+
+const visibleModelChips = computed(() => modelChips.value.slice(0, EDITOR_MODEL_VISIBLE_COUNT));
+const hiddenModelChips = computed(() => modelChips.value.slice(EDITOR_MODEL_VISIBLE_COUNT));
+const hiddenModelCount = computed(() => hiddenModelChips.value.length);
 
 function removeChip(chip: ModelChip) {
   editorModels.value = editorModels.value.filter((item) => item !== chip.name);
@@ -257,13 +275,6 @@ async function copyModel(model: string) {
   }, COPIED_HINT_MS);
 }
 
-/** chip 键盘复制：仅 chip 本体聚焦时响应，内部删除按钮的按键不拦截。 */
-function chipKeydown(event: KeyboardEvent, model: string) {
-  if (event.target !== event.currentTarget) return;
-  event.preventDefault();
-  void copyModel(model);
-}
-
 onUnmounted(() => {
   if (copiedTimer !== undefined) clearTimeout(copiedTimer);
 });
@@ -293,12 +304,25 @@ function openSync() {
   editorView.value = 'sync';
 }
 
-/** 同步视图返回：勾选模型与别名映射写回草稿，恢复窗口自适应尺寸。 */
+/** 同步视图保存并返回：勾选模型与别名映射写回草稿，恢复窗口自适应尺寸。 */
 function handleSyncBack(models: string[], aliases: Record<string, string>) {
   editorModels.value = models;
   editorAliasesMap.value = aliases;
+  leaveSyncView();
+}
+
+function leaveSyncView() {
   floatingWindow.value?.unlockSize();
   editorView.value = 'form';
+}
+
+/** 同步视图下关闭按钮/Esc 不关窗，只丢弃同步草稿并回到表单。 */
+function handleWindowClose() {
+  if (editorView.value === 'sync') {
+    leaveSyncView();
+    return;
+  }
+  emit('close');
 }
 
 // --- 保存 ---
@@ -384,7 +408,8 @@ function handleSave() {
     :cascade="cascade"
     :attention="attention"
     :topmost="topmost"
-    @close="emit('close')"
+    :close-aria-label="editorView === 'sync' ? t('channel.syncDiscard') : t('common.close')"
+    @close="handleWindowClose"
     @pointerdown="emit('raise')"
   >
     <template #header-extra>
@@ -498,37 +523,50 @@ function handleSave() {
                 </button>
               </legend>
               <ul v-if="modelChips.length > 0" class="grid grid-cols-2 gap-1.5">
-                <li v-for="chip in modelChips" :key="chip.name">
-                  <Tooltip :text="chip.tooltip">
-                    <div
-                      role="button"
-                      tabindex="0"
-                      class="flex cursor-pointer items-center gap-1 rounded-md py-1 pr-1 pl-2"
-                      :class="
-                        chip.tooltip === '' ? 'bg-[var(--seed-surface-alt)]' : 'model-chip-alias'
-                      "
-                      data-testid="channel-model-chip"
-                      :data-model="chip.name"
-                      @click="copyModel(chip.name)"
-                      @keydown.enter="chipKeydown($event, chip.name)"
-                      @keydown.space="chipKeydown($event, chip.name)"
-                    >
-                      <span class="min-w-0 flex-1 truncate font-mono text-xs">{{ chip.name }}</span>
+                <li v-for="chip in visibleModelChips" :key="chip.name">
+                  <ChannelEditorChip
+                    :name="chip.name"
+                    :tooltip="chip.tooltip"
+                    :is-copied="copiedModel === chip.name"
+                    :has-alias-relation="chip.hasAliasRelation"
+                    @copy="copyModel(chip.name)"
+                    @remove="removeChip(chip)"
+                  />
+                </li>
+                <li v-if="hiddenModelCount > 0" class="flex items-center">
+                  <PopoverRoot>
+                    <PopoverTrigger as-child>
                       <button
                         type="button"
-                        class="text-fg-subtle hover:text-danger cursor-pointer rounded p-0.5 hover:bg-[var(--danger-bg)]"
-                        data-testid="channel-model-remove"
-                        :aria-label="t('channel.removeModel', { model: chip.name })"
-                        @click.stop="removeChip(chip)"
+                        class="badge badge-neutral cursor-pointer"
+                        data-testid="overflow-more"
+                        :aria-label="t('common.moreCount', { count: hiddenModelCount })"
                       >
-                        <UiIcon
-                          :name="copiedModel === chip.name ? 'check' : 'close'"
-                          :size="12"
-                          :class="copiedModel === chip.name && 'text-success'"
-                        />
+                        {{ t('common.moreCount', { count: hiddenModelCount }) }}
                       </button>
-                    </div>
-                  </Tooltip>
+                    </PopoverTrigger>
+                    <PopoverPortal>
+                      <PopoverContent
+                        align="start"
+                        :side-offset="4"
+                        class="data-table-menu overflow-chip-menu seed-scrollbar"
+                        data-testid="overflow-chip-menu"
+                      >
+                        <ul class="overflow-chip-grid">
+                          <li v-for="chip in hiddenModelChips" :key="chip.name" class="min-w-0">
+                            <ChannelEditorChip
+                              :name="chip.name"
+                              :tooltip="chip.tooltip"
+                              :is-copied="copiedModel === chip.name"
+                              :has-alias-relation="chip.hasAliasRelation"
+                              @copy="copyModel(chip.name)"
+                              @remove="removeChip(chip)"
+                            />
+                          </li>
+                        </ul>
+                      </PopoverContent>
+                    </PopoverPortal>
+                  </PopoverRoot>
                 </li>
               </ul>
               <p v-else class="text-fg-muted text-xs" data-testid="channel-models-empty">

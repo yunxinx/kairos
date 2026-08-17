@@ -703,7 +703,7 @@ html[lang='zh-CN'] {
   padding: 1px 4px;
 }
 
-/* 同步表格别名列输入：常显、紧凑，行点击切换勾选时输入框自身不触发 */
+/* 同步表格别名列输入：常显、紧凑；勾选只由复选框与选择状态列触发 */
 .sync-alias-input {
   width: 100%;
   padding: 3px 6px;
@@ -1135,7 +1135,7 @@ html[lang='zh-CN'] {
   background: var(--seed-border);
 }
 
-/* +N 完整名单：两栏提高密度，列距留给截断 chip 呼吸 */
+/* +N 收起名单：两栏提高密度，列距留给截断 chip 呼吸 */
 .data-table-menu.overflow-chip-menu {
   width: 22rem;
   max-width: min(22rem, calc(100vw - 24px));

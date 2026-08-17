@@ -23,6 +23,8 @@ const props = withDefaults(
     attention?: boolean;
     /** 是否最前窗口；仅最前窗口响应 Esc 关闭。 */
     topmost?: boolean;
+    /** 关闭按钮的可访问名称；缺省为「关闭」。子视图可改成「不保存并返回」等。 */
+    closeAriaLabel?: string | null;
   }>(),
   {
     anchor: null,
@@ -32,6 +34,7 @@ const props = withDefaults(
     cascade: 0,
     attention: false,
     topmost: true,
+    closeAriaLabel: null,
   },
 );
 
@@ -217,7 +220,7 @@ onUnmounted(() => {
       <button
         type="button"
         class="btn btn-ghost btn-sm"
-        :aria-label="t('common.close')"
+        :aria-label="closeAriaLabel ?? t('common.close')"
         @click="emit('close')"
       >
         <UiIcon name="close" :size="16" />
