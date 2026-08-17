@@ -16,8 +16,8 @@ use crate::store::resources::{Channel, ChannelRecord};
 /// 别名表，禁止全体套用第一个候选的出站名。
 #[derive(Debug, Clone)]
 pub struct Route {
-    /// 按尝试顺序排列的候选渠道（克隆自配置记录）。
-    pub channels: Vec<Channel>,
+    /// 按尝试顺序排列的候选渠道记录（含稳定 id，克隆自配置）。
+    pub channels: Vec<ChannelRecord>,
 }
 
 /// 该渠道对入站模型名应发给上游的出站名：命中本渠道别名表则用 value，否则原样。
@@ -106,7 +106,7 @@ pub fn route(channels: &[ChannelRecord], model: &str) -> Option<Route> {
     priorities.sort_unstable();
 
     let mut rng = rand::rng();
-    let mut channels: Vec<Channel> = Vec::with_capacity(candidates.len());
+    let mut channels: Vec<ChannelRecord> = Vec::with_capacity(candidates.len());
     for priority in priorities {
         let group = &priority_groups[&priority];
         // 组内按 weight 加权随机排列：A-ExpJ 指数抽样，每个渠道的 key =
@@ -118,7 +118,7 @@ pub fn route(channels: &[ChannelRecord], model: &str) -> Option<Route> {
             .map(|(i, record)| (exp_key(record.channel.weight, &mut rng), i))
             .collect();
         keys.sort_by(|a, b| a.0.total_cmp(&b.0));
-        channels.extend(keys.into_iter().map(|(_, i)| group[i].channel.clone()));
+        channels.extend(keys.into_iter().map(|(_, i)| group[i].clone()));
     }
 
     Some(Route { channels })
@@ -170,9 +170,9 @@ mod tests {
         let route = route(&channels, "gpt-4o").expect("应有候选");
         assert_eq!(route.channels.len(), 3, "全部候选都应参与 failover");
         // 前两个是最高优先级（p1），最后一个兜底（p2）。
-        assert_eq!(route.channels[0].priority, 1);
-        assert_eq!(route.channels[1].priority, 1);
-        assert_eq!(route.channels[2].priority, 2);
+        assert_eq!(route.channels[0].channel.priority, 1);
+        assert_eq!(route.channels[1].channel.priority, 1);
+        assert_eq!(route.channels[2].channel.priority, 2);
     }
 
     /// 同级 weight 加权随机：高 weight 渠道应更可能被排在前。
@@ -187,7 +187,7 @@ mod tests {
         let trials = 200;
         for _ in 0..trials {
             let route = route(&channels, "gpt-4o").expect("应有候选");
-            if route.channels[0].name == "heavy" {
+            if route.channels[0].channel.name == "heavy" {
                 heavy_first += 1;
             }
         }
@@ -215,7 +215,7 @@ mod tests {
         ];
         let route = route(&channels, "gpt-4o").expect("启用渠道应可命中");
         assert_eq!(route.channels.len(), 1, "禁用渠道不应进入候选");
-        assert_eq!(route.channels[0].name, "on");
+        assert_eq!(route.channels[0].channel.name, "on");
     }
 
     /// 全部候选都被禁用 → 与无候选同等处理，返回 None。
@@ -233,7 +233,10 @@ mod tests {
         c.model_aliases
             .insert("fast".to_string(), "gpt-4o-mini".to_string());
         let route = route(&[record(1, c)], "fast").expect("别名短名应命中");
-        assert_eq!(outbound_model(&route.channels[0], "fast"), "gpt-4o-mini");
+        assert_eq!(
+            outbound_model(&route.channels[0].channel, "fast"),
+            "gpt-4o-mini"
+        );
     }
 
     /// 未命中别名时出站模型名原样。
@@ -241,7 +244,10 @@ mod tests {
     fn outbound_model_unchanged_without_alias() {
         let channels = vec![record(1, channel("c", 1, 1, &["gpt-4o"]))];
         let route = route(&channels, "gpt-4o").expect("应有候选");
-        assert_eq!(outbound_model(&route.channels[0], "gpt-4o"), "gpt-4o");
+        assert_eq!(
+            outbound_model(&route.channels[0].channel, "gpt-4o"),
+            "gpt-4o"
+        );
     }
 
     /// 各候选渠道用自己的别名表得到出站名，不共用第一个候选。
@@ -253,10 +259,13 @@ mod tests {
             .insert("fast".to_string(), "gpt-4o-mini".to_string());
         let plain = channel("plain", 1, 1, &["fast"]);
         let route = route(&[record(1, aliased), record(2, plain)], "fast").expect("应有候选");
-        assert_eq!(route.channels[0].name, "plain");
-        assert_eq!(outbound_model(&route.channels[0], "fast"), "fast");
-        assert_eq!(route.channels[1].name, "aliased");
-        assert_eq!(outbound_model(&route.channels[1], "fast"), "gpt-4o-mini");
+        assert_eq!(route.channels[0].channel.name, "plain");
+        assert_eq!(outbound_model(&route.channels[0].channel, "fast"), "fast");
+        assert_eq!(route.channels[1].channel.name, "aliased");
+        assert_eq!(
+            outbound_model(&route.channels[1].channel, "fast"),
+            "gpt-4o-mini"
+        );
     }
 
     /// 两条启用渠道同一别名指向不同真名 → 冲突。

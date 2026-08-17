@@ -374,8 +374,9 @@ test.describe('channel manual model add', () => {
       );
       await expect(channelRow).toBeVisible();
       expect(await savedChannelModels(page, channelName)).toEqual(
-        expect.arrayContaining(['gpt-4o-mini', 'mini']),
+        expect.arrayContaining(['gpt-4o-mini']),
       );
+      expect(await savedChannelModels(page, channelName)).not.toContain('mini');
       expect(await savedChannelModels(page, channelName)).not.toContain(manualId);
 
       const beforeSave = await chatCompletionsStatus(page, token.token_key, manualId);
@@ -476,6 +477,95 @@ test.describe('channel manual model add', () => {
       await page.getByTestId('channel-add-model-input').fill('mini');
       await page.getByTestId('channel-add-model').click();
       await expect(page.locator('[data-form-field="addModel"]')).toContainText('已是别名');
+    } finally {
+      await upstream.close();
+    }
+  });
+});
+
+test.describe('channel alias occupancy', () => {
+  test('refuses an alias that occupies another selected model, then keeps it as a nickname after uncheck', async ({
+    page,
+  }) => {
+    const alpha = 'e2e-occ-alpha';
+    const beta = 'e2e-occ-beta';
+    const gamma = 'e2e-occ-gamma';
+    const channelName = 'e2e-occ-channel';
+    const upstream = await startProbeUpstream(200, { models: [alpha, beta, gamma] });
+    try {
+      await page.goto('/channel');
+      await page.getByTestId('create-channel').click();
+      await page.locator('[id^="channel-editor-name"]').fill(channelName);
+      await page.locator('[id^="channel-editor-base-url"]').fill(upstream.baseUrl);
+      await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
+      await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
+
+      const alphaRow = page.locator(`[data-testid="channel-sync-row"][data-model="${alpha}"]`);
+      const betaRow = page.locator(`[data-testid="channel-sync-row"][data-model="${beta}"]`);
+      const gammaRow = page.locator(`[data-testid="channel-sync-row"][data-model="${gamma}"]`);
+      await alphaRow.getByTestId('channel-sync-checkbox').click();
+      await betaRow.getByTestId('channel-sync-checkbox').click();
+      await gammaRow.getByTestId('channel-sync-checkbox').click();
+      await alphaRow.getByTestId('channel-sync-alias-input').fill(beta);
+
+      const conflict = page.getByTestId('channel-sync-alias-conflict');
+      await expect(conflict).toBeVisible();
+      await expect(conflict).toContainText(beta);
+      await expect(alphaRow.getByTestId('channel-sync-alias-input')).toHaveAttribute(
+        'aria-invalid',
+        'true',
+      );
+      await page.getByTestId('channel-sync-back').click();
+      await expect(page.getByTestId('channel-sync-view')).toBeVisible();
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(0);
+
+      await alphaRow.getByTestId('channel-sync-alias-input').fill('e2e-occ-nick');
+      await betaRow.getByTestId('channel-sync-alias-input').fill('e2e-occ-nick');
+      await expect(conflict).toContainText('e2e-occ-nick');
+      await betaRow.getByTestId('channel-sync-alias-input').fill('');
+      await alphaRow.getByTestId('channel-sync-alias-input').fill(beta);
+      await expect(conflict).toContainText(beta);
+
+      await betaRow.getByTestId('channel-sync-checkbox').click();
+      await expect(conflict).toHaveCount(0);
+      await page.getByTestId('channel-sync-back').click();
+      await expect(page.getByTestId('channel-model-chip')).toHaveCount(3);
+      await expect(
+        page.locator(`[data-testid="channel-model-chip"][data-model="${alpha}"]`),
+      ).toBeVisible();
+      await expect(
+        page.locator(`[data-testid="channel-model-chip"][data-model="${beta}"]`),
+      ).toHaveClass(/model-chip-alias/);
+      await expect(
+        page.locator(`[data-testid="channel-model-chip"][data-model="${gamma}"]`),
+      ).toBeVisible();
+
+      await page.getByTestId('channel-save').click();
+      const channelRow = page.locator(
+        `[data-testid="channel-row"][data-channel-name="${channelName}"]`,
+      );
+      await expect(channelRow).toBeVisible();
+
+      await page.goto('/models');
+      await expect(
+        page.locator(
+          `[data-testid="inventory-row"][data-model="${alpha}"][data-section-channel="${channelName}"]`,
+        ),
+      ).toBeVisible();
+      await expect(
+        page.locator(
+          `[data-testid="inventory-row"][data-model="${gamma}"][data-section-channel="${channelName}"]`,
+        ),
+      ).toBeVisible();
+      await expect(page.locator(`[data-testid="inventory-row"][data-model="${beta}"]`)).toHaveCount(
+        0,
+      );
+      await expect(
+        page.locator(
+          `[data-testid="inventory-row"][data-model="${alpha}"] [data-testid="inventory-alias-chip"]`,
+        ),
+      ).toHaveText(beta);
     } finally {
       await upstream.close();
     }

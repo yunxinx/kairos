@@ -723,6 +723,11 @@ html[lang='zh-CN'] {
   border-color: var(--alias);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--alias) 25%, transparent);
 }
+.sync-alias-input-invalid,
+.sync-alias-input-invalid:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 25%, transparent);
+}
 
 /* 别名列略收、与状态列相邻内边距收紧，把宽度让给模型名称 */
 [data-slot='table-head'].sync-col-alias,

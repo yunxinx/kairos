@@ -17,6 +17,9 @@ const props = withDefaults(
   defineProps<{
     /** 可调用名，始终锁定。 */
     model: string;
+    /** 价格所属渠道，始终锁定。 */
+    channelId: number;
+    channelName: string;
     /** 已有价格；null 表示未定价、本次为创建。 */
     initial: Price | null;
     anchor?: FloatingWindowAnchor | null;
@@ -38,6 +41,7 @@ const { t } = useI18n();
 
 const uid = useId();
 const modelInputId = `pricing-editor-model-${uid}`;
+const channelInputId = `pricing-editor-channel-${uid}`;
 const inputInputId = `pricing-editor-input-${uid}`;
 const outputInputId = `pricing-editor-output-${uid}`;
 const cacheReadInputId = `pricing-editor-cache-read-${uid}`;
@@ -74,7 +78,9 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const saveMutation = useMutation({
   mutationFn: (body: Price) =>
-    props.initial === null ? apiClient.createPrice(body) : apiClient.updatePrice(props.model, body),
+    props.initial === null
+      ? apiClient.createPrice(body)
+      : apiClient.updatePrice(props.channelId, props.model, body),
   onSuccess: async () => {
     editorError.value = '';
     emit('close');
@@ -114,6 +120,7 @@ function handleSave() {
     return;
   }
   saveMutation.mutate({
+    channel_id: props.channelId,
     model: props.model,
     input_micros: inputMicros,
     output_micros: outputMicros,
@@ -136,6 +143,17 @@ function handleSave() {
   >
     <form novalidate @submit.prevent="handleSave">
       <div class="card-body space-y-3">
+        <FormField field-name="channel" :label="t('pricing.channel')" :input-id="channelInputId">
+          <template #default>
+            <FormTextInput
+              :id="channelInputId"
+              :model-value="channelName"
+              type="text"
+              disabled
+              data-testid="pricing-editor-channel"
+            />
+          </template>
+        </FormField>
         <FormField field-name="model" :label="t('pricing.model')" :input-id="modelInputId">
           <template #default>
             <FormTextInput :id="modelInputId" :model-value="model" type="text" disabled />

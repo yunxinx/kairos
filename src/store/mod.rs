@@ -861,6 +861,24 @@ mod tests {
         let mut conn = pool.acquire().await.expect("应能获取连接");
         // token_balance 有外键，先播种归属令牌，让探测只命中 STRICT 而非外键。
         seed_token(&mut conn, "strict-probe").await;
+        let channel_id = crate::store::resources::insert_channel(
+            &mut conn,
+            &crate::store::resources::Channel {
+                name: "strict-price".to_string(),
+                protocol: crate::config::Protocol::OpenAiChat,
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: "sk".to_string(),
+                models: vec![],
+                model_aliases: std::collections::HashMap::new(),
+                priority: 0,
+                weight: 1,
+                timeout_ms: 1000,
+                max_retries: 0,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("应能写渠道");
 
         let probes = [
             (
@@ -890,11 +908,6 @@ mod tests {
                  VALUES ('c', 'openai_chat', 'u', 'k', '[]', '{}', 'not-a-number', 1, 1000, 1)",
             ),
             (
-                "prices",
-                "INSERT INTO prices (model, input_micros, output_micros) \
-                 VALUES ('m', 'not-a-number', 0)",
-            ),
-            (
                 "settings",
                 "INSERT INTO settings (setting_key, setting_value) VALUES ('k2', x'00')",
             ),
@@ -915,9 +928,23 @@ mod tests {
             );
         }
 
+        assert!(
+            sqlx::query(
+                "INSERT INTO prices (channel_id, model, input_micros, output_micros) \
+                 VALUES (?, 'm', 'not-a-number', 0)"
+            )
+            .bind(channel_id)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "prices 应仍是 STRICT 表，错类型写入须被拒"
+        );
+
         let result = sqlx::query(
-            "INSERT INTO prices (model, input_micros, output_micros) VALUES ('m2', 1.5, 0)",
+            "INSERT INTO prices (channel_id, model, input_micros, output_micros) \
+             VALUES (?, 'm2', 1.5, 0)",
         )
+        .bind(channel_id)
         .execute(&pool)
         .await;
         assert!(result.is_err(), "INTEGER 列写 REAL 应被 STRICT 拒绝");

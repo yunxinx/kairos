@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // 上游模型同步视图：进入后不自动请求，由用户点「同步」拉取上游模型列表；
 // 勾选表格 + 别名列（常显输入、逗号分隔多个）+ 选择/别名两个维度的状态筛选，
-// 「保存并返回」把勾选结果与别名映射经 emit 写回父级草稿；失败以独立浮窗就近
+// 「保存并返回」把勾选结果与别名映射经 emit 写回父级草稿；别名占用另一已勾选
+// 主模型名或同一别名指向两个主模型时拒绝提交。失败以独立浮窗就近
 // 「同步」按钮弹出，3s 自动消失（鼠标悬浮/键盘焦点暂停计时）。
 import { computed, onUnmounted, ref, useId } from 'vue';
 import { useMutation } from '@tanstack/vue-query';
@@ -22,7 +23,7 @@ import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
-import { compareModels } from '@/lib/model-list';
+import { commitSyncListing, compareModels } from '@/lib/model-list';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
 /** 草稿超时非法时拉取上游模型的兜底超时，与新建渠道缺省超时一致。 */
@@ -432,20 +433,38 @@ function toggleAllVisible() {
   });
 }
 
+/** 勾选与别名草稿收成清单；占用已勾选主模型名或同一别名指向两个主模型时拒绝。 */
+const listingCommit = computed(() => commitSyncListing(syncRows.value));
+const listingConflict = computed(() =>
+  listingCommit.value.ok ? null : listingCommit.value.conflict,
+);
+const listingConflictMessage = computed(() => {
+  const conflict = listingConflict.value;
+  if (conflict === null) return '';
+  if (conflict.kind === 'occupies_selected') {
+    return t('channel.syncAliasOccupiesSelected', {
+      alias: conflict.alias,
+      owner: conflict.owner,
+      occupied: conflict.occupied,
+    });
+  }
+  return t('channel.syncAliasClaimedTwice', {
+    alias: conflict.alias,
+    first: conflict.first,
+    second: conflict.second,
+  });
+});
+
+function rowAliasConflicts(row: SyncRow): boolean {
+  const conflict = listingConflict.value;
+  return conflict !== null && row.aliases.includes(conflict.alias);
+}
+
 /** 保存并返回即提交：勾选行产出主模型名与别名入清单；「仅别名生效」行只产出别名。 */
 function closeSync() {
-  // 用 Set 去重：别名恰与某主模型名同名时不产生重复清单条目。
-  const models = new Set<string>();
-  const aliases: Record<string, string> = {};
-  for (const row of syncRows.value) {
-    if (!row.selected) continue;
-    if (!row.aliasOnly) models.add(row.name);
-    for (const alias of row.aliases) {
-      models.add(alias);
-      aliases[alias] = row.name;
-    }
-  }
-  emit('back', [...models].sort(compareModels), aliases);
+  const committed = listingCommit.value;
+  if (!committed.ok) return;
+  emit('back', committed.models, committed.aliases);
 }
 </script>
 
@@ -581,6 +600,14 @@ function closeSync() {
         </button>
       </div>
     </div>
+    <p
+      v-if="listingConflict !== null"
+      class="text-danger text-sm"
+      role="alert"
+      data-testid="channel-sync-alias-conflict"
+    >
+      {{ listingConflictMessage }}
+    </p>
     <DataTablePanel>
       <Table>
         <TableHeader>
@@ -629,9 +656,11 @@ function closeSync() {
               <input
                 type="text"
                 class="sync-alias-input"
+                :class="rowAliasConflicts(row) && 'sync-alias-input-invalid'"
                 :value="aliasDrafts[row.name] ?? ''"
                 :placeholder="t('channel.syncAliasPlaceholder')"
                 data-testid="channel-sync-alias-input"
+                :aria-invalid="rowAliasConflicts(row) ? 'true' : undefined"
                 :aria-label="`${t('channel.syncColAlias')}: ${row.name}`"
                 @input="setAliasDraft(row.name, ($event.target as HTMLInputElement).value)"
               />

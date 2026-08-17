@@ -70,11 +70,13 @@ const pricesQuery = useQuery({
   queryFn: () => apiClient.listPrices(),
 });
 
-const memberOptions = computed(() =>
-  buildInventory(channelsQuery.data.value ?? [], pricesQuery.data.value ?? []).map(
-    (row) => row.name,
+const memberOptions = computed(() => [
+  ...new Set(
+    buildInventory(channelsQuery.data.value ?? [], pricesQuery.data.value ?? []).map(
+      (row) => row.name,
+    ),
   ),
-);
+]);
 
 const models = computed(() => unifiedQuery.data.value ?? []);
 const showTableSkeleton = computed(() => unifiedQuery.isPending.value && !unifiedQuery.data.value);

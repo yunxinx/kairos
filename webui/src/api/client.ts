@@ -139,15 +139,15 @@ export const apiClient = {
     return apiFetch('/prices', { method: 'POST', body: JSON.stringify(body) });
   },
 
-  updatePrice(model: string, body: Price): Promise<Price> {
-    return apiFetch(`/prices/${encodeURIComponent(model)}`, {
+  updatePrice(channelId: number, model: string, body: Price): Promise<Price> {
+    return apiFetch(`/prices/${channelId}/${encodeURIComponent(model)}`, {
       method: 'PUT',
       body: JSON.stringify(body),
     });
   },
 
-  deletePrice(model: string): Promise<Price> {
-    return apiFetch(`/prices/${encodeURIComponent(model)}`, { method: 'DELETE' });
+  deletePrice(channelId: number, model: string): Promise<Price> {
+    return apiFetch(`/prices/${channelId}/${encodeURIComponent(model)}`, { method: 'DELETE' });
   },
 
   listModelGroups(): Promise<ModelGroup[]> {

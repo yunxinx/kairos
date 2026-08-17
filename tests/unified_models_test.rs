@@ -5,7 +5,10 @@
 
 mod common;
 
-use common::{TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use common::{
+    SEED_PRICE_ATTACH_LISTING_CHANNELS, TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway,
+    UpstreamBehavior,
+};
 use kairos::config;
 use kairos::store::resources::{Channel, Price, UnifiedModel};
 use serde_json::{Value, json};
@@ -306,6 +309,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
     ];
     seed.prices = vec![
         Price {
+            channel_id: SEED_PRICE_ATTACH_LISTING_CHANNELS,
             model: "cheap".to_string(),
             input_micros: 1_000_000,
             output_micros: 1_000_000,
@@ -313,6 +317,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             cache_write_micros: None,
         },
         Price {
+            channel_id: SEED_PRICE_ATTACH_LISTING_CHANNELS,
             model: "pricey".to_string(),
             input_micros: 10_000_000,
             output_micros: 10_000_000,

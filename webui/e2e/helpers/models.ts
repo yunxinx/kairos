@@ -8,7 +8,7 @@ const headers = { Authorization: `Bearer ${E2E_ADMIN_KEY}` };
 export async function seedChannel(
   page: Page,
   body: Partial<Channel> & Pick<Channel, 'name' | 'models'>,
-): Promise<void> {
+): Promise<{ id: number }> {
   const resp = await page.request.post('/channels', {
     headers,
     data: {
@@ -25,6 +25,8 @@ export async function seedChannel(
     },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
+  const created = (await resp.json()) as { id: number };
+  return { id: created.id };
 }
 
 /** 经管理 API 写入一条价格。 */

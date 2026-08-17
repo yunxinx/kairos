@@ -10,7 +10,7 @@ mod common;
 
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use kairos::config;
-use kairos::store::resources::Channel;
+use kairos::store::resources::{Channel, Price};
 use serde_json::{Value, json};
 
 fn ok_response() -> Value {
@@ -93,6 +93,73 @@ async fn retryable_429_fails_over_to_next_channel() {
     // 两个渠道都被请求过（首渠道失败一次，次渠道成功一次）。
     assert_eq!(ups[0].received().len(), 1, "首渠道应收一次请求");
     assert_eq!(ups[1].received().len(), 1, "次渠道应收一次请求");
+}
+
+/// 首渠道 429、次渠道成功：只按成功渠道单价结算一次。
+#[tokio::test]
+async fn failover_bills_succeeding_channel_price_once() {
+    const PRICE_A: i64 = 1_000_000;
+    const PRICE_B: i64 = 3_000_000;
+    let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].max_retries = 0;
+        seed.channels[1].max_retries = 0;
+        seed.prices = vec![
+            Price {
+                channel_id: 1,
+                model: TEST_MODEL.to_string(),
+                input_micros: PRICE_A,
+                output_micros: 0,
+                cache_read_micros: None,
+                cache_write_micros: None,
+            },
+            Price {
+                channel_id: 2,
+                model: TEST_MODEL.to_string(),
+                input_micros: PRICE_B,
+                output_micros: 0,
+                cache_read_micros: None,
+                cache_write_micros: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Status429);
+    ups[1].set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-bill-b", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0, "total_tokens": 1_000_000}
+    })));
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "failover 后应成功");
+    assert_eq!(ups[0].received().len(), 1, "首渠道应收一次请求");
+    assert_eq!(ups[1].received().len(), 1, "次渠道应收一次请求");
+
+    let cost: (i64,) =
+        sqlx::query_as("SELECT cost_usd_micros FROM request_log ORDER BY id DESC LIMIT 1")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应落结算");
+    assert_eq!(cost.0, PRICE_B, "应按成功渠道单价结算，不得用失败渠道价");
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_log")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计日志");
+    assert_eq!(count.0, 1, "失败 hop 不落账，只应有一条成功日志");
+
+    let balance: (i64, i64) = sqlx::query_as(
+        "SELECT balance_usd_micros, settled_usd_micros FROM token_balance WHERE token_key = ?",
+    )
+    .bind(TEST_TOKEN_KEY)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("令牌余额应存在");
+    assert_eq!(balance.0, 5_000_000 - PRICE_B, "余额只应按成功渠道扣一次");
+    assert_eq!(balance.1, PRICE_B, "累计结算应等于成功渠道费用");
 }
 
 /// 首渠道 5xx、次渠道成功：failover 到下一渠道。

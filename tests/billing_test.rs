@@ -4,7 +4,9 @@
 
 mod common;
 
-use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use common::{
+    SEED_PRICE_ATTACH_LISTING_CHANNELS, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior,
+};
 use kairos::store::resources::Price;
 use serde_json::{Value, json};
 
@@ -132,6 +134,7 @@ async fn unconfigured_cache_tier_is_not_charged() {
     let mut gw = TestGateway::start_with(|base| {
         let mut seed = common::test_seed(base);
         seed.prices = vec![Price {
+            channel_id: SEED_PRICE_ATTACH_LISTING_CHANNELS,
             model: TEST_MODEL.to_string(),
             input_micros: 2_500_000,
             output_micros: 10_000_000,

@@ -32,7 +32,10 @@ use crate::{
     core::ir::{ChatRequest, ContentPart, Message, Role},
     runtime, store,
     store::StoreError,
-    store::resources::{Channel, ChannelRecord, ModelGroup, Price, Settings, Token, UnifiedModel},
+    store::resources::{
+        Channel, ChannelRecord, ModelGroup, Price, Settings, Token, UnifiedModel,
+        channel_lists_callable,
+    },
 };
 
 use super::http::OutboundAuth;
@@ -78,7 +81,10 @@ pub fn router(
         .route("/channels/{id}", put(update_channel).delete(delete_channel))
         .route("/channels/{id}/test", post(test_channel))
         .route("/prices", get(list_prices).post(create_price))
-        .route("/prices/{model}", put(update_price).delete(delete_price))
+        .route(
+            "/prices/{channel_id}/{model}",
+            put(update_price).delete(delete_price),
+        )
         .route(
             "/model-groups",
             get(list_model_groups).post(create_model_group),
@@ -340,6 +346,7 @@ async fn create_channel(
                 channel.name
             )));
         }
+        reject_alias_occupancy(&channel)?;
         reject_alias_conflict(&snapshot.channels, &channel, None)?;
         reject_unhidden_unified_collision(
             &snapshot.channels,
@@ -388,6 +395,7 @@ async fn update_channel(
                 channel.name
             )));
         }
+        reject_alias_occupancy(&channel)?;
         reject_alias_conflict(&snapshot.channels, &channel, Some(id))?;
         reject_unhidden_unified_collision(
             &snapshot.channels,
@@ -401,6 +409,13 @@ async fn update_channel(
     crate::store::resources::update_channel(&mut tx, id, &channel)
         .await
         .map_err(AdminError::Store)?;
+    crate::store::resources::retain_channel_prices(
+        &mut tx,
+        id,
+        &crate::store::resources::channel_callable_names(&channel),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_channel_record(&deps, id).await?;
@@ -425,15 +440,24 @@ async fn delete_channel(
 
 // --- 价格 ---
 
-/// 列出全部价格（按 `model` 排序，保证确定性）。
+/// 列出全部价格（按渠道 id、模型名排序，保证确定性）。
 async fn list_prices(State(deps): State<AdminDeps>) -> Result<Json<Vec<Price>>, AdminError> {
     let snapshot = deps.snapshot.read().await;
-    let mut prices: Vec<Price> = snapshot.prices.values().cloned().collect();
-    prices.sort_by(|a, b| a.model.cmp(&b.model));
+    let mut prices: Vec<Price> = snapshot
+        .prices
+        .values()
+        .flat_map(|inner| inner.values())
+        .cloned()
+        .collect();
+    prices.sort_by(|left, right| {
+        left.channel_id
+            .cmp(&right.channel_id)
+            .then(left.model.cmp(&right.model))
+    });
     Ok(Json(prices))
 }
 
-/// 新建价格：同模型已存在则冲突（409），否则写库 + 换快照 + 返回新价格。
+/// 新建价格：同一渠道同一模型已存在则冲突（409），否则写库 + 换快照 + 返回新价格。
 async fn create_price(
     State(deps): State<AdminDeps>,
     body: Result<Json<Price>, axum::extract::rejection::JsonRejection>,
@@ -442,8 +466,16 @@ async fn create_price(
     validate_price(&price)?;
     {
         let snapshot = deps.snapshot.read().await;
-        if snapshot.prices.contains_key(&price.model) {
-            return Err(AdminError::Conflict(format!("价格 {} 已存在", price.model)));
+        reject_unknown_price_channel(&snapshot, price.channel_id)?;
+        reject_unlisted_price_callable(&snapshot, price.channel_id, &price.model)?;
+        if snapshot
+            .price_for_channel(price.channel_id, &price.model)
+            .is_some()
+        {
+            return Err(AdminError::Conflict(format!(
+                "价格 渠道 {} / {} 已存在",
+                price.channel_id, price.model
+            )));
         }
     }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
@@ -452,37 +484,43 @@ async fn create_price(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    let created = read_price(&deps, &price.model).await?;
+    let created = read_price(&deps, price.channel_id, &price.model).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// 整体替换价格（按路径 `model`，路径权威）：写库 + 换快照 + 返回新价格。
+/// 整体替换价格（路径 `channel_id`/`model` 权威）：写库 + 换快照 + 返回新价格。
 async fn update_price(
     State(deps): State<AdminDeps>,
-    Path(model): Path<String>,
+    Path((channel_id, model)): Path<(i64, String)>,
     body: Result<Json<Price>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Price>, AdminError> {
     let mut price = body.map_err(AdminError::bad_body)?;
+    price.channel_id = channel_id;
     price.model = model;
     validate_price(&price)?;
+    {
+        let snapshot = deps.snapshot.read().await;
+        reject_unknown_price_channel(&snapshot, price.channel_id)?;
+        reject_unlisted_price_callable(&snapshot, price.channel_id, &price.model)?;
+    }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_price(&mut tx, &price)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    let updated = read_price(&deps, &price.model).await?;
+    let updated = read_price(&deps, price.channel_id, &price.model).await?;
     Ok(Json(updated))
 }
 
 /// 删除价格：不存在则 404，否则删除并返回被删价格。
 async fn delete_price(
     State(deps): State<AdminDeps>,
-    Path(model): Path<String>,
+    Path((channel_id, model)): Path<(i64, String)>,
 ) -> Result<Json<Price>, AdminError> {
-    let deleted = read_price(&deps, &model).await?;
+    let deleted = read_price(&deps, channel_id, &model).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::resources::delete_price(&mut tx, &model)
+    crate::store::resources::delete_price(&mut tx, channel_id, &model)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
@@ -1365,14 +1403,49 @@ async fn read_channel_record(deps: &AdminDeps, id: i64) -> Result<ChannelRecord,
         .ok_or_else(|| AdminError::NotFound(format!("渠道 {id} 不存在")))
 }
 
-/// 从当前快照读回一个价格；不存在返回 `NotFound`。
-async fn read_price(deps: &AdminDeps, model: &str) -> Result<Price, AdminError> {
+/// 从当前快照读回一条价格；不存在返回 `NotFound`。
+async fn read_price(deps: &AdminDeps, channel_id: i64, model: &str) -> Result<Price, AdminError> {
     let snapshot = deps.snapshot.read().await;
     snapshot
-        .prices
-        .get(model)
+        .price_for_channel(channel_id, model)
         .cloned()
-        .ok_or_else(|| AdminError::NotFound(format!("价格 {model} 不存在")))
+        .ok_or_else(|| AdminError::NotFound(format!("价格 渠道 {channel_id} / {model} 不存在")))
+}
+
+/// 价格行引用的渠道必须存在。
+fn reject_unknown_price_channel(
+    snapshot: &crate::runtime::RuntimeSnapshot,
+    channel_id: i64,
+) -> Result<(), AdminError> {
+    if snapshot
+        .channels
+        .iter()
+        .any(|record| record.id == channel_id)
+    {
+        Ok(())
+    } else {
+        Err(AdminError::NotFound(format!("渠道 {channel_id} 不存在")))
+    }
+}
+
+/// 价格模型名必须是该渠道已登记的可调用名（清单或别名 key）。
+fn reject_unlisted_price_callable(
+    snapshot: &crate::runtime::RuntimeSnapshot,
+    channel_id: i64,
+    model: &str,
+) -> Result<(), AdminError> {
+    let record = snapshot
+        .channels
+        .iter()
+        .find(|record| record.id == channel_id)
+        .ok_or_else(|| AdminError::NotFound(format!("渠道 {channel_id} 不存在")))?;
+    if channel_lists_callable(&record.channel, model) {
+        Ok(())
+    } else {
+        Err(AdminError::InvalidBody(format!(
+            "模型 {model} 未在渠道 {channel_id} 的清单或别名中登记"
+        )))
+    }
 }
 
 /// 从当前快照读回一个模型组；不存在返回 `NotFound`。
@@ -1499,6 +1572,22 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     Ok(())
 }
 
+/// 同一渠道上非恒等别名的 key 与 value 都在 `models` 里则拒绝：该名既是独立主模型，又被改写成另一个已登记主模型。
+fn reject_alias_occupancy(channel: &Channel) -> Result<(), AdminError> {
+    let listed: HashSet<&String> = channel.models.iter().collect();
+    for (alias, canonical) in &channel.model_aliases {
+        if alias == canonical {
+            continue;
+        }
+        if listed.contains(alias) && listed.contains(canonical) {
+            return Err(AdminError::Conflict(format!(
+                "别名 {alias} 占用清单中的同名主模型（指向 {canonical}）。同一渠道上一个名字不能既是独立主模型，又是指向其他主模型的别名"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 保存后的启用渠道集合若同一别名指向不同真名，拒绝并提示改用统一模型。
 fn reject_alias_conflict(
     existing: &[ChannelRecord],
@@ -1590,7 +1679,7 @@ enum AdminError {
     InvalidBody(String),
     /// 资源不存在（404）。
     NotFound(String),
-    /// 资源冲突（409）：同名已存在，或启用渠道间别名指向不同真名。
+    /// 资源冲突（409）：同名已存在、渠道内别名占用已登记主模型，或启用渠道间别名指向不同真名。
     Conflict(String),
     /// 上游访问失败（502）：模型列表请求不可达、非 2xx 或响应形态非法。
     Upstream(String),

@@ -59,6 +59,7 @@ mod tests {
     /// 构一个库加载来的价格行（micro-USD / 1M tokens）。
     fn price(input: i64, output: i64, cache_read: Option<i64>, cache_write: Option<i64>) -> Price {
         Price {
+            channel_id: 1,
             model: "gpt-4o".to_string(),
             input_micros: input,
             output_micros: output,

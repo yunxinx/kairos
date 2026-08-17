@@ -158,6 +158,7 @@ interface ModelChip {
 }
 
 const modelChips = computed((): ModelChip[] => {
+  const listed = new Set(editorModels.value);
   const canonicalAliases = new Map<string, string[]>();
   for (const [alias, canonical] of Object.entries(editorAliasesMap.value)) {
     const list = canonicalAliases.get(canonical);
@@ -167,7 +168,7 @@ const modelChips = computed((): ModelChip[] => {
       canonicalAliases.set(canonical, [alias]);
     }
   }
-  return [...editorModels.value].sort(compareModels).map((name) => {
+  const chips: ModelChip[] = editorModels.value.map((name) => {
     const canonical = editorAliasesMap.value[name];
     if (canonical !== undefined) {
       return { name, isAlias: true, tooltip: t('channel.chipAliasTooltip', { canonical }) };
@@ -182,18 +183,38 @@ const modelChips = computed((): ModelChip[] => {
           : '',
     };
   });
+  for (const [alias, canonical] of Object.entries(editorAliasesMap.value)) {
+    if (listed.has(alias)) continue;
+    chips.push({
+      name: alias,
+      isAlias: true,
+      tooltip: t('channel.chipAliasTooltip', { canonical }),
+    });
+  }
+  chips.sort((left, right) => compareModels(left.name, right.name));
+  return chips;
 });
 
 function removeChip(chip: ModelChip) {
   editorModels.value = editorModels.value.filter((item) => item !== chip.name);
-  if (!chip.isAlias) return;
-  // 删别名：同时清空其映射；删主模型名则保留别名（同步视图呈「仅别名生效」）。
-  editorAliasesMap.value = Object.fromEntries(
-    Object.entries(editorAliasesMap.value).filter(([alias]) => alias !== chip.name),
-  );
+  if (chip.isAlias) {
+    // 删别名：同时清空其映射；别名 key 可能不在 `models` 里。
+    editorAliasesMap.value = Object.fromEntries(
+      Object.entries(editorAliasesMap.value).filter(([alias]) => alias !== chip.name),
+    );
+    return;
+  }
+  // 删主模型名：把指向它的昵称写入清单，同步视图呈「仅别名生效」。
+  const nicknames = Object.entries(editorAliasesMap.value)
+    .filter(([alias, canonical]) => canonical === chip.name && alias !== chip.name)
+    .map(([alias]) => alias)
+    .filter((alias) => !editorModels.value.includes(alias));
+  if (nicknames.length > 0) {
+    editorModels.value = [...editorModels.value, ...nicknames];
+  }
 }
 
-/** 把 trim 后的 ID 追加进草稿清单。别名 key 同时在 `models` 里，先判「已是别名」。 */
+/** 把 trim 后的 ID 追加进草稿清单。已是别名 key 的名字不可再当作独立主模型加入。 */
 function addModel() {
   const id = addModelDraft.value.trim();
   if (id === '') {
@@ -463,7 +484,7 @@ function handleSave() {
                   data-testid="channel-model-count"
                   :aria-label="t('channel.modelsTitle')"
                 >
-                  {{ editorModels.length }}
+                  {{ modelChips.length }}
                 </span>
                 <span class="legend-rule" aria-hidden="true" />
                 <button

@@ -19,6 +19,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import {
   CATALOG_TIERS,
   buildCatalogFillPreview,
+  catalogSourceKey,
   fetchModelsDevCatalog,
   type CatalogFillPreview,
   type CatalogTier,
@@ -82,6 +83,8 @@ const preview = computed((): CatalogFillPreview[] => {
   return buildCatalogFillPreview(
     props.rows.map((row) => ({
       model: row.name,
+      channelId: row.channelId,
+      channelName: row.channelName,
       lookupId: catalogLookupId(row),
       price: row.price,
     })),
@@ -115,9 +118,11 @@ const writeMutation = useMutation({
     for (const row of rows) {
       if (row.status !== 'will-write' || row.nextPrice === null) continue;
       const body: Price = row.nextPrice;
-      const existing = props.rows.find((item) => item.name === row.model)?.price;
+      const existing = props.rows.find(
+        (item) => item.channelId === row.channelId && item.name === row.model,
+      )?.price;
       if (existing) {
-        await apiClient.updatePrice(row.model, body);
+        await apiClient.updatePrice(row.channelId, row.model, body);
       } else {
         await apiClient.createPrice(body);
       }
@@ -138,8 +143,8 @@ function handleConfirm() {
   writeMutation.mutate(preview.value);
 }
 
-function pickHost(model: string, providerId: string) {
-  hostPicks.value = { ...hostPicks.value, [model]: providerId };
+function pickHost(channelId: number, model: string, providerId: string) {
+  hostPicks.value = { ...hostPicks.value, [catalogSourceKey(channelId, model)]: providerId };
 }
 </script>
 
@@ -187,6 +192,7 @@ function pickHost(model: string, providerId: string) {
           <TableHeader>
             <TableRow>
               <TableHead>{{ t('pricing.model') }}</TableHead>
+              <TableHead>{{ t('pricing.channel') }}</TableHead>
               <TableHead>{{ t('models.catalogLookup') }}</TableHead>
               <TableHead>{{ t('models.catalogHost') }}</TableHead>
               <TableHead>{{ t('pricing.inputUsd') }}</TableHead>
@@ -199,20 +205,22 @@ function pickHost(model: string, providerId: string) {
           <TableBody>
             <TableRow
               v-for="row in preview"
-              :key="row.model"
+              :key="catalogSourceKey(row.channelId, row.model)"
               data-testid="catalog-preview-row"
               :data-model="row.model"
+              :data-channel="row.channelName"
             >
               <TableCell class="font-medium">{{ row.model }}</TableCell>
+              <TableCell class="text-xs">{{ row.channelName }}</TableCell>
               <TableCell class="font-mono text-xs">{{ row.lookupId }}</TableCell>
               <TableCell>
                 <UiSelect
                   v-if="row.hits.length > 1"
-                  :id="`catalog-host-${row.model}`"
+                  :id="`catalog-host-${row.channelId}-${row.model}`"
                   :model-value="row.selectedProviderId ?? ''"
                   :options="row.hostOptions"
                   data-testid="catalog-host-select"
-                  @update:model-value="(value) => pickHost(row.model, value)"
+                  @update:model-value="(value) => pickHost(row.channelId, row.model, value)"
                 />
                 <span v-else-if="row.hostName" class="text-xs">{{ row.hostName }}</span>
                 <span v-else class="text-fg-muted text-xs">{{ t('common.emptyCell') }}</span>
@@ -230,7 +238,7 @@ function pickHost(model: string, providerId: string) {
               <TableCell data-testid="catalog-preview-status">{{ statusLabel(row) }}</TableCell>
             </TableRow>
             <TableRow v-if="preview.length === 0">
-              <TableCell :colspan="8" class="h-24 whitespace-normal">
+              <TableCell :colspan="9" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.catalogEmpty')" />
               </TableCell>
             </TableRow>

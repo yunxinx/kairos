@@ -37,7 +37,7 @@ use crate::{
     core::stream::{SseFrame, StreamAccumulator},
     runtime::{RuntimeSnapshot, SnapshotHandle},
     store,
-    store::resources::{Channel, Token},
+    store::resources::{Channel, ChannelRecord, Token},
 };
 
 use super::failover::{Outbound, run_failover};
@@ -410,13 +410,13 @@ async fn handle_request(
     last_failure.expect("准入已保证至少一条可路由跳")
 }
 
-/// 一次出站跳：已登记模型名 + 该模型的渠道路由 + 该模型单价。
+/// 一次出站跳：已登记模型名 + 已定价渠道的 failover 顺序。
 ///
 /// 普通请求只有一条；统一模型按成员顺序，跳过未定价或不可路由的成员。
+/// 各渠道单价不同，结算时按实际打到的渠道取价。
 struct RouteHop {
     routed_model: String,
     route: routing::Route,
-    price: PriceSnapshot,
 }
 
 /// 单条已登记模型无法作为出站跳的原因。
@@ -425,15 +425,27 @@ enum HopDeny {
     NoPrice,
 }
 
-/// 为可调用名构造一条出站跳：须有启用渠道且已定价。
+/// 为可调用名构造一条出站跳：须有启用且已定价的渠道。
 fn hop_for_callable(snapshot: &RuntimeSnapshot, model: &str) -> Result<RouteHop, HopDeny> {
-    let route = routing::route(&snapshot.channels, model).ok_or(HopDeny::NoRoute)?;
-    let price = snapshot.prices.get(model).ok_or(HopDeny::NoPrice)?;
+    let mut route = routing::route(&snapshot.channels, model).ok_or(HopDeny::NoRoute)?;
+    route
+        .channels
+        .retain(|record| snapshot.price_for_channel(record.id, model).is_some());
+    if route.channels.is_empty() {
+        return Err(HopDeny::NoPrice);
+    }
     Ok(RouteHop {
         routed_model: model.to_string(),
         route,
-        price: PriceSnapshot::from_store_price(price),
     })
+}
+
+/// 准入已保证该渠道对该可调用名有价格。
+fn billed_price(snapshot: &RuntimeSnapshot, record: &ChannelRecord, model: &str) -> PriceSnapshot {
+    snapshot
+        .price_for_channel(record.id, model)
+        .map(PriceSnapshot::from_store_price)
+        .expect("准入已过滤无价格渠道")
 }
 
 /// 解析本次请求的出站跳序列。
@@ -494,6 +506,7 @@ struct CallCtx<'a> {
     /// 本跳出站用的已登记模型名（统一模型时为成员，否则同入站名）。
     routed_model: &'a str,
     token: &'a Token,
+    /// 本尝试渠道对该可调用名的单价（准入已过滤无价格渠道）。
     price: PriceSnapshot,
     started: i64,
     /// 入站 wire 协议：响应重编码与错误格式按此分派。
@@ -516,9 +529,9 @@ async fn dispatch_hop(
 ) -> Response {
     // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
     // 任一渠道命中别名、或统一模型成员名与入站名不同时也回落 IR：直通无法改写请求体模型名。
-    let passthrough = hop.route.channels.iter().all(|channel| {
-        channel.protocol == inbound_protocol
-            && routing::outbound_model(channel, &hop.routed_model) == request.model
+    let passthrough = hop.route.channels.iter().all(|record| {
+        record.channel.protocol == inbound_protocol
+            && routing::outbound_model(&record.channel, &hop.routed_model) == request.model
     });
     if passthrough {
         let passthrough_ctx = PassthroughCtx {
@@ -527,7 +540,6 @@ async fn dispatch_hop(
             request,
             routed_model: &hop.routed_model,
             token,
-            price: hop.price,
             started,
             raw_body,
             inbound_protocol,
@@ -542,7 +554,6 @@ async fn dispatch_hop(
         &hop.routed_model,
         &hop.route,
         token,
-        hop.price,
         started,
         inbound_protocol,
         request_body_for_log,
@@ -563,15 +574,14 @@ async fn outbound_with_failover(
     routed_model: &str,
     route: &routing::Route,
     token: &Token,
-    price: PriceSnapshot,
     started: i64,
     inbound_protocol: Protocol,
     request_body_for_log: Option<Vec<u8>>,
 ) -> Response {
     run_failover(
         route,
-        |channel| {
-            let channel = channel.clone();
+        |record| {
+            let record = record.clone();
             let request_body_for_log = request_body_for_log.clone();
             Box::pin(async move {
                 let mut ctx = CallCtx {
@@ -580,15 +590,15 @@ async fn outbound_with_failover(
                     request,
                     routed_model,
                     token,
-                    price,
+                    price: billed_price(snapshot, &record, routed_model),
                     started,
                     inbound_protocol,
                     request_body: request_body_for_log.clone(),
                 };
                 if request.stream {
-                    stream_completion(&mut ctx, &channel).await
+                    stream_completion(&mut ctx, &record.channel).await
                 } else {
-                    non_stream_completion(&mut ctx, &channel).await
+                    non_stream_completion(&mut ctx, &record.channel).await
                 }
             })
         },
@@ -634,7 +644,6 @@ struct PassthroughCtx<'a> {
     /// 本跳出站用的已登记模型名（统一模型时为成员）。
     routed_model: &'a str,
     token: &'a Token,
-    price: PriceSnapshot,
     started: i64,
     raw_body: &'a [u8],
     /// 入站 wire 协议（直通时与出站同协议）。
@@ -650,13 +659,13 @@ struct PassthroughCtx<'a> {
 async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Route) -> Response {
     run_failover(
         route,
-        |channel| {
-            let channel = channel.clone();
+        |record| {
+            let record = record.clone();
             Box::pin(async move {
                 if ctx.request.stream {
-                    passthrough_stream_completion(ctx, &channel).await
+                    passthrough_stream_completion(ctx, &record).await
                 } else {
-                    passthrough_non_stream_completion(ctx, &channel).await
+                    passthrough_non_stream_completion(ctx, &record).await
                 }
             })
         },
@@ -695,7 +704,11 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
 /// 请求体仅做目标性补丁（OpenAI 流式注入 `stream_options.include_usage` 供计费，
 /// Anthropic 无需补丁），响应以字节流直通到下游，不做完整解码。流结束后按嗅探
 /// 累积的 usage 结算并落日志。渠道 timeout 只约束到响应头。
-async fn passthrough_stream_completion(ctx: &PassthroughCtx<'_>, channel: &Channel) -> Outbound {
+async fn passthrough_stream_completion(
+    ctx: &PassthroughCtx<'_>,
+    record: &ChannelRecord,
+) -> Outbound {
+    let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, true, channel.protocol);
     let upstream_url = passthrough_upstream_url(channel);
 
@@ -757,7 +770,7 @@ async fn passthrough_stream_completion(ctx: &PassthroughCtx<'_>, channel: &Chann
         channel: channel.clone(),
         status_code,
         started: ctx.started,
-        price: ctx.price,
+        price: billed_price(ctx.snapshot, record, ctx.routed_model),
         protocol: channel.protocol,
         request_body: ctx.request_body.clone(),
         response_body: Vec::new(),
@@ -786,8 +799,9 @@ async fn passthrough_stream_completion(ctx: &PassthroughCtx<'_>, channel: &Chann
 /// 响应体原样返回，不做完整解码。
 async fn passthrough_non_stream_completion(
     ctx: &PassthroughCtx<'_>,
-    channel: &Channel,
+    record: &ChannelRecord,
 ) -> Outbound {
+    let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, false, channel.protocol);
     let upstream_url = passthrough_upstream_url(channel);
 
@@ -830,7 +844,8 @@ async fn passthrough_non_stream_completion(
     if is_success {
         // 响应体原样透传（字节级一致），从 JSON 嗅探 usage 计费。
         let usage = protocol::sniff_usage(&parsed, channel.protocol).unwrap_or_default();
-        let cost = billing::cost_micros(&usage, &ctx.price);
+        let price = billed_price(ctx.snapshot, record, ctx.routed_model);
+        let cost = billing::cost_micros(&usage, &price);
         // 成功且 usage 非零才结算；失败或零输出不扣费。
         if cost > 0 {
             match ctx.deps.pool.acquire().await {
@@ -854,7 +869,7 @@ async fn passthrough_non_stream_completion(
             ctx.started,
             Billing {
                 usage,
-                price: ctx.price,
+                price,
                 cost_usd_micros: cost,
                 request_body: ctx.request_body.clone(),
                 response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
@@ -1550,8 +1565,8 @@ fn outbound_model_for_channel_name<'a>(
     route
         .channels
         .iter()
-        .find(|c| c.name == channel_name)
-        .map(|c| routing::outbound_model(c, inbound))
+        .find(|record| record.channel.name == channel_name)
+        .map(|record| routing::outbound_model(&record.channel, inbound))
 }
 
 /// 按渠道协议设置出站认证头。

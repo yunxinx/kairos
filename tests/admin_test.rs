@@ -431,6 +431,7 @@ async fn channel_and_price_immediate_effect() {
         reqwest::Method::POST,
         "/prices",
         json!({
+            "channel_id": mini_id,
             "model": "gpt-4o-mini",
             "input_micros": 150_000,
             "output_micros": 600_000,
@@ -489,7 +490,10 @@ async fn channel_and_price_immediate_effect() {
 
     // 删除价格：请求再次 503（无价格）。
     let resp = client
-        .delete(format!("{}/prices/gpt-4o-mini", gw.admin_base_url()))
+        .delete(format!(
+            "{}/prices/{mini_id}/gpt-4o-mini",
+            gw.admin_base_url()
+        ))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await
@@ -516,6 +520,367 @@ async fn channel_and_price_immediate_effect() {
         reqwest::StatusCode::SERVICE_UNAVAILABLE,
         "删除渠道后模型应无路由"
     );
+}
+
+/// 同一可调用名在两条渠道上各自定价；改其一不影响另一条，结算按实际打到的渠道。
+#[tokio::test]
+async fn same_model_prices_are_per_channel() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let left_id = channel_id_by_name(&gw, "test-channel").await;
+
+    let mut right = channel_body("other-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    right["priority"] = json!(2);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", right).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let right_id = created["id"].as_i64().expect("创建应回传库生成的 id");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/prices",
+        json!({
+            "channel_id": right_id,
+            "model": TEST_MODEL,
+            "input_micros": 9_000_000,
+            "output_micros": 0,
+            "cache_read_micros": null,
+            "cache_write_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let resp = admin_put(
+        &gw,
+        &format!("/prices/{left_id}/{TEST_MODEL}"),
+        json!({
+            "channel_id": left_id,
+            "model": TEST_MODEL,
+            "input_micros": 1_000_000,
+            "output_micros": 0,
+            "cache_read_micros": null,
+            "cache_write_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let listed: Value = admin_get(&gw, "/prices")
+        .await
+        .json()
+        .await
+        .expect("价格列表应可解析");
+    let prices = listed.as_array().expect("价格列表应为数组");
+    let left_price = prices
+        .iter()
+        .find(|price| price["channel_id"] == left_id && price["model"] == TEST_MODEL)
+        .expect("左渠道价格应在");
+    let right_price = prices
+        .iter()
+        .find(|price| price["channel_id"] == right_id && price["model"] == TEST_MODEL)
+        .expect("右渠道价格应在");
+    assert_eq!(left_price["input_micros"], 1_000_000);
+    assert_eq!(right_price["input_micros"], 9_000_000);
+
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-per-ch", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1000000, "completion_tokens": 0, "total_tokens": 1000000}
+    })));
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let left_cost: (i64,) =
+        sqlx::query_as("SELECT cost_usd_micros FROM request_log ORDER BY id DESC LIMIT 1")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应落结算");
+    assert_eq!(left_cost.0, 1_000_000, "优先渠道成功应按其单价结算");
+
+    let mut disabled = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    disabled["enabled"] = json!(false);
+    let resp = admin_put(&gw, &format!("/channels/{left_id}"), disabled).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-per-ch-b", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1000000, "completion_tokens": 0, "total_tokens": 1000000}
+    })));
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let right_cost: (i64,) =
+        sqlx::query_as("SELECT cost_usd_micros FROM request_log ORDER BY id DESC LIMIT 1")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应落结算");
+    assert_eq!(right_cost.0, 9_000_000, "切到右渠道后应按其单价结算");
+}
+
+/// 读当前价格列表。
+async fn listed_prices(gw: &TestGateway) -> Value {
+    admin_get(gw, "/prices")
+        .await
+        .json()
+        .await
+        .expect("价格列表应可解析")
+}
+
+/// 价格列表是否含该 (渠道, 模型) 行。
+fn prices_contain(listed: &Value, channel_id: i64, model: &str) -> bool {
+    listed
+        .as_array()
+        .expect("价格列表应为数组")
+        .iter()
+        .any(|price| price["channel_id"] == channel_id && price["model"] == model)
+}
+
+/// 未在该渠道清单或别名中登记的名字不能定价：POST/PUT 均为 400，列表不变。
+#[tokio::test]
+async fn price_for_unlisted_callable_is_400() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = channel_id_by_name(&gw, "test-channel").await;
+    let before = listed_prices(&gw).await;
+    let body = json!({
+        "channel_id": channel_id,
+        "model": "not-on-channel",
+        "input_micros": 1_000_000,
+        "output_micros": 0,
+        "cache_read_micros": null,
+        "cache_write_micros": null
+    });
+
+    let resp = admin_json(&gw, reqwest::Method::POST, "/prices", body.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(error["error"]["code"], "invalid_body");
+    let message = error["error"]["message"].as_str().expect("消息应为字符串");
+    assert!(
+        message.contains("清单") || message.contains("别名"),
+        "应说明未在该渠道登记，实际 {message}"
+    );
+    assert!(
+        message.contains("not-on-channel"),
+        "应点名未登记的模型，实际 {message}"
+    );
+    assert_eq!(listed_prices(&gw).await, before, "拒绝写入后价格列表应不变");
+    assert!(
+        !prices_contain(&before, channel_id, "not-on-channel"),
+        "播种不应含未登记名的价格"
+    );
+
+    let resp = admin_put(&gw, &format!("/prices/{channel_id}/not-on-channel"), body).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(error["error"]["code"], "invalid_body");
+    assert_eq!(listed_prices(&gw).await, before, "PUT 拒绝后价格列表应不变");
+}
+
+/// 同一 (渠道, 模型) 再 POST 冲突（spec 9）；播种已有 test-channel / gpt-4o。
+#[tokio::test]
+async fn posting_existing_channel_model_price_is_409() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = channel_id_by_name(&gw, "test-channel").await;
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/prices",
+        json!({
+            "channel_id": channel_id,
+            "model": TEST_MODEL,
+            "input_micros": 1_000_000,
+            "output_micros": 0,
+            "cache_read_micros": null,
+            "cache_write_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let error: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(error["error"]["code"], "conflict");
+}
+
+/// 渠道 PUT 拿掉已登记名时，该渠道对应价格被收掉；另一渠道同名价格仍在。
+#[tokio::test]
+async fn dropping_listed_name_retains_other_channel_price() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let left_id = channel_id_by_name(&gw, "test-channel").await;
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body("other-channel", gw.upstream.base_url(), json!([TEST_MODEL])),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let right_id = created["id"].as_i64().expect("创建应回传库生成的 id");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/prices",
+        json!({
+            "channel_id": right_id,
+            "model": TEST_MODEL,
+            "input_micros": 9_000_000,
+            "output_micros": 0,
+            "cache_read_micros": null,
+            "cache_write_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let resp = admin_put(
+        &gw,
+        &format!("/channels/{left_id}"),
+        channel_body(
+            "test-channel",
+            gw.upstream.base_url(),
+            json!(["kept-unrelated"]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let listed = listed_prices(&gw).await;
+    assert!(
+        !prices_contain(&listed, left_id, TEST_MODEL),
+        "拿掉清单名后该渠道价格应被收掉"
+    );
+    assert!(
+        prices_contain(&listed, right_id, TEST_MODEL),
+        "另一渠道同名价格应仍在"
+    );
+}
+
+/// 删除渠道级联删掉其价格行。
+#[tokio::test]
+async fn deleting_channel_cascades_its_prices() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body(
+            "cascade-channel",
+            gw.upstream.base_url(),
+            json!(["cascade-model"]),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let channel_id = created["id"].as_i64().expect("创建应回传库生成的 id");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/prices",
+        json!({
+            "channel_id": channel_id,
+            "model": "cascade-model",
+            "input_micros": 1_000_000,
+            "output_micros": 0,
+            "cache_read_micros": null,
+            "cache_write_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    assert!(prices_contain(
+        &listed_prices(&gw).await,
+        channel_id,
+        "cascade-model"
+    ));
+
+    let resp = reqwest::Client::new()
+        .delete(format!("{}/channels/{channel_id}", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可删除渠道");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let listed = listed_prices(&gw).await;
+    let leftover = listed
+        .as_array()
+        .expect("价格列表应为数组")
+        .iter()
+        .any(|price| price["channel_id"] == channel_id);
+    assert!(!leftover, "删除渠道后不应残留该渠道的价格行");
+}
+
+/// 同名两渠道仅低优先级有价：跳过未定价渠道，按有价渠道结算，不 503。
+#[tokio::test]
+async fn unpriced_sibling_is_skipped_not_503() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let seed_id = channel_id_by_name(&gw, "test-channel").await;
+    let resp = reqwest::Client::new()
+        .delete(format!(
+            "{}/prices/{seed_id}/{TEST_MODEL}",
+            gw.admin_base_url()
+        ))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可删除播种价格");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let mut sibling = channel_body(
+        "priced-sibling",
+        gw.upstream.base_url(),
+        json!([TEST_MODEL]),
+    );
+    sibling["priority"] = json!(2);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", sibling).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let sibling_id = created["id"].as_i64().expect("创建应回传库生成的 id");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/prices",
+        json!({
+            "channel_id": sibling_id,
+            "model": TEST_MODEL,
+            "input_micros": 3_000_000,
+            "output_micros": 0,
+            "cache_read_micros": null,
+            "cache_write_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-skip-unpriced", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0, "total_tokens": 1_000_000}
+    })));
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "有价渠道在后也应跳过未定价 hop，不得 503"
+    );
+
+    let log: (i64, String) =
+        sqlx::query_as("SELECT cost_usd_micros, channel FROM request_log ORDER BY id DESC LIMIT 1")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应落结算");
+    assert_eq!(
+        log.0, 3_000_000,
+        "1M prompt 费用应等于有价渠道 input_micros"
+    );
+    assert_eq!(log.1, "priced-sibling");
 }
 
 /// 渠道 PUT 追加模型 ID（对应编辑器手动添加并保存）：保存前该 ID 不可路由；
@@ -575,6 +940,7 @@ async fn channel_appended_model_unpriced_is_503_then_callable() {
         reqwest::Method::POST,
         "/prices",
         json!({
+            "channel_id": channel_id,
             "model": "manual-only",
             "input_micros": 150_000,
             "output_micros": 600_000,
@@ -737,11 +1103,13 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 负单价 → 400（语义校验）。
+    let seed_channel_id = channel_id_by_name(&gw, "test-channel").await;
     let resp = admin_json(
         &gw,
         reqwest::Method::POST,
         "/prices",
         json!({
+            "channel_id": seed_channel_id,
             "model": "m-neg",
             "input_micros": -1,
             "output_micros": 0,
@@ -916,10 +1284,12 @@ async fn inflight_request_keeps_admission_snapshot() {
     assert!(!first_chunk.is_empty(), "准入后应立即收到上游首块");
 
     // 准入后改价：在途结算必须仍按旧快照单价，证明持有的是准入时刻快照而非当前快照。
+    let seed_channel_id = channel_id_by_name(&gw, "test-channel").await;
     let resp = admin_put(
         &gw,
-        &format!("/prices/{TEST_MODEL}"),
+        &format!("/prices/{seed_channel_id}/{TEST_MODEL}"),
         json!({
+            "channel_id": seed_channel_id,
             "model": TEST_MODEL,
             "input_micros": 9_000_000,
             "output_micros": 10_000_000,
@@ -1024,11 +1394,16 @@ async fn runtime_resources_survive_process_restart() {
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let restart_channel: Value = resp.json().await.expect("应返回新建渠道");
+    let restart_channel_id = restart_channel["id"]
+        .as_i64()
+        .expect("创建应回传库生成的 id");
     let resp = admin_json(
         &gw,
         reqwest::Method::POST,
         "/prices",
         json!({
+            "channel_id": restart_channel_id,
             "model": "restart-only",
             "input_micros": 111_000,
             "output_micros": 222_000,
@@ -1112,12 +1487,15 @@ async fn empty_db_bootstraps_via_admin_api() {
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let boot_channel: Value = resp.json().await.expect("应返回新建渠道");
+    let boot_channel_id = boot_channel["id"].as_i64().expect("创建应回传库生成的 id");
 
     let resp = admin_json(
         &gw,
         reqwest::Method::POST,
         "/prices",
         json!({
+            "channel_id": boot_channel_id,
             "model": TEST_MODEL,
             "input_micros": 2_500_000,
             "output_micros": 10_000_000,
@@ -2022,7 +2400,7 @@ async fn channel_probe_uses_requested_model_and_rejects_unknown() {
         json!([TEST_MODEL, "gpt-4o-mini"]),
     );
     extra["model_aliases"] = json!({ "mini": "gpt-4o-mini" });
-    extra["models"] = json!([TEST_MODEL, "gpt-4o-mini", "mini"]);
+    extra["models"] = json!([TEST_MODEL, "gpt-4o-mini"]);
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", extra).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建渠道");
@@ -2405,5 +2783,96 @@ async fn enabled_channels_reject_divergent_alias_values() {
         resp.status(),
         reqwest::StatusCode::CONFLICT,
         "更新为不同真名应拒绝"
+    );
+}
+
+/// 同一渠道上非恒等别名的 key 与 value 都在 `models` 里：创建/更新 409。
+/// 昵称不在清单、或仅别名在清单（value 不在 `models`）则允许。
+#[tokio::test]
+async fn channel_rejects_intra_channel_alias_occupancy() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let owner = "occ-owner";
+    let occupied = "occ-nick";
+
+    let mut occupying = channel_body(
+        "occ-reject",
+        gw.upstream.base_url(),
+        json!([owner, occupied]),
+    );
+    occupying["model_aliases"] = json!({ occupied: owner });
+    let before: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", occupying).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: Value = resp.json().await.expect("冲突体应可解析");
+    assert_eq!(body["error"]["code"], "conflict");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains(occupied),
+        "冲突文案应点名占用别名，实际: {message}"
+    );
+    assert!(
+        message.contains(owner),
+        "冲突文案应点名被指向的主模型，实际: {message}"
+    );
+    let after: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    assert_eq!(before, after, "占用关系写不应改变库与快照");
+
+    let mut nickname = channel_body("occ-nick-ok", gw.upstream.base_url(), json!([owner]));
+    nickname["model_aliases"] = json!({ occupied: owner });
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", nickname).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "昵称不在 models 时应允许"
+    );
+
+    let mut alias_only = channel_body("occ-alias-only", gw.upstream.base_url(), json!([occupied]));
+    alias_only["model_aliases"] = json!({ occupied: owner });
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", alias_only).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "仅别名在 models 时应允许"
+    );
+
+    let mut allowed = channel_body("occ-put-base", gw.upstream.base_url(), json!([owner]));
+    allowed["model_aliases"] = json!({ occupied: owner });
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", allowed.clone()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("应返回新建渠道");
+    let channel_id = created["id"].as_i64().expect("创建应回传整数 id");
+
+    let mut occupy_update = allowed;
+    occupy_update["models"] = json!([owner, occupied]);
+    let resp = admin_put(&gw, &format!("/channels/{channel_id}"), occupy_update).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "更新为占用形应拒绝"
+    );
+    let listed: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let still = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == channel_id)
+        .expect("渠道应仍在列表");
+    assert_eq!(still["models"], json!([owner]), "占用更新不应改 models");
+    assert_eq!(
+        still["model_aliases"],
+        json!({ occupied: owner }),
+        "占用更新不应改别名"
     );
 }

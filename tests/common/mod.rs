@@ -259,6 +259,10 @@ pub const TEST_TOKEN_KEY: &str = "sk-test-token";
 /// 测试用可用模型。
 pub const TEST_MODEL: &str = "gpt-4o";
 
+/// 播种价格的渠道哨兵：`seed_into_db` 把它展开到每条已插入且
+/// [`resources::channel_lists_callable`] 的渠道。
+pub const SEED_PRICE_ATTACH_LISTING_CHANNELS: i64 = 0;
+
 /// 测试 seed 中的令牌定义：定义 + 初始余额（USD，播种时换算为 micro-USD）。
 pub struct SeedToken {
     pub token_key: String,
@@ -309,6 +313,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
         }],
         prices: vec![
             Price {
+                channel_id: SEED_PRICE_ATTACH_LISTING_CHANNELS,
                 model: TEST_MODEL.to_string(),
                 input_micros: 2_500_000,
                 output_micros: 10_000_000,
@@ -317,6 +322,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             },
             // 别名短名 `fast` 也是计费模型名（本票按 request.model 计价）。
             Price {
+                channel_id: SEED_PRICE_ATTACH_LISTING_CHANNELS,
                 model: "fast".to_string(),
                 input_micros: 150_000,
                 output_micros: 600_000,
@@ -343,10 +349,12 @@ pub fn empty_seed(_upstream_base: &str) -> Seed {
 /// 把 seed 播种进数据库：渠道/价格直接插入，令牌则定义 + 初始余额。
 pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
     let mut conn = pool.acquire().await.expect("应能获取连接");
+    let mut inserted = Vec::new();
     for channel in &seed.channels {
-        resources::insert_channel(&mut conn, channel)
+        let id = resources::insert_channel(&mut conn, channel)
             .await
             .expect("应能播种渠道");
+        inserted.push((id, channel));
     }
     for token in &seed.tokens {
         resources::upsert_token(
@@ -374,9 +382,21 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         .expect("应能播种令牌初始余额");
     }
     for price in &seed.prices {
-        resources::upsert_price(&mut conn, price)
-            .await
-            .expect("应能播种价格");
+        if price.channel_id != SEED_PRICE_ATTACH_LISTING_CHANNELS {
+            resources::upsert_price(&mut conn, price)
+                .await
+                .expect("应能播种价格");
+            continue;
+        }
+        for (id, channel) in &inserted {
+            if resources::channel_lists_callable(channel, &price.model) {
+                let mut attached = price.clone();
+                attached.channel_id = *id;
+                resources::upsert_price(&mut conn, &attached)
+                    .await
+                    .expect("应能播种价格");
+            }
+        }
     }
     for model in &seed.unified_models {
         resources::upsert_unified_model(&mut conn, model)

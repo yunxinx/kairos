@@ -9,7 +9,7 @@ use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
 use crate::config::Protocol;
-use crate::store::resources::Channel;
+use crate::store::resources::ChannelRecord;
 
 use super::{protocol, routing};
 
@@ -43,15 +43,15 @@ pub(super) async fn run_failover<'a, A, L>(
     inbound_protocol: Protocol,
 ) -> Response
 where
-    A: FnMut(&Channel) -> BoxFuture<'a, Outbound>,
+    A: FnMut(&ChannelRecord) -> BoxFuture<'a, Outbound>,
     L: Fn(&str, u16, bool, &[u8]) -> BoxFuture<'a, ()>,
 {
     let mut last_retryable: Option<(String, Option<u16>, String)> = None;
 
-    for channel in &route.channels {
-        let max_attempts = (channel.max_retries + 1) as usize;
+    for record in &route.channels {
+        let max_attempts = (record.channel.max_retries + 1) as usize;
         for attempt_no in 0..max_attempts {
-            match attempt(channel).await {
+            match attempt(record).await {
                 Outbound::Success(response) => return response,
                 Outbound::Fatal {
                     channel,

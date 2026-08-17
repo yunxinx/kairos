@@ -30,8 +30,8 @@ pub struct RuntimeSnapshot {
     pub channels: Vec<resources::ChannelRecord>,
     /// 令牌定义，按 `token_key` 索引（认证查找）。
     pub tokens: HashMap<String, resources::Token>,
-    /// 价格表，按模型名索引（计费准入）。
-    pub prices: HashMap<String, resources::Price>,
+    /// 价格表，外层按渠道稳定 id、内层按可调用名索引（计费准入）。
+    pub prices: HashMap<i64, HashMap<String, resources::Price>>,
     /// 模型组，按组名索引（令牌允许名单）。
     pub model_groups: HashMap<String, resources::ModelGroup>,
     /// 统一模型，按可调用名索引（有序 failover）。
@@ -40,6 +40,13 @@ pub struct RuntimeSnapshot {
     pub full_body: bool,
     /// 入站请求体大小上限（字节，来自 `max_request_bytes` 开关）。
     pub max_request_bytes: u64,
+}
+
+impl RuntimeSnapshot {
+    /// 按渠道稳定 id + 可调用名取单价。
+    pub fn price_for_channel(&self, channel_id: i64, model: &str) -> Option<&resources::Price> {
+        self.prices.get(&channel_id)?.get(model)
+    }
 }
 
 /// 快照的原子替换句柄：管理 API 写库成功后写入新快照，请求路径读当前快照。
@@ -64,10 +71,13 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         .into_iter()
         .map(|token| (token.token_key.clone(), token))
         .collect();
-    let prices = price_rows
-        .into_iter()
-        .map(|price| (price.model.clone(), price))
-        .collect();
+    let mut prices: HashMap<i64, HashMap<String, resources::Price>> = HashMap::new();
+    for price in price_rows {
+        prices
+            .entry(price.channel_id)
+            .or_default()
+            .insert(price.model.clone(), price);
+    }
     let model_groups = group_rows
         .into_iter()
         .map(|group| (group.name.clone(), group))
@@ -158,7 +168,7 @@ mod tests {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
 
-        resources::insert_channel(
+        let channel_id = resources::insert_channel(
             &mut conn,
             &resources::Channel {
                 name: "c1".to_string(),
@@ -192,6 +202,7 @@ mod tests {
         resources::upsert_price(
             &mut conn,
             &resources::Price {
+                channel_id,
                 model: "gpt-4o".to_string(),
                 input_micros: 2_500_000,
                 output_micros: 10_000_000,
@@ -231,7 +242,7 @@ mod tests {
             snap.tokens["sk-a"].model_group,
             resources::DEFAULT_MODEL_GROUP
         );
-        assert!(snap.prices.contains_key("gpt-4o"));
+        assert!(snap.price_for_channel(channel_id, "gpt-4o").is_some());
         assert!(
             snap.model_groups
                 .contains_key(resources::DEFAULT_MODEL_GROUP)

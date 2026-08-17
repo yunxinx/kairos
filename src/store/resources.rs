@@ -95,6 +95,18 @@ pub struct UnifiedModel {
     pub hide: bool,
 }
 
+/// 渠道已登记的可调用名：`models` ∪ 别名 key。
+pub fn channel_callable_names(channel: &Channel) -> HashSet<String> {
+    let mut names: HashSet<String> = channel.models.iter().cloned().collect();
+    names.extend(channel.model_aliases.keys().cloned());
+    names
+}
+
+/// 该渠道是否把 `model` 当作可调用名（清单条目或别名 key）。
+pub fn channel_lists_callable(channel: &Channel, model: &str) -> bool {
+    channel.models.iter().any(|name| name == model) || channel.model_aliases.contains_key(model)
+}
+
 /// 渠道已登记的可调用名：各渠道 `models` ∪ 别名 key（含禁用渠道）。
 ///
 /// 禁用渠道的名字仍算已登记：统一模型保存时可以引用；请求时再按启用渠道路由，
@@ -104,8 +116,7 @@ pub fn registered_callable_names<'a>(
 ) -> HashSet<String> {
     let mut names = HashSet::new();
     for channel in channels {
-        names.extend(channel.models.iter().cloned());
-        names.extend(channel.model_aliases.keys().cloned());
+        names.extend(channel_callable_names(channel));
     }
     names
 }
@@ -181,10 +192,13 @@ pub struct TokenRecord {
     pub last_used_at: Option<i64>,
 }
 
-/// 单模型四档单价（micro-USD / 1M tokens）；缓存档 `None` 表示该档不计价。
+/// 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）；
+/// 缓存档 `None` 表示该档不计价。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Price {
+    /// 渠道稳定身份；与 `model` 一起构成价格行主键。
+    pub channel_id: i64,
     pub model: String,
     pub input_micros: i64,
     pub output_micros: i64,
@@ -620,10 +634,10 @@ pub async fn token_exists(
     Ok(row.is_some())
 }
 
-/// 读出全部价格（每模型一行）。
+/// 读出全部价格（每渠道每模型一行）。
 pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
     let rows = sqlx::query(
-        "SELECT model, input_micros, output_micros, cache_read_micros, cache_write_micros \
+        "SELECT channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros \
          FROM prices",
     )
     .fetch_all(pool)
@@ -634,6 +648,7 @@ pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
         .iter()
         .map(|row| {
             Ok(Price {
+                channel_id: row.try_get("channel_id").map_err(StoreError::Query)?,
                 model: row.try_get("model").map_err(StoreError::Query)?,
                 input_micros: row.try_get("input_micros").map_err(StoreError::Query)?,
                 output_micros: row.try_get("output_micros").map_err(StoreError::Query)?,
@@ -649,17 +664,18 @@ pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
     Ok(prices)
 }
 
-/// 新增或整体替换一个模型的价格（按 `model`），同一事务内幂等。
+/// 新增或整体替换一条价格（按 `channel_id` + `model`），同一事务内幂等。
 pub async fn upsert_price(conn: &mut SqliteConnection, price: &Price) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO prices \
-         (model, input_micros, output_micros, cache_read_micros, cache_write_micros) \
-         VALUES (?, ?, ?, ?, ?) \
-         ON CONFLICT(model) DO UPDATE SET \
+         (channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros) \
+         VALUES (?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(channel_id, model) DO UPDATE SET \
            input_micros = excluded.input_micros, output_micros = excluded.output_micros, \
            cache_read_micros = excluded.cache_read_micros, \
            cache_write_micros = excluded.cache_write_micros",
     )
+    .bind(price.channel_id)
     .bind(&price.model)
     .bind(price.input_micros)
     .bind(price.output_micros)
@@ -671,13 +687,45 @@ pub async fn upsert_price(conn: &mut SqliteConnection, price: &Price) -> Result<
     Ok(())
 }
 
-/// 按 `model` 删除价格；不存在视为成功（幂等）。
-pub async fn delete_price(conn: &mut SqliteConnection, model: &str) -> Result<(), StoreError> {
-    sqlx::query("DELETE FROM prices WHERE model = ?")
+/// 按渠道与模型名删除价格；不存在视为成功（幂等）。
+pub async fn delete_price(
+    conn: &mut SqliteConnection,
+    channel_id: i64,
+    model: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM prices WHERE channel_id = ? AND model = ?")
+        .bind(channel_id)
         .bind(model)
         .execute(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 删掉该渠道上已不在可调用名集合中的价格行。
+pub async fn retain_channel_prices(
+    conn: &mut SqliteConnection,
+    channel_id: i64,
+    names: &HashSet<String>,
+) -> Result<(), StoreError> {
+    if names.is_empty() {
+        sqlx::query("DELETE FROM prices WHERE channel_id = ?")
+            .bind(channel_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+        return Ok(());
+    }
+    let listed = serde_json::to_string(names).map_err(serde_error)?;
+    sqlx::query(
+        "DELETE FROM prices WHERE channel_id = ? \
+         AND model NOT IN (SELECT value FROM json_each(?))",
+    )
+    .bind(channel_id)
+    .bind(&listed)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
     Ok(())
 }
 
@@ -1207,7 +1255,26 @@ mod tests {
     async fn price_upsert_then_list_roundtrip() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
+        let channel_id = insert_channel(
+            &mut conn,
+            &Channel {
+                name: "p".to_string(),
+                protocol: crate::config::Protocol::OpenAiChat,
+                base_url: "http://127.0.0.1:9".to_string(),
+                api_key: "sk".to_string(),
+                models: vec!["gpt-4o".to_string()],
+                model_aliases: HashMap::new(),
+                priority: 0,
+                weight: 1,
+                timeout_ms: 1000,
+                max_retries: 0,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("应能写渠道");
         let price = Price {
+            channel_id,
             model: "gpt-4o".to_string(),
             input_micros: 2_500_000,
             output_micros: 10_000_000,
@@ -1218,6 +1285,78 @@ mod tests {
 
         let prices = list_prices(&pool).await.expect("应能读价格");
         assert_eq!(prices, vec![price]);
+    }
+
+    /// 同一可调用名在两条渠道上各自一行；改其中一行不影响另一行。
+    #[tokio::test]
+    async fn same_model_prices_are_independent_per_channel() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let mut left = sample_channel();
+        left.name = "left".to_string();
+        let mut right = sample_channel();
+        right.name = "right".to_string();
+        let left_id = insert_channel(&mut conn, &left)
+            .await
+            .expect("应能写左渠道");
+        let right_id = insert_channel(&mut conn, &right)
+            .await
+            .expect("应能写右渠道");
+
+        let mut left_price = Price {
+            channel_id: left_id,
+            model: "gpt-4o".to_string(),
+            input_micros: 1_000_000,
+            output_micros: 2_000_000,
+            cache_read_micros: None,
+            cache_write_micros: None,
+        };
+        let right_price = Price {
+            channel_id: right_id,
+            model: "gpt-4o".to_string(),
+            input_micros: 9_000_000,
+            output_micros: 8_000_000,
+            cache_read_micros: None,
+            cache_write_micros: None,
+        };
+        upsert_price(&mut conn, &left_price)
+            .await
+            .expect("应能写左渠道价格");
+        upsert_price(&mut conn, &right_price)
+            .await
+            .expect("应能写右渠道价格");
+
+        left_price.input_micros = 3_000_000;
+        upsert_price(&mut conn, &left_price)
+            .await
+            .expect("应能改左渠道价格");
+
+        let prices = list_prices(&pool).await.expect("应能读价格");
+        let listed_left = prices
+            .iter()
+            .find(|price| price.channel_id == left_id && price.model == "gpt-4o")
+            .expect("左渠道价格应在");
+        let listed_right = prices
+            .iter()
+            .find(|price| price.channel_id == right_id && price.model == "gpt-4o")
+            .expect("右渠道价格应在");
+        assert_eq!(listed_left.input_micros, 3_000_000);
+        assert_eq!(listed_right.input_micros, 9_000_000);
+
+        retain_channel_prices(&mut conn, left_id, &HashSet::new())
+            .await
+            .expect("应能清掉左渠道价格");
+        let prices = list_prices(&pool).await.expect("应能读价格");
+        assert!(
+            prices.iter().all(|price| price.channel_id != left_id),
+            "左渠道价格应被 retain 清掉"
+        );
+        assert!(
+            prices
+                .iter()
+                .any(|price| price.channel_id == right_id && price.model == "gpt-4o"),
+            "右渠道价格应保留"
+        );
     }
 
     /// 开关写入 → 读回往返一致；删除幂等。

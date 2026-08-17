@@ -34,6 +34,7 @@ import {
   aliasChips,
   buildInventory,
   channelChangedByStrip,
+  inventoryRowKey,
   listedNamesOnChannel,
   sectionInventory,
   sortInventory,
@@ -44,7 +45,7 @@ import {
 } from '@/lib/inventory';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
-type InventoryDeleteTarget = { name: string; channelName: string };
+type InventoryDeleteTarget = { name: string; channelId: number; channelName: string };
 type InventorySectionRow = InventoryRow & { aliasChipItems: AliasChip[] };
 
 type InventoryWindowPayload =
@@ -104,7 +105,7 @@ const filteredRows = computed(() => {
   const statuses = new Set(statusFilter.value);
   const channels = new Set(selectedChannels.value);
   const rows = inventory.value.filter((row) => {
-    if (channels.size > 0 && !row.channelNames.some((name) => channels.has(name))) {
+    if (channels.size > 0 && !channels.has(row.channelName)) {
       return false;
     }
     if (statuses.size > 0) {
@@ -115,7 +116,7 @@ const filteredRows = computed(() => {
     if (!q) return true;
     return (
       row.name.toLowerCase().includes(q) ||
-      row.channelNames.some((name) => name.toLowerCase().includes(q)) ||
+      row.channelName.toLowerCase().includes(q) ||
       row.aliases.some((item) => item.alias.toLowerCase().includes(q)) ||
       row.outbound.some((item) => item.alias.toLowerCase().includes(q))
     );
@@ -135,9 +136,7 @@ const statusOptions = computed(() => {
 const channelOptions = computed(() => {
   const counts = new Map<string, number>();
   for (const row of inventory.value) {
-    for (const name of row.channelNames) {
-      counts.set(name, (counts.get(name) ?? 0) + 1);
-    }
+    counts.set(row.channelName, (counts.get(row.channelName) ?? 0) + 1);
   }
   return [...(channelsQuery.data.value ?? [])]
     .map((channel) => ({
@@ -173,57 +172,47 @@ const selection = useRowSelection<string>();
 const allVisibleSelected = computed({
   get: () =>
     filteredRows.value.length > 0 &&
-    filteredRows.value.every((row) => selection.isSelected(row.name)),
+    filteredRows.value.every((row) => selection.isSelected(inventoryRowKey(row))),
   set: (value) =>
     selection.setMany(
-      filteredRows.value.map((row) => row.name),
+      filteredRows.value.map((row) => inventoryRowKey(row)),
       value,
     ),
 });
 
 const someVisibleSelected = computed(() =>
-  filteredRows.value.some((row) => selection.isSelected(row.name)),
+  filteredRows.value.some((row) => selection.isSelected(inventoryRowKey(row))),
 );
 
-watch(inventory, (rows) => selection.prune(rows.map((row) => row.name)));
+watch(inventory, (rows) => selection.prune(rows.map((row) => inventoryRowKey(row))));
 
 const selectedRows = computed(() =>
-  inventory.value.filter((row) => selection.isSelected(row.name)),
+  inventory.value.filter((row) => selection.isSelected(inventoryRowKey(row))),
 );
 
 async function removeInventoryTargets(targets: InventoryDeleteTarget[]) {
   const channels = channelsQuery.data.value ?? [];
-  const rowByName = new Map(inventory.value.map((row) => [row.name, row]));
-  const dropByChannel = new Map<string, Set<string>>();
-  const droppedListed = new Set<string>();
+  const rowByKey = new Map(inventory.value.map((row) => [inventoryRowKey(row), row]));
+  const dropByChannelId = new Map<number, Set<string>>();
   for (const target of targets) {
-    const row = rowByName.get(target.name);
+    const row = rowByKey.get(inventoryRowKey({ channelId: target.channelId, name: target.name }));
     if (!row) continue;
-    let drop = dropByChannel.get(target.channelName);
+    let drop = dropByChannelId.get(target.channelId);
     if (!drop) {
       drop = new Set();
-      dropByChannel.set(target.channelName, drop);
+      dropByChannelId.set(target.channelId, drop);
     }
-    for (const name of listedNamesOnChannel(row, target.channelName)) {
+    for (const name of listedNamesOnChannel(row)) {
       drop.add(name);
-      droppedListed.add(name);
     }
   }
 
-  const remainingModels = new Set<string>();
   for (const channel of channels) {
-    const drop = dropByChannel.get(channel.name);
-    const next = drop ? stripNamesFromChannel(channel, drop) : channel;
-    for (const name of next.models) remainingModels.add(name);
-    if (drop && channelChangedByStrip(channel, next)) {
+    const drop = dropByChannelId.get(channel.id);
+    if (!drop) continue;
+    const next = stripNamesFromChannel(channel, drop);
+    if (channelChangedByStrip(channel, next)) {
       await apiClient.updateChannel(channel.id, next);
-    }
-  }
-
-  const prices = pricesQuery.data.value ?? [];
-  for (const price of prices) {
-    if (droppedListed.has(price.model) && !remainingModels.has(price.model)) {
-      await apiClient.deletePrice(price.model);
     }
   }
 }
@@ -231,29 +220,29 @@ async function removeInventoryTargets(targets: InventoryDeleteTarget[]) {
 const deleteMutation = useMutation({
   mutationFn: (targets: InventoryDeleteTarget[]) => removeInventoryTargets(targets),
   onSuccess: async (_data, targets) => {
-    const names = new Set(targets.map((target) => target.name));
-    const keys = new Set(targets.map((target) => `${target.channelName}:${target.name}`));
+    const keys = new Set(
+      targets.map((target) => inventoryRowKey({ channelId: target.channelId, name: target.name })),
+    );
     for (const item of [...windows.value]) {
       if (item.payload.kind === 'bulk-delete') closeWindow(item.id);
-      if (
-        item.payload.kind === 'delete' &&
-        keys.has(`${item.payload.channelName}:${item.payload.row.name}`)
-      ) {
+      if (item.payload.kind === 'delete' && keys.has(inventoryRowKey(item.payload.row))) {
         closeWindow(item.id);
       }
     }
-    selection.setMany([...names], false);
+    selection.setMany([...keys], false);
     await queryClient.invalidateQueries({ queryKey: ['channels'] });
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
   },
   onError: (err, targets) => {
     const message = extractApiError(err).message;
-    const keys = new Set(targets.map((target) => `${target.channelName}:${target.name}`));
+    const keys = new Set(
+      targets.map((target) => inventoryRowKey({ channelId: target.channelId, name: target.name })),
+    );
     for (const item of windows.value) {
       const matchDelete =
         item.payload.kind === 'delete' &&
         targets.length === 1 &&
-        keys.has(`${item.payload.channelName}:${item.payload.row.name}`);
+        keys.has(inventoryRowKey(item.payload.row));
       if (item.payload.kind === 'bulk-delete' || matchDelete) {
         deleteErrors.value[item.id] = message;
       }
@@ -274,8 +263,12 @@ function visibleDeleteTargets(): InventoryDeleteTarget[] {
   const targets: InventoryDeleteTarget[] = [];
   for (const section of sections.value) {
     for (const row of section.rows) {
-      if (selection.isSelected(row.name)) {
-        targets.push({ name: row.name, channelName: section.channelName });
+      if (selection.isSelected(inventoryRowKey(row))) {
+        targets.push({
+          name: row.name,
+          channelId: row.channelId,
+          channelName: section.channelName,
+        });
       }
     }
   }
@@ -284,7 +277,9 @@ function visibleDeleteTargets(): InventoryDeleteTarget[] {
 
 function openEdit(row: InventoryRow) {
   const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'editor' && entry.payload.row.name === row.name,
+    (entry) =>
+      entry.payload.kind === 'editor' &&
+      inventoryRowKey(entry.payload.row) === inventoryRowKey(row),
   );
   if (existing) {
     bringToFront(existing.id);
@@ -412,19 +407,19 @@ function loadErrorMessage(): string {
               </TableRow>
               <TableRow
                 v-for="row in section.rows"
-                :key="`${section.channelName}:${row.name}`"
+                :key="inventoryRowKey(row)"
                 data-testid="inventory-row"
                 :data-model="row.name"
                 :data-price-model="row.name"
                 :data-section-channel="section.channelName"
                 :data-unpriced="row.price === null ? 'true' : 'false'"
                 :class="row.price === null ? 'inventory-row-unpriced' : undefined"
-                :data-state="selection.isSelected(row.name) ? 'selected' : undefined"
+                :data-state="selection.isSelected(inventoryRowKey(row)) ? 'selected' : undefined"
               >
                 <SelectCell
-                  :checked="selection.isSelected(row.name)"
+                  :checked="selection.isSelected(inventoryRowKey(row))"
                   test-id="inventory-select"
-                  @toggle="selection.toggle(row.name)"
+                  @toggle="selection.toggle(inventoryRowKey(row))"
                 />
                 <TableCell class="font-medium">
                   <span class="inline-flex items-center gap-2">
@@ -519,6 +514,8 @@ function loadErrorMessage(): string {
       <PriceEditorWindow
         v-if="win.payload.kind === 'editor'"
         :model="win.payload.row.name"
+        :channel-id="win.payload.row.channelId"
+        :channel-name="win.payload.row.channelName"
         :initial="win.payload.row.price"
         :anchor="win.anchor"
         :stack-order="win.z"
@@ -566,7 +563,11 @@ function loadErrorMessage(): string {
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
         @confirm="
           deleteMutation.mutate([
-            { name: win.payload.row.name, channelName: win.payload.channelName },
+            {
+              name: win.payload.row.name,
+              channelId: win.payload.row.channelId,
+              channelName: win.payload.channelName,
+            },
           ])
         "
       />

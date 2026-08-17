@@ -82,7 +82,7 @@ test.describe('models page', () => {
 
     await seedChannel(page, {
       name: 'e2e-fold-channel',
-      models: ['e2e-fold-canon', 'e2e-fold-nick'],
+      models: ['e2e-fold-canon'],
       model_aliases: { 'e2e-fold-nick': 'e2e-fold-canon' },
     });
     await page.reload();
@@ -91,6 +91,26 @@ test.describe('models page', () => {
     await expect(folded.getByTestId('inventory-alias')).toContainText('e2e-fold-nick');
     await expect(
       page.locator('[data-testid="inventory-row"][data-model="e2e-fold-nick"]'),
+    ).toHaveCount(0);
+
+    await seedChannel(page, {
+      name: 'e2e-multi-alias-channel',
+      models: ['e2e-multi-canon'],
+      model_aliases: {
+        'e2e-multi-a': 'e2e-multi-canon',
+        'e2e-multi-b': 'e2e-multi-canon',
+      },
+    });
+    await page.reload();
+    const multi = page.locator('[data-testid="inventory-row"][data-model="e2e-multi-canon"]');
+    await expect(multi).toBeVisible();
+    await expect(multi.getByTestId('inventory-alias')).toContainText('e2e-multi-a');
+    await expect(multi.getByTestId('inventory-alias')).toContainText('e2e-multi-b');
+    await expect(
+      page.locator('[data-testid="inventory-row"][data-model="e2e-multi-a"]'),
+    ).toHaveCount(0);
+    await expect(
+      page.locator('[data-testid="inventory-row"][data-model="e2e-multi-b"]'),
     ).toHaveCount(0);
 
     await canonical.getByTestId('pricing-edit-entry').click();
@@ -151,11 +171,12 @@ test.describe('models page', () => {
       models: ['e2e-del-alias'],
       model_aliases: { 'e2e-del-alias': 'e2e-del-canonical' },
     });
-    await seedChannel(page, {
+    const canonChannel = await seedChannel(page, {
       name: 'e2e-del-canon-ch',
       models: ['e2e-del-canonical'],
     });
     await seedPrice(page, {
+      channel_id: canonChannel.id,
       model: 'e2e-del-canonical',
       input_micros: 1_000_000,
       output_micros: 2_000_000,
@@ -179,8 +200,12 @@ test.describe('models page', () => {
   test('catalog fill previews, requires a provider pick, overwrites selected tiers, and keeps unchecked ones', async ({
     page,
   }) => {
-    await seedChannel(page, { name: 'e2e-cat-channel', models: ['e2e-cat-mini'] });
+    const catChannel = await seedChannel(page, {
+      name: 'e2e-cat-channel',
+      models: ['e2e-cat-mini'],
+    });
     await seedPrice(page, {
+      channel_id: catChannel.id,
       model: 'e2e-cat-mini',
       input_micros: 9_000_000,
       output_micros: 8_000_000,
@@ -239,11 +264,12 @@ test.describe('models page', () => {
   test('coding token, group, and unified id can coexist; downstream tab and logs show outbound', async ({
     page,
   }) => {
-    await seedChannel(page, {
+    const codingChannel = await seedChannel(page, {
       name: 'e2e-coding-channel',
       models: ['e2e-code-mini', 'e2e-code-haiku'],
     });
     await seedPrice(page, {
+      channel_id: codingChannel.id,
       model: 'e2e-code-mini',
       input_micros: 150_000,
       output_micros: 600_000,
@@ -251,6 +277,7 @@ test.describe('models page', () => {
       cache_write_micros: null,
     });
     await seedPrice(page, {
+      channel_id: codingChannel.id,
       model: 'e2e-code-haiku',
       input_micros: 250_000,
       output_micros: 1_250_000,
@@ -393,6 +420,101 @@ test.describe('models page', () => {
         '[data-testid="inventory-row"][data-model="e2e-shared"][data-section-channel="e2e-layout-b"]',
       ),
     ).toHaveCount(0);
+  });
+
+  test('same model on two channels keeps independent prices', async ({ page }) => {
+    const left = await seedChannel(page, { name: 'e2e-price-a', models: ['e2e-dup'] });
+    const right = await seedChannel(page, { name: 'e2e-price-b', models: ['e2e-dup'] });
+    await seedPrice(page, {
+      channel_id: left.id,
+      model: 'e2e-dup',
+      input_micros: 1_000_000,
+      output_micros: 2_000_000,
+      cache_read_micros: null,
+      cache_write_micros: null,
+    });
+    await seedPrice(page, {
+      channel_id: right.id,
+      model: 'e2e-dup',
+      input_micros: 4_000_000,
+      output_micros: 5_000_000,
+      cache_read_micros: null,
+      cache_write_micros: null,
+    });
+    await page.goto('/models');
+    const rowA = page.locator(
+      '[data-testid="inventory-row"][data-model="e2e-dup"][data-section-channel="e2e-price-a"]',
+    );
+    const rowB = page.locator(
+      '[data-testid="inventory-row"][data-model="e2e-dup"][data-section-channel="e2e-price-b"]',
+    );
+    await expect(rowA.getByTestId('price-input')).toHaveText('1');
+    await expect(rowB.getByTestId('price-input')).toHaveText('4');
+
+    await rowA.getByTestId('pricing-edit-entry').click();
+    await expect(page.getByTestId('pricing-editor-channel')).toHaveValue('e2e-price-a');
+    await expect(page.getByTestId('pricing-editor-channel')).toBeDisabled();
+    await page.locator('[id^="pricing-editor-input"]').fill('3');
+    await page.locator('[id^="pricing-editor-output"]').fill('6');
+    await page.getByTestId('pricing-save-entry').click();
+
+    await expect(rowA.getByTestId('price-input')).toHaveText('3');
+    await expect(rowA.getByTestId('price-output')).toHaveText('6');
+    await expect(rowB.getByTestId('price-input')).toHaveText('4');
+    await expect(rowB.getByTestId('price-output')).toHaveText('5');
+  });
+
+  test('deleting a row leaves the same model and independent prices on the other channel', async ({
+    page,
+  }) => {
+    const left = await seedChannel(page, { name: 'e2e-del-price-a', models: ['e2e-keep'] });
+    const right = await seedChannel(page, { name: 'e2e-del-price-b', models: ['e2e-keep'] });
+    await seedPrice(page, {
+      channel_id: left.id,
+      model: 'e2e-keep',
+      input_micros: 1_000_000,
+      output_micros: 2_000_000,
+      cache_read_micros: null,
+      cache_write_micros: null,
+    });
+    await seedPrice(page, {
+      channel_id: right.id,
+      model: 'e2e-keep',
+      input_micros: 4_000_000,
+      output_micros: 5_000_000,
+      cache_read_micros: null,
+      cache_write_micros: null,
+    });
+    await page.goto('/models');
+    const rowA = page.locator(
+      '[data-testid="inventory-row"][data-model="e2e-keep"][data-section-channel="e2e-del-price-a"]',
+    );
+    const rowB = page.locator(
+      '[data-testid="inventory-row"][data-model="e2e-keep"][data-section-channel="e2e-del-price-b"]',
+    );
+    await clickRowAction(rowA, page, 'inventory-delete');
+    await page.getByRole('dialog').getByTestId('inventory-delete-confirm').click();
+    await expect(rowA).toHaveCount(0);
+    await expect(rowB).toBeVisible();
+    await expect(rowB.getByTestId('price-input')).toHaveText('4');
+    await expect(rowB.getByTestId('price-output')).toHaveText('5');
+
+    const listed = await page.request.get('/prices', {
+      headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+    });
+    const prices = (await listed.json()) as Array<{
+      channel_id: number;
+      model: string;
+      input_micros: number;
+    }>;
+    const leftPrice = prices.find(
+      (item) => item.channel_id === left.id && item.model === 'e2e-keep',
+    );
+    const rightPrice = prices.find(
+      (item) => item.channel_id === right.id && item.model === 'e2e-keep',
+    );
+    expect(leftPrice).toBeUndefined();
+    expect(rightPrice?.input_micros).toBe(4_000_000);
   });
 
   test('deleting a group with bound tokens asks to force; force rebinds tokens to default', async ({

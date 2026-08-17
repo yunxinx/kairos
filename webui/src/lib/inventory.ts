@@ -6,10 +6,11 @@ export interface AliasMapping {
   channelName: string;
 }
 
-/** 清单一行：渠道 `models` 里的可调用名。上游真名若不在清单中，不成行。 */
+/** 清单一行：某一渠道 `models` 里的一个可调用名。上游真名若不在清单中，不成行。 */
 export interface InventoryRow {
   name: string;
-  channelNames: string[];
+  channelId: number;
+  channelName: string;
   /** 指向本行的下游别名（本行是清单里的主模型）。 */
   aliases: AliasMapping[];
   /** 本行作为「仅别名在清单」时的出站主模型。 */
@@ -23,10 +24,14 @@ export interface InventorySection {
   rows: InventoryRow[];
 }
 
-function addChannel(row: InventoryRow, channelName: string) {
-  if (!row.channelNames.includes(channelName)) {
-    row.channelNames.push(channelName);
-  }
+/** 渠道稳定身份与可调用名的合成键；清单行与单价共用。 */
+export function channelModelKey(channelId: number, model: string): string {
+  return `${channelId}:${model}`;
+}
+
+/** 清单行选择/窗口键。 */
+export function inventoryRowKey(row: Pick<InventoryRow, 'channelId' | 'name'>): string {
+  return channelModelKey(row.channelId, row.name);
 }
 
 function addRelated(list: AliasMapping[], alias: string, channelName: string) {
@@ -41,22 +46,27 @@ function addRelated(list: AliasMapping[], alias: string, channelName: string) {
  * - 别名 key 与其主模型都在清单 → 折叠进主模型行，别名列展示该 key；
  * - 只把别名放进清单（主模型不在 `models`）→ 行名是别名，别名列展示主模型；
  *   主模型本身不成行（路由也不按 alias value 匹配）。
+ * 同一可调用名在不同渠道上各成一行，单价按 (渠道, 模型) 取。
  */
 export function buildInventory(channels: ChannelView[], prices: Price[]): InventoryRow[] {
-  const byName = new Map<string, InventoryRow>();
-  const priceByModel = new Map(prices.map((price) => [price.model, price]));
+  const byKey = new Map<string, InventoryRow>();
+  const priceByKey = new Map(
+    prices.map((price) => [channelModelKey(price.channel_id, price.model), price]),
+  );
 
-  function rowOf(name: string): InventoryRow {
-    const existing = byName.get(name);
+  function rowOf(channel: ChannelView, name: string): InventoryRow {
+    const key = channelModelKey(channel.id, name);
+    const existing = byKey.get(key);
     if (existing) return existing;
     const created: InventoryRow = {
       name,
-      channelNames: [],
+      channelId: channel.id,
+      channelName: channel.name,
       aliases: [],
       outbound: [],
-      price: priceByModel.get(name) ?? null,
+      price: priceByKey.get(key) ?? null,
     };
-    byName.set(name, created);
+    byKey.set(key, created);
     return created;
   }
 
@@ -68,8 +78,7 @@ export function buildInventory(channels: ChannelView[], prices: Price[]): Invent
       if (canonical !== undefined && inList.has(canonical)) {
         continue;
       }
-      const row = rowOf(name);
-      addChannel(row, channel.name);
+      const row = rowOf(channel, name);
       if (canonical !== undefined) {
         addRelated(row.outbound, canonical, channel.name);
       }
@@ -77,19 +86,20 @@ export function buildInventory(channels: ChannelView[], prices: Price[]): Invent
 
     for (const [alias, canonical] of Object.entries(channel.model_aliases)) {
       if (!inList.has(canonical)) continue;
-      const row = rowOf(canonical);
-      addChannel(row, channel.name);
+      const row = rowOf(channel, canonical);
       addRelated(row.aliases, alias, channel.name);
     }
   }
 
-  const rows = [...byName.values()];
+  const rows = [...byKey.values()];
   for (const row of rows) {
-    row.channelNames.sort((left, right) => left.localeCompare(right));
     row.aliases.sort(compareRelated);
     row.outbound.sort(compareRelated);
   }
-  rows.sort((left, right) => left.name.localeCompare(right.name));
+  rows.sort(
+    (left, right) =>
+      left.name.localeCompare(right.name) || left.channelName.localeCompare(right.channelName),
+  );
   return rows;
 }
 
@@ -135,14 +145,11 @@ export function aliasChips(row: InventoryRow, channelName?: string | null): Alia
 
 /**
  * 从指定渠道删除该行时，要从该渠道 `models` 拿掉的清单名：
- * 行名 + 该渠道上折叠进本行的别名 key。不含出站主模型（它不在本渠道清单里）。
+ * 行名 + 折叠进本行的别名 key。不含出站主模型（它不在本渠道清单里）。
+ * 行已按单一来源渠道成行，别名列无需再按渠道名过滤。
  */
-export function listedNamesOnChannel(row: InventoryRow, channelName: string): string[] {
-  const names = [row.name];
-  for (const item of row.aliases) {
-    if (item.channelName === channelName) names.push(item.alias);
-  }
-  return names;
+export function listedNamesOnChannel(row: InventoryRow): string[] {
+  return [row.name, ...row.aliases.map((item) => item.alias)];
 }
 
 /** 从渠道写契约里拿掉指定名字（主模型与别名 key/value）。 */
@@ -169,15 +176,13 @@ export function channelChangedByStrip(channel: ChannelView, next: Channel): bool
   return channel.models.some((name, index) => name !== next.models[index]);
 }
 
-/** 按渠道分段：同一可调用名按其成员渠道出现在每一段。 */
+/** 按渠道分段：每一行只属于其来源渠道。 */
 export function sectionInventory(rows: InventoryRow[]): InventorySection[] {
   const byChannel = new Map<string, InventoryRow[]>();
   for (const row of rows) {
-    for (const channelName of row.channelNames) {
-      const list = byChannel.get(channelName);
-      if (list) list.push(row);
-      else byChannel.set(channelName, [row]);
-    }
+    const list = byChannel.get(row.channelName);
+    if (list) list.push(row);
+    else byChannel.set(row.channelName, [row]);
   }
   return [...byChannel.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
@@ -187,7 +192,10 @@ export function sectionInventory(rows: InventoryRow[]): InventorySection[] {
     }));
 }
 
-/** 按可调用名排序。 */
+/** 按可调用名、再按渠道名排序。 */
 export function sortInventory(rows: InventoryRow[]): InventoryRow[] {
-  return [...rows].sort((left, right) => left.name.localeCompare(right.name));
+  return [...rows].sort(
+    (left, right) =>
+      left.name.localeCompare(right.name) || left.channelName.localeCompare(right.channelName),
+  );
 }

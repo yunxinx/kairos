@@ -1,5 +1,6 @@
 import type { Price } from '@/api/types';
 import { parseUsdToMicros } from '@/lib/format';
+import { channelModelKey } from '@/lib/inventory';
 
 /** models.dev 公开目录；匹配必须带 providerId，禁止只按裸 ID 跨提供方写入。 */
 export const MODELS_DEV_CATALOG_URL = 'https://models.dev/api.json';
@@ -70,6 +71,7 @@ export function catalogDollarsToMicros(value: number | undefined): number | null
  */
 export function applyCatalogTiers(
   model: string,
+  channelId: number,
   existing: Price | null,
   cost: CatalogCost,
   tiers: ReadonlySet<CatalogTier>,
@@ -78,6 +80,7 @@ export function applyCatalogTiers(
   const outputMicros = pickRequiredTier(tiers.has('output'), cost.output, existing?.output_micros);
   if (inputMicros === null || outputMicros === null) return null;
   return {
+    channel_id: channelId,
     model,
     input_micros: inputMicros,
     output_micros: outputMicros,
@@ -120,6 +123,8 @@ export type CatalogTier = (typeof CATALOG_TIERS)[number];
 
 export interface CatalogFillSource {
   model: string;
+  channelId: number;
+  channelName: string;
   lookupId: string;
   price: Price | null;
 }
@@ -133,6 +138,8 @@ export interface CatalogHostOption {
 
 export interface CatalogFillPreview {
   model: string;
+  channelId: number;
+  channelName: string;
   lookupId: string;
   hits: CatalogHit[];
   hostOptions: CatalogHostOption[];
@@ -158,12 +165,17 @@ function hostPresentation(hits: CatalogHit[]): {
 
 function pricesEqual(left: Price, right: Price): boolean {
   return (
+    left.channel_id === right.channel_id &&
     left.model === right.model &&
     left.input_micros === right.input_micros &&
     left.output_micros === right.output_micros &&
     left.cache_read_micros === right.cache_read_micros &&
     left.cache_write_micros === right.cache_write_micros
   );
+}
+
+export function catalogSourceKey(channelId: number, model: string): string {
+  return channelModelKey(channelId, model);
 }
 
 /** 为勾选的清单行生成目录填价预览；多个提供方未选则标 `need-host`。勾选档位允许覆盖已填单价。 */
@@ -176,34 +188,41 @@ export function buildCatalogFillPreview(
   return sources.map((source) => {
     const hits = findCatalogHits(catalog, source.lookupId);
     const hosts = hostPresentation(hits);
+    const identity = {
+      model: source.model,
+      channelId: source.channelId,
+      channelName: source.channelName,
+      lookupId: source.lookupId,
+    };
     if (hits.length === 0) {
       return {
-        model: source.model,
-        lookupId: source.lookupId,
+        ...identity,
         hits,
         ...hosts,
         selectedProviderId: null,
         nextPrice: null,
-        status: 'no-match',
+        status: 'no-match' as const,
       };
     }
     const auto = hits.length === 1 ? hits[0] : undefined;
-    const picked = auto ?? hits.find((hit) => hit.providerId === hostPicks[source.model]);
+    const picked =
+      auto ??
+      hits.find(
+        (hit) => hit.providerId === hostPicks[catalogSourceKey(source.channelId, source.model)],
+      );
     if (!picked) {
       return {
-        model: source.model,
-        lookupId: source.lookupId,
+        ...identity,
         hits,
         ...hosts,
         selectedProviderId: null,
         nextPrice: null,
-        status: 'need-host',
+        status: 'need-host' as const,
       };
     }
     if (tiers.size === 0) {
       return {
-        model: source.model,
-        lookupId: source.lookupId,
+        ...identity,
         hits,
         ...hosts,
         selectedProviderId: picked.providerId,
@@ -211,12 +230,17 @@ export function buildCatalogFillPreview(
         status: source.price ? 'unchanged' : 'no-match',
       };
     }
-    const nextPrice = applyCatalogTiers(source.model, source.price, picked.cost, tiers);
+    const nextPrice = applyCatalogTiers(
+      source.model,
+      source.channelId,
+      source.price,
+      picked.cost,
+      tiers,
+    );
     const unchanged =
       nextPrice !== null && source.price !== null && pricesEqual(source.price, nextPrice);
     return {
-      model: source.model,
-      lookupId: source.lookupId,
+      ...identity,
       hits,
       ...hosts,
       selectedProviderId: picked.providerId,

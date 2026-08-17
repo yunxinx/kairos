@@ -72,8 +72,9 @@ export function channelWriteBody(view: ChannelView): Channel {
   };
 }
 
-/** 单模型四档单价（micro-USD / 1M tokens）。 */
+/** 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）。 */
 export interface Price {
+  channel_id: number;
   model: string;
   input_micros: number;
   output_micros: number;
