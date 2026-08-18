@@ -667,6 +667,7 @@ async fn anthropic_passthrough_forwards_inbound_version_header() {
         .post(format!("{}/v1/messages", gw.base_url()))
         .header("x-api-key", TEST_TOKEN_KEY)
         .header("anthropic-version", "2024-10-22")
+        .header("anthropic-beta", "prompt-caching-2024-07-31")
         .json(&json!({
             "model": TEST_MODEL,
             "max_tokens": 16,
@@ -680,6 +681,11 @@ async fn anthropic_passthrough_forwards_inbound_version_header() {
         gw.upstream.received_anthropic_versions(),
         vec![Some("2024-10-22".to_string())],
         "直通应转发下游版本头"
+    );
+    assert_eq!(
+        gw.upstream.received_anthropic_betas(),
+        vec![Some("prompt-caching-2024-07-31".to_string())],
+        "直通应转发 anthropic-beta"
     );
 }
 
@@ -738,6 +744,9 @@ async fn ir_path_keeps_default_anthropic_version() {
         .post(format!("{}/v1/chat/completions", gw.base_url()))
         .bearer_auth(TEST_TOKEN_KEY)
         .header("anthropic-version", "2024-10-22")
+        .header("anthropic-beta", "prompt-caching-2024-07-31")
+        .header("openai-organization", "org-ir")
+        .header("openai-project", "proj-ir")
         .json(&json!({
             "model": TEST_MODEL,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -750,5 +759,56 @@ async fn ir_path_keeps_default_anthropic_version() {
         gw.upstream.received_anthropic_versions(),
         vec![Some("2023-06-01".to_string())],
         "IR 路径应钉适配器默认版本"
+    );
+    assert_eq!(
+        gw.upstream.received_anthropic_betas(),
+        vec![Some("prompt-caching-2024-07-31".to_string())],
+        "IR 路径仍应转发功能头"
+    );
+    assert_eq!(
+        gw.upstream.received_openai_organizations(),
+        vec![Some("org-ir".to_string())],
+        "IR 路径应转发 openai-organization"
+    );
+    assert_eq!(
+        gw.upstream.received_openai_projects(),
+        vec![Some("proj-ir".to_string())],
+        "IR 路径应转发 openai-project"
+    );
+}
+
+/// 同协议 OpenAI 直通：白名单功能头原样转发。
+#[tokio::test]
+async fn openai_passthrough_forwards_org_and_project_headers() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-h", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })));
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .header("openai-organization", "org-pt")
+        .header("openai-project", "proj-pt")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        gw.upstream.received_openai_organizations(),
+        vec![Some("org-pt".to_string())],
+        "直通应转发 openai-organization"
+    );
+    assert_eq!(
+        gw.upstream.received_openai_projects(),
+        vec![Some("proj-pt".to_string())],
+        "直通应转发 openai-project"
     );
 }

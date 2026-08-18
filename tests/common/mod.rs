@@ -72,6 +72,9 @@ impl UpstreamBehavior {
 pub struct ReceivedLog {
     pub requests: Vec<Value>,
     pub anthropic_versions: Vec<Option<String>>,
+    pub anthropic_betas: Vec<Option<String>>,
+    pub openai_organizations: Vec<Option<String>>,
+    pub openai_projects: Vec<Option<String>>,
 }
 
 /// 可编程 mock 上游 server。
@@ -96,7 +99,7 @@ impl MockUpstream {
             .route("/responses", post(handle))
             .layer(middleware::from_fn_with_state(
                 received.clone(),
-                capture_anthropic_version,
+                capture_outbound_headers,
             ))
             .route("/models", get(handle_models))
             // 禁用 axum 默认 2MB 上限：mock 上游需接收大请求体（模拟网关转发的多模态/base64）。
@@ -158,6 +161,33 @@ impl MockUpstream {
             .anthropic_versions
             .clone()
     }
+
+    /// 拷贝收到的 `anthropic-beta` 头（缺省为 `None`）。
+    pub fn received_anthropic_betas(&self) -> Vec<Option<String>> {
+        self.received
+            .lock()
+            .expect("received 锁不应被污染")
+            .anthropic_betas
+            .clone()
+    }
+
+    /// 拷贝收到的 `openai-organization` 头（缺省为 `None`）。
+    pub fn received_openai_organizations(&self) -> Vec<Option<String>> {
+        self.received
+            .lock()
+            .expect("received 锁不应被污染")
+            .openai_organizations
+            .clone()
+    }
+
+    /// 拷贝收到的 `openai-project` 头（缺省为 `None`）。
+    pub fn received_openai_projects(&self) -> Vec<Option<String>> {
+        self.received
+            .lock()
+            .expect("received 锁不应被污染")
+            .openai_projects
+            .clone()
+    }
 }
 
 #[derive(Clone)]
@@ -166,8 +196,8 @@ struct MockDeps {
     received: Arc<Mutex<ReceivedLog>>,
 }
 
-/// 记录出站 `anthropic-version`；只挂在有请求体的 POST 路由上，避免 GET `/models` 错位。
-async fn capture_anthropic_version(
+/// 记录出站功能头；只挂在有请求体的 POST 路由上，避免 GET `/models` 错位。
+async fn capture_outbound_headers(
     State(received): State<Arc<Mutex<ReceivedLog>>>,
     request: Request,
     next: Next,
@@ -177,11 +207,28 @@ async fn capture_anthropic_version(
         .get("anthropic-version")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    received
-        .lock()
-        .expect("received 锁不应被污染")
-        .anthropic_versions
-        .push(version);
+    let beta = request
+        .headers()
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let organization = request
+        .headers()
+        .get("openai-organization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let project = request
+        .headers()
+        .get("openai-project")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    {
+        let mut log = received.lock().expect("received 锁不应被污染");
+        log.anthropic_versions.push(version);
+        log.anthropic_betas.push(beta);
+        log.openai_organizations.push(organization);
+        log.openai_projects.push(project);
+    }
     next.run(request).await
 }
 

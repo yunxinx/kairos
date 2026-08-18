@@ -697,6 +697,7 @@ async fn handle_request(
             &body,
             request_body_for_log.clone(),
             inbound_anthropic_version,
+            &headers,
             &request_id,
         )
         .await;
@@ -860,6 +861,7 @@ struct CallCtx<'a> {
     /// 入站 wire 协议：响应重编码与错误格式按此分派。
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
+    inbound_headers: &'a HeaderMap,
     request_id: &'a str,
 }
 
@@ -876,6 +878,7 @@ async fn dispatch_hop(
     raw_body: &[u8],
     request_body_for_log: Option<Bytes>,
     inbound_anthropic_version: Option<&HeaderValue>,
+    inbound_headers: &HeaderMap,
     request_id: &str,
 ) -> Response {
     // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
@@ -896,6 +899,7 @@ async fn dispatch_hop(
             inbound_protocol,
             request_body: request_body_for_log,
             inbound_anthropic_version,
+            inbound_headers,
             request_id,
         };
         return passthrough_with_failover(&passthrough_ctx, &hop.route).await;
@@ -910,6 +914,7 @@ async fn dispatch_hop(
         started,
         inbound_protocol,
         request_body_for_log,
+        inbound_headers,
         request_id,
     )
     .await
@@ -931,6 +936,7 @@ async fn outbound_with_failover(
     started: i64,
     inbound_protocol: Protocol,
     request_body_for_log: Option<Bytes>,
+    inbound_headers: &HeaderMap,
     request_id: &str,
 ) -> Response {
     run_failover(
@@ -949,6 +955,7 @@ async fn outbound_with_failover(
                     started,
                     inbound_protocol,
                     request_body: request_body_for_log.clone(),
+                    inbound_headers,
                     request_id,
                 };
                 if request.stream {
@@ -1010,6 +1017,7 @@ struct PassthroughCtx<'a> {
     request_body: Option<Bytes>,
     /// 直通时转发下游的 `anthropic-version`；缺省则出站用官方默认。
     inbound_anthropic_version: Option<&'a HeaderValue>,
+    inbound_headers: &'a HeaderMap,
     request_id: &'a str,
 }
 
@@ -1083,6 +1091,7 @@ async fn passthrough_stream_completion(
             .client
             .post(&upstream_url)
             .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
+            .apply_feature_headers(ctx.inbound_headers)
             .header("content-type", "application/json")
             .body(outbound)
             .send(),
@@ -1191,6 +1200,7 @@ async fn passthrough_non_stream_completion(
             .client
             .post(&upstream_url)
             .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
+            .apply_feature_headers(ctx.inbound_headers)
             .header("content-type", "application/json")
             .body(outbound)
             .send(),
@@ -1537,6 +1547,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
         .post(&upstream_url)
         .timeout(Duration::from_millis(channel.timeout_ms))
         .apply_outbound_auth(channel)
+        .apply_feature_headers(ctx.inbound_headers)
         .json(&outbound_value)
         .send()
         .await;
@@ -1675,6 +1686,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         deps.client
             .post(&upstream_url)
             .apply_outbound_auth(channel)
+            .apply_feature_headers(ctx.inbound_headers)
             .json(&outbound)
             .send(),
     )
@@ -2081,6 +2093,10 @@ fn outbound_model_for_channel_name<'a>(
 /// Anthropic 出站在下游未带版本头时使用的官方默认。
 const DEFAULT_ANTHROPIC_VERSION: HeaderValue = HeaderValue::from_static("2023-06-01");
 
+/// 入站功能头白名单：直通与 IR 都原样转发出站，不含认证与 hop-by-hop。
+const FORWARDED_FEATURE_HEADERS: &[&str] =
+    &["anthropic-beta", "openai-organization", "openai-project"];
+
 /// 按渠道协议设置出站认证头。
 ///
 /// OpenAI 用 `Authorization: Bearer`；Anthropic 用 `x-api-key` 并带
@@ -2092,6 +2108,7 @@ pub(super) trait OutboundAuth {
         channel: &Channel,
         inbound_version: Option<&HeaderValue>,
     ) -> Self;
+    fn apply_feature_headers(self, inbound: &HeaderMap) -> Self;
 }
 
 impl OutboundAuth for reqwest::RequestBuilder {
@@ -2113,6 +2130,16 @@ impl OutboundAuth for reqwest::RequestBuilder {
                     .unwrap_or(DEFAULT_ANTHROPIC_VERSION),
             ),
         }
+    }
+
+    fn apply_feature_headers(self, inbound: &HeaderMap) -> Self {
+        let mut builder = self;
+        for name in FORWARDED_FEATURE_HEADERS {
+            if let Some(value) = inbound.get(*name) {
+                builder = builder.header(*name, value.clone());
+            }
+        }
+        builder
     }
 }
 
