@@ -283,7 +283,7 @@ pub struct Seed {
     pub prices: Vec<Price>,
     /// 统一模型（可选；缺省空）。
     pub unified_models: Vec<resources::UnifiedModel>,
-    /// 运行时开关（键为 `full_body`/`max_request_bytes`，值为 JSON）。
+    /// 运行时开关（键为 `full_body`/`max_request_bytes` 等 Settings 契约键，值为 JSON）。
     pub settings: HashMap<String, Value>,
 }
 
@@ -483,9 +483,12 @@ impl TestGateway {
                 .local_addr()
                 .expect("管理监听应能获取监听地址");
             tokio::spawn(async move {
-                axum::serve(admin_listener, admin_app)
-                    .await
-                    .expect("管理面服务应运行");
+                axum::serve(
+                    admin_listener,
+                    admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .expect("管理面服务应运行");
             });
             Some(admin_addr)
         } else {
@@ -498,7 +501,12 @@ impl TestGateway {
             .expect("网关应能绑定随机端口");
         let addr = listener.local_addr().expect("网关应能获取监听地址");
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("网关服务应运行");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("网关服务应运行");
         });
 
         Self {
@@ -543,7 +551,12 @@ impl TestGateway {
             .expect("网关应能绑定随机端口");
         let addr = listener.local_addr().expect("网关应能获取监听地址");
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("网关服务应运行");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("网关服务应运行");
         });
 
         let gw = Self {
@@ -587,7 +600,12 @@ impl TestGateway {
             .expect("网关应能绑定随机端口");
         let addr = listener.local_addr().expect("应能取端口");
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("网关服务应运行");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("网关服务应运行");
         });
         format!("http://{addr}")
     }

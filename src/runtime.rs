@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use sqlx::SqlitePool;
@@ -15,12 +16,17 @@ use tokio::sync::RwLock;
 
 use crate::store::StoreError;
 use crate::store::resources::{
-    self, SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_MAX_REQUEST_BYTES,
+    self, SETTING_AUTH_THROTTLE_MAX_FAILURES, SETTING_AUTH_THROTTLE_WINDOW_SECS,
+    SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_MAX_REQUEST_BYTES,
+    SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS,
+    SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
 
-/// 入站请求体大小上限的默认值（字节）：覆盖常规 base64 图片，与参考网关 bifrost
-/// 的 `max_request_body_size_mb: 100` 对齐；运营可经管理 API 在线调整。
-pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 100 * 1024 * 1024;
+pub use crate::store::resources::{
+    DEFAULT_AUTH_THROTTLE_MAX_FAILURES, DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
+    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_RETRY_AFTER_CAP_SECS, DEFAULT_RETRY_BACKOFF_CAP_MS,
+    DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+};
 
 /// 网关运行时资源的内存快照：不可变整体，原子替换。
 ///
@@ -44,12 +50,49 @@ pub struct RuntimeSnapshot {
     pub max_request_bytes: u64,
     /// 价格目录自动同步间隔（天，来自 `catalog_sync_interval_days`；`0` 为只手动）。
     pub catalog_sync_interval_days: u64,
+    /// 同一 IP 窗口内允许的认证失败次数（`0` 关闭限流）。
+    pub auth_throttle_max_failures: u64,
+    /// 认证失败计数窗口（秒）。
+    pub auth_throttle_window_secs: u64,
+    /// SSE 重装缓冲上限（字节）。
+    pub sse_reassembly_max_bytes: u64,
+    /// 同渠道重试基础间隔（毫秒）。
+    pub retry_backoff_ms: u64,
+    /// 同渠道指数退避封顶（毫秒）。
+    pub retry_backoff_cap_ms: u64,
+    /// 上游 `Retry-After` 最大等待（秒）。
+    pub retry_after_cap_secs: u64,
 }
 
 impl RuntimeSnapshot {
     /// 按渠道稳定 id + 可调用名取单价。
     pub fn price_for_channel(&self, channel_id: i64, model: &str) -> Option<&resources::Price> {
         self.prices.get(&channel_id)?.get(model)
+    }
+
+    /// 认证失败计数窗口；库内为 0 时按 1 秒处理，避免 `Duration::from_secs(0)` 让窗口立刻过期。
+    pub fn auth_throttle_window(&self) -> Duration {
+        Duration::from_secs(self.auth_throttle_window_secs.max(1))
+    }
+
+    /// SSE 重装缓冲上限（与 `Vec` 长度比较用）。
+    pub fn sse_reassembly_max(&self) -> usize {
+        usize::try_from(self.sse_reassembly_max_bytes).unwrap_or(usize::MAX)
+    }
+
+    /// 把快照中的运行时开关聚合成管理 API 的 Settings 契约。
+    pub fn to_settings(&self) -> resources::Settings {
+        resources::Settings {
+            full_body: self.full_body,
+            max_request_bytes: self.max_request_bytes,
+            catalog_sync_interval_days: self.catalog_sync_interval_days,
+            auth_throttle_max_failures: self.auth_throttle_max_failures,
+            auth_throttle_window_secs: self.auth_throttle_window_secs,
+            sse_reassembly_max_bytes: self.sse_reassembly_max_bytes,
+            retry_backoff_ms: self.retry_backoff_ms,
+            retry_backoff_cap_ms: self.retry_backoff_cap_ms,
+            retry_after_cap_secs: self.retry_after_cap_secs,
+        }
     }
 }
 
@@ -62,7 +105,7 @@ pub type SnapshotHandle = Arc<RwLock<Arc<RuntimeSnapshot>>>;
 /// 从库加载全部运行时资源进内存快照。
 ///
 /// 四类资源分别读取：渠道/令牌/价格直接装载，运行时开关经 `load_settings` 解析
-/// 出 `full_body` 与 `max_request_bytes`（缺省用默认值）。
+/// 出日志、网关保护与目录同步等设置（缺省用默认值）。
 pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreError> {
     let channels = resources::list_channel_records(pool).await?;
     let token_rows = resources::list_tokens(pool).await?;
@@ -100,7 +143,42 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         full_body: load_full_body(&settings),
         max_request_bytes: load_max_request_bytes(&settings),
         catalog_sync_interval_days: load_catalog_sync_interval_days(&settings),
+        auth_throttle_max_failures: load_u64(
+            &settings,
+            SETTING_AUTH_THROTTLE_MAX_FAILURES,
+            DEFAULT_AUTH_THROTTLE_MAX_FAILURES,
+        ),
+        auth_throttle_window_secs: load_u64(
+            &settings,
+            SETTING_AUTH_THROTTLE_WINDOW_SECS,
+            DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
+        ),
+        sse_reassembly_max_bytes: load_u64(
+            &settings,
+            SETTING_SSE_REASSEMBLY_MAX_BYTES,
+            DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+        ),
+        retry_backoff_ms: load_u64(
+            &settings,
+            SETTING_RETRY_BACKOFF_MS,
+            DEFAULT_RETRY_BACKOFF_MS,
+        ),
+        retry_backoff_cap_ms: load_u64(
+            &settings,
+            SETTING_RETRY_BACKOFF_CAP_MS,
+            DEFAULT_RETRY_BACKOFF_CAP_MS,
+        ),
+        retry_after_cap_secs: load_u64(
+            &settings,
+            SETTING_RETRY_AFTER_CAP_SECS,
+            DEFAULT_RETRY_AFTER_CAP_SECS,
+        ),
     })
+}
+
+/// 从开关表解析无符号整数：缺键或非整数时用 `default`。
+fn load_u64(settings: &HashMap<String, Value>, key: &str, default: u64) -> u64 {
+    settings.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
 /// 从开关表解析 `full_body`：缺省关闭。
@@ -113,18 +191,16 @@ fn load_full_body(settings: &HashMap<String, Value>) -> bool {
 
 /// 从开关表解析 `max_request_bytes`：缺省用 `DEFAULT_MAX_REQUEST_BYTES`。
 fn load_max_request_bytes(settings: &HashMap<String, Value>) -> u64 {
-    settings
-        .get(SETTING_MAX_REQUEST_BYTES)
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+    load_u64(
+        settings,
+        SETTING_MAX_REQUEST_BYTES,
+        DEFAULT_MAX_REQUEST_BYTES,
+    )
 }
 
 /// 从开关表解析 `catalog_sync_interval_days`：缺省 0（只手动）。
 fn load_catalog_sync_interval_days(settings: &HashMap<String, Value>) -> u64 {
-    settings
-        .get(SETTING_CATALOG_SYNC_INTERVAL_DAYS)
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
+    load_u64(settings, SETTING_CATALOG_SYNC_INTERVAL_DAYS, 0)
 }
 
 /// 把一个库加载出的快照包装成原子替换句柄。
@@ -174,6 +250,21 @@ mod tests {
             "body 上限缺省用默认值"
         );
         assert_eq!(snap.catalog_sync_interval_days, 0, "目录同步缺省只手动");
+        assert_eq!(
+            snap.auth_throttle_max_failures,
+            DEFAULT_AUTH_THROTTLE_MAX_FAILURES
+        );
+        assert_eq!(
+            snap.auth_throttle_window_secs,
+            DEFAULT_AUTH_THROTTLE_WINDOW_SECS
+        );
+        assert_eq!(
+            snap.sse_reassembly_max_bytes,
+            DEFAULT_SSE_REASSEMBLY_MAX_BYTES
+        );
+        assert_eq!(snap.retry_backoff_ms, DEFAULT_RETRY_BACKOFF_MS);
+        assert_eq!(snap.retry_backoff_cap_ms, DEFAULT_RETRY_BACKOFF_CAP_MS);
+        assert_eq!(snap.retry_after_cap_secs, DEFAULT_RETRY_AFTER_CAP_SECS);
     }
 
     /// 播种资源与开关后加载：快照反映库内状态。

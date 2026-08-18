@@ -1,5 +1,7 @@
 //! 渠道 failover 编排：统一处理重试预算、可重试错误与最终错误归因。
 
+use std::time::Duration;
+
 use axum::{
     Json,
     http::StatusCode,
@@ -13,6 +15,28 @@ use crate::store::resources::ChannelRecord;
 
 use super::{protocol, routing};
 
+/// 同渠道重试的退避参数（来自运行时设置）。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RetryBackoff {
+    /// 无 `Retry-After` 时的基础间隔。
+    pub base: Duration,
+    /// 指数退避封顶。
+    pub cap: Duration,
+    /// 上游 `Retry-After` 的最大等待。
+    pub after_cap: Duration,
+}
+
+impl RetryBackoff {
+    /// 由设置毫秒/秒构造；各字段至少为 1，避免零间隔忙等。
+    pub(super) fn from_ms(base_ms: u64, cap_ms: u64, after_cap_secs: u64) -> Self {
+        Self {
+            base: Duration::from_millis(base_ms.max(1)),
+            cap: Duration::from_millis(cap_ms.max(1)),
+            after_cap: Duration::from_secs(after_cap_secs.max(1)),
+        }
+    }
+}
+
 /// 单次出站调用的结果。
 pub(super) enum Outbound {
     /// 成功：响应已就绪，可直接交给下游。
@@ -22,6 +46,8 @@ pub(super) enum Outbound {
         channel: String,
         status: Option<u16>,
         message: String,
+        /// 上游 `Retry-After` 的 delta-seconds；无则按指数退避。
+        retry_after: Option<Duration>,
     },
     /// 不可重试错误（其他 4xx）。
     Fatal {
@@ -29,6 +55,19 @@ pub(super) enum Outbound {
         status: u16,
         message: String,
     },
+}
+
+/// 同渠道下一次重试前等待的时长。
+pub(super) fn retry_delay(
+    attempt_no: usize,
+    retry_after: Option<Duration>,
+    backoff: RetryBackoff,
+) -> Duration {
+    if let Some(after) = retry_after {
+        return after.min(backoff.after_cap);
+    }
+    let shift = u32::try_from(attempt_no).unwrap_or(u32::MAX).min(16);
+    backoff.base.saturating_mul(1u32 << shift).min(backoff.cap)
 }
 
 /// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
@@ -41,6 +80,7 @@ pub(super) async fn run_failover<'a, A, L>(
     mut attempt: A,
     log_failure: L,
     inbound_protocol: Protocol,
+    backoff: RetryBackoff,
 ) -> Response
 where
     A: FnMut(&ChannelRecord) -> BoxFuture<'a, Outbound>,
@@ -72,9 +112,11 @@ where
                     channel,
                     status,
                     message,
+                    retry_after,
                 } => {
                     last_retryable = Some((channel, status, message));
                     if attempt_no + 1 < max_attempts {
+                        tokio::time::sleep(retry_delay(attempt_no, retry_after, backoff)).await;
                         continue;
                     }
                     break;
@@ -112,4 +154,42 @@ pub(super) fn upstream_error_body(
         error.insert("gateway".into(), gateway);
     }
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RetryBackoff, retry_delay};
+    use std::time::Duration;
+
+    fn default_backoff() -> RetryBackoff {
+        RetryBackoff::from_ms(200, 5_000, 60)
+    }
+
+    #[test]
+    fn retry_delay_is_exponential_and_capped() {
+        let backoff = default_backoff();
+        assert_eq!(retry_delay(0, None, backoff), Duration::from_millis(200));
+        assert_eq!(retry_delay(1, None, backoff), Duration::from_millis(400));
+        assert_eq!(retry_delay(2, None, backoff), Duration::from_millis(800));
+        assert_eq!(retry_delay(16, None, backoff), Duration::from_secs(5));
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(3)), backoff),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(120)), backoff),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn retry_delay_uses_configured_base_and_caps() {
+        let backoff = RetryBackoff::from_ms(100, 1_000, 10);
+        assert_eq!(retry_delay(0, None, backoff), Duration::from_millis(100));
+        assert_eq!(retry_delay(4, None, backoff), Duration::from_millis(1_000));
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(30)), backoff),
+            Duration::from_secs(10)
+        );
+    }
 }

@@ -107,6 +107,8 @@ pub struct RequestLog {
     pub price: PriceSnapshot,
     /// 本次费用（micro-USD）。
     pub cost_usd_micros: i64,
+    /// 费用是否已写入 `token_balance`；结算失败时为 `false`，供对账补扣。
+    pub settled: bool,
     /// 可选的入站请求原始字节（仅 `logging.full_body` 开启时保存）。
     pub request_body: Option<Vec<u8>>,
     /// 可选的入站响应原始字节（仅 `logging.full_body` 开启时保存）。
@@ -123,8 +125,8 @@ pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i
           status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
           cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
           cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
-          request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          settled, request_body, response_body) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.created_at)
     .bind(&log.token_name)
@@ -144,6 +146,7 @@ pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i
     .bind(log.price.cache_read_micros)
     .bind(log.price.cache_write_micros)
     .bind(log.cost_usd_micros)
+    .bind(log.settled as i64)
     .bind(&log.request_body)
     .bind(&log.response_body)
     .execute(pool)
@@ -305,8 +308,8 @@ impl RequestLogQuery {
 }
 
 /// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目。
-pub async fn query_request_logs(
-    pool: &SqlitePool,
+async fn query_request_logs_on(
+    conn: &mut SqliteConnection,
     filter: &RequestLogQuery,
 ) -> Result<Vec<RequestLog>, StoreError> {
     let mut qb = sqlx::QueryBuilder::new(
@@ -314,7 +317,7 @@ pub async fn query_request_logs(
          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
-         request_body, response_body FROM request_log",
+         settled, request_body, response_body FROM request_log",
     );
     push_request_log_filters(&mut qb, filter);
     qb.push(" ORDER BY id DESC");
@@ -333,7 +336,7 @@ pub async fn query_request_logs(
 
     let rows = qb
         .build()
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
 
@@ -344,9 +347,30 @@ pub async fn query_request_logs(
     Ok(logs)
 }
 
-/// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
-pub async fn count_request_logs(
+/// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目。
+pub async fn query_request_logs(
     pool: &SqlitePool,
+    filter: &RequestLogQuery,
+) -> Result<Vec<RequestLog>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    query_request_logs_on(&mut conn, filter).await
+}
+
+/// 在同一事务内读本页条目与总数，避免两次查询之间被新行插入导致 total 与 items 对不齐。
+pub async fn query_request_log_page(
+    pool: &SqlitePool,
+    filter: &RequestLogQuery,
+) -> Result<(Vec<RequestLog>, u64), StoreError> {
+    let mut tx = pool.begin().await.map_err(StoreError::Query)?;
+    let logs = query_request_logs_on(&mut tx, filter).await?;
+    let total = count_request_logs_on(&mut tx, filter).await?;
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok((logs, total))
+}
+
+/// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
+async fn count_request_logs_on(
+    conn: &mut SqliteConnection,
     filter: &RequestLogQuery,
 ) -> Result<u64, StoreError> {
     let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*) AS cnt FROM request_log");
@@ -354,11 +378,20 @@ pub async fn count_request_logs(
 
     let row = qb
         .build()
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
     let count: i64 = row.try_get("cnt").map_err(StoreError::Query)?;
     Ok(count.max(0) as u64)
+}
+
+/// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
+pub async fn count_request_logs(
+    pool: &SqlitePool,
+    filter: &RequestLogQuery,
+) -> Result<u64, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    count_request_logs_on(&mut conn, filter).await
 }
 
 /// `/stats` 缺省时间窗（天）。
@@ -438,7 +471,7 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS success_count, \
          COALESCE(SUM(input_tokens), 0) AS input_tokens, \
          COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros \
          FROM request_log WHERE created_at >= ?",
     )
@@ -498,7 +531,7 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
 pub async fn query_lifetime_stats(pool: &SqlitePool) -> Result<LifetimeStats, StoreError> {
     let row = sqlx::query(
         "SELECT COUNT(*) AS request_count, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
          COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
            AS total_tokens \
@@ -548,7 +581,7 @@ async fn query_hourly_buckets(
                    COUNT(*) AS request_count, \
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
                         THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
             FROM request_log WHERE created_at >= ? \
             GROUP BY hour \
@@ -588,7 +621,7 @@ async fn query_daily_buckets(
                    COUNT(*) AS request_count, \
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
                         THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
             FROM request_log WHERE created_at >= ? \
             GROUP BY day \
@@ -620,7 +653,7 @@ async fn query_cost_share(
     let sql = match dimension {
         CostDimension::Model => {
             "SELECT model AS name, COUNT(*) AS request_count, \
-             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
                AS cost_usd_micros \
              FROM request_log WHERE created_at >= ? \
              GROUP BY model \
@@ -628,7 +661,7 @@ async fn query_cost_share(
         }
         CostDimension::Channel => {
             "SELECT channel AS name, COUNT(*) AS request_count, \
-             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN cost_usd_micros ELSE 0 END), 0) \
+             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
                AS cost_usd_micros \
              FROM request_log WHERE created_at >= ? \
              GROUP BY channel \
@@ -763,6 +796,10 @@ fn map_request_log_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestLog, Stor
             .map_err(StoreError::Query)?,
         price,
         cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        settled: row
+            .try_get::<i64, _>("settled")
+            .map_err(StoreError::Query)?
+            != 0,
         request_body: row.try_get("request_body").map_err(StoreError::Query)?,
         response_body: row.try_get("response_body").map_err(StoreError::Query)?,
     })
@@ -1188,6 +1225,7 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: 12,
+                    settled: true,
                     request_body: None,
                     response_body: None,
                 },
@@ -1268,6 +1306,7 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: 0,
+                    settled: true,
                     request_body: None,
                     response_body: None,
                 },
@@ -1344,6 +1383,7 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 12,
+                settled: true,
                 request_body: None,
                 response_body: None,
             },
@@ -1404,6 +1444,7 @@ mod tests {
                 cache_write_tokens: 0,
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
+                settled: true,
                 request_body: None,
                 response_body: None,
             },
@@ -1416,5 +1457,85 @@ mod tests {
             .expect("应能查询");
         assert_eq!(rows[0].outbound_model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(rows[1].outbound_model, None);
+        assert!(rows[1].settled, "缺 settled 列的存量行默认已结算");
+    }
+
+    /// 迁移 0016：热表过滤列有索引；未结算费用不进入 stats 聚合。
+    #[tokio::test]
+    async fn request_log_indexes_exist_and_unsettled_cost_is_excluded() {
+        let (_dir, pool) = test_pool().await;
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'request_log'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("应能查索引");
+        for expected in [
+            "idx_request_log_created_at",
+            "idx_request_log_token_key",
+            "idx_request_log_model",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "应有索引 {expected}，实际 {names:?}"
+            );
+        }
+
+        let price = PriceSnapshot::default();
+        insert_request_log(
+            &pool,
+            &RequestLog {
+                id: 0,
+                created_at: 1,
+                token_name: "t".to_string(),
+                token_key: "sk-a".to_string(),
+                inbound_protocol: "openai_chat".to_string(),
+                model: "gpt-4o".to_string(),
+                outbound_model: None,
+                channel: "c1".to_string(),
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                price,
+                cost_usd_micros: 9_999,
+                settled: false,
+                request_body: None,
+                response_body: None,
+            },
+        )
+        .await
+        .expect("应能写未结算日志");
+        insert_request_log(
+            &pool,
+            &RequestLog {
+                id: 0,
+                created_at: 2,
+                token_name: "t".to_string(),
+                token_key: "sk-a".to_string(),
+                inbound_protocol: "openai_chat".to_string(),
+                model: "gpt-4o".to_string(),
+                outbound_model: None,
+                channel: "c1".to_string(),
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                price,
+                cost_usd_micros: 100,
+                settled: true,
+                request_body: None,
+                response_body: None,
+            },
+        )
+        .await
+        .expect("应能写已结算日志");
+
+        let lifetime = query_lifetime_stats(&pool).await.expect("应能聚合");
+        assert_eq!(lifetime.cost_usd_micros, 100, "未结算费用不应计入");
     }
 }

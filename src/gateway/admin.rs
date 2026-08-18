@@ -12,11 +12,12 @@
 //! （`/channels/{id}/test`）与按渠道草稿拉取上游模型列表（`/channels/models`）。
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -42,6 +43,7 @@ use crate::{
 
 use super::http::OutboundAuth;
 use super::protocol;
+use super::throttle::AuthThrottle;
 
 /// 管理面依赖：存储连接池 + 运行时快照句柄（写后原子替换）+ 出站 HTTP 客户端。
 #[derive(Clone)]
@@ -49,6 +51,14 @@ struct AdminDeps {
     pool: SqlitePool,
     snapshot: crate::runtime::SnapshotHandle,
     client: reqwest::Client,
+}
+
+/// 管理认证中间件状态：静态 admin key + 认证失败限流 + 快照（读限流阈值）。
+#[derive(Clone)]
+struct AdminAuth {
+    admin_key: String,
+    throttle: AuthThrottle,
+    snapshot: crate::runtime::SnapshotHandle,
 }
 
 /// 组装管理面路由：资源 CRUD 挂在 admin key 认证中间件之后；静态 UI 为 fallback。
@@ -68,7 +78,7 @@ pub fn router(
         .expect("未配置会失败的 ClientBuilder 选项，rustls 客户端应能构建");
     let deps = AdminDeps {
         pool,
-        snapshot,
+        snapshot: snapshot.clone(),
         client,
     };
     Router::new()
@@ -110,7 +120,14 @@ pub fn router(
         .route("/logs", get(query_logs))
         .route("/stats", get(get_stats))
         .route("/stats/lifetime", get(get_lifetime_stats))
-        .route_layer(middleware::from_fn_with_state(admin_key, admin_auth))
+        .route_layer(middleware::from_fn_with_state(
+            AdminAuth {
+                admin_key,
+                throttle: AuthThrottle::new(),
+                snapshot,
+            },
+            admin_auth,
+        ))
         // fallback 不走 route_layer：静态资源与 SPA 回退免认证；API 路由仍受中间件保护。
         .fallback(super::webui::serve)
         .with_state(deps)
@@ -119,17 +136,38 @@ pub fn router(
 /// admin key 认证中间件：请求需带 `Authorization: Bearer <admin_key>`，否则 401。
 ///
 /// 管理面与协议面监听隔离，本中间件只作用于管理路由；认证失败返回结构化错误。
-async fn admin_auth(State(admin_key): State<String>, request: Request, next: Next) -> Response {
-    let authorized = request
+/// 同一 IP 在窗口内认证失败过多则 429，比较密钥用常数时间避免侧信道。
+async fn admin_auth(
+    State(auth): State<AdminAuth>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let ip = addr.ip();
+    let snapshot = auth.snapshot.read().await;
+    let max_failures = snapshot.auth_throttle_max_failures;
+    let window = snapshot.auth_throttle_window();
+    drop(snapshot);
+    if auth.throttle.is_blocked(ip, max_failures, window) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                json!({ "error": { "code": "rate_limited", "message": "认证尝试过于频繁，请稍后再试" } }),
+            ),
+        )
+            .into_response();
+    }
+    let provided = request
         .headers()
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
-        == Some(admin_key.as_str());
-    if authorized {
+        .unwrap_or("");
+    if constant_time_eq(provided.as_bytes(), auth.admin_key.as_bytes()) {
         next.run(request).await
     } else {
+        auth.throttle.record_failure(ip, max_failures, window);
         (
             StatusCode::UNAUTHORIZED,
             Json(
@@ -138,6 +176,16 @@ async fn admin_auth(State(admin_key): State<String>, request: Request, next: Nex
         )
             .into_response()
     }
+}
+
+/// 常数时间比较：长度不同时仍扫描较短一侧，避免按首个差异字节提前返回。
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = (left.len() != right.len()) as u8;
+    let n = left.len().min(right.len());
+    for i in 0..n {
+        diff |= left[i] ^ right[i];
+    }
+    diff == 0
 }
 
 // --- 令牌 ---
@@ -654,11 +702,17 @@ async fn delete_model_group(
 // --- 统一模型 ---
 
 /// 列出全部统一模型（按 `id` 排序，保证确定性）。
+///
+/// 读视图带 `available`：渠道已删/停用/不再登记该名时为 false，写契约不含此字段。
 async fn list_unified_models(
     State(deps): State<AdminDeps>,
-) -> Result<Json<Vec<UnifiedModel>>, AdminError> {
+) -> Result<Json<Vec<UnifiedModelView>>, AdminError> {
     let snapshot = deps.snapshot.read().await;
-    let mut models: Vec<UnifiedModel> = snapshot.unified_models.values().cloned().collect();
+    let mut models: Vec<UnifiedModelView> = snapshot
+        .unified_models
+        .values()
+        .map(|model| unified_model_view(model, &snapshot))
+        .collect();
     models.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Json(models))
 }
@@ -756,8 +810,8 @@ async fn get_settings(State(deps): State<AdminDeps>) -> Result<Json<Settings>, A
 
 /// 整体更新运行时设置：写库 → 换快照 → 返回变更后设置。
 ///
-/// 设置变更后经快照原子替换即时生效：入站请求体上限的变更立刻拦截超限请求，
-/// full_body 开关的变更立刻作用于后续请求的日志落库。
+/// 设置变更后经快照原子替换即时生效：入站请求体上限、认证限流、SSE 重装上限
+/// 与同渠道退避的变更立刻作用于后续请求。
 async fn update_settings(
     State(deps): State<AdminDeps>,
     body: Result<Json<Settings>, axum::extract::rejection::JsonRejection>,
@@ -774,11 +828,41 @@ async fn update_settings(
     Ok(Json(updated))
 }
 
-/// 校验设置字段：入站请求体上限须为正（0 会拒绝一切请求，属运营误配）。
+/// 校验设置字段：须为正的阈值写成 0 属运营误配；认证失败次数允许 0（关闭限流）。
 fn validate_settings(settings: &Settings) -> Result<(), AdminError> {
     if settings.max_request_bytes == 0 {
         return Err(AdminError::InvalidBody(
             "max_request_bytes 必须大于 0".to_string(),
+        ));
+    }
+    if settings.auth_throttle_window_secs == 0 {
+        return Err(AdminError::InvalidBody(
+            "auth_throttle_window_secs 必须大于 0".to_string(),
+        ));
+    }
+    if settings.sse_reassembly_max_bytes == 0 {
+        return Err(AdminError::InvalidBody(
+            "sse_reassembly_max_bytes 必须大于 0".to_string(),
+        ));
+    }
+    if settings.retry_backoff_ms == 0 {
+        return Err(AdminError::InvalidBody(
+            "retry_backoff_ms 必须大于 0".to_string(),
+        ));
+    }
+    if settings.retry_backoff_cap_ms == 0 {
+        return Err(AdminError::InvalidBody(
+            "retry_backoff_cap_ms 必须大于 0".to_string(),
+        ));
+    }
+    if settings.retry_backoff_cap_ms < settings.retry_backoff_ms {
+        return Err(AdminError::InvalidBody(
+            "retry_backoff_cap_ms 不能小于 retry_backoff_ms".to_string(),
+        ));
+    }
+    if settings.retry_after_cap_secs == 0 {
+        return Err(AdminError::InvalidBody(
+            "retry_after_cap_secs 必须大于 0".to_string(),
         ));
     }
     Ok(())
@@ -787,11 +871,7 @@ fn validate_settings(settings: &Settings) -> Result<(), AdminError> {
 /// 从当前快照读回设置。
 async fn read_settings(deps: &AdminDeps) -> Result<Settings, AdminError> {
     let snapshot = deps.snapshot.read().await;
-    Ok(Settings {
-        full_body: snapshot.full_body,
-        max_request_bytes: snapshot.max_request_bytes,
-        catalog_sync_interval_days: snapshot.catalog_sync_interval_days,
-    })
+    Ok(snapshot.to_settings())
 }
 
 /// 目录写入契约：整表替换缓存行；同步时刻由服务端填写。
@@ -980,18 +1060,20 @@ struct LogEntry {
     cache_read_price_usd_micros: i64,
     cache_write_price_usd_micros: i64,
     cost_usd_micros: i64,
+    /// 费用是否已写入 `token_balance`。
+    settled: bool,
     request_body: Option<String>,
     response_body: Option<String>,
 }
 
 impl LogEntry {
-    /// 从存储行构造 wire 条目；完整 body 字节以 base64 编码。
+    /// 从存储行构造 wire 条目；完整 body 字节以 base64 编码；令牌 key 按 UI 同款规则脱敏。
     fn from_store_log(log: store::RequestLog) -> Self {
         Self {
             id: log.id,
             created_at: log.created_at,
             token_name: log.token_name,
-            token_key: log.token_key,
+            token_key: mask_token_key(&log.token_key),
             inbound_protocol: log.inbound_protocol,
             model: log.model,
             outbound_model: log.outbound_model,
@@ -1007,6 +1089,7 @@ impl LogEntry {
             cache_read_price_usd_micros: log.price.cache_read_micros,
             cache_write_price_usd_micros: log.price.cache_write_micros,
             cost_usd_micros: log.cost_usd_micros,
+            settled: log.settled,
             request_body: log.request_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
             response_body: log.response_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
         }
@@ -1041,10 +1124,7 @@ async fn query_logs(
     filter.from_created_at = params.from_created_at;
     filter.to_created_at = params.to_created_at;
 
-    let rows = store::query_request_logs(&deps.pool, &filter)
-        .await
-        .map_err(AdminError::Store)?;
-    let total = store::count_request_logs(&deps.pool, &filter)
+    let (rows, total) = store::query_request_log_page(&deps.pool, &filter)
         .await
         .map_err(AdminError::Store)?;
     let items = rows.into_iter().map(LogEntry::from_store_log).collect();
@@ -1251,6 +1331,7 @@ async fn test_channel(
     let id = parse_channel_id(raw_id)?;
     let record = read_channel_record(&deps, id).await?;
     let channel = record.channel;
+    reject_non_http_url(&channel.base_url)?;
     let model = resolve_probe_model(&channel, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("模型 {requested} 不在渠道 {id} 的清单中"))
     })?;
@@ -1394,6 +1475,7 @@ async fn list_upstream_models(
     if draft.base_url.trim().is_empty() {
         return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
     }
+    reject_non_http_url(&draft.base_url)?;
     if draft.api_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
     }
@@ -1646,6 +1728,49 @@ fn normalize_model_group(group: &mut ModelGroup) -> Result<(), AdminError> {
     Ok(())
 }
 
+/// 统一成员读视图：写契约仍是 `UnifiedMember`（不含 `available`）。
+#[derive(Debug, Serialize)]
+struct UnifiedMemberView {
+    channel_id: i64,
+    model: String,
+    available: bool,
+}
+
+/// 统一模型读视图。
+#[derive(Debug, Serialize)]
+struct UnifiedModelView {
+    id: String,
+    models: Vec<UnifiedMemberView>,
+    hide: bool,
+}
+
+fn unified_model_view(
+    model: &UnifiedModel,
+    snapshot: &crate::runtime::RuntimeSnapshot,
+) -> UnifiedModelView {
+    UnifiedModelView {
+        id: model.id.clone(),
+        models: model
+            .models
+            .iter()
+            .map(|member| UnifiedMemberView {
+                channel_id: member.channel_id,
+                model: member.model.clone(),
+                available: member_is_available(snapshot, member),
+            })
+            .collect(),
+        hide: model.hide,
+    }
+}
+
+fn member_is_available(snapshot: &crate::runtime::RuntimeSnapshot, member: &UnifiedMember) -> bool {
+    snapshot.channels.iter().any(|record| {
+        record.id == member.channel_id
+            && record.channel.enabled
+            && channel_lists_callable(&record.channel, &member.model)
+    })
+}
+
 /// 规整统一模型：ID 去空白；成员须非空、钉在已有渠道的已登记名上、保序去重。
 fn normalize_unified_model(
     model: &mut UnifiedModel,
@@ -1723,6 +1848,7 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     if channel.base_url.trim().is_empty() {
         return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
     }
+    reject_non_http_url(&channel.base_url)?;
     if channel.api_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
     }
@@ -1730,6 +1856,28 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody("weight 不能小于 1".to_string()));
     }
     Ok(())
+}
+
+/// 探测与渠道草稿仅允许 http/https，避免 `file://` 等 scheme 打到本机文件。
+fn reject_non_http_url(raw: &str) -> Result<(), AdminError> {
+    let parsed = reqwest::Url::parse(raw.trim())
+        .map_err(|_| AdminError::InvalidBody("base_url 不是合法绝对 URL".to_string()))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        other => Err(AdminError::InvalidBody(format!(
+            "探测 URL 仅支持 http/https，收到 {other}"
+        ))),
+    }
+}
+
+/// 与 Web UI `maskTokenKey` 同款：长度大于 16 时保留前后 8 位，中间固定六个 `*`。
+fn mask_token_key(key: &str) -> String {
+    const EDGE: usize = 8;
+    if key.len() <= EDGE * 2 {
+        key.to_string()
+    } else {
+        format!("{}******{}", &key[..EDGE], &key[key.len() - EDGE..])
+    }
 }
 
 /// 同一渠道上非恒等别名的 key 与 value 都在 `models` 里则拒绝：该名既是独立主模型，又被改写成另一个已登记主模型。

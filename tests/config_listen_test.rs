@@ -40,7 +40,12 @@ async fn config_driven_listen_and_fallback() {
         .await
         .expect("应能监听配置端口");
     tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("网关服务应运行");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("网关服务应运行");
     });
 
     // 配置的端口上，未实现路径返回确定 404。

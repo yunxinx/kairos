@@ -260,11 +260,11 @@ fn append_data_lines(out: &mut Vec<u8>, data: &str) {
     }
 }
 
-/// 从 SSE 缓冲中取出一帧：事件名、数据载荷与剩余缓冲。
+/// 从 SSE 缓冲中取出一帧：事件名与数据载荷；已消费字节从 `buffer` 头部 drain。
 ///
 /// SSE 帧以 `\n\n` 或 `\r\n\r\n` 分隔。keep-alive、空数据和 `[DONE]`
 /// 哨兵会被消费，但返回空载荷。全程字节操作，避免跨块 UTF-8 被截坏。
-pub(super) fn take_frame(buffer: &[u8]) -> Option<(Option<String>, Vec<u8>, Vec<u8>)> {
+pub(super) fn take_frame(buffer: &mut Vec<u8>) -> Option<(Option<String>, Vec<u8>)> {
     let crlf = buffer
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -278,8 +278,8 @@ pub(super) fn take_frame(buffer: &[u8]) -> Option<(Option<String>, Vec<u8>, Vec<
         (Some(frame), None) | (None, Some(frame)) => frame,
         (None, None) => return None,
     };
-    let frame_text = &buffer[..end];
-    let rest = buffer[end + separator_len..].to_vec();
+    let frame_text = buffer[..end].to_vec();
+    buffer.drain(..end + separator_len);
 
     let mut event_name = None;
     let mut data_lines = Vec::new();
@@ -294,7 +294,7 @@ pub(super) fn take_frame(buffer: &[u8]) -> Option<(Option<String>, Vec<u8>, Vec<
             }
         }
     }
-    Some((event_name, data_lines.join(&b'\n'), rest))
+    Some((event_name, data_lines.join(&b'\n')))
 }
 
 #[cfg(test)]
@@ -350,26 +350,29 @@ mod tests {
 
     #[test]
     fn parses_event_and_data_with_crlf() {
-        let input = b"event: message\r\ndata: {\"ok\":true}\r\n\r\nrest";
-        let (event, data, rest) = take_frame(input).expect("应解析完整 SSE 帧");
+        let mut input = b"event: message\r\ndata: {\"ok\":true}\r\n\r\nrest".to_vec();
+        let (event, data) = take_frame(&mut input).expect("应解析完整 SSE 帧");
         assert_eq!(event.as_deref(), Some("message"));
         assert_eq!(data, br#"{"ok":true}"#);
-        assert_eq!(rest, b"rest");
+        assert_eq!(input, b"rest");
     }
 
     #[test]
     fn joins_multiple_data_lines_and_consumes_done() {
-        let input = b"data: first\ndata: second\n\n";
-        let (_, data, rest) = take_frame(input).expect("应解析多行 data");
+        let mut input = b"data: first\ndata: second\n\n".to_vec();
+        let (_, data) = take_frame(&mut input).expect("应解析多行 data");
         assert_eq!(data, b"first\nsecond");
-        assert!(rest.is_empty());
+        assert!(input.is_empty());
 
-        let (_, done, _) = take_frame(b"data: [DONE]\n\n").expect("应消费 DONE 帧");
-        assert!(done.is_empty());
+        let mut done = b"data: [DONE]\n\n".to_vec();
+        let (_, payload) = take_frame(&mut done).expect("应消费 DONE 帧");
+        assert!(payload.is_empty());
     }
 
     #[test]
     fn incomplete_frame_is_left_buffered() {
-        assert!(take_frame(b"event: message\ndata: partial").is_none());
+        let mut input = b"event: message\ndata: partial".to_vec();
+        assert!(take_frame(&mut input).is_none());
+        assert_eq!(input, b"event: message\ndata: partial");
     }
 }

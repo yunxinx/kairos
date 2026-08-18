@@ -453,3 +453,41 @@ async fn multimodal_inbound_passthrough_streaming_bills() {
     assert_eq!(input, 10);
     assert_eq!(output, 2);
 }
+
+/// 同一 IP 连续认证失败达到上限后返回 429。
+#[tokio::test]
+async fn auth_failures_are_throttled_per_ip() {
+    let gw = TestGateway::start().await;
+    let client = reqwest::Client::new();
+    let body = json!({
+        "model": TEST_MODEL,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    for attempt in 0..30 {
+        let resp = client
+            .post(format!("{}/v1/chat/completions", gw.base_url()))
+            .bearer_auth("sk-wrong")
+            .json(&body)
+            .send()
+            .await
+            .expect("应能请求网关");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "第 {} 次认证失败应为 401",
+            attempt + 1
+        );
+    }
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth("sk-wrong")
+        .json(&body)
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "超过窗口失败次数应 429"
+    );
+}

@@ -281,14 +281,68 @@ pub const SETTING_FULL_BODY: &str = "full_body";
 pub const SETTING_MAX_REQUEST_BYTES: &str = "max_request_bytes";
 /// 运行时开关键：价格目录自动同步间隔（天）；`0` 表示只手动同步。
 pub const SETTING_CATALOG_SYNC_INTERVAL_DAYS: &str = "catalog_sync_interval_days";
+/// 运行时开关键：同一 IP 窗口内允许的认证失败次数；`0` 表示关闭限流。
+pub const SETTING_AUTH_THROTTLE_MAX_FAILURES: &str = "auth_throttle_max_failures";
+/// 运行时开关键：认证失败计数窗口（秒）。
+pub const SETTING_AUTH_THROTTLE_WINDOW_SECS: &str = "auth_throttle_window_secs";
+/// 运行时开关键：SSE 重装缓冲上限（字节）。
+pub const SETTING_SSE_REASSEMBLY_MAX_BYTES: &str = "sse_reassembly_max_bytes";
+/// 运行时开关键：同渠道重试基础间隔（毫秒）。
+pub const SETTING_RETRY_BACKOFF_MS: &str = "retry_backoff_ms";
+/// 运行时开关键：同渠道指数退避封顶（毫秒）。
+pub const SETTING_RETRY_BACKOFF_CAP_MS: &str = "retry_backoff_cap_ms";
+/// 运行时开关键：上游 `Retry-After` 最大等待（秒）。
+pub const SETTING_RETRY_AFTER_CAP_SECS: &str = "retry_after_cap_secs";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
 pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
-/// 运行时设置的聚合契约：日志开关与价格目录同步间隔。
+/// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片，与参考网关 bifrost
+/// 的 `max_request_body_size_mb: 100` 对齐。
+pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 100 * 1024 * 1024;
+/// 认证失败限流次数缺省值。
+pub const DEFAULT_AUTH_THROTTLE_MAX_FAILURES: u64 = 30;
+/// 认证失败计数窗口缺省值（秒）。
+pub const DEFAULT_AUTH_THROTTLE_WINDOW_SECS: u64 = 60;
+/// SSE 重装缓冲上限缺省值（字节）。
+pub const DEFAULT_SSE_REASSEMBLY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// 同渠道重试基础间隔缺省值（毫秒）。
+pub const DEFAULT_RETRY_BACKOFF_MS: u64 = 200;
+/// 同渠道指数退避封顶缺省值（毫秒）。
+pub const DEFAULT_RETRY_BACKOFF_CAP_MS: u64 = 5_000;
+/// 上游 `Retry-After` 最大等待缺省值（秒）。
+pub const DEFAULT_RETRY_AFTER_CAP_SECS: u64 = 60;
+
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_auth_throttle_max_failures() -> u64 {
+    DEFAULT_AUTH_THROTTLE_MAX_FAILURES
+}
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_auth_throttle_window_secs() -> u64 {
+    DEFAULT_AUTH_THROTTLE_WINDOW_SECS
+}
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_sse_reassembly_max_bytes() -> u64 {
+    DEFAULT_SSE_REASSEMBLY_MAX_BYTES
+}
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_retry_backoff_ms() -> u64 {
+    DEFAULT_RETRY_BACKOFF_MS
+}
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_retry_backoff_cap_ms() -> u64 {
+    DEFAULT_RETRY_BACKOFF_CAP_MS
+}
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_retry_after_cap_secs() -> u64 {
+    DEFAULT_RETRY_AFTER_CAP_SECS
+}
+
+/// 运行时设置的聚合契约：日志、网关保护与价格目录同步间隔。
 ///
 /// 落库时拆成键值记录（`settings` 表），管理 API 以其 JSON 形态作为
 /// wire 契约（成对读写），故派生 `Serialize`/`Deserialize` 并拒绝未知字段。
 /// `catalog_synced_at` 不在此契约：它是目录元数据，随 `GET /catalog` 或 `GET /catalog/meta` 返回。
+/// 新增字段在 PUT 省略时取与空库相同的缺省值，避免旧客户端把保护阈值写成 0。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -299,6 +353,40 @@ pub struct Settings {
     /// 价格目录自动同步间隔（天）；`0` 表示只手动同步。
     #[serde(default)]
     pub catalog_sync_interval_days: u64,
+    /// 同一 IP 窗口内允许的认证失败次数；`0` 表示关闭限流。
+    #[serde(default = "default_auth_throttle_max_failures")]
+    pub auth_throttle_max_failures: u64,
+    /// 认证失败计数窗口（秒）。
+    #[serde(default = "default_auth_throttle_window_secs")]
+    pub auth_throttle_window_secs: u64,
+    /// SSE 重装缓冲上限（字节）。
+    #[serde(default = "default_sse_reassembly_max_bytes")]
+    pub sse_reassembly_max_bytes: u64,
+    /// 同渠道重试基础间隔（毫秒）。
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    /// 同渠道指数退避封顶（毫秒）。
+    #[serde(default = "default_retry_backoff_cap_ms")]
+    pub retry_backoff_cap_ms: u64,
+    /// 上游 `Retry-After` 最大等待（秒）。
+    #[serde(default = "default_retry_after_cap_secs")]
+    pub retry_after_cap_secs: u64,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            full_body: false,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            catalog_sync_interval_days: 0,
+            auth_throttle_max_failures: DEFAULT_AUTH_THROTTLE_MAX_FAILURES,
+            auth_throttle_window_secs: DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
+            sse_reassembly_max_bytes: DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+            retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
+            retry_backoff_cap_ms: DEFAULT_RETRY_BACKOFF_CAP_MS,
+            retry_after_cap_secs: DEFAULT_RETRY_AFTER_CAP_SECS,
+        }
+    }
 }
 
 /// `Protocol` 落库用的 wire 字符串。
@@ -871,9 +959,9 @@ pub async fn delete_setting(conn: &mut SqliteConnection, key: &str) -> Result<()
     Ok(())
 }
 
-/// 成对写入运行时设置：日志开关、入站上限与目录同步间隔一同落库（幂等）。
+/// 成对写入运行时设置：契约内全部键一同落库（幂等）。
 ///
-/// 供管理 API 的 `/settings` 写操作使用：三项在同一个事务内写入，保证聚合
+/// 供管理 API 的 `/settings` 写操作使用：各键在同一个事务内写入，保证聚合
 /// 契约的原子性。读回经 `list_settings` 由调用方聚合。`catalog_synced_at` 不在此写入。
 pub async fn upsert_settings(
     conn: &mut SqliteConnection,
@@ -890,6 +978,42 @@ pub async fn upsert_settings(
         conn,
         SETTING_CATALOG_SYNC_INTERVAL_DAYS,
         &Value::from(settings.catalog_sync_interval_days),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_AUTH_THROTTLE_MAX_FAILURES,
+        &Value::from(settings.auth_throttle_max_failures),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_AUTH_THROTTLE_WINDOW_SECS,
+        &Value::from(settings.auth_throttle_window_secs),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_SSE_REASSEMBLY_MAX_BYTES,
+        &Value::from(settings.sse_reassembly_max_bytes),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_RETRY_BACKOFF_MS,
+        &Value::from(settings.retry_backoff_ms),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_RETRY_BACKOFF_CAP_MS,
+        &Value::from(settings.retry_backoff_cap_ms),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_RETRY_AFTER_CAP_SECS,
+        &Value::from(settings.retry_after_cap_secs),
     )
     .await?;
     Ok(())
@@ -1577,6 +1701,7 @@ mod tests {
             full_body: true,
             max_request_bytes: 8_000_000,
             catalog_sync_interval_days: 0,
+            ..Settings::default()
         };
         upsert_settings(&mut conn, &settings)
             .await
@@ -1593,6 +1718,8 @@ mod tests {
                 full_body: true,
                 max_request_bytes: 1_000,
                 catalog_sync_interval_days: 7,
+                auth_throttle_max_failures: 10,
+                ..Settings::default()
             },
         )
         .await
@@ -1601,6 +1728,7 @@ mod tests {
         assert_eq!(map[SETTING_MAX_REQUEST_BYTES], Value::from(1_000u64));
         assert_eq!(map[SETTING_FULL_BODY], Value::Bool(true));
         assert_eq!(map[SETTING_CATALOG_SYNC_INTERVAL_DAYS], Value::from(7u64));
+        assert_eq!(map[SETTING_AUTH_THROTTLE_MAX_FAILURES], Value::from(10u64));
     }
 
     /// 事务中途失败不污染库：事务内有效写入随回滚一并撤销。

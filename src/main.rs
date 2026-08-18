@@ -38,9 +38,12 @@ async fn main() -> anyhow::Result<()> {
             println!("kairos 管理面监听 {admin_addr}（未嵌入 Web UI，仅提供 API）");
         }
         tokio::spawn(async move {
-            axum::serve(admin_listener, admin_app)
-                .await
-                .expect("管理面服务应运行");
+            axum::serve(
+                admin_listener,
+                admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("管理面服务应运行");
         });
         let catalog_pool = pool.clone();
         let catalog_client = reqwest::Client::builder()
@@ -56,7 +59,11 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     println!("kairos 网关监听 {listen}");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

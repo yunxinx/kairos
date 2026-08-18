@@ -558,3 +558,49 @@ async fn stale_member_is_skipped_then_next_serves() {
     assert_eq!(ups[0].received()[0]["model"], "cheap");
     assert_eq!(ups[1].received().len(), 0);
 }
+
+/// 删除钉住的渠道后，GET 统一模型把该成员标为 `available: false`。
+#[tokio::test]
+async fn deleted_channel_marks_unified_member_unavailable() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = first_channel_id(&gw).await;
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/unified-models",
+        json!({
+            "id": "bundle",
+            "models": [member_json(channel_id, TEST_MODEL)],
+            "hide": false
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let listed: Value = admin_get(&gw, "/unified-models")
+        .await
+        .json()
+        .await
+        .expect("列表应可解析");
+    assert_eq!(listed[0]["models"][0]["available"], true);
+
+    let deleted = admin_send(
+        &gw,
+        reqwest::Method::DELETE,
+        &format!("/channels/{channel_id}"),
+    )
+    .await;
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+
+    let listed: Value = admin_get(&gw, "/unified-models")
+        .await
+        .json()
+        .await
+        .expect("列表应可解析");
+    assert_eq!(listed[0]["id"], "bundle");
+    assert_eq!(listed[0]["models"][0]["channel_id"], channel_id);
+    assert_eq!(
+        listed[0]["models"][0]["available"], false,
+        "渠道删除后成员应标为不可用"
+    );
+}

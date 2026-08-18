@@ -10,6 +10,7 @@ mod logging;
 mod protocol;
 mod routing;
 mod sse;
+mod throttle;
 mod webui;
 
 pub use admin::router as admin_router;

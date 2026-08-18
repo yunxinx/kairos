@@ -88,6 +88,15 @@ async fn non_stream_passthrough_forwards_body_and_response() {
 
     let resp = send_completion(&gw.base_url()).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("application/json"),
+        "非流式直通应带回 Content-Type，实际 {content_type:?}"
+    );
 
     // 下游收到的响应与 mock 上游返回的字节一致（且含 usage）。
     let body: Value = resp.json().await.expect("响应应可解析");
@@ -585,4 +594,46 @@ async fn passthrough_failover_happens_before_first_byte() {
         upstreams[1].received()[0].get("stream_options").is_none(),
         "非流式直通不应注入 stream_options"
     );
+}
+
+/// 响应头已返回后，上游块间隔超过渠道 `timeout_ms` 则按空闲超时结束流并结算。
+#[tokio::test]
+async fn stream_passthrough_idle_timeout_ends_stream() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].timeout_ms = 80;
+        seed
+    })
+    .await;
+    let first = concat!(
+        "data: {\"id\":\"chatcmpl-idle\",\"object\":\"chat.completion.chunk\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n"
+    );
+    gw.upstream.set_behavior(UpstreamBehavior::DelayedRawSse {
+        chunks: vec![first.as_bytes().to_vec(), b"data: never\n\n".to_vec()],
+        delay_ms: 400,
+    });
+
+    let started = std::time::Instant::now();
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let _frames = collect_sse_frames(resp).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "空闲超时应在第二块到达前结束流，实际 {:?}",
+        started.elapsed()
+    );
+}
+
+/// 未形成完整 SSE 帧的重装缓冲超过 8MB 时断流，避免无分隔符的上游撑爆内存。
+#[tokio::test]
+async fn stream_passthrough_caps_reassembly_buffer() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![vec![
+        b'x';
+        8 * 1024 * 1024 + 1
+    ]]));
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let _body = resp.bytes().await.expect("超限后流应结束而非挂起");
 }

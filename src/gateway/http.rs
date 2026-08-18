@@ -8,16 +8,20 @@
 //!
 //! v2 起运行时资源（渠道/令牌/价格/模型组/统一模型/开关）来自 [`crate::runtime::RuntimeSnapshot`]：
 //! 请求在准入时刻抓取一个快照引用，整个请求生命周期只读该引用，不受后续原子
-//! 替换影响。入站请求体上限与 full_body 开关同样来自快照设置。统一模型按成员
+//! 替换影响。入站请求体上限、full_body、认证限流、SSE 重装上限与同渠道退避同样来自快照设置。统一模型按成员
 //! 顺序一次只出站一条，该条再走渠道路由；计价按实际打到的成员。三种入站协议
 //! 的标准模型列表（`GET /v1/models`）按令牌分组与统一模型隐藏过滤。
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -41,12 +45,13 @@ use crate::{
     store::resources::{Channel, ChannelRecord, Token},
 };
 
-use super::failover::{Outbound, run_failover};
+use super::failover::{Outbound, RetryBackoff, run_failover};
 use super::logging::{Billing, log_request, unix_millis};
 use super::sse::{
     OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
     take_frame,
 };
+use super::throttle::AuthThrottle;
 
 use super::{protocol, routing};
 
@@ -56,6 +61,7 @@ pub struct Deps {
     pub(super) pool: SqlitePool,
     pub(super) client: reqwest::Client,
     pub(super) snapshot: SnapshotHandle,
+    pub(super) auth_throttle: AuthThrottle,
 }
 
 /// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
@@ -71,6 +77,7 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         pool,
         client,
         snapshot,
+        auth_throttle: AuthThrottle::new(),
     };
 
     // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
@@ -93,18 +100,30 @@ async fn not_found() -> (StatusCode, &'static str) {
 }
 
 /// Chat Completions 入站端点。
-async fn chat_completions(State(deps): State<Deps>, request: Request) -> Response {
-    handle_request(deps, Protocol::OpenAiChat, request).await
+async fn chat_completions(
+    State(deps): State<Deps>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    handle_request(deps, Protocol::OpenAiChat, addr.ip(), request).await
 }
 
 /// Anthropic Messages 入站端点。
-async fn messages(State(deps): State<Deps>, request: Request) -> Response {
-    handle_request(deps, Protocol::AnthropicMessages, request).await
+async fn messages(
+    State(deps): State<Deps>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    handle_request(deps, Protocol::AnthropicMessages, addr.ip(), request).await
 }
 
 /// OpenAI Responses 入站端点。
-async fn responses(State(deps): State<Deps>, request: Request) -> Response {
-    handle_request(deps, Protocol::OpenAiResponses, request).await
+async fn responses(
+    State(deps): State<Deps>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request,
+) -> Response {
+    handle_request(deps, Protocol::OpenAiResponses, addr.ip(), request).await
 }
 
 /// 下游标准模型列表：`GET /v1/models`。
@@ -112,12 +131,40 @@ async fn responses(State(deps): State<Deps>, request: Request) -> Response {
 /// OpenAI Chat Completions 与 Responses 共用官方 Models API（无 `anthropic-version`
 /// 时按 OpenAI list 编码）。带 `anthropic-version` 时按 Anthropic list 编码。
 /// 认证与现有入站协议一致；成功体至少含各可见模型的 `id`。
-async fn list_models(State(deps): State<Deps>, headers: HeaderMap) -> Response {
+async fn list_models(
+    State(deps): State<Deps>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     let snapshot = deps.snapshot.read().await.clone();
     let inbound_protocol = list_models_protocol(&headers);
+    let started = unix_millis();
+    if deps.auth_throttle.is_blocked(
+        addr.ip(),
+        snapshot.auth_throttle_max_failures,
+        snapshot.auth_throttle_window(),
+    ) {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "认证尝试过于频繁，请稍后再试",
+            &deps,
+            snapshot.full_body,
+            None,
+            None,
+            started,
+            inbound_protocol,
+            None,
+        )
+        .await;
+    }
     let token = match authenticate(&snapshot, &headers) {
         Ok(token) => token,
         Err(err) => {
+            deps.auth_throttle.record_failure(
+                addr.ip(),
+                snapshot.auth_throttle_max_failures,
+                snapshot.auth_throttle_window(),
+            );
             return error_response(
                 StatusCode::UNAUTHORIZED,
                 &err.to_string(),
@@ -125,7 +172,7 @@ async fn list_models(State(deps): State<Deps>, headers: HeaderMap) -> Response {
                 snapshot.full_body,
                 None,
                 None,
-                unix_millis(),
+                started,
                 inbound_protocol,
                 None,
             )
@@ -217,7 +264,12 @@ async fn payload_too_large(
 /// `inbound_protocol` 决定入站解码/响应编码与错误格式；出站侧按渠道 `protocol`
 /// 分派。同协议且未命中别名时走直通快路径（响应字节流直通、逐帧嗅探 usage
 /// 计费），否则经 IR 完整路径。
-async fn handle_request(deps: Deps, inbound_protocol: Protocol, request: Request) -> Response {
+async fn handle_request(
+    deps: Deps,
+    inbound_protocol: Protocol,
+    peer: IpAddr,
+    request: Request,
+) -> Response {
     let started = unix_millis();
     // 准入时刻抓取快照引用：在途请求持有该引用直到结束，不受后续原子替换影响。
     let snapshot = deps.snapshot.read().await.clone();
@@ -274,9 +326,32 @@ async fn handle_request(deps: Deps, inbound_protocol: Protocol, request: Request
     let request_body_for_log = full_body.then(|| body.to_vec());
 
     // 1. 认证：Bearer 或 x-api-key 两种头都接受。认证先行，未认证不出站。
+    if deps.auth_throttle.is_blocked(
+        peer,
+        snapshot.auth_throttle_max_failures,
+        snapshot.auth_throttle_window(),
+    ) {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "认证尝试过于频繁，请稍后再试",
+            &deps,
+            full_body,
+            None,
+            None,
+            started,
+            inbound_protocol,
+            request_body_for_log,
+        )
+        .await;
+    }
     let token = match authenticate(&snapshot, &headers) {
         Ok(token) => token,
         Err(err) => {
+            deps.auth_throttle.record_failure(
+                peer,
+                snapshot.auth_throttle_max_failures,
+                snapshot.auth_throttle_window(),
+            );
             let message = err.to_string();
             return error_response(
                 StatusCode::UNAUTHORIZED,
@@ -457,6 +532,8 @@ async fn handle_request(deps: Deps, inbound_protocol: Protocol, request: Request
         )
         .await;
     }
+    // 准入连接只服务余额检查与 last_used；出站/结算另取连接，避免整段请求占着池槽。
+    drop(conn);
 
     // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。失败再下一条，成功即停。
     // 同协议且该跳所有候选都不改写出站名时走直通快路径，否则经 IR 完整路径。
@@ -731,6 +808,7 @@ async fn outbound_with_failover(
             })
         },
         inbound_protocol,
+        retry_backoff(snapshot),
     )
     .await
 }
@@ -798,6 +876,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             })
         },
         ctx.inbound_protocol,
+        retry_backoff(ctx.snapshot),
     )
     .await
 }
@@ -833,6 +912,7 @@ async fn passthrough_stream_completion(
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: None,
+                retry_after: None,
                 message: "直通流式上游不可达".to_string(),
             };
         }
@@ -840,6 +920,7 @@ async fn passthrough_stream_completion(
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: None,
+                retry_after: None,
                 message: "直通流式上游响应超时".to_string(),
             };
         }
@@ -847,12 +928,14 @@ async fn passthrough_stream_completion(
 
     let status_code = resp.status().as_u16();
     if !resp.status().is_success() {
+        let retry_after = parse_retry_after(resp.headers());
         let upstream_body = resp.text().await.unwrap_or_default();
         let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
         if is_retryable_status(status_code) {
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: Some(status_code),
+                retry_after,
                 message: "上游返回可重试错误".to_string(),
             };
         }
@@ -926,6 +1009,7 @@ async fn passthrough_non_stream_completion(
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: None,
+                retry_after: None,
                 message: "直通非流式上游不可达".to_string(),
             };
         }
@@ -933,6 +1017,7 @@ async fn passthrough_non_stream_completion(
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: None,
+                retry_after: None,
                 message: "直通非流式上游响应超时".to_string(),
             };
         }
@@ -940,8 +1025,32 @@ async fn passthrough_non_stream_completion(
 
     let status_code = resp.status().as_u16();
     let is_success = resp.status().is_success();
-    // 字节级透传：直接取上游响应字节，不经 String 转码。
-    let upstream_body = resp.bytes().await.unwrap_or_default();
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    let retry_after = parse_retry_after(resp.headers());
+    let idle = channel_idle(channel.timeout_ms);
+    let upstream_body = match tokio::time::timeout(idle, resp.bytes()).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                retry_after: None,
+                message: "直通非流式上游读体失败".to_string(),
+            };
+        }
+        Err(_) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                retry_after: None,
+                message: "直通非流式上游读体超时".to_string(),
+            };
+        }
+    };
     let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
 
     if is_success {
@@ -949,19 +1058,7 @@ async fn passthrough_non_stream_completion(
         let usage = protocol::sniff_usage(&parsed, channel.protocol).unwrap_or_default();
         let price = billed_price(ctx.snapshot, record, ctx.routed_model);
         let cost = billing::cost_micros(&usage, &price);
-        // 成功且 usage 非零才结算；失败或零输出不扣费。
-        if cost > 0 {
-            match ctx.deps.pool.acquire().await {
-                Ok(mut settle_conn) => {
-                    if let Err(err) =
-                        store::settle_charge(&mut settle_conn, &ctx.token.token_key, cost).await
-                    {
-                        eprintln!("直通非流式结算失败: {err}");
-                    }
-                }
-                Err(err) => eprintln!("直通非流式结算连接失败: {err}"),
-            }
-        }
+        let settled = try_settle(&ctx.deps.pool, &ctx.token.token_key, cost).await;
         log_request(
             ctx.deps,
             ctx.token,
@@ -974,17 +1071,23 @@ async fn passthrough_non_stream_completion(
                 usage,
                 price,
                 cost_usd_micros: cost,
+                settled,
                 request_body: ctx.request_body.clone(),
                 response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
             },
             ctx.inbound_protocol,
         )
         .await;
-        Outbound::Success(Response::new(Body::from(upstream_body)))
+        let mut response = Response::new(Body::from(upstream_body));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type);
+        Outbound::Success(response)
     } else if is_retryable_status(status_code) {
         Outbound::Retryable {
             channel: channel.name.clone(),
             status: Some(status_code),
+            retry_after,
             message: "上游返回可重试错误".to_string(),
         }
     } else {
@@ -1068,113 +1171,102 @@ async fn pipe_passthrough_stream<S>(
     let mut sse_buffer: Vec<u8> = Vec::new();
     let mut downstream_open = true;
     let mut done_filter = OpenAiDoneFilter::default();
+    let idle = channel_idle(ctx.channel.timeout_ms);
     let mut byte_stream = Box::pin(byte_stream);
 
     loop {
-        match byte_stream.next().await {
-            Some(Ok(chunk)) => {
-                sse_buffer.extend_from_slice(&chunk);
-                // 传输快路径只处理原始块；旁路解析的结果不影响这个块是否转发。
-                if downstream_open {
-                    let chunks = if ctx.protocol == Protocol::OpenAiChat {
-                        done_filter.push(chunk)
-                    } else {
-                        vec![chunk]
-                    };
-                    for forwarded in chunks {
-                        if !send_passthrough_chunk(
-                            &tx,
-                            forwarded,
-                            ctx.snapshot.full_body,
-                            &mut ctx.response_body,
-                        )
-                        .await
-                        {
-                            // 下游断开：停止发送，但继续消费上游直至结算。
-                            downstream_open = false;
-                            break;
-                        }
-                    }
-                }
-
-                while let Some((_event_name, frame, rest)) = take_frame(&sse_buffer) {
-                    sse_buffer = rest;
-                    if frame.is_empty() {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_slice::<Value>(&frame)
-                        && let Some(sniffed) = protocol::sniff_usage(&value, ctx.protocol)
-                    {
-                        usage.union_max(sniffed);
-                    }
-                }
-            }
-            Some(Err(_)) | None => {
-                if downstream_open && ctx.protocol == Protocol::OpenAiChat {
-                    for trailing in done_filter.finish() {
-                        if !send_passthrough_chunk(
-                            &tx,
-                            trailing,
-                            ctx.snapshot.full_body,
-                            &mut ctx.response_body,
-                        )
-                        .await
-                        {
-                            downstream_open = false;
-                            break;
-                        }
-                    }
-                }
-                // OpenAI 协议约定以 `data: [DONE]` 终止；哨兵也是入站响应的一部分，
-                // full_body 开启时在实际下发前记入（结算先于哨兵，日志此时能带全）。
-                if ctx.snapshot.full_body && downstream_open && ctx.protocol == Protocol::OpenAiChat
-                {
-                    ctx.response_body
-                        .extend_from_slice(&data_frame_to_wire("[DONE]"));
-                }
-                // 流结束：按嗅探累积的 usage 结算并落日志。
-                let cost = billing::cost_micros(&usage, &ctx.price);
-                if cost > 0 {
-                    match ctx.deps.pool.acquire().await {
-                        Ok(mut settle_conn) => {
-                            if let Err(err) =
-                                store::settle_charge(&mut settle_conn, &ctx.token.token_key, cost)
-                                    .await
-                            {
-                                eprintln!("直通流式结算失败: {err}");
-                            }
-                        }
-                        Err(err) => eprintln!("直通流式结算连接失败: {err}"),
-                    }
-                }
-                log_request(
-                    &ctx.deps,
-                    &ctx.token,
-                    &ctx.request.model,
-                    outbound_model_for_log(&ctx.channel, &ctx.routed_model),
-                    &ctx.channel.name,
-                    ctx.status_code,
-                    ctx.started,
-                    Billing {
-                        usage,
-                        price: ctx.price,
-                        cost_usd_micros: cost,
-                        request_body: ctx.request_body.clone(),
-                        response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
-                    },
-                    ctx.protocol,
+        let chunk = match tokio::time::timeout(idle, byte_stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        };
+        sse_buffer.extend_from_slice(&chunk);
+        // 传输快路径只处理原始块；旁路解析的结果不影响这个块是否转发。
+        if downstream_open {
+            let chunks = if ctx.protocol == Protocol::OpenAiChat {
+                done_filter.push(chunk)
+            } else {
+                vec![chunk]
+            };
+            for forwarded in chunks {
+                if !send_passthrough_chunk(
+                    &tx,
+                    forwarded,
+                    ctx.snapshot.full_body,
+                    &mut ctx.response_body,
                 )
-                .await;
-                // OpenAI 协议约定以 `data: [DONE]` 终止；Anthropic 以上游
-                // message_stop 收尾，无需哨兵。
-                if downstream_open && ctx.protocol == Protocol::OpenAiChat {
-                    let _ = tx
-                        .send(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
-                        .await;
+                .await
+                {
+                    // 下游断开：停止发送，但继续消费上游直至结算。
+                    downstream_open = false;
+                    break;
                 }
-                return;
             }
         }
+
+        while let Some((_event_name, frame)) = take_frame(&mut sse_buffer) {
+            if frame.is_empty() {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_slice::<Value>(&frame)
+                && let Some(sniffed) = protocol::sniff_usage(&value, ctx.protocol)
+            {
+                usage.union_max(sniffed);
+            }
+        }
+        if sse_buffer.len() > ctx.snapshot.sse_reassembly_max() {
+            break;
+        }
+    }
+
+    if downstream_open && ctx.protocol == Protocol::OpenAiChat {
+        for trailing in done_filter.finish() {
+            if !send_passthrough_chunk(
+                &tx,
+                trailing,
+                ctx.snapshot.full_body,
+                &mut ctx.response_body,
+            )
+            .await
+            {
+                downstream_open = false;
+                break;
+            }
+        }
+    }
+    // OpenAI 协议约定以 `data: [DONE]` 终止；哨兵也是入站响应的一部分，
+    // full_body 开启时在实际下发前记入（结算先于哨兵，日志此时能带全）。
+    if ctx.snapshot.full_body && downstream_open && ctx.protocol == Protocol::OpenAiChat {
+        ctx.response_body
+            .extend_from_slice(&data_frame_to_wire("[DONE]"));
+    }
+    // 流结束：按嗅探累积的 usage 结算并落日志。
+    let cost = billing::cost_micros(&usage, &ctx.price);
+    let settled = try_settle(&ctx.deps.pool, &ctx.token.token_key, cost).await;
+    log_request(
+        &ctx.deps,
+        &ctx.token,
+        &ctx.request.model,
+        outbound_model_for_log(&ctx.channel, &ctx.routed_model),
+        &ctx.channel.name,
+        ctx.status_code,
+        ctx.started,
+        Billing {
+            usage,
+            price: ctx.price,
+            cost_usd_micros: cost,
+            settled,
+            request_body: ctx.request_body.clone(),
+            response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
+        },
+        ctx.protocol,
+    )
+    .await;
+    // OpenAI 协议约定以 `data: [DONE]` 终止；Anthropic 以上游
+    // message_stop 收尾，无需哨兵。
+    if downstream_open && ctx.protocol == Protocol::OpenAiChat {
+        let _ = tx
+            .send(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
+            .await;
     }
 }
 
@@ -1239,6 +1331,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: None,
+                retry_after: None,
                 message: "上游不可达".to_string(),
             };
         }
@@ -1246,6 +1339,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
 
     let status = resp.status();
     let status_code = status.as_u16();
+    let retry_after = parse_retry_after(resp.headers());
     let upstream_body = resp.text().await.unwrap_or_default();
     let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
 
@@ -1261,19 +1355,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                 ir.warnings.extend(request_warnings);
                 let usage = &ir.usage;
                 let cost = billing::cost_micros(usage, &price);
-                // 成功且 usage 非零才结算；失败或零输出不扣费。
-                if cost > 0 {
-                    match deps.pool.acquire().await {
-                        Ok(mut settle_conn) => {
-                            if let Err(err) =
-                                store::settle_charge(&mut settle_conn, &token.token_key, cost).await
-                            {
-                                eprintln!("结算失败: {err}");
-                            }
-                        }
-                        Err(err) => eprintln!("结算连接失败: {err}"),
-                    }
-                }
+                let settled = try_settle(&deps.pool, &token.token_key, cost).await;
                 let inbound = protocol::encode_response(&ir, inbound_protocol);
                 // full_body 记录实际返回下游的入站响应字节（重编码结果）；
                 // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
@@ -1292,6 +1374,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                         usage: usage.clone(),
                         price,
                         cost_usd_micros: cost,
+                        settled,
                         request_body: ctx.request_body.clone(),
                         response_body: inbound_wire,
                     },
@@ -1314,6 +1397,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
         Outbound::Retryable {
             channel: channel.name.clone(),
             status: Some(status_code),
+            retry_after,
             message: "上游返回可重试错误".to_string(),
         }
     } else {
@@ -1377,6 +1461,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: None,
+                retry_after: None,
                 message: "流式上游不可达".to_string(),
             };
         }
@@ -1384,6 +1469,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: None,
+                retry_after: None,
                 message: "流式上游响应超时".to_string(),
             };
         }
@@ -1393,12 +1479,14 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
     let status_code = status.as_u16();
     // 上游非 2xx：SSE 流此时尚未开始，直接按错误处理。
     if !status.is_success() {
+        let retry_after = parse_retry_after(resp.headers());
         let upstream_body = resp.text().await.unwrap_or_default();
         let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
         if is_retryable_status(status_code) {
             return Outbound::Retryable {
                 channel: channel.name.clone(),
                 status: Some(status_code),
+                retry_after,
                 message: "上游返回可重试错误".to_string(),
             };
         }
@@ -1481,6 +1569,7 @@ async fn pipe_stream<S>(
     let mut sse_buffer: Vec<u8> = Vec::new();
     let mut saw_finish = false;
     let mut downstream_open = true;
+    let idle = channel_idle(ctx.channel.timeout_ms);
     let mut byte_stream = Box::pin(byte_stream);
 
     // 流首先下发 message_start（Anthropic 需要；OpenAI 无）与 stream-start 的
@@ -1507,8 +1596,7 @@ async fn pipe_stream<S>(
 
     loop {
         // 尝试从已缓冲字节提取完整 SSE 数据帧。
-        if let Some((_event_name, frame, rest)) = take_frame(&sse_buffer) {
-            sse_buffer = rest;
+        if let Some((_event_name, frame)) = take_frame(&mut sse_buffer) {
             // 空载荷帧（keep-alive 注释、[DONE] 哨兵）直接消费。
             if frame.is_empty() {
                 continue;
@@ -1535,42 +1623,46 @@ async fn pipe_stream<S>(
         }
 
         // 缓冲不足一帧：从上游读取更多字节。
-        match byte_stream.next().await {
-            Some(Ok(bytes)) => sse_buffer.extend_from_slice(&bytes),
-            Some(Err(_)) | None => {
-                // 流结束：若上游未发 finish 帧（异常中断），补发一个。
-                let response = accumulator.finish();
-                if !saw_finish && downstream_open {
-                    let finish_event = StreamEvent::Finish {
-                        finish_reason: response.finish_reason.clone(),
-                        usage: response.usage.clone(),
-                        provider_metadata: response.provider_metadata.clone(),
-                    };
-                    for frame in encoder.encode(&finish_event) {
-                        record_frame_wire(&mut ctx, &frame);
-                        if tx.send(event_from_frame(&frame)).await.is_err() {
-                            break;
-                        }
-                    }
+        match tokio::time::timeout(idle, byte_stream.next()).await {
+            Ok(Some(Ok(bytes))) => {
+                sse_buffer.extend_from_slice(&bytes);
+                if sse_buffer.len() > ctx.snapshot.sse_reassembly_max() {
+                    break;
                 }
-                // 终止哨兵也是入站响应的一部分，full_body 开启时先记入再结算，
-                // 保证日志带全实际下发的字节（结算仍先于哨兵下发）。
-                if downstream_open
-                    && ctx.snapshot.full_body
-                    && let Some(terminator) = terminator.as_ref()
-                {
-                    ctx.response_body
-                        .extend_from_slice(&data_frame_to_wire(terminator));
-                }
-                // 先结算再发终止哨兵：下游读到终止时计费必定已落库。
-                settle_and_log(&ctx, response).await;
-                // OpenAI 协议约定以 `data: [DONE]` 结束；Anthropic 以 message_stop 收尾。
-                if downstream_open && let Some(terminator) = terminator {
-                    let _ = tx.send(SseEvent::default().data(terminator)).await;
-                }
-                return;
+            }
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        }
+    }
+
+    // 流结束：若上游未发 finish 帧（异常中断），补发一个。
+    let response = accumulator.finish();
+    if !saw_finish && downstream_open {
+        let finish_event = StreamEvent::Finish {
+            finish_reason: response.finish_reason.clone(),
+            usage: response.usage.clone(),
+            provider_metadata: response.provider_metadata.clone(),
+        };
+        for frame in encoder.encode(&finish_event) {
+            record_frame_wire(&mut ctx, &frame);
+            if tx.send(event_from_frame(&frame)).await.is_err() {
+                break;
             }
         }
+    }
+    // 终止哨兵也是入站响应的一部分，full_body 开启时先记入再结算，
+    // 保证日志带全实际下发的字节（结算仍先于哨兵下发）。
+    if downstream_open
+        && ctx.snapshot.full_body
+        && let Some(terminator) = terminator.as_ref()
+    {
+        ctx.response_body
+            .extend_from_slice(&data_frame_to_wire(terminator));
+    }
+    // 先结算再发终止哨兵：下游读到终止时计费必定已落库。
+    settle_and_log(&ctx, response).await;
+    // OpenAI 协议约定以 `data: [DONE]` 结束；Anthropic 以 message_stop 收尾。
+    if downstream_open && let Some(terminator) = terminator {
+        let _ = tx.send(SseEvent::default().data(terminator)).await;
     }
 }
 
@@ -1585,18 +1677,7 @@ fn record_frame_wire(ctx: &mut StreamTask, frame: &SseFrame) {
 async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
     let usage = &response.usage;
     let cost = billing::cost_micros(usage, &ctx.price);
-    if cost > 0 {
-        match ctx.deps.pool.acquire().await {
-            Ok(mut settle_conn) => {
-                if let Err(err) =
-                    store::settle_charge(&mut settle_conn, &ctx.token.token_key, cost).await
-                {
-                    eprintln!("流式结算失败: {err}");
-                }
-            }
-            Err(err) => eprintln!("流式结算连接失败: {err}"),
-        }
-    }
+    let settled = try_settle(&ctx.deps.pool, &ctx.token.token_key, cost).await;
     log_request(
         &ctx.deps,
         &ctx.token,
@@ -1609,6 +1690,7 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
             usage: response.usage.clone(),
             price: ctx.price,
             cost_usd_micros: cost,
+            settled,
             request_body: ctx.request_body.clone(),
             response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
@@ -1652,6 +1734,48 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 /// 判断上游 HTTP 状态码是否可重试：网络错误与 429/5xx 允许 failover。
 fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
+}
+
+/// 只解析 `Retry-After` 的 delta-seconds；HTTP-date 忽略。上限由设置
+/// `retry_after_cap_secs` 在退避时施加。
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let secs: u64 = value.parse().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
+/// 从快照构造同渠道重试退避。
+fn retry_backoff(snapshot: &RuntimeSnapshot) -> RetryBackoff {
+    RetryBackoff::from_ms(
+        snapshot.retry_backoff_ms,
+        snapshot.retry_backoff_cap_ms,
+        snapshot.retry_after_cap_secs,
+    )
+}
+
+/// 流式空闲超时与非流式读体超时：渠道 `timeout_ms`，至少 1ms。
+fn channel_idle(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.max(1))
+}
+
+/// 尝试把费用写入 `token_balance`。`cost <= 0` 视为无需结算（已结清）。
+async fn try_settle(pool: &SqlitePool, token_key: &str, cost: i64) -> bool {
+    if cost <= 0 {
+        return true;
+    }
+    match pool.acquire().await {
+        Ok(mut conn) => match store::settle_charge(&mut conn, token_key, cost).await {
+            Ok(_) => true,
+            Err(err) => {
+                eprintln!("结算失败: {err}");
+                false
+            }
+        },
+        Err(err) => {
+            eprintln!("结算连接失败: {err}");
+            false
+        }
+    }
 }
 
 /// 日志用的出站模型名：按该渠道自己的别名表改写。
@@ -1733,6 +1857,7 @@ async fn error_response(
                 usage: Usage::default(),
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
+                settled: true,
                 request_body,
                 response_body: response_wire,
             },

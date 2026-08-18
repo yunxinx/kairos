@@ -12,13 +12,39 @@ use crate::{
 use super::http::Deps;
 
 /// 一次请求的计费结果，供日志落库。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(super) struct Billing {
     pub(super) usage: Usage,
     pub(super) price: PriceSnapshot,
     pub(super) cost_usd_micros: i64,
+    /// 费用是否已写入 `token_balance`；无费用或结算成功为 `true`。
+    pub(super) settled: bool,
     pub(super) request_body: Option<Vec<u8>>,
     pub(super) response_body: Option<Vec<u8>>,
+}
+
+impl Default for Billing {
+    fn default() -> Self {
+        Self {
+            usage: Usage::default(),
+            price: PriceSnapshot::default(),
+            cost_usd_micros: 0,
+            settled: true,
+            request_body: None,
+            response_body: None,
+        }
+    }
+}
+
+/// 按运行时上限截断落库 body，避免 full_body 流式响应把库撑爆。
+fn clip_logged_body(body: Option<Vec<u8>>, max_bytes: u64) -> Option<Vec<u8>> {
+    body.map(|mut bytes| {
+        let max = max_bytes.min(usize::MAX as u64) as usize;
+        if bytes.len() > max {
+            bytes.truncate(max);
+        }
+        bytes
+    })
 }
 
 /// 落一条请求日志。await 以保证响应返回时日志已落库。
@@ -38,6 +64,7 @@ pub(super) async fn log_request(
     inbound_protocol: Protocol,
 ) {
     let now = unix_millis();
+    let max_bytes = deps.snapshot.read().await.max_request_bytes;
     let log = store::RequestLog {
         id: 0,
         created_at: now,
@@ -55,8 +82,9 @@ pub(super) async fn log_request(
         cache_write_tokens: billing.usage.cache_write_tokens,
         price: billing.price,
         cost_usd_micros: billing.cost_usd_micros,
-        request_body: billing.request_body,
-        response_body: billing.response_body,
+        settled: billing.settled,
+        request_body: clip_logged_body(billing.request_body, max_bytes),
+        response_body: clip_logged_body(billing.response_body, max_bytes),
     };
     if let Err(err) = store::insert_request_log(&deps.pool, &log).await {
         eprintln!("请求日志落库失败: {err}");

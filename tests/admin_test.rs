@@ -1593,6 +1593,12 @@ async fn settings_write_takes_effect_immediately() {
     let settings: Value = resp.json().await.expect("设置应可解析");
     assert_eq!(settings["full_body"], false);
     assert!(settings["max_request_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(settings["auth_throttle_max_failures"], 30);
+    assert_eq!(settings["auth_throttle_window_secs"], 60);
+    assert_eq!(settings["sse_reassembly_max_bytes"], 8 * 1024 * 1024);
+    assert_eq!(settings["retry_backoff_ms"], 200);
+    assert_eq!(settings["retry_backoff_cap_ms"], 5_000);
+    assert_eq!(settings["retry_after_cap_secs"], 60);
 
     // 写设置：body 上限压到 100 字节，返回变更后设置。
     let resp = admin_put(
@@ -1620,6 +1626,112 @@ async fn settings_write_takes_effect_immediately() {
         "新 body 上限应立即拦截超限请求"
     );
     assert!(gw.upstream.received().is_empty(), "超限不应出站");
+}
+
+/// 网关保护类设置读写往返；非法阈值返回 400。
+#[tokio::test]
+async fn settings_gateway_knobs_roundtrip_and_validation() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({
+            "full_body": false,
+            "max_request_bytes": 1_000_000,
+            "auth_throttle_max_failures": 2,
+            "auth_throttle_window_secs": 30,
+            "sse_reassembly_max_bytes": 4_000_000,
+            "retry_backoff_ms": 100,
+            "retry_backoff_cap_ms": 1_000,
+            "retry_after_cap_secs": 10
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let settings: Value = resp.json().await.expect("设置应可解析");
+    assert_eq!(settings["auth_throttle_max_failures"], 2);
+    assert_eq!(settings["auth_throttle_window_secs"], 30);
+    assert_eq!(settings["sse_reassembly_max_bytes"], 4_000_000);
+    assert_eq!(settings["retry_backoff_ms"], 100);
+    assert_eq!(settings["retry_backoff_cap_ms"], 1_000);
+    assert_eq!(settings["retry_after_cap_secs"], 10);
+
+    let got: Value = admin_get(&gw, "/settings")
+        .await
+        .json()
+        .await
+        .expect("设置应可解析");
+    assert_eq!(got["auth_throttle_max_failures"], 2);
+    assert_eq!(got["sse_reassembly_max_bytes"], 4_000_000);
+
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({
+            "full_body": false,
+            "max_request_bytes": 1_000_000,
+            "sse_reassembly_max_bytes": 0
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({
+            "full_body": false,
+            "max_request_bytes": 1_000_000,
+            "retry_backoff_ms": 500,
+            "retry_backoff_cap_ms": 100
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// 认证失败限流次数写入后对新请求即时生效。
+#[tokio::test]
+async fn settings_auth_throttle_takes_effect_immediately() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({
+            "full_body": false,
+            "max_request_bytes": 1_000_000,
+            "auth_throttle_max_failures": 1
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let body = json!({
+        "model": TEST_MODEL,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth("sk-wrong")
+        .json(&body)
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth("sk-wrong")
+        .json(&body)
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS,
+        "次数上限 1 时第二次认证失败应 429"
+    );
 }
 
 /// 设置写入开启 full_body：后续请求的完整 body 落库，且 /logs 以 base64 返回 body。
@@ -1889,6 +2001,63 @@ async fn alias_logs_inbound_and_outbound_model() {
     assert_eq!(entry["channel"], "test-channel");
 }
 
+/// GET `/logs` 对长令牌 key 按前 8 + `******` + 后 8 脱敏；短测试 key 保持明文。
+#[tokio::test]
+async fn logs_redact_long_token_keys() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let long_key = format!("ks-{}", "a".repeat(64));
+    store::insert_request_log(
+        &gw.pool,
+        &store::RequestLog {
+            id: 0,
+            created_at: 1,
+            token_name: "long".to_string(),
+            token_key: long_key.clone(),
+            inbound_protocol: "openai_chat".to_string(),
+            model: "m".to_string(),
+            outbound_model: None,
+            channel: "c".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            price: kairos::core::billing::PriceSnapshot::default(),
+            cost_usd_micros: 0,
+            settled: true,
+            request_body: None,
+            response_body: None,
+        },
+    )
+    .await
+    .expect("应能写长 key 日志");
+
+    let page: Value = admin_get(&gw, "/logs?page_size=10")
+        .await
+        .json()
+        .await
+        .expect("日志应可解析");
+    let items = page["items"].as_array().expect("应有 items");
+    let long_entry = items
+        .iter()
+        .find(|item| item["token_name"] == "long")
+        .expect("应有长 key 行");
+    let masked = long_entry["token_key"]
+        .as_str()
+        .expect("token_key 应为字符串");
+    assert_eq!(
+        masked,
+        format!(
+            "{}******{}",
+            &long_key[..8],
+            &long_key[long_key.len() - 8..]
+        )
+    );
+    assert!(!masked.contains(&"a".repeat(20)), "中间明文不应出现");
+    assert_eq!(long_entry["settled"], true);
+}
+
 /// 新端点的非法输入返回结构化错误：设置上限为 0、未知设置字段、余额调不存在令牌、
 /// 日志非法查询参数。
 #[tokio::test]
@@ -1984,6 +2153,7 @@ async fn seed_log(pool: &sqlx::SqlitePool, log: SeededLog) {
             cache_write_tokens: 0,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: log.cost_usd_micros,
+            settled: true,
             request_body: None,
             response_body: None,
         },
@@ -2547,6 +2717,16 @@ async fn list_upstream_models_errors_are_structured() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = resp.json().await.expect("应返回结构化错误");
     assert_eq!(body["error"]["code"], "invalid_body");
+
+    // 非 http(s) scheme → 400，避免 file:// 等探测本机。
+    let mut file_url = draft.clone();
+    file_url["base_url"] = json!("file:///etc/passwd");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels/models", file_url).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "invalid_body");
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("http"), "应提示仅支持 http/https，实际 {msg}");
 
     // 未知字段 → 400。
     let mut unknown = draft.clone();
