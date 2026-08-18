@@ -9,6 +9,7 @@ import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import { useToast } from '@/composables/useToast';
 import { formatUsdAmount, parseUsdToMicros } from '@/lib/format';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
@@ -40,6 +41,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const { error } = useToast();
 
 const uid = useId();
 const modelInputId = `pricing-editor-model-${uid}`;
@@ -67,7 +69,6 @@ const editorInput = ref(initialValues.input);
 const editorOutput = ref(initialValues.output);
 const editorCacheRead = ref(initialValues.cacheRead);
 const editorCacheWrite = ref(initialValues.cacheWrite);
-const editorError = ref('');
 
 const dirty = computed(
   () =>
@@ -84,12 +85,11 @@ const saveMutation = useMutation({
       ? apiClient.createPrice(body)
       : apiClient.updatePrice(props.channelId, props.model, body),
   onSuccess: async () => {
-    editorError.value = '';
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
   },
   onError: (err) => {
-    editorError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -100,7 +100,6 @@ function optionalMicros(value: string): number | null {
 }
 
 function handleSave() {
-  editorError.value = '';
   const specs: FieldValidationSpec[] = [
     {
       name: 'input',
@@ -130,7 +129,6 @@ function handleSave() {
     cache_write_micros: optionalMicros(editorCacheWrite.value),
   });
 }
-
 </script>
 
 <template>
@@ -256,9 +254,6 @@ function handleSave() {
             </template>
           </FormField>
         </div>
-        <p v-if="editorError" class="text-danger text-sm" data-testid="pricing-editor-error">
-          {{ editorError }}
-        </p>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">

@@ -87,13 +87,13 @@ const hiddenCount = computed(() => hidden.value.length);
             >
               <span class="text-fg-muted font-mono text-xs">{{ VISIBLE_COUNT + offset + 1 }}</span>
               <span class="font-mono text-sm">{{ line.member }}</span>
-        <span
-          v-if="!line.available"
-          class="badge badge-warning"
-          data-testid="unified-member-unavailable"
-        >
-          {{ t('models.unifiedMemberUnavailable') }}
-        </span>
+              <span
+                v-if="!line.available"
+                class="badge badge-warning"
+                data-testid="unified-member-unavailable"
+              >
+                {{ t('models.unifiedMemberUnavailable') }}
+              </span>
               <OverflowChips
                 v-if="line.channel"
                 :items="[line.channel]"

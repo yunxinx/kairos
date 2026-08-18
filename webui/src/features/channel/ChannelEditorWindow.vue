@@ -6,7 +6,7 @@
 // 追加进草稿；「设置模型」切换到 ChannelModelSync 表格视图，点「保存并返回」把
 // 勾选模型与别名映射写回草稿，右上角关闭为「不保存并返回」；保存仍走表单页签
 // 的既有流程。
-import { useId, computed, onUnmounted, ref, useTemplateRef, watch } from 'vue';
+import { useId, computed, ref, useTemplateRef, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
@@ -21,6 +21,7 @@ import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.v
 import UiIcon from '@/components/ui/UiIcon.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import { useToast } from '@/composables/useToast';
 import ChannelEditorChip from '@/features/channel/ChannelEditorChip.vue';
 import ChannelModelSync from '@/features/channel/ChannelModelSync.vue';
 import { compareModels, sameAliasMap, sameModelSet } from '@/lib/model-list';
@@ -35,9 +36,6 @@ type EditorTab = 'basic' | 'advanced';
 
 /** 高级设置页签内的字段：保存校验失败时需切回该页签才能看到错误。 */
 const ADVANCED_FIELDS: ReadonlySet<string> = new Set(['timeoutMs', 'maxRetries']);
-
-/** chip 点击复制后「已复制」图标的展示时长。 */
-const COPIED_HINT_MS = 1_500;
 
 /** 两列网格末格留给 +N；露出奇数个 chip，避免把编辑器撑高。 */
 const EDITOR_MODEL_VISIBLE_COUNT = 9;
@@ -66,6 +64,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const { copy, error } = useToast();
 
 const editorTitle = computed(() =>
   props.initial === null ? t('channel.editorCreate') : t('channel.editorEdit'),
@@ -123,7 +122,6 @@ const editorTimeoutMs = ref(initialValues.timeoutMs);
 const editorMaxRetries = ref(initialValues.maxRetries);
 const editorEnabled = ref(initialValues.enabled);
 const editorGroup = ref(initialValues.modelGroup);
-const editorError = ref('');
 /** 手动添加模型 ID 的输入草稿；点添加后 trim 写入 `editorModels`。 */
 const addModelDraft = ref('');
 
@@ -157,13 +155,12 @@ const saveMutation = useMutation({
       ? apiClient.createChannel(body)
       : apiClient.updateChannel(props.initial.id, body),
   onSuccess: async () => {
-    editorError.value = '';
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['channels'] });
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
   },
   onError: (err) => {
-    editorError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -274,25 +271,9 @@ function clearAddModelDraft() {
 
 // --- chip 点击复制模型名 ---
 
-const copiedModel = ref<string | null>(null);
-let copiedTimer: ReturnType<typeof setTimeout> | undefined;
-
-async function copyModel(model: string) {
-  try {
-    await navigator.clipboard.writeText(model);
-  } catch {
-    return;
-  }
-  copiedModel.value = model;
-  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
-  copiedTimer = setTimeout(() => {
-    if (copiedModel.value === model) copiedModel.value = null;
-  }, COPIED_HINT_MS);
+function copyModel(model: string) {
+  void copy(model, t('common.copiedModelName'), t('common.copyFailedModelName'));
 }
-
-onUnmounted(() => {
-  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
-});
 
 // --- 上游模型同步视图 ---
 
@@ -343,7 +324,6 @@ function handleWindowClose() {
 // --- 保存 ---
 
 function handleSave() {
-  editorError.value = '';
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
     { name: 'baseUrl', value: editorBaseUrl.value, rules: [{ kind: 'required' }] },
@@ -396,7 +376,7 @@ function handleSave() {
     .getQueryData<ChannelView[]>(['channels'])
     ?.find((item) => item.id === props.initial?.id);
   if (!latest) {
-    editorError.value = t('channel.goneOnSave');
+    error(t('channel.goneOnSave'));
     return;
   }
   saveMutation.mutate({
@@ -557,7 +537,6 @@ function handleSave() {
                   <ChannelEditorChip
                     :name="chip.name"
                     :tooltip="chip.tooltip"
-                    :is-copied="copiedModel === chip.name"
                     :has-alias-relation="chip.hasAliasRelation"
                     @copy="copyModel(chip.name)"
                     @remove="removeChip(chip)"
@@ -587,7 +566,6 @@ function handleSave() {
                             <ChannelEditorChip
                               :name="chip.name"
                               :tooltip="chip.tooltip"
-                              :is-copied="copiedModel === chip.name"
                               :has-alias-relation="chip.hasAliasRelation"
                               @copy="copyModel(chip.name)"
                               @remove="removeChip(chip)"
@@ -706,9 +684,6 @@ function handleSave() {
             </div>
           </div>
         </div>
-        <p v-if="editorError" class="text-danger text-sm" data-testid="channel-editor-error">
-          {{ editorError }}
-        </p>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">

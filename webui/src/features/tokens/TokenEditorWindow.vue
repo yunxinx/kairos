@@ -14,6 +14,7 @@ import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import { useToast } from '@/composables/useToast';
 import { formatUsdAmount, parseUsdToMicros } from '@/lib/format';
 import { DEFAULT_MODEL_GROUP, groupSelectOptions } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
@@ -43,6 +44,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const { error } = useToast();
 
 const uid = useId();
 const nameInputId = `token-editor-name-${uid}`;
@@ -72,7 +74,6 @@ const editorName = ref(initialName);
 const editorLimit = ref(initialLimit);
 const editorEnabled = ref(initialEnabled);
 const editorGroup = ref(initialGroup);
-const editorError = ref('');
 
 const groupOptions = computed(() =>
   groupSelectOptions(groupsQuery.data.value ?? [], editorGroup.value, t('models.ungrouped')),
@@ -83,7 +84,6 @@ const groupOptions = computed(() =>
 const displayedBalance = ref(props.initial ? props.initial.balance_usd_micros : 0);
 const editorAmount = ref(props.initial ? formatUsdAmount(props.initial.balance_usd_micros) : '0');
 const quickDelta = ref(0);
-const balanceError = ref('');
 
 const dirty = computed(
   () =>
@@ -105,7 +105,6 @@ const saveMutation = useMutation({
       ? apiClient.createToken(payload.body)
       : apiClient.updateToken(payload.body.token_key, payload.body),
   onSuccess: async () => {
-    editorError.value = '';
     // 余额变更随保存一同生效：定义保存成功后，有差额才调用余额接口。
     const delta = props.initial === null ? 0 : balanceDelta();
     if (delta !== 0) {
@@ -116,7 +115,7 @@ const saveMutation = useMutation({
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
   onError: (err) => {
-    editorError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -124,12 +123,11 @@ const balanceMutation = useMutation({
   mutationFn: (delta: number) =>
     apiClient.adjustTokenBalance(props.initial?.token_key ?? '', { delta_usd_micros: delta }),
   onSuccess: async () => {
-    balanceError.value = '';
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
   onError: async (err) => {
-    balanceError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
     // 定义字段此时已保存成功：同步列表，避免窗口内外状态分叉。
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
@@ -151,8 +149,6 @@ function balanceDelta(): number {
 }
 
 function handleSave() {
-  editorError.value = '';
-  balanceError.value = '';
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
     { name: 'limit', value: editorLimit.value, rules: [{ kind: 'usd', min: 0 }] },
@@ -358,14 +354,7 @@ function applyQuick(deltaUsd: number) {
               </button>
             </div>
           </div>
-          <p v-if="balanceError" class="text-danger mt-2 text-sm" data-testid="token-balance-error">
-            {{ balanceError }}
-          </p>
         </fieldset>
-
-        <p v-if="editorError" class="text-danger text-sm" data-testid="token-editor-error">
-          {{ editorError }}
-        </p>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">

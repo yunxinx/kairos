@@ -16,6 +16,7 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import { useToast } from '@/composables/useToast';
 import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
@@ -40,6 +41,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const { error } = useToast();
 const uid = useId();
 const nameInputId = `group-editor-name-${uid}`;
 
@@ -55,7 +57,6 @@ const initialModels = props.initial?.models ?? [];
 
 const editorName = ref(initialName);
 const editorModels = ref([...initialModels]);
-const editorError = ref('');
 const searchText = ref('');
 
 /** 组内表：模型名用百分比，避免 `auto` + truncate 把列挤没。 */
@@ -97,17 +98,15 @@ const saveMutation = useMutation({
       ? apiClient.createModelGroup(body)
       : apiClient.updateModelGroup(props.initial.name, body),
   onSuccess: async () => {
-    editorError.value = '';
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
   },
   onError: (err) => {
-    editorError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
 function handleSave() {
-  editorError.value = '';
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
   ];
@@ -233,10 +232,6 @@ function handleSave() {
             </VirtualTable>
           </DataTablePanel>
         </div>
-
-        <p v-if="editorError" class="text-danger text-sm" data-testid="group-editor-error">
-          {{ editorError }}
-        </p>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">

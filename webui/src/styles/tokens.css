@@ -13,6 +13,7 @@
   --z-floating: 110;
   --z-window: 120;
   --z-popover: 130;
+  --z-toast: 140;
   --spacing-touch: 2.75rem;
   --height-chart: 20rem;
   /* 概览底栏列高 = card-header + card-body 上下内边距 + 图表区（与逐日趋势卡同构） */
@@ -77,6 +78,10 @@
 
 .z-floating {
   z-index: var(--z-floating);
+}
+
+.z-toast {
+  z-index: var(--z-toast);
 }
 
 .min-h-touch {

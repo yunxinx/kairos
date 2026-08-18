@@ -85,6 +85,11 @@
     "navMenu": "Menu",
     "copy": "Copy",
     "copied": "Copied",
+    "copiedModelName": "Model name copied",
+    "copiedTokenKey": "Token key copied",
+    "copyFailed": "Could not copy to the clipboard.",
+    "copyFailedModelName": "Could not copy the model name.",
+    "copyFailedTokenKey": "Could not copy the token key.",
     "clearSearch": "Clear search",
     "clearInput": "Clear",
     "previousPage": "Previous",
@@ -443,6 +448,8 @@
   },
   "a11y": {
     "skipToContent": "Skip to main content",
+    "toastLabel": "Notification",
+    "toastViewport": "Notifications ({hotkey})",
     "fieldGuide": "Format and requirements",
     "showPassword": "Show password",
     "hidePassword": "Hide password"

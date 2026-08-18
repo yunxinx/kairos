@@ -31,6 +31,7 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
+import { useToast } from '@/composables/useToast';
 import ChannelEditorWindow from '@/features/channel/ChannelEditorWindow.vue';
 import ChannelProbeWindow from '@/features/channel/ChannelProbeWindow.vue';
 import OverflowChips from '@/components/ui/OverflowChips.vue';
@@ -57,6 +58,7 @@ const PROTOCOL_ICON_SRC: Record<Protocol, string> = {
 };
 
 const { t } = useI18n();
+const { error } = useToast();
 const queryClient = useQueryClient();
 
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
@@ -76,7 +78,6 @@ const {
   bringToFront,
 } = useWindowStack<ChannelWindowPayload>();
 
-const actionError = ref('');
 const deleteErrors = ref<Record<number, string>>({});
 const searchText = ref('');
 
@@ -143,10 +144,12 @@ const deleteMutation = useMutation({
     await invalidateChannels();
   },
   onError: (err, id) => {
+    const message = extractApiError(err).message;
+    error(message);
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.channel.id === id,
     );
-    if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
+    if (entry) deleteErrors.value[entry.id] = message;
   },
 });
 
@@ -162,11 +165,10 @@ const toggleMutation = useMutation({
       enabled: !channel.enabled,
     }),
   onSuccess: async () => {
-    actionError.value = '';
     await invalidateChannels();
   },
   onError: (err) => {
-    actionError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -181,11 +183,10 @@ const fieldMutation = useMutation({
   mutationFn: ({ channel, patch }: { channel: ChannelView; patch: ChannelFieldPatch }) =>
     apiClient.updateChannel(channel.id, { ...channelWriteBody(channel), ...patch }),
   onSuccess: async () => {
-    actionError.value = '';
     await invalidateChannels();
   },
   onError: (err) => {
-    actionError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -270,8 +271,6 @@ function openProbe(channel: ChannelView) {
     />
 
     <div v-else class="flex flex-col">
-      <p v-if="actionError" class="text-danger mb-4 shrink-0">{{ actionError }}</p>
-
       <DataTable :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>

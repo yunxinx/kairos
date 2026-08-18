@@ -26,6 +26,7 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
+import { useToast } from '@/composables/useToast';
 import TokenEditorWindow from '@/features/tokens/TokenEditorWindow.vue';
 import { formatUnixMillis, formatUsdMicros, maskTokenKey, relativeTimeParts } from '@/lib/format';
 import { groupDisplayName } from '@/lib/visible-models';
@@ -41,15 +42,13 @@ const QUOTA_WARN_RATIO = 0.7;
 const QUOTA_DANGER_RATIO = 0.9;
 /** 相对时间展示的刷新间隔（毫秒）。 */
 const RELATIVE_TIME_TICK_MS = 30_000;
-/** 复制成功提示的停留时长（毫秒）。 */
-const COPIED_HINT_MS = 1_500;
 
 const { t, locale } = useI18n();
+const { copy, error } = useToast();
 const queryClient = useQueryClient();
 
 const searchText = ref('');
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
-const actionError = ref('');
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
   const anchor = pendingAnchor.value;
@@ -120,23 +119,10 @@ onMounted(() => {
 });
 onUnmounted(() => {
   if (relativeTimer !== undefined) clearInterval(relativeTimer);
-  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
 });
 
-const copiedKey = ref<string | null>(null);
-let copiedTimer: ReturnType<typeof setTimeout> | undefined;
-
-async function copyKey(key: string) {
-  try {
-    await navigator.clipboard.writeText(key);
-  } catch {
-    return;
-  }
-  copiedKey.value = key;
-  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
-  copiedTimer = setTimeout(() => {
-    if (copiedKey.value === key) copiedKey.value = null;
-  }, COPIED_HINT_MS);
+function copyKey(key: string) {
+  void copy(key, t('common.copiedTokenKey'), t('common.copyFailedTokenKey'));
 }
 
 function quotaRatio(token: TokenRow): number {
@@ -197,10 +183,12 @@ const deleteMutation = useMutation({
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
   onError: (err, tokenKey) => {
+    const message = extractApiError(err).message;
+    error(message);
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.token.token_key === tokenKey,
     );
-    if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
+    if (entry) deleteErrors.value[entry.id] = message;
   },
 });
 
@@ -219,11 +207,10 @@ const toggleMutation = useMutation({
       model_group: token.model_group,
     }),
   onSuccess: async () => {
-    actionError.value = '';
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
   onError: (err) => {
-    actionError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -357,7 +344,7 @@ function openBulkDelete() {
                     :title="t('common.copy')"
                     @click="copyKey(token.token_key)"
                   >
-                    <UiIcon :name="copiedKey === token.token_key ? 'check' : 'copy'" :size="14" />
+                    <UiIcon name="copy" :size="14" />
                   </button>
                 </span>
               </TableCell>
@@ -465,9 +452,6 @@ function openBulkDelete() {
           {{ t('common.delete') }}
         </button>
       </DataTableBulkBar>
-      <p v-if="actionError" class="text-danger mt-2 text-sm" data-testid="token-action-error">
-        {{ actionError }}
-      </p>
     </div>
 
     <template v-for="(win, index) in windows" :key="win.id">

@@ -1,9 +1,7 @@
 <script setup lang="ts">
-// 表格「模型」列：点击复制名称；悬停描边表示可点。
-import { onUnmounted, ref } from 'vue';
+// 表格「模型」列：点击复制名称；悬停描边表示可点。成功/失败由 Toast 反馈。
 import { useI18n } from 'vue-i18n';
-
-const COPIED_HINT_MS = 1_500;
+import { useToast } from '@/composables/useToast';
 
 const props = defineProps<{
   text: string;
@@ -11,25 +9,11 @@ const props = defineProps<{
 }>();
 
 const { t } = useI18n();
-const copied = ref(false);
-let copiedTimer: ReturnType<typeof setTimeout> | undefined;
+const { copy } = useToast();
 
-async function copy() {
-  try {
-    await navigator.clipboard.writeText(props.text);
-  } catch {
-    return;
-  }
-  copied.value = true;
-  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
-  copiedTimer = setTimeout(() => {
-    copied.value = false;
-  }, COPIED_HINT_MS);
+function handleCopy() {
+  void copy(props.text, t('common.copiedModelName'), t('common.copyFailedModelName'));
 }
-
-onUnmounted(() => {
-  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
-});
 </script>
 
 <template>
@@ -37,8 +21,8 @@ onUnmounted(() => {
     type="button"
     class="copyable-name"
     :data-testid="testId"
-    :title="copied ? t('common.copied') : t('common.copy')"
-    @click.stop="copy"
+    :title="t('common.copy')"
+    @click.stop="handleCopy"
   >
     {{ text }}
   </button>

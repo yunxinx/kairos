@@ -1964,6 +1964,148 @@ html[lang='zh-CN'] .font-serif {
   }
 }
 
+/* ── Toast（右上角堆叠；悬停暂停由 Reka Viewport 派发） ── */
+.toast-viewport {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(22rem, calc(100vw - 32px));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  outline: none;
+}
+
+.toast-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: 100%;
+  min-height: 2.5rem;
+  padding: 8px 8px 8px 12px;
+  background: var(--seed-surface);
+  border: 2px solid var(--seed-border);
+  border-radius: var(--seed-radius);
+  box-shadow: 2px 3px 0 0 var(--card-shadow);
+}
+
+.toast-item-success {
+  background: color-mix(in srgb, var(--success) 10%, var(--seed-surface));
+}
+
+.toast-item-danger {
+  background: color-mix(in srgb, var(--danger) 10%, var(--seed-surface));
+}
+
+.toast-item-icon {
+  flex-shrink: 0;
+  display: block;
+}
+
+.toast-item-success .toast-item-icon {
+  color: var(--success);
+}
+
+.toast-item-danger .toast-item-icon {
+  color: var(--danger);
+}
+
+.toast-item-message {
+  margin: 0;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.25;
+  font-weight: 500;
+}
+
+.toast-item-close {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: none;
+  border-radius: var(--seed-radius);
+  appearance: none;
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.toast-item-close svg {
+  display: block;
+}
+
+.toast-item-close:hover {
+  color: var(--seed-fg);
+  background: color-mix(in srgb, var(--seed-fg) 8%, transparent);
+}
+
+.toast-item-close:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.toast-item[data-state='open'] {
+  animation: toast-in 280ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.toast-item[data-state='closed'] {
+  animation: toast-out 200ms ease both;
+}
+
+.toast-item[data-swipe='move'] {
+  transform: translateX(var(--reka-toast-swipe-move-x));
+}
+
+.toast-item[data-swipe='cancel'] {
+  transform: translateX(0);
+  transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.toast-item[data-swipe='end'] {
+  animation: toast-swipe-out 180ms ease-out both;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(calc(100% + 16px));
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes toast-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes toast-swipe-out {
+  from {
+    transform: translateX(var(--reka-toast-swipe-end-x));
+  }
+  to {
+    transform: translateX(calc(100% + 16px));
+  }
+}
+
 /* ── Reka UI: Checkbox ── */
 .ui-checkbox {
   --checkbox-size: 16px;

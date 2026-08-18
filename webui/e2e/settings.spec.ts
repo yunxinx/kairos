@@ -9,11 +9,11 @@ test.describe('settings page', () => {
     request,
   }) => {
     await page.goto('/config');
-    await expect(page.getByRole('heading', { name: /settings/i })).toBeVisible();
+    await expect(page.getByRole('tablist', { name: /settings/i })).toBeVisible();
 
     await page.locator('#settings-max-request-bytes').fill('0.01');
     await page.getByTestId('settings-save').click();
-    await expect(page.getByTestId('settings-save-success')).toBeVisible();
+    await expect(page.getByTestId('toast')).toContainText(/saved|已保存/);
 
     const oversized = 'x'.repeat(20_000);
     const resp = await request.post(`http://127.0.0.1:${E2E_PROTOCOL_PORT}/v1/chat/completions`, {
@@ -41,11 +41,11 @@ test.describe('settings page', () => {
     if (await checkbox.isChecked()) {
       await checkbox.uncheck();
       await page.getByTestId('settings-save').click();
-      await expect(page.getByTestId('settings-save-success')).toBeVisible();
+      await expect(page.getByTestId('toast')).toContainText(/saved|已保存/);
     }
     await checkbox.check();
     await page.getByTestId('settings-save').click();
-    await expect(page.getByTestId('settings-save-success')).toBeVisible();
+    await expect(page.getByTestId('toast')).toContainText(/saved|已保存/);
 
     const resp = await request.get('/settings', {
       headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },

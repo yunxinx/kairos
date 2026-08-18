@@ -23,6 +23,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import { useToast } from '@/composables/useToast';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import { buildInventory, inventoryRowKey, type InventoryRow } from '@/lib/inventory';
 import { moveItem } from '@/lib/move-item';
@@ -50,6 +51,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
+const { error } = useToast();
 const uid = useId();
 const idInputId = `unified-editor-id-${uid}`;
 const hideInputId = `unified-editor-hide-${uid}`;
@@ -64,7 +66,6 @@ const initialHide = props.initial?.hide ?? false;
 const editorId = ref(initialId);
 const editorMembers = ref([...initialMembers]);
 const editorHide = ref(initialHide);
-const editorError = ref('');
 const dragFrom = ref<number | null>(null);
 const dropInsert = ref<number | null>(null);
 const searchText = ref('');
@@ -104,17 +105,15 @@ const saveMutation = useMutation({
       ? apiClient.createUnifiedModel(body)
       : apiClient.updateUnifiedModel(props.initial.id, body),
   onSuccess: async () => {
-    editorError.value = '';
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },
   onError: (err) => {
-    editorError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
 function handleSave() {
-  editorError.value = '';
   const specs: FieldValidationSpec[] = [
     { name: 'id', value: editorId.value, rules: [{ kind: 'required' }] },
   ];
@@ -418,10 +417,6 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
         >
           <FormSwitch :id="hideInputId" v-model="editorHide" data-testid="unified-hide-switch" />
         </FormField>
-
-        <p v-if="editorError" class="text-danger text-sm" data-testid="unified-editor-error">
-          {{ editorError }}
-        </p>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">

@@ -25,6 +25,7 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
+import { useToast } from '@/composables/useToast';
 import GroupEditorWindow from '@/features/models/GroupEditorWindow.vue';
 import OverflowChips from '@/components/ui/OverflowChips.vue';
 import { DEFAULT_MODEL_GROUP, registeredCallableNames } from '@/lib/visible-models';
@@ -37,6 +38,7 @@ type GroupWindowPayload =
   | BulkDeletePayload;
 
 const { t } = useI18n();
+const { error } = useToast();
 const queryClient = useQueryClient();
 const searchText = ref('');
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
@@ -151,6 +153,7 @@ const deleteMutation = useMutation({
       );
     });
     if (entry) deleteErrors.value[entry.id] = message;
+    error(message);
   },
 });
 

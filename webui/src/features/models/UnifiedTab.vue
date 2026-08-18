@@ -27,6 +27,7 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
+import { useToast } from '@/composables/useToast';
 import UnifiedEditorWindow from '@/features/models/UnifiedEditorWindow.vue';
 import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
 import { unifiedUsesChannel } from '@/lib/unified-sources';
@@ -38,6 +39,7 @@ type UnifiedWindowPayload =
   | BulkDeletePayload;
 
 const { t } = useI18n();
+const { error } = useToast();
 const queryClient = useQueryClient();
 const searchText = ref('');
 const statusFilter = ref<string[]>([]);
@@ -151,10 +153,12 @@ const deleteMutation = useMutation({
     await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },
   onError: (err, id) => {
+    const message = extractApiError(err).message;
+    error(message);
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.model.id === id,
     );
-    if (entry) deleteErrors.value[entry.id] = extractApiError(err).message;
+    if (entry) deleteErrors.value[entry.id] = message;
   },
 });
 

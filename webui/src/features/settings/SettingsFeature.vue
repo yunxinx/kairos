@@ -13,11 +13,13 @@ import InlineError from '@/components/ui/InlineError.vue';
 import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import { useToast } from '@/composables/useToast';
 import { formatBytesAsMb, formatUnixMillis, parseMbToBytes } from '@/lib/format';
 
 type SettingsSection = 'logging' | 'gateway' | 'catalog';
 
 const { t } = useI18n();
+const { error, success } = useToast();
 const section = ref<SettingsSection>('logging');
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } =
@@ -35,9 +37,6 @@ const retryAfterCapSecs = ref('');
 /** 上次从接口载入的字节值；未改 MB 文案时原样回写，避免 0.00 显示把小字节上限抹掉。 */
 const loadedMaxRequestBytes = ref<number | null>(null);
 const loadedSseReassemblyBytes = ref<number | null>(null);
-const saveError = ref('');
-const saveSuccess = ref(false);
-const syncError = ref('');
 
 const settingsQuery = useQuery({
   queryKey: ['settings'],
@@ -75,16 +74,11 @@ function applySettings(settings: Settings) {
 const saveMutation = useMutation({
   mutationFn: (body: Settings) => apiClient.updateSettings(body),
   onSuccess: async () => {
-    saveError.value = '';
-    saveSuccess.value = true;
+    success(t('settings.saveSuccess'));
     await queryClient.invalidateQueries({ queryKey: ['settings'] });
-    setTimeout(() => {
-      saveSuccess.value = false;
-    }, 4000);
   },
   onError: (err) => {
-    saveSuccess.value = false;
-    saveError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -93,8 +87,6 @@ function mbUnchanged(input: string, loaded: number | null): boolean {
 }
 
 function handleSave() {
-  saveError.value = '';
-  saveSuccess.value = false;
   const requestMbSame = mbUnchanged(maxRequestMb.value, loadedMaxRequestBytes.value);
   const sseMbSame = mbUnchanged(sseReassemblyMb.value, loadedSseReassemblyBytes.value);
   if (!requestMbSame) {
@@ -204,21 +196,17 @@ function resetForm() {
   const settings = settingsQuery.data.value;
   if (!settings) return;
   clearErrors();
-  saveError.value = '';
-  saveSuccess.value = false;
-  syncError.value = '';
   applySettings(settings);
 }
 
 const syncMutation = useMutation({
   mutationFn: () => apiClient.syncCatalog(),
   onSuccess: async () => {
-    syncError.value = '';
     await queryClient.invalidateQueries({ queryKey: ['catalog'] });
     await queryClient.invalidateQueries({ queryKey: ['catalog-meta'] });
   },
   onError: (err) => {
-    syncError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
@@ -340,13 +328,6 @@ const tabsAria = computed(() => t('settings.sections'));
                 </template>
               </FormField>
             </div>
-            <p
-              v-if="syncError"
-              class="text-danger mt-3 text-sm"
-              data-testid="settings-catalog-sync-error"
-            >
-              {{ syncError }}
-            </p>
           </TabsContent>
           <TabsContent value="logging" class="card-body">
             <div class="settings-fields-row">
@@ -527,20 +508,6 @@ const tabsAria = computed(() => t('settings.sections'));
             </div>
           </TabsContent>
           <div class="card-footer card-body flex flex-wrap items-center justify-end gap-2">
-            <p
-              v-if="saveError"
-              class="text-danger mr-auto text-sm"
-              data-testid="settings-save-error"
-            >
-              {{ saveError }}
-            </p>
-            <p
-              v-if="saveSuccess"
-              class="text-success mr-auto text-sm"
-              data-testid="settings-save-success"
-            >
-              {{ t('settings.saveSuccess') }}
-            </p>
             <button
               type="button"
               class="btn btn-subtle"

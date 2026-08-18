@@ -9,6 +9,7 @@ import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import InlineError from '@/components/ui/InlineError.vue';
+import { useToast } from '@/composables/useToast';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
@@ -55,6 +56,7 @@ interface FloatingWindowControls {
 }
 
 const { t } = useI18n();
+const { error } = useToast();
 const uid = useId();
 const queryClient = useQueryClient();
 const floatingWindow = useTemplateRef<FloatingWindowControls>('floatingWindow');
@@ -63,7 +65,6 @@ const fillMode = ref<CatalogFillMode>('blanks');
 const searchText = ref('');
 const statusFilter = ref<string[]>([]);
 const selectedChannels = ref<string[]>([]);
-const writeError = ref('');
 const editorView = ref<'preview' | 'browse'>('preview');
 const browseKey = ref<string | null>(null);
 
@@ -191,17 +192,15 @@ const writeMutation = useMutation({
     }
   },
   onSuccess: async () => {
-    writeError.value = '';
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
   },
   onError: (err) => {
-    writeError.value = extractApiError(err).message;
+    error(extractApiError(err).message);
   },
 });
 
 function handleConfirm() {
-  writeError.value = '';
   writeMutation.mutate(preview.value);
 }
 
@@ -385,9 +384,11 @@ function handleWindowClose() {
                             v-else-if="previewOf(row)!.hits.length === 1"
                             class="inline-flex min-w-0 items-center gap-2"
                           >
-                            <span class="truncate text-xs" :title="previewOf(row)!.hostName ?? ''">{{
-                              previewOf(row)!.hostName
-                            }}</span>
+                            <span
+                              class="truncate text-xs"
+                              :title="previewOf(row)!.hostName ?? ''"
+                              >{{ previewOf(row)!.hostName }}</span
+                            >
                             <button
                               type="button"
                               class="btn btn-ghost btn-sm shrink-0"
@@ -435,9 +436,6 @@ function handleWindowClose() {
             </table>
           </div>
         </DataTablePanel>
-        <p v-if="writeError" class="text-danger text-sm" data-testid="catalog-fill-error">
-          {{ writeError }}
-        </p>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">

@@ -315,12 +315,7 @@ const filteredSyncRows = computed(() => {
 });
 
 /** 勾选/别名/状态固定窄宽；模型名用百分比，避免 `auto` + truncate 把列挤没。 */
-const syncColumns = [
-  { width: '2.5rem' },
-  { width: '40%' },
-  { width: '9.5rem' },
-  { width: '7rem' },
-];
+const syncColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '9.5rem' }, { width: '7rem' }];
 
 const syncEmptyTitle = computed(() => {
   if (syncRows.value.length > 0) return t('channel.syncEmptySearch');

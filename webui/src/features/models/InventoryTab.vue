@@ -27,6 +27,7 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
+import { useToast } from '@/composables/useToast';
 import CatalogFillWindow from '@/features/models/CatalogFillWindow.vue';
 import PriceEditorWindow from '@/features/models/PriceEditorWindow.vue';
 import { formatUsdAmount } from '@/lib/format';
@@ -55,6 +56,7 @@ type InventoryWindowPayload =
   | BulkDeletePayload;
 
 const { t } = useI18n();
+const { error } = useToast();
 const queryClient = useQueryClient();
 
 const searchText = ref('');
@@ -235,6 +237,7 @@ const deleteMutation = useMutation({
   },
   onError: (err, targets) => {
     const message = extractApiError(err).message;
+    error(message);
     const keys = new Set(
       targets.map((target) => inventoryRowKey({ channelId: target.channelId, name: target.name })),
     );

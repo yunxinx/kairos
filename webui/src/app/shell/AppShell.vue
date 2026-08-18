@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useI18n } from 'vue-i18n';
 import MarketingSiteFooter from '@/app/shell/MarketingSiteFooter.vue';
+import Toaster from '@/components/ui/Toaster.vue';
 
 defineProps<{
   hideNav?: boolean;
@@ -42,5 +43,6 @@ const { t } = useI18n();
       <MarketingSiteFooter v-if="showPublicFooter" />
     </main>
     <slot v-if="!hideNav" name="mobile-nav" />
+    <Toaster />
   </div>
 </template>

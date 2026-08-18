@@ -7,7 +7,6 @@ import UiIcon from '@/components/ui/UiIcon.vue';
 const props = defineProps<{
   name: string;
   tooltip: string;
-  isCopied: boolean;
   hasAliasRelation: boolean;
 }>();
 
@@ -47,11 +46,7 @@ function onChipKeydown(event: KeyboardEvent) {
         :aria-label="t('channel.removeModel', { model: props.name })"
         @click.stop="emit('remove')"
       >
-        <UiIcon
-          :name="props.isCopied ? 'check' : 'close'"
-          :size="12"
-          :class="props.isCopied && 'text-success'"
-        />
+        <UiIcon name="close" :size="12" />
       </button>
     </div>
   </Tooltip>
