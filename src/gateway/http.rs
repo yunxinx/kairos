@@ -46,7 +46,7 @@ use crate::{
 };
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
-use super::logging::{Billing, log_request, unix_millis};
+use super::logging::{Billing, log_request, new_request_id, unix_millis};
 use super::rate_limit::{RequestRateLimiter, effective_rate_limit_rpm};
 use super::sse::{
     OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
@@ -142,6 +142,7 @@ async fn list_models(
     let snapshot = deps.snapshot.read().await.clone();
     let inbound_protocol = list_models_protocol(&headers);
     let started = unix_millis();
+    let request_id = new_request_id();
     if deps.auth_throttle.is_blocked(
         addr.ip(),
         snapshot.auth_throttle_max_failures,
@@ -157,6 +158,7 @@ async fn list_models(
             started,
             inbound_protocol,
             None,
+            &request_id,
         )
         .await;
     }
@@ -178,6 +180,7 @@ async fn list_models(
                 started,
                 inbound_protocol,
                 None,
+                &request_id,
             )
             .await;
         }
@@ -192,6 +195,7 @@ async fn list_models(
             inbound_protocol,
             None,
             retry_after,
+            &request_id,
         )
         .await;
     }
@@ -260,6 +264,7 @@ async fn payload_too_large(
     inbound_protocol: Protocol,
     max_request_bytes: u64,
     token: Option<&Token>,
+    request_id: &str,
 ) -> Response {
     let message = format!("请求体超过上限 {max_request_bytes} 字节");
     error_response(
@@ -272,6 +277,7 @@ async fn payload_too_large(
         started,
         inbound_protocol,
         None,
+        request_id,
     )
     .await
 }
@@ -288,6 +294,7 @@ async fn handle_request(
     request: Request,
 ) -> Response {
     let started = unix_millis();
+    let request_id = new_request_id();
     // 准入时刻抓取快照引用：在途请求持有该引用直到结束，不受后续原子替换影响。
     let snapshot = deps.snapshot.read().await.clone();
     let full_body = snapshot.full_body;
@@ -313,6 +320,7 @@ async fn handle_request(
             started,
             inbound_protocol,
             None,
+            &request_id,
         )
         .await;
     }
@@ -335,6 +343,7 @@ async fn handle_request(
                 started,
                 inbound_protocol,
                 None,
+                &request_id,
             )
             .await;
         }
@@ -350,6 +359,7 @@ async fn handle_request(
             inbound_protocol,
             None,
             retry_after,
+            &request_id,
         )
         .await;
     }
@@ -366,6 +376,7 @@ async fn handle_request(
             inbound_protocol,
             max_request_bytes,
             Some(token),
+            &request_id,
         )
         .await;
     }
@@ -379,6 +390,7 @@ async fn handle_request(
                 inbound_protocol,
                 max_request_bytes,
                 Some(token),
+                &request_id,
             )
             .await;
         }
@@ -393,6 +405,7 @@ async fn handle_request(
                 started,
                 inbound_protocol,
                 None,
+                &request_id,
             )
             .await;
         }
@@ -416,6 +429,7 @@ async fn handle_request(
                 started,
                 inbound_protocol,
                 request_body_for_log,
+                &request_id,
             )
             .await;
         }
@@ -434,6 +448,7 @@ async fn handle_request(
                 started,
                 inbound_protocol,
                 request_body_for_log,
+                &request_id,
             )
             .await;
         }
@@ -452,6 +467,7 @@ async fn handle_request(
             started,
             inbound_protocol,
             request_body_for_log,
+            &request_id,
         )
         .await;
     }
@@ -470,6 +486,7 @@ async fn handle_request(
                 started,
                 inbound_protocol,
                 request_body_for_log,
+                &request_id,
             )
             .await;
         }
@@ -488,6 +505,7 @@ async fn handle_request(
                 err,
                 inbound_protocol,
                 request_body_for_log,
+                &request_id,
             )
             .await;
         }
@@ -510,6 +528,7 @@ async fn handle_request(
                 err,
                 inbound_protocol,
                 request_body_for_log,
+                &request_id,
             )
             .await;
         }
@@ -530,6 +549,7 @@ async fn handle_request(
             started,
             inbound_protocol,
             request_body_for_log,
+            &request_id,
         )
         .await;
     }
@@ -550,6 +570,7 @@ async fn handle_request(
             started,
             inbound_protocol,
             request_body_for_log,
+            &request_id,
         )
         .await;
     }
@@ -572,6 +593,7 @@ async fn handle_request(
                 started,
                 inbound_protocol,
                 request_body_for_log,
+                &request_id,
             )
             .await;
         }
@@ -592,6 +614,7 @@ async fn handle_request(
                 started,
                 inbound_protocol,
                 request_body_for_log,
+                &request_id,
             )
             .await;
         }
@@ -621,6 +644,7 @@ async fn handle_request(
             &body,
             request_body_for_log.clone(),
             inbound_anthropic_version,
+            &request_id,
         )
         .await;
         if response.status().is_success() {
@@ -783,6 +807,7 @@ struct CallCtx<'a> {
     /// 入站 wire 协议：响应重编码与错误格式按此分派。
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
+    request_id: &'a str,
 }
 
 /// 按一条跳的渠道路由发起出站：直通或 IR，遇可重试错误在该跳内 failover。
@@ -798,6 +823,7 @@ async fn dispatch_hop(
     raw_body: &[u8],
     request_body_for_log: Option<Bytes>,
     inbound_anthropic_version: Option<&HeaderValue>,
+    request_id: &str,
 ) -> Response {
     // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
     // 任一渠道命中别名、或统一模型成员名与入站名不同时也回落 IR：直通无法改写请求体模型名。
@@ -817,6 +843,7 @@ async fn dispatch_hop(
             inbound_protocol,
             request_body: request_body_for_log,
             inbound_anthropic_version,
+            request_id,
         };
         return passthrough_with_failover(&passthrough_ctx, &hop.route).await;
     }
@@ -830,6 +857,7 @@ async fn dispatch_hop(
         started,
         inbound_protocol,
         request_body_for_log,
+        request_id,
     )
     .await
 }
@@ -850,6 +878,7 @@ async fn outbound_with_failover(
     started: i64,
     inbound_protocol: Protocol,
     request_body_for_log: Option<Bytes>,
+    request_id: &str,
 ) -> Response {
     run_failover(
         route,
@@ -867,6 +896,7 @@ async fn outbound_with_failover(
                     started,
                     inbound_protocol,
                     request_body: request_body_for_log.clone(),
+                    request_id,
                 };
                 if request.stream {
                     stream_completion(&mut ctx, &record.channel).await
@@ -881,6 +911,7 @@ async fn outbound_with_failover(
             let channel = channel.to_string();
             let request_body = request_body_for_log.clone();
             let response_body = snapshot.full_body.then(|| body_wire.to_vec());
+            let request_id = request_id.to_string();
             Box::pin(async move {
                 log_request(
                     deps,
@@ -896,6 +927,7 @@ async fn outbound_with_failover(
                         ..Default::default()
                     },
                     inbound_protocol,
+                    &request_id,
                 )
                 .await;
             })
@@ -925,6 +957,7 @@ struct PassthroughCtx<'a> {
     request_body: Option<Bytes>,
     /// 直通时转发下游的 `anthropic-version`；缺省则出站用官方默认。
     inbound_anthropic_version: Option<&'a HeaderValue>,
+    request_id: &'a str,
 }
 
 /// 直通快路径：按渠道路由顺序发起同协议出站调用，遇可重试错误自动 failover。
@@ -951,6 +984,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             let channel = channel.to_string();
             let request_body = ctx.request_body.clone();
             let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
+            let request_id = ctx.request_id.to_string();
             Box::pin(async move {
                 log_request(
                     ctx.deps,
@@ -966,6 +1000,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                         ..Default::default()
                     },
                     ctx.inbound_protocol,
+                    &request_id,
                 )
                 .await;
             })
@@ -1055,6 +1090,7 @@ async fn passthrough_stream_completion(
         protocol: channel.protocol,
         request_body: ctx.request_body.clone(),
         response_body: Vec::new(),
+        request_id: ctx.request_id.to_string(),
     };
     let byte_stream = resp.bytes_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
@@ -1169,6 +1205,7 @@ async fn passthrough_non_stream_completion(
                 response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
             },
             ctx.inbound_protocol,
+            ctx.request_id,
         )
         .await;
         let mut response = Response::new(Body::from(upstream_body));
@@ -1243,6 +1280,7 @@ struct PassthroughStreamTask {
     protocol: Protocol,
     request_body: Option<Bytes>,
     response_body: Vec<u8>,
+    request_id: String,
 }
 
 /// 把上游 SSE 原始字节块直搬到下游，并在旁路缓冲中逐帧嗅探 usage。
@@ -1373,6 +1411,7 @@ async fn pipe_passthrough_stream<S>(
             response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
         ctx.protocol,
+        &ctx.request_id,
     )
     .await;
     // OpenAI 协议约定以 `data: [DONE]` 终止；Anthropic 以上游
@@ -1492,6 +1531,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                         response_body: inbound_wire,
                     },
                     inbound_protocol,
+                    ctx.request_id,
                 )
                 .await;
                 Outbound::Success(Json(inbound).into_response())
@@ -1629,6 +1669,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         inbound_protocol,
         request_body: ctx.request_body.clone(),
         response_body: Vec::new(),
+        request_id: ctx.request_id.to_string(),
     };
     tokio::spawn(async move {
         pipe_stream(byte_stream, tx, ctx).await;
@@ -1658,6 +1699,7 @@ struct StreamTask {
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
     response_body: Vec<u8>,
+    request_id: String,
 }
 
 /// 把上游 SSE 字节流逐帧解码 → 累积 → 重编码，推送到下游通道。
@@ -1847,6 +1889,7 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
             response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
         ctx.inbound_protocol,
+        &ctx.request_id,
     )
     .await;
 }
@@ -2017,6 +2060,7 @@ async fn error_response(
     started: i64,
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
+    request_id: &str,
 ) -> Response {
     let body = protocol::encode_error(status.as_u16(), message, inbound_protocol);
     if let (Some(token), Some(model)) = (token, model) {
@@ -2037,6 +2081,7 @@ async fn error_response(
                 response_body: response_wire,
             },
             inbound_protocol,
+            request_id,
         )
         .await;
     }
@@ -2066,6 +2111,7 @@ async fn too_many_token_requests(
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
     retry_after: Duration,
+    request_id: &str,
 ) -> Response {
     let mut response = error_response(
         StatusCode::TOO_MANY_REQUESTS,
@@ -2077,6 +2123,7 @@ async fn too_many_token_requests(
         started,
         inbound_protocol,
         request_body,
+        request_id,
     )
     .await;
     let secs = retry_after.as_secs().max(1);
@@ -2097,6 +2144,7 @@ async fn db_error_response(
     err: impl std::fmt::Display,
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
+    request_id: &str,
 ) -> Response {
     let message = format!("计费状态读取失败: {err}");
     error_response(
@@ -2109,6 +2157,7 @@ async fn db_error_response(
         started,
         inbound_protocol,
         request_body,
+        request_id,
     )
     .await
 }

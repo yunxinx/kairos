@@ -116,6 +116,8 @@ pub struct RequestLog {
     pub cost_usd_micros: i64,
     /// 费用是否已写入 `token_balance`；结算失败时为 `false`，供对账补扣。
     pub settled: bool,
+    /// 一次下游入站请求的身份；同一请求的多次出站尝试共用。存量行可能为 `None`。
+    pub request_id: Option<String>,
     /// 可选的入站请求原始字节（仅 `logging.full_body` 开启时保存）。
     pub request_body: Option<Vec<u8>>,
     /// 可选的入站响应原始字节（仅 `logging.full_body` 开启时保存）。
@@ -141,8 +143,8 @@ pub async fn insert_request_log_on(
           status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
           cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
           cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
-          settled, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          settled, request_id, request_body, response_body) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.created_at)
     .bind(&log.token_name)
@@ -163,6 +165,7 @@ pub async fn insert_request_log_on(
     .bind(log.price.cache_write_micros)
     .bind(log.cost_usd_micros)
     .bind(log.settled as i64)
+    .bind(&log.request_id)
     .bind(&log.request_body)
     .bind(&log.response_body)
     .execute(&mut *conn)
@@ -557,8 +560,9 @@ pub struct CostShare {
 
 /// 全量累计：不受 `/stats` 时间窗影响。
 ///
-/// 口径不一致是有意的：`request_count` 与 `total_tokens` 含全部请求日志行
-/// （含未结算），`cost_usd_micros` 只计 HTTP 2xx 且已结算的费用。并列展示时
+/// 口径：`request_count` 按 `request_id` 去重（存量无 id 的行回退到主键），
+/// 表示下游入站次数；`total_tokens` 含全部请求日志行（含未结算），
+/// `cost_usd_micros` 只计 HTTP 2xx 且已结算的费用。并列展示时
 /// 不要把 token 合计当成已入账费用的用量。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifetimeStats {
@@ -579,7 +583,7 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
     let from_created_at = start_day.saturating_mul(MS_PER_DAY);
 
     let summary_row = sqlx::query(
-        "SELECT COUNT(*) AS request_count, \
+        "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS success_count, \
          COALESCE(SUM(input_tokens), 0) AS input_tokens, \
          COALESCE(SUM(output_tokens), 0) AS output_tokens, \
@@ -642,7 +646,7 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
 /// 全量累计：请求数、成功结算费用、四分量 token 合计。
 pub async fn query_lifetime_stats(pool: &SqlitePool) -> Result<LifetimeStats, StoreError> {
     let row = sqlx::query(
-        "SELECT COUNT(*) AS request_count, \
+        "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
          COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
@@ -690,7 +694,7 @@ async fn query_hourly_buckets(
          FROM calendar \
          LEFT JOIN ( \
             SELECT strftime('%Y-%m-%dT%H:00:00Z', created_at / 1000, 'unixepoch') AS hour, \
-                   COUNT(*) AS request_count, \
+                   COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
@@ -730,7 +734,7 @@ async fn query_daily_buckets(
          FROM calendar \
          LEFT JOIN ( \
             SELECT date(created_at / 1000, 'unixepoch') AS day, \
-                   COUNT(*) AS request_count, \
+                   COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
@@ -764,7 +768,7 @@ async fn query_cost_share(
 ) -> Result<Vec<CostShare>, StoreError> {
     let sql = match dimension {
         CostDimension::Model => {
-            "SELECT model AS name, COUNT(*) AS request_count, \
+            "SELECT model AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
              COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
                AS cost_usd_micros \
              FROM request_log WHERE created_at >= ? \
@@ -772,7 +776,7 @@ async fn query_cost_share(
              ORDER BY cost_usd_micros DESC, name ASC"
         }
         CostDimension::Channel => {
-            "SELECT channel AS name, COUNT(*) AS request_count, \
+            "SELECT channel AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
              COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
                AS cost_usd_micros \
              FROM request_log WHERE created_at >= ? \
@@ -975,6 +979,7 @@ fn map_request_log_row(
             .try_get::<i64, _>("settled")
             .map_err(StoreError::Query)?
             != 0,
+        request_id: None,
         request_body: if include_body {
             row.try_get("request_body").map_err(StoreError::Query)?
         } else {
@@ -1409,6 +1414,7 @@ mod tests {
                     price,
                     cost_usd_micros: 12,
                     settled: true,
+                    request_id: None,
                     request_body: None,
                     response_body: None,
                 },
@@ -1490,6 +1496,7 @@ mod tests {
                     price,
                     cost_usd_micros: 0,
                     settled: true,
+                    request_id: None,
                     request_body: None,
                     response_body: None,
                 },
@@ -1567,6 +1574,7 @@ mod tests {
                 price,
                 cost_usd_micros: 12,
                 settled: true,
+                request_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -1628,6 +1636,7 @@ mod tests {
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
                 settled: true,
+                request_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -1685,6 +1694,7 @@ mod tests {
                 price,
                 cost_usd_micros: 9_999,
                 settled: false,
+                request_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -1711,6 +1721,7 @@ mod tests {
                 price,
                 cost_usd_micros: 100,
                 settled: true,
+                request_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -1741,9 +1752,36 @@ mod tests {
             price: PriceSnapshot::default(),
             cost_usd_micros: 1,
             settled,
+            request_id: None,
             request_body: None,
             response_body: None,
         }
+    }
+
+    /// 同一下游请求的多跳对账行按 `request_id` 计一次；无 id 的存量行仍按主键计。
+    #[tokio::test]
+    async fn lifetime_stats_counts_unique_request_id() {
+        let (_dir, pool) = test_pool().await;
+        let mut hop1 = sample_log(1, true);
+        hop1.request_id = Some("req-shared".to_string());
+        hop1.status_code = 429;
+        let mut hop2 = sample_log(2, true);
+        hop2.request_id = Some("req-shared".to_string());
+        insert_request_log(&pool, &hop1)
+            .await
+            .expect("应能写失败跳");
+        insert_request_log(&pool, &hop2)
+            .await
+            .expect("应能写成功跳");
+        insert_request_log(&pool, &sample_log(3, true))
+            .await
+            .expect("应能写无 id 存量行");
+
+        let lifetime = query_lifetime_stats(&pool).await.expect("应能聚合");
+        assert_eq!(
+            lifetime.request_count, 2,
+            "共享 request_id 的两跳计 1，加上一条存量"
+        );
     }
 
     /// 请求日志分页的 settled 过滤；未结算计数忽略 settled 维。

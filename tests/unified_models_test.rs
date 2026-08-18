@@ -406,6 +406,23 @@ async fn ordered_failover_tries_one_member_at_a_time() {
     assert_eq!(ups[1].received().len(), 1, "cheap 失败后再打 pricey");
     assert_eq!(ups[0].received()[0]["model"], "cheap");
     assert_eq!(ups[1].received()[0]["model"], "pricey");
+
+    let rows: Vec<(i64, Option<String>)> =
+        sqlx::query_as("SELECT id, request_id FROM request_log ORDER BY id")
+            .fetch_all(&gw.pool)
+            .await
+            .expect("应能查请求日志");
+    assert_eq!(rows.len(), 2, "失败跳与成功跳各一行");
+    assert!(rows[0].1.is_some(), "新日志应有 request_id");
+    assert_eq!(rows[0].1, rows[1].1, "同一下游请求的 hop 共用 request_id");
+
+    let lifetime = kairos::store::query_lifetime_stats(&gw.pool)
+        .await
+        .expect("应能聚合");
+    assert_eq!(
+        lifetime.request_count, 1,
+        "stats 应按下游请求计，而不是按 hop 行数"
+    );
 }
 
 /// 首成员返回 400（请求本身有问题）时不再 hop 到下一成员。

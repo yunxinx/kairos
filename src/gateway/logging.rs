@@ -72,6 +72,7 @@ pub(super) async fn log_request(
     started: i64,
     billing: Billing,
     inbound_protocol: Protocol,
+    request_id: &str,
 ) {
     let now = unix_millis();
     let max_bytes = deps.snapshot.read().await.log_body_max_bytes;
@@ -104,6 +105,7 @@ pub(super) async fn log_request(
         price: billing.price,
         cost_usd_micros: billing.cost_usd_micros,
         settled: billing.cost_usd_micros <= 0,
+        request_id: Some(request_id.to_string()),
         request_body: clip_logged_body(billing.request_body.map(|bytes| bytes.to_vec()), max_bytes),
         response_body: clip_logged_body(billing.response_body, max_bytes),
     };
@@ -244,6 +246,12 @@ pub(super) fn unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// 一次下游入站请求的身份，供 hop 之间共用。
+pub(super) fn new_request_id() -> String {
+    use rand::distr::{Alphanumeric, SampleString};
+    Alphanumeric.sample_string(&mut rand::rng(), 22)
 }
 
 #[cfg(test)]
