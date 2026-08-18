@@ -4,7 +4,10 @@
 //! 中间件。已注册的资源 API 仍由 [`super::admin`] 的中间件保护。
 
 use axum::{
-    http::{Method, StatusCode, Uri, header},
+    http::{
+        HeaderValue, Method, StatusCode, Uri,
+        header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS},
+    },
     response::{IntoResponse, Response},
 };
 use rust_embed::Embed;
@@ -52,11 +55,46 @@ fn index_html() -> Response {
 }
 
 fn file_response(path: &str, data: std::borrow::Cow<'static, [u8]>) -> Response {
-    ([(header::CONTENT_TYPE, content_type_for(path))], data).into_response()
+    (
+        [
+            (
+                CONTENT_TYPE,
+                HeaderValue::from_static(content_type_for(path)),
+            ),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static(cache_control_for(path)),
+            ),
+            (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+        ],
+        data,
+    )
+        .into_response()
 }
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "路径未实现").into_response()
+}
+
+/// html 与未指纹化资源不缓存；Vite 带内容哈希的资产可长期 immutable。
+fn cache_control_for(path: &str) -> &'static str {
+    if path == "index.html" || path.ends_with(".html") {
+        "no-cache"
+    } else if is_fingerprinted_asset(path) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+/// Vite 默认文件名：`index-Ab12Cd34.js`（stem 以 `-` + ≥8 位字母数字哈希结尾）。
+fn is_fingerprinted_asset(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let Some((stem, _)) = name.rsplit_once('.') else {
+        return false;
+    };
+    stem.rsplit_once('-')
+        .is_some_and(|(_, hash)| hash.len() >= 8 && hash.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 /// 按扩展名给出 Content-Type；未知类型按 octet-stream，避免引入额外 crate。
