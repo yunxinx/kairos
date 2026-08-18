@@ -3,6 +3,7 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
+import { unifiedMemberWriteBody } from '@/api/types';
 import type { ChannelView, Price, UnifiedMember, UnifiedModel } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
@@ -120,7 +121,7 @@ function handleSave() {
   if (!validate(specs, t)) return;
   saveMutation.mutate({
     id: editorId.value.trim(),
-    models: [...editorMembers.value],
+    models: editorMembers.value.map(unifiedMemberWriteBody),
     hide: editorHide.value,
   });
 }

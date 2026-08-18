@@ -15,18 +15,26 @@ import UiIcon from '@/components/ui/UiIcon.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { formatBytesAsMb, formatUnixMillis, parseMbToBytes } from '@/lib/format';
 
-type SettingsSection = 'logging' | 'catalog';
+type SettingsSection = 'logging' | 'gateway' | 'catalog';
 
 const { t } = useI18n();
 const section = ref<SettingsSection>('logging');
 const queryClient = useQueryClient();
-const { fieldError, fieldInputHandlers, clearErrors, validate } = useFormValidation();
+const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } =
+  useFormValidation();
 
 const fullBody = ref(false);
 const maxRequestMb = ref('');
 const catalogIntervalDays = ref('0');
+const authThrottleMax = ref('');
+const authThrottleWindow = ref('');
+const sseReassemblyMb = ref('');
+const retryBackoffMs = ref('');
+const retryBackoffCapMs = ref('');
+const retryAfterCapSecs = ref('');
 /** 上次从接口载入的字节值；未改 MB 文案时原样回写，避免 0.00 显示把小字节上限抹掉。 */
 const loadedMaxRequestBytes = ref<number | null>(null);
+const loadedSseReassemblyBytes = ref<number | null>(null);
 const saveError = ref('');
 const saveSuccess = ref(false);
 const syncError = ref('');
@@ -55,6 +63,13 @@ function applySettings(settings: Settings) {
   loadedMaxRequestBytes.value = settings.max_request_bytes;
   maxRequestMb.value = formatBytesAsMb(settings.max_request_bytes);
   catalogIntervalDays.value = String(settings.catalog_sync_interval_days);
+  authThrottleMax.value = String(settings.auth_throttle_max_failures);
+  authThrottleWindow.value = String(settings.auth_throttle_window_secs);
+  loadedSseReassemblyBytes.value = settings.sse_reassembly_max_bytes;
+  sseReassemblyMb.value = formatBytesAsMb(settings.sse_reassembly_max_bytes);
+  retryBackoffMs.value = String(settings.retry_backoff_ms);
+  retryBackoffCapMs.value = String(settings.retry_backoff_cap_ms);
+  retryAfterCapSecs.value = String(settings.retry_after_cap_secs);
 }
 
 const saveMutation = useMutation({
@@ -73,13 +88,16 @@ const saveMutation = useMutation({
   },
 });
 
+function mbUnchanged(input: string, loaded: number | null): boolean {
+  return loaded !== null && input.trim() === formatBytesAsMb(loaded);
+}
+
 function handleSave() {
   saveError.value = '';
   saveSuccess.value = false;
-  const loadedBytes = loadedMaxRequestBytes.value;
-  const mbUnchanged =
-    loadedBytes !== null && maxRequestMb.value.trim() === formatBytesAsMb(loadedBytes);
-  if (!mbUnchanged) {
+  const requestMbSame = mbUnchanged(maxRequestMb.value, loadedMaxRequestBytes.value);
+  const sseMbSame = mbUnchanged(sseReassemblyMb.value, loadedSseReassemblyBytes.value);
+  if (!requestMbSame) {
     const isValid = validate(
       [
         {
@@ -95,8 +113,66 @@ function handleSave() {
       return;
     }
   }
-  const maxRequestBytes = mbUnchanged ? loadedBytes : parseMbToBytes(maxRequestMb.value);
+  const maxRequestBytes = requestMbSame
+    ? loadedMaxRequestBytes.value
+    : parseMbToBytes(maxRequestMb.value);
   if (maxRequestBytes === null) return;
+
+  const gatewayValid = validate(
+    [
+      {
+        name: 'authThrottleMax',
+        value: authThrottleMax.value,
+        rules: [{ kind: 'required' }, { kind: 'uint', min: 0 }],
+      },
+      {
+        name: 'authThrottleWindow',
+        value: authThrottleWindow.value,
+        rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+      },
+      ...(!sseMbSame
+        ? [
+            {
+              name: 'sseReassemblyMax',
+              value: sseReassemblyMb.value,
+              rules: [{ kind: 'required' as const }, { kind: 'mb' as const, min: 1 }],
+            },
+          ]
+        : []),
+      {
+        name: 'retryBackoffMs',
+        value: retryBackoffMs.value,
+        rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+      },
+      {
+        name: 'retryBackoffCap',
+        value: retryBackoffCapMs.value,
+        rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+      },
+      {
+        name: 'retryAfterCap',
+        value: retryAfterCapSecs.value,
+        rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+      },
+    ],
+    t,
+  );
+  if (!gatewayValid) {
+    section.value = 'gateway';
+    return;
+  }
+  const sseReassemblyMax = sseMbSame
+    ? loadedSseReassemblyBytes.value
+    : parseMbToBytes(sseReassemblyMb.value);
+  if (sseReassemblyMax === null) return;
+  const backoffMs = Number(retryBackoffMs.value.trim());
+  const backoffCapMs = Number(retryBackoffCapMs.value.trim());
+  if (backoffCapMs < backoffMs) {
+    section.value = 'gateway';
+    showFieldError('retryBackoffCap', t('settings.retryBackoffCapTooSmall'));
+    return;
+  }
+
   const intervalValid = validate(
     [
       {
@@ -115,6 +191,12 @@ function handleSave() {
     full_body: fullBody.value,
     max_request_bytes: maxRequestBytes,
     catalog_sync_interval_days: Number(catalogIntervalDays.value.trim()),
+    auth_throttle_max_failures: Number(authThrottleMax.value.trim()),
+    auth_throttle_window_secs: Number(authThrottleWindow.value.trim()),
+    sse_reassembly_max_bytes: sseReassemblyMax,
+    retry_backoff_ms: backoffMs,
+    retry_backoff_cap_ms: backoffCapMs,
+    retry_after_cap_secs: Number(retryAfterCapSecs.value.trim()),
   });
 }
 
@@ -160,6 +242,13 @@ const tabsAria = computed(() => t('settings.sections'));
             data-testid="settings-section-logging"
           >
             {{ t('settings.section.logging') }}
+          </TabsTrigger>
+          <TabsTrigger
+            value="gateway"
+            class="page-tab-switch-btn"
+            data-testid="settings-section-gateway"
+          >
+            {{ t('settings.section.gateway') }}
           </TabsTrigger>
           <TabsTrigger
             value="catalog"
@@ -296,6 +385,142 @@ const tabsAria = computed(() => t('settings.sections'));
                     :invalid="invalid"
                     :hint-id="hintId"
                     v-on="fieldInputHandlers('maxRequestBytes')"
+                  />
+                </template>
+              </FormField>
+            </div>
+          </TabsContent>
+          <TabsContent value="gateway" class="card-body">
+            <div class="settings-fields-row">
+              <FormField
+                field-name="authThrottleMax"
+                layout="inline"
+                :label="t('settings.authThrottleMax')"
+                input-id="settings-auth-throttle-max"
+                :error="fieldError('authThrottleMax')"
+                :guide="t('settings.authThrottleMaxGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-auth-throttle-max"
+                    v-model="authThrottleMax"
+                    type="text"
+                    inputmode="numeric"
+                    class="font-mono"
+                    data-testid="settings-auth-throttle-max"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('authThrottleMax')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="authThrottleWindow"
+                layout="inline"
+                :label="t('settings.authThrottleWindow')"
+                input-id="settings-auth-throttle-window"
+                :error="fieldError('authThrottleWindow')"
+                :guide="t('settings.authThrottleWindowGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-auth-throttle-window"
+                    v-model="authThrottleWindow"
+                    type="text"
+                    inputmode="numeric"
+                    class="font-mono"
+                    data-testid="settings-auth-throttle-window"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('authThrottleWindow')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="sseReassemblyMax"
+                layout="inline"
+                :label="t('settings.sseReassemblyMax')"
+                input-id="settings-sse-reassembly-max"
+                :error="fieldError('sseReassemblyMax')"
+                :guide="t('settings.sseReassemblyMaxGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-sse-reassembly-max"
+                    v-model="sseReassemblyMb"
+                    type="text"
+                    inputmode="decimal"
+                    class="font-mono"
+                    data-testid="settings-sse-reassembly-max"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('sseReassemblyMax')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="retryBackoffMs"
+                layout="inline"
+                :label="t('settings.retryBackoffMs')"
+                input-id="settings-retry-backoff-ms"
+                :error="fieldError('retryBackoffMs')"
+                :guide="t('settings.retryBackoffMsGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-retry-backoff-ms"
+                    v-model="retryBackoffMs"
+                    type="text"
+                    inputmode="numeric"
+                    class="font-mono"
+                    data-testid="settings-retry-backoff-ms"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('retryBackoffMs')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="retryBackoffCap"
+                layout="inline"
+                :label="t('settings.retryBackoffCap')"
+                input-id="settings-retry-backoff-cap"
+                :error="fieldError('retryBackoffCap')"
+                :guide="t('settings.retryBackoffCapGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-retry-backoff-cap"
+                    v-model="retryBackoffCapMs"
+                    type="text"
+                    inputmode="numeric"
+                    class="font-mono"
+                    data-testid="settings-retry-backoff-cap"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('retryBackoffCap')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="retryAfterCap"
+                layout="inline"
+                :label="t('settings.retryAfterCap')"
+                input-id="settings-retry-after-cap"
+                :error="fieldError('retryAfterCap')"
+                :guide="t('settings.retryAfterCapGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-retry-after-cap"
+                    v-model="retryAfterCapSecs"
+                    type="text"
+                    inputmode="numeric"
+                    class="font-mono"
+                    data-testid="settings-retry-after-cap"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('retryAfterCap')"
                   />
                 </template>
               </FormField>

@@ -95,6 +95,15 @@ export interface ModelGroup {
 export interface UnifiedMember {
   channel_id: number;
   model: string;
+  /** GET 读视图：渠道仍在、已启用且仍登记该名。写契约不含此字段。 */
+  available?: boolean;
+}
+
+/** 写契约：剥离只读 `available`（后端 `deny_unknown_fields` 拒收未知字段）。 */
+export function unifiedMemberWriteBody(
+  member: UnifiedMember,
+): Pick<UnifiedMember, 'channel_id' | 'model'> {
+  return { channel_id: member.channel_id, model: member.model };
 }
 
 /** 统一模型：一个下游可调用名，按顺序尝试若干钉渠道的成员。 */
@@ -110,6 +119,18 @@ export interface Settings {
   max_request_bytes: number;
   /** 价格目录自动同步间隔（天）；`0` 表示只手动同步。 */
   catalog_sync_interval_days: number;
+  /** 同一 IP 窗口内允许的认证失败次数；`0` 表示关闭限流。 */
+  auth_throttle_max_failures: number;
+  /** 认证失败计数窗口（秒）。 */
+  auth_throttle_window_secs: number;
+  /** SSE 重装缓冲上限（字节）。 */
+  sse_reassembly_max_bytes: number;
+  /** 同渠道重试基础间隔（毫秒）。 */
+  retry_backoff_ms: number;
+  /** 同渠道指数退避封顶（毫秒）。 */
+  retry_backoff_cap_ms: number;
+  /** 上游 Retry-After 最大等待（秒）。 */
+  retry_after_cap_secs: number;
 }
 
 /** 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。 */
@@ -184,6 +205,8 @@ export interface LogEntry {
   cache_read_price_usd_micros: number;
   cache_write_price_usd_micros: number;
   cost_usd_micros: number;
+  /** 费用是否已写入 token_balance。 */
+  settled: boolean;
   request_body: string | null;
   response_body: string | null;
 }
