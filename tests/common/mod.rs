@@ -22,8 +22,9 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{StatusCode, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -70,6 +71,7 @@ impl UpstreamBehavior {
 #[derive(Debug, Default)]
 pub struct ReceivedLog {
     pub requests: Vec<Value>,
+    pub anthropic_versions: Vec<Option<String>>,
 }
 
 /// 可编程 mock 上游 server。
@@ -92,6 +94,10 @@ impl MockUpstream {
             .route("/chat/completions", post(handle))
             .route("/messages", post(handle))
             .route("/responses", post(handle))
+            .layer(middleware::from_fn_with_state(
+                received.clone(),
+                capture_anthropic_version,
+            ))
             .route("/models", get(handle_models))
             // 禁用 axum 默认 2MB 上限：mock 上游需接收大请求体（模拟网关转发的多模态/base64）。
             .layer(DefaultBodyLimit::disable())
@@ -143,6 +149,15 @@ impl MockUpstream {
             .requests
             .clone()
     }
+
+    /// 拷贝收到的 `anthropic-version` 头（缺省为 `None`）。
+    pub fn received_anthropic_versions(&self) -> Vec<Option<String>> {
+        self.received
+            .lock()
+            .expect("received 锁不应被污染")
+            .anthropic_versions
+            .clone()
+    }
 }
 
 #[derive(Clone)]
@@ -151,8 +166,26 @@ struct MockDeps {
     received: Arc<Mutex<ReceivedLog>>,
 }
 
+/// 记录出站 `anthropic-version`；只挂在有请求体的 POST 路由上，避免 GET `/models` 错位。
+async fn capture_anthropic_version(
+    State(received): State<Arc<Mutex<ReceivedLog>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let version = request
+        .headers()
+        .get("anthropic-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    received
+        .lock()
+        .expect("received 锁不应被污染")
+        .anthropic_versions
+        .push(version);
+    next.run(request).await
+}
+
 async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Response {
-    // 记录收到的出站请求体。
     deps.received
         .lock()
         .expect("received 锁不应被污染")
@@ -271,6 +304,8 @@ pub struct SeedToken {
     pub limit_usd: Option<f64>,
     /// 初始余额（USD），缺省 0。
     pub balance_usd: f64,
+    /// 该令牌 RPM；`None` 跟随全局兜底。
+    pub rate_limit_rpm: Option<u64>,
 }
 
 /// 测试资源清单：播种进 DB 后由网关加载进运行时快照。
@@ -311,6 +346,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             name: "dev".to_string(),
             limit_usd: None,
             balance_usd: 5.0,
+            rate_limit_rpm: None,
         }],
         prices: vec![
             Price {
@@ -367,6 +403,7 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
                     .limit_usd
                     .map(|usd| (usd * 1_000_000.0).round() as i64),
                 enabled: true,
+                rate_limit_rpm: token.rate_limit_rpm,
                 model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
             },
             unix_millis(),

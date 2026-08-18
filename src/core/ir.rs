@@ -212,6 +212,14 @@ impl Usage {
             self.raw = other.raw;
         }
     }
+
+    /// 四分量是否全为零（上游未回报 usage 时的嗅探/解码缺省值）。
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+    }
 }
 
 /// 工具定义（出站请求侧）。

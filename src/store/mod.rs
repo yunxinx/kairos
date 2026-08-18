@@ -11,7 +11,7 @@ mod system_log;
 
 pub use system_log::{
     SystemLog, SystemLogList, SystemLogQuery, insert_system_log, query_system_log_page,
-    record_system_error,
+    record_system_error, record_system_warn,
 };
 
 use std::path::Path;
@@ -326,7 +326,7 @@ impl RequestLogQuery {
     }
 }
 
-/// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目。
+/// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目（不含 body）。
 async fn query_request_logs_on(
     conn: &mut SqliteConnection,
     filter: &RequestLogQuery,
@@ -336,7 +336,7 @@ async fn query_request_logs_on(
          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
-         settled, request_body, response_body FROM request_log",
+         settled FROM request_log",
     );
     push_request_log_filters(&mut qb, filter);
     qb.push(" ORDER BY id DESC");
@@ -350,9 +350,103 @@ async fn query_request_logs_on(
 
     let mut logs = Vec::with_capacity(rows.len());
     for row in rows {
-        logs.push(map_request_log_row(&row)?);
+        logs.push(map_request_log_row(&row, false)?);
     }
     Ok(logs)
+}
+
+/// 按主键读一条请求日志（含 body）；不存在返回 `None`。
+pub async fn get_request_log(pool: &SqlitePool, id: i64) -> Result<Option<RequestLog>, StoreError> {
+    let row = sqlx::query(
+        "SELECT id, created_at, token_name, token_key, inbound_protocol, model, outbound_model, \
+         channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+         settled, request_body, response_body FROM request_log WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    row.map(|row| map_request_log_row(&row, true)).transpose()
+}
+
+/// 未结算请求日志的运营闭环结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsettledLogAction {
+    /// 已补扣或豁免，行现为已结算。
+    Closed,
+    /// 该行已经是已结算。
+    AlreadySettled,
+    /// 没有这条日志。
+    NotFound,
+}
+
+/// 对未结算日志补扣：按行上费用写入 `token_balance`（允许透支），并标为已结算。
+///
+/// 费用为 0 时只翻 `settled`。已结算或缺失不改余额。
+pub async fn settle_unsettled_log(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> Result<UnsettledLogAction, StoreError> {
+    let Some((token_key, cost, settled)) = load_log_settlement(conn, id).await? else {
+        return Ok(UnsettledLogAction::NotFound);
+    };
+    if settled {
+        return Ok(UnsettledLogAction::AlreadySettled);
+    }
+    if cost > 0 {
+        settle_charge(conn, &token_key, cost).await?;
+    }
+    mark_request_log_settled(conn, id).await?;
+    Ok(UnsettledLogAction::Closed)
+}
+
+/// 豁免未结算日志：只翻 `settled`，不动余额。
+pub async fn waive_unsettled_log(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> Result<UnsettledLogAction, StoreError> {
+    let Some((_, _, settled)) = load_log_settlement(conn, id).await? else {
+        return Ok(UnsettledLogAction::NotFound);
+    };
+    if settled {
+        return Ok(UnsettledLogAction::AlreadySettled);
+    }
+    mark_request_log_settled(conn, id).await?;
+    Ok(UnsettledLogAction::Closed)
+}
+
+/// 读一条日志的结算所需字段；不存在返回 `None`。
+async fn load_log_settlement(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> Result<Option<(String, i64, bool)>, StoreError> {
+    let row =
+        sqlx::query("SELECT token_key, cost_usd_micros, settled FROM request_log WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let token_key: String = row.try_get("token_key").map_err(StoreError::Query)?;
+    let cost: i64 = row.try_get("cost_usd_micros").map_err(StoreError::Query)?;
+    let settled = row
+        .try_get::<i64, _>("settled")
+        .map_err(StoreError::Query)?
+        != 0;
+    Ok(Some((token_key, cost, settled)))
+}
+
+async fn mark_request_log_settled(conn: &mut SqliteConnection, id: i64) -> Result<(), StoreError> {
+    sqlx::query("UPDATE request_log SET settled = 1 WHERE id = ?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
 }
 
 /// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目。
@@ -462,6 +556,10 @@ pub struct CostShare {
 }
 
 /// 全量累计：不受 `/stats` 时间窗影响。
+///
+/// 口径不一致是有意的：`request_count` 与 `total_tokens` 含全部请求日志行
+/// （含未结算），`cost_usd_micros` 只计 HTTP 2xx 且已结算的费用。并列展示时
+/// 不要把 token 合计当成已入账费用的用量。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifetimeStats {
     pub request_count: u64,
@@ -833,8 +931,11 @@ pub(crate) fn like_substring_pattern(keyword: &str) -> String {
     pattern
 }
 
-/// 把请求日志行映射为 `RequestLog`。
-fn map_request_log_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestLog, StoreError> {
+/// 把请求日志行映射为 `RequestLog`。列表查询不选 BLOB 列，`include_body` 为 false。
+fn map_request_log_row(
+    row: &sqlx::sqlite::SqliteRow,
+    include_body: bool,
+) -> Result<RequestLog, StoreError> {
     let price = PriceSnapshot {
         input_micros: row
             .try_get("input_price_usd_micros")
@@ -874,8 +975,16 @@ fn map_request_log_row(row: &sqlx::sqlite::SqliteRow) -> Result<RequestLog, Stor
             .try_get::<i64, _>("settled")
             .map_err(StoreError::Query)?
             != 0,
-        request_body: row.try_get("request_body").map_err(StoreError::Query)?,
-        response_body: row.try_get("response_body").map_err(StoreError::Query)?,
+        request_body: if include_body {
+            row.try_get("request_body").map_err(StoreError::Query)?
+        } else {
+            None
+        },
+        response_body: if include_body {
+            row.try_get("response_body").map_err(StoreError::Query)?
+        } else {
+            None
+        },
     })
 }
 
@@ -1657,6 +1766,44 @@ mod tests {
         assert!(!rows[0].settled);
         assert_eq!(total, 1);
         assert_eq!(unsettled_total, 1);
+    }
+
+    /// 列表查询不读 body；按 id 详情才返回 BLOB。
+    #[tokio::test]
+    async fn request_log_list_omits_bodies_and_detail_returns_them() {
+        let (_dir, pool) = test_pool().await;
+        let mut log = sample_log(1, true);
+        log.request_body = Some(b"{\"model\":\"gpt-4o\"}".to_vec());
+        log.response_body = Some(b"{\"ok\":true}".to_vec());
+        let id = insert_request_log(&pool, &log)
+            .await
+            .expect("应能写带 body 的日志");
+
+        let (rows, _, _) = query_request_log_page(&pool, &RequestLogQuery::new(1, 10))
+            .await
+            .expect("应能分页");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].request_body.is_none(), "列表不应读 request_body");
+        assert!(rows[0].response_body.is_none(), "列表不应读 response_body");
+
+        let detail = get_request_log(&pool, id)
+            .await
+            .expect("应能按 id 读取")
+            .expect("详情应存在");
+        assert_eq!(
+            detail.request_body.as_deref(),
+            Some(b"{\"model\":\"gpt-4o\"}".as_slice())
+        );
+        assert_eq!(
+            detail.response_body.as_deref(),
+            Some(b"{\"ok\":true}".as_slice())
+        );
+        assert!(
+            get_request_log(&pool, id + 1)
+                .await
+                .expect("不存在也应成功")
+                .is_none()
+        );
     }
 
     /// 系统日志分页与关键字过滤。

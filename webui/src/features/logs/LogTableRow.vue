@@ -11,10 +11,16 @@ defineProps<{
   entry: LogEntry;
   expanded: boolean;
   detailColSpan: number;
+  detail?: LogEntry | null;
+  detailLoading?: boolean;
+  detailError?: string;
+  closing?: boolean;
 }>();
 
 const emit = defineEmits<{
   toggleExpand: [];
+  settle: [];
+  waive: [];
 }>();
 
 const { t, locale } = useI18n();
@@ -86,7 +92,43 @@ function statusBadgeClass(statusCode: number): string {
           </dd>
         </div>
       </dl>
-      <LogBodyPanel :entry="entry" />
+      <div
+        v-if="!entry.settled"
+        class="mb-4 flex flex-wrap gap-2"
+        data-testid="log-unsettled-actions"
+      >
+        <button
+          type="button"
+          class="btn btn-subtle"
+          data-testid="log-settle"
+          :disabled="closing"
+          :title="t('logs.settleGuide')"
+          @click="emit('settle')"
+        >
+          {{ t('logs.settleCharge') }}
+        </button>
+        <button
+          type="button"
+          class="btn btn-subtle"
+          data-testid="log-waive"
+          :disabled="closing"
+          :title="t('logs.waiveGuide')"
+          @click="emit('waive')"
+        >
+          {{ t('logs.waiveCharge') }}
+        </button>
+      </div>
+      <LogBodyPanel v-if="detail" :entry="detail" />
+      <p
+        v-else-if="detailLoading"
+        class="text-fg-muted text-sm"
+        data-testid="log-body-loading"
+      >
+        {{ t('logs.bodyLoading') }}
+      </p>
+      <p v-else-if="detailError" class="text-danger text-sm" data-testid="log-body-error">
+        {{ detailError }}
+      </p>
     </TableCell>
   </TableRow>
 </template>

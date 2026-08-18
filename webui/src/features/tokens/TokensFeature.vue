@@ -203,6 +203,7 @@ const toggleMutation = useMutation({
       token_key: token.token_key,
       name: token.name,
       limit_usd_micros: token.limit_usd_micros,
+      rate_limit_rpm: token.rate_limit_rpm,
       enabled: !token.enabled,
       model_group: token.model_group,
     }),

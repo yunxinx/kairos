@@ -18,6 +18,8 @@ export interface Token {
   token_key: string;
   name: string;
   limit_usd_micros: number | null;
+  /** 每分钟请求上限；`null` 跟随全局兜底，`0` 表示该令牌不限速。 */
+  rate_limit_rpm: number | null;
   enabled: boolean;
   /** 绑定的模型组名；未指定时为内置 `default`。 */
   model_group: string;
@@ -133,6 +135,8 @@ export interface Settings {
   retry_backoff_cap_ms: number;
   /** 上游 Retry-After 最大等待（秒）。 */
   retry_after_cap_secs: number;
+  /** 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。 */
+  rate_limit_rpm: number;
 }
 
 /** 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。 */
@@ -209,7 +213,9 @@ export interface LogEntry {
   cost_usd_micros: number;
   /** 费用是否已写入 token_balance。 */
   settled: boolean;
+  /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
   request_body: string | null;
+  /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
   response_body: string | null;
 }
 
@@ -306,7 +312,10 @@ export interface StatsView {
   by_channel: ChannelShare[];
 }
 
-/** `/stats/lifetime` 全量累计，不受时间窗影响。 */
+/** `/stats/lifetime` 全量累计，不受时间窗影响。
+ *
+ * `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 只计已结算的成功费用。
+ */
 export interface LifetimeStats {
   request_count: number;
   cost_usd_micros: number;

@@ -35,6 +35,7 @@ const sseReassemblyMb = ref('');
 const retryBackoffMs = ref('');
 const retryBackoffCapMs = ref('');
 const retryAfterCapSecs = ref('');
+const rateLimitRpm = ref('');
 /** 上次从接口载入的字节值；未改 MB 文案时原样回写，避免 0.00 显示把小字节上限抹掉。 */
 const loadedMaxRequestBytes = ref<number | null>(null);
 const loadedLogBodyBytes = ref<number | null>(null);
@@ -73,6 +74,7 @@ function applySettings(settings: Settings) {
   retryBackoffMs.value = String(settings.retry_backoff_ms);
   retryBackoffCapMs.value = String(settings.retry_backoff_cap_ms);
   retryAfterCapSecs.value = String(settings.retry_after_cap_secs);
+  rateLimitRpm.value = String(settings.rate_limit_rpm);
 }
 
 const saveMutation = useMutation({
@@ -168,6 +170,11 @@ function handleSave() {
         value: retryAfterCapSecs.value,
         rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
       },
+      {
+        name: 'rateLimitRpm',
+        value: rateLimitRpm.value,
+        rules: [{ kind: 'required' }, { kind: 'uint', min: 0 }],
+      },
     ],
     t,
   );
@@ -212,6 +219,7 @@ function handleSave() {
     retry_backoff_ms: backoffMs,
     retry_backoff_cap_ms: backoffCapMs,
     retry_after_cap_secs: Number(retryAfterCapSecs.value.trim()),
+    rate_limit_rpm: Number(rateLimitRpm.value.trim()),
   });
 }
 
@@ -547,6 +555,28 @@ const tabsAria = computed(() => t('settings.sections'));
                     :invalid="invalid"
                     :hint-id="hintId"
                     v-on="fieldInputHandlers('retryAfterCap')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="rateLimitRpm"
+                layout="inline"
+                :label="t('settings.rateLimitRpm')"
+                input-id="settings-rate-limit-rpm"
+                :error="fieldError('rateLimitRpm')"
+                :guide="t('settings.rateLimitRpmGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-rate-limit-rpm"
+                    v-model="rateLimitRpm"
+                    type="text"
+                    inputmode="numeric"
+                    class="font-mono"
+                    data-testid="settings-rate-limit-rpm"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('rateLimitRpm')"
                   />
                 </template>
               </FormField>

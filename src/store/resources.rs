@@ -64,6 +64,9 @@ pub struct Token {
     pub name: String,
     /// 累计结算上限（micro-USD）；`None` 表示无上限。
     pub limit_usd_micros: Option<i64>,
+    /// 该令牌每分钟请求上限；`None` 跟随全局兜底，`Some(0)` 表示不限速。
+    #[serde(default)]
+    pub rate_limit_rpm: Option<u64>,
     /// 是否启用：禁用的令牌在网关认证阶段被拒绝。
     pub enabled: bool,
     /// 绑定的模型组名；缺省为 [`DEFAULT_MODEL_GROUP`]。
@@ -295,6 +298,8 @@ pub const SETTING_RETRY_BACKOFF_MS: &str = "retry_backoff_ms";
 pub const SETTING_RETRY_BACKOFF_CAP_MS: &str = "retry_backoff_cap_ms";
 /// 运行时开关键：上游 `Retry-After` 最大等待（秒）。
 pub const SETTING_RETRY_AFTER_CAP_SECS: &str = "retry_after_cap_secs";
+/// 运行时开关键：未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
+pub const SETTING_RATE_LIMIT_RPM: &str = "rate_limit_rpm";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
 pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
@@ -316,6 +321,8 @@ pub const DEFAULT_RETRY_BACKOFF_MS: u64 = 200;
 pub const DEFAULT_RETRY_BACKOFF_CAP_MS: u64 = 5_000;
 /// 上游 `Retry-After` 最大等待缺省值（秒）。
 pub const DEFAULT_RETRY_AFTER_CAP_SECS: u64 = 60;
+/// 全局每分钟请求兜底缺省值：`0` 表示不设全局上限（令牌也可显式不限速）。
+pub const DEFAULT_RATE_LIMIT_RPM: u64 = 0;
 
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_auth_throttle_max_failures() -> u64 {
@@ -383,6 +390,9 @@ pub struct Settings {
     /// 上游 `Retry-After` 最大等待（秒）。
     #[serde(default = "default_retry_after_cap_secs")]
     pub retry_after_cap_secs: u64,
+    /// 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
+    #[serde(default)]
+    pub rate_limit_rpm: u64,
 }
 
 impl Default for Settings {
@@ -398,6 +408,7 @@ impl Default for Settings {
             retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
             retry_backoff_cap_ms: DEFAULT_RETRY_BACKOFF_CAP_MS,
             retry_after_cap_secs: DEFAULT_RETRY_AFTER_CAP_SECS,
+            rate_limit_rpm: DEFAULT_RATE_LIMIT_RPM,
         }
     }
 }
@@ -571,7 +582,7 @@ pub async fn list_tokens(pool: &SqlitePool) -> Result<Vec<Token>, StoreError> {
 /// 读出全部令牌记录（含创建/最后使用时间等生命周期元数据）。
 pub async fn list_token_records(pool: &SqlitePool) -> Result<Vec<TokenRecord>, StoreError> {
     let rows = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at, model_group \
+        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group \
          FROM tokens",
     )
     .fetch_all(pool)
@@ -587,7 +598,7 @@ pub async fn get_token_record(
     token_key: &str,
 ) -> Result<Option<TokenRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, enabled, created_at, last_used_at, model_group \
+        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group \
          FROM tokens WHERE token_key = ?",
     )
     .bind(token_key)
@@ -601,11 +612,13 @@ pub async fn get_token_record(
 /// 把令牌行映射为 `TokenRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreError> {
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
+    let rate_limit_rpm: Option<i64> = row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
     Ok(TokenRecord {
         token: Token {
             token_key: row.try_get("token_key").map_err(StoreError::Query)?,
             name: row.try_get("name").map_err(StoreError::Query)?,
             limit_usd_micros: row.try_get("limit_usd_micros").map_err(StoreError::Query)?,
+            rate_limit_rpm: rate_limit_rpm.and_then(|n| u64::try_from(n).ok()),
             enabled: enabled != 0,
             model_group: row.try_get("model_group").map_err(StoreError::Query)?,
         },
@@ -624,15 +637,17 @@ pub async fn upsert_token(
     created_at: i64,
 ) -> Result<(), StoreError> {
     sqlx::query(
-        "INSERT INTO tokens (token_key, name, limit_usd_micros, enabled, created_at, model_group) \
-         VALUES (?, ?, ?, ?, ?, ?) \
+        "INSERT INTO tokens (token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, model_group) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(token_key) DO UPDATE SET \
            name = excluded.name, limit_usd_micros = excluded.limit_usd_micros, \
+           rate_limit_rpm = excluded.rate_limit_rpm, \
            enabled = excluded.enabled, model_group = excluded.model_group",
     )
     .bind(&token.token_key)
     .bind(&token.name)
     .bind(token.limit_usd_micros)
+    .bind(bind_rate_limit_rpm(token.rate_limit_rpm))
     .bind(token.enabled)
     .bind(created_at)
     .bind(&token.model_group)
@@ -640,6 +655,11 @@ pub async fn upsert_token(
     .await
     .map_err(StoreError::Query)?;
     Ok(())
+}
+
+/// 令牌 RPM 落库为可空整数；超出 `i64` 的值截到 `i64::MAX`（管理面校验会先拦住）。
+fn bind_rate_limit_rpm(rpm: Option<u64>) -> Option<i64> {
+    rpm.map(|n| i64::try_from(n).unwrap_or(i64::MAX))
 }
 
 /// 刷新令牌的最后使用时间；供网关在请求通过计费准入后调用。
@@ -1035,6 +1055,12 @@ pub async fn upsert_settings(
         &Value::from(settings.retry_after_cap_secs),
     )
     .await?;
+    set_setting(
+        conn,
+        SETTING_RATE_LIMIT_RPM,
+        &Value::from(settings.rate_limit_rpm),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1198,6 +1224,7 @@ mod tests {
             name: "dev".to_string(),
             limit_usd_micros: Some(5_000_000),
             enabled: true,
+            rate_limit_rpm: None,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
         };
         upsert_token(&mut conn, &token, 1_700_000_000_000)
@@ -1218,6 +1245,7 @@ mod tests {
             name: "dev".to_string(),
             limit_usd_micros: None,
             enabled: true,
+            rate_limit_rpm: None,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
         };
         upsert_token(&mut conn, &token, 1_000)
@@ -1276,6 +1304,7 @@ mod tests {
                 name: "dev".to_string(),
                 limit_usd_micros: None,
                 enabled: true,
+                rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
             },
             1,
@@ -1301,6 +1330,7 @@ mod tests {
                 name: "v1".to_string(),
                 limit_usd_micros: None,
                 enabled: true,
+                rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
             },
             1,
@@ -1320,6 +1350,7 @@ mod tests {
                 name: "v2".to_string(),
                 limit_usd_micros: Some(9_000_000),
                 enabled: true,
+                rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
             },
             2,
@@ -1391,6 +1422,7 @@ mod tests {
                 name: "dev".to_string(),
                 limit_usd_micros: None,
                 enabled: true,
+                rate_limit_rpm: None,
                 model_group: "coding".to_string(),
             },
             1,

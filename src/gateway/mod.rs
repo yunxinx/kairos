@@ -8,6 +8,7 @@ mod failover;
 mod http;
 mod logging;
 mod protocol;
+mod rate_limit;
 mod routing;
 mod sse;
 mod throttle;

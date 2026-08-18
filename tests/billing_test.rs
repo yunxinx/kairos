@@ -115,7 +115,39 @@ async fn zero_usage_is_not_charged() {
     assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
 }
 
-/// 上游失败（非 2xx）与网络不可达均不扣费。
+/// 成功 2xx 但上游不回报 usage：零计费，并落一条可观测的系统日志。
+#[tokio::test]
+async fn missing_usage_on_success_writes_system_warning() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-bill",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "ok" },
+            "logprobs": null,
+            "finish_reason": "stop"
+        }]
+    })));
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
+
+    let (level, target, message): (String, String, String) = sqlx::query_as(
+        "SELECT level, target, message FROM system_log WHERE target = 'billing' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应落 usage 缺失的系统日志");
+    assert_eq!(level, "warn");
+    assert_eq!(target, "billing");
+    assert!(
+        message.contains("上游未回报 usage"),
+        "系统日志应说明零计费原因，实际: {message}"
+    );
+}
 #[tokio::test]
 async fn failed_request_is_not_charged() {
     let mut gw = TestGateway::start().await;
@@ -348,4 +380,41 @@ async fn balance_persists_across_restart() {
         after_reload < 5_000_000 - 4250,
         "重启后继续结算，余额不应被重置，实际 {after_reload}"
     );
+}
+
+/// 带极大 `max_tokens` 时按 output 单价粗估，挡住极端输出上限。
+#[tokio::test]
+async fn huge_max_tokens_is_rejected_before_upstream() {
+    let gw = TestGateway::start().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 600_000,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+    assert!(gw.upstream.received().is_empty(), "预估超余额不应出站");
+    assert_eq!(
+        balance_micros(&gw, TEST_TOKEN_KEY).await,
+        5_000_000,
+        "被门槛挡住时不应扣费"
+    );
+}
+
+/// 未带 `max_tokens` 时不做输出粗估，沿用余额门槛。
+#[tokio::test]
+async fn omitted_max_tokens_does_not_use_estimate_gate() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(json!({
+            "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2
+        }))));
+    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }

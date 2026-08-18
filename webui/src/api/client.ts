@@ -8,6 +8,7 @@ import type {
   ChannelView,
   LogQuery,
   LogPage,
+  LogEntry,
   SystemLogQuery,
   SystemLogPage,
   ModelGroup,
@@ -230,6 +231,18 @@ export const apiClient = {
 
   queryLogs(query: LogQuery = {}): Promise<LogPage> {
     return apiFetch(`/logs${buildQuery(query)}`);
+  },
+
+  getLog(id: number): Promise<LogEntry> {
+    return apiFetch(`/logs/${id}`);
+  },
+
+  settleLog(id: number): Promise<LogEntry> {
+    return apiFetch(`/logs/${id}/settle`, { method: 'POST' });
+  },
+
+  waiveLog(id: number): Promise<LogEntry> {
+    return apiFetch(`/logs/${id}/waive`, { method: 'POST' });
   },
 
   querySystemLogs(query: SystemLogQuery = {}): Promise<SystemLogPage> {

@@ -625,15 +625,130 @@ async fn stream_passthrough_idle_timeout_ends_stream() {
     );
 }
 
-/// 未形成完整 SSE 帧的重装缓冲超过 8MB 时断流，避免无分隔符的上游撑爆内存。
+/// 未形成完整 SSE 帧的重装缓冲超过上限时向下游发错误事件，避免当成正常结束。
 #[tokio::test]
 async fn stream_passthrough_caps_reassembly_buffer() {
-    let mut gw = TestGateway::start().await;
-    gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![vec![
-        b'x';
-        8 * 1024 * 1024 + 1
-    ]]));
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.settings
+            .insert("sse_reassembly_max_bytes".to_string(), json!(64));
+        seed
+    })
+    .await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::RawSse(vec![vec![b'x'; 128]]));
     let resp = send_stream(&gw.base_url()).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let _body = resp.bytes().await.expect("超限后流应结束而非挂起");
+    let bytes = resp.bytes().await.expect("超限后流应结束而非挂起");
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        body.contains("SSE 重装缓冲超过上限"),
+        "下游应看到截断错误，实际: {body}"
+    );
+}
+
+/// 同协议 Anthropic 直通：下游 `anthropic-version` 原样转发，缺省才钉官方默认。
+#[tokio::test]
+async fn anthropic_passthrough_forwards_inbound_version_header() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = config::Protocol::AnthropicMessages;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_01x", "type": "message", "role": "assistant", "model": "gpt-4o",
+        "content": [{ "type": "text", "text": "ok" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    })));
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .header("x-api-key", TEST_TOKEN_KEY)
+        .header("anthropic-version", "2024-10-22")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        gw.upstream.received_anthropic_versions(),
+        vec![Some("2024-10-22".to_string())],
+        "直通应转发下游版本头"
+    );
+}
+
+/// 同协议 Anthropic 直通：下游未带版本头时出站钉官方默认。
+#[tokio::test]
+async fn anthropic_passthrough_defaults_version_when_inbound_omits_it() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = config::Protocol::AnthropicMessages;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_01x", "type": "message", "role": "assistant", "model": "gpt-4o",
+        "content": [{ "type": "text", "text": "ok" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    })));
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .header("x-api-key", TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        gw.upstream.received_anthropic_versions(),
+        vec![Some("2023-06-01".to_string())],
+        "直通缺省版本头应钉官方默认"
+    );
+}
+
+/// 跨协议回落 IR：即使下游带了更新的版本头，出站仍钉适配器默认。
+#[tokio::test]
+async fn ir_path_keeps_default_anthropic_version() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = config::Protocol::AnthropicMessages;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_01x", "type": "message", "role": "assistant", "model": "gpt-4o",
+        "content": [{ "type": "text", "text": "ok" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    })));
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .header("anthropic-version", "2024-10-22")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        gw.upstream.received_anthropic_versions(),
+        vec![Some("2023-06-01".to_string())],
+        "IR 路径应钉适配器默认版本"
+    );
 }

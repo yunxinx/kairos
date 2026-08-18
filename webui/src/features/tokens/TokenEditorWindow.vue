@@ -50,6 +50,7 @@ const uid = useId();
 const nameInputId = `token-editor-name-${uid}`;
 const groupInputId = `token-editor-group-${uid}`;
 const limitInputId = `token-editor-limit-${uid}`;
+const rpmInputId = `token-editor-rpm-${uid}`;
 const enabledInputId = `token-editor-enabled-${uid}`;
 const amountInputId = `token-editor-amount-${uid}`;
 
@@ -67,11 +68,16 @@ const initialLimit =
   props.initial && props.initial.limit_usd_micros !== null
     ? formatUsdAmount(props.initial.limit_usd_micros)
     : '';
+const initialRpm =
+  props.initial && props.initial.rate_limit_rpm !== null && props.initial.rate_limit_rpm !== undefined
+    ? String(props.initial.rate_limit_rpm)
+    : '';
 const initialEnabled = props.initial ? props.initial.enabled : true;
 const initialGroup = props.initial ? props.initial.model_group : DEFAULT_MODEL_GROUP;
 
 const editorName = ref(initialName);
 const editorLimit = ref(initialLimit);
+const editorRpm = ref(initialRpm);
 const editorEnabled = ref(initialEnabled);
 const editorGroup = ref(initialGroup);
 
@@ -89,6 +95,7 @@ const dirty = computed(
   () =>
     editorName.value !== initialName ||
     editorLimit.value !== initialLimit ||
+    editorRpm.value !== initialRpm ||
     editorEnabled.value !== initialEnabled ||
     editorGroup.value !== initialGroup ||
     editorAmount.value !== formatUsdAmount(displayedBalance.value) ||
@@ -152,6 +159,7 @@ function handleSave() {
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
     { name: 'limit', value: editorLimit.value, rules: [{ kind: 'usd', min: 0 }] },
+    { name: 'rateLimitRpm', value: editorRpm.value, rules: [{ kind: 'uint', min: 0 }] },
   ];
   if (props.initial !== null) {
     specs.push({
@@ -163,11 +171,19 @@ function handleSave() {
   if (!validate(specs, t)) return;
   const name = editorName.value.trim();
   const limit = parseUsdToMicros(editorLimit.value);
+  const rpmRaw = editorRpm.value.trim();
+  const rate_limit_rpm = rpmRaw === '' ? null : Number(rpmRaw);
   const enabled = editorEnabled.value;
   if (props.initial === null) {
     saveMutation.mutate({
       kind: 'create',
-      body: { name, limit_usd_micros: limit, enabled, model_group: editorGroup.value },
+      body: {
+        name,
+        limit_usd_micros: limit,
+        rate_limit_rpm,
+        enabled,
+        model_group: editorGroup.value,
+      },
     });
   } else {
     saveMutation.mutate({
@@ -176,6 +192,7 @@ function handleSave() {
         token_key: initialKey,
         name,
         limit_usd_micros: limit,
+        rate_limit_rpm,
         enabled,
         model_group: editorGroup.value,
       },
@@ -250,6 +267,27 @@ function applyQuick(deltaUsd: number) {
               :invalid="invalid"
               :hint-id="hintId"
               v-on="fieldInputHandlers('limit')"
+            />
+          </template>
+        </FormField>
+        <FormField
+          field-name="rateLimitRpm"
+          :label="t('tokens.rateLimitRpm')"
+          :input-id="rpmInputId"
+          :error="fieldError('rateLimitRpm')"
+          :guide="t('tokens.rateLimitRpmGuide')"
+        >
+          <template #default="{ hintId, invalid }">
+            <FormTextInput
+              :id="rpmInputId"
+              v-model="editorRpm"
+              type="text"
+              inputmode="numeric"
+              class="font-mono"
+              data-testid="token-editor-rpm"
+              :invalid="invalid"
+              :hint-id="hintId"
+              v-on="fieldInputHandlers('rateLimitRpm')"
             />
           </template>
         </FormField>

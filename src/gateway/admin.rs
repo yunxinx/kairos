@@ -41,7 +41,7 @@ use crate::{
     },
 };
 
-use super::http::OutboundAuth;
+use super::http::{OutboundAuth, extract_bearer};
 use super::protocol;
 use super::throttle::AuthThrottle;
 
@@ -118,6 +118,9 @@ pub fn router(
         .route("/catalog/meta", get(get_catalog_meta))
         .route("/catalog/sync", post(sync_catalog))
         .route("/logs", get(query_logs))
+        .route("/logs/{id}", get(get_log))
+        .route("/logs/{id}/settle", post(settle_log))
+        .route("/logs/{id}/waive", post(waive_log))
         .route("/system-logs", get(query_system_logs))
         .route("/stats", get(get_stats))
         .route("/stats/lifetime", get(get_lifetime_stats))
@@ -162,8 +165,7 @@ async fn admin_auth(
         .headers()
         .get("authorization")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
+        .and_then(extract_bearer)
         .unwrap_or("");
     if constant_time_eq(provided.as_bytes(), auth.admin_key.as_bytes()) {
         next.run(request).await
@@ -197,6 +199,7 @@ struct TokenView {
     token_key: String,
     name: String,
     limit_usd_micros: Option<i64>,
+    rate_limit_rpm: Option<u64>,
     enabled: bool,
     model_group: String,
     created_at: i64,
@@ -210,6 +213,7 @@ impl TokenView {
             token_key: record.token.token_key,
             name: record.token.name,
             limit_usd_micros: record.token.limit_usd_micros,
+            rate_limit_rpm: record.token.rate_limit_rpm,
             enabled: record.token.enabled,
             model_group: record.token.model_group,
             created_at: record.created_at,
@@ -237,6 +241,8 @@ async fn list_tokens(State(deps): State<AdminDeps>) -> Result<Json<Vec<TokenView
 struct TokenCreate {
     name: String,
     limit_usd_micros: Option<i64>,
+    #[serde(default)]
+    rate_limit_rpm: Option<u64>,
     enabled: bool,
     #[serde(default = "crate::store::resources::default_model_group")]
     model_group: String,
@@ -272,6 +278,7 @@ async fn create_token(
         },
         name: create.name,
         limit_usd_micros: create.limit_usd_micros,
+        rate_limit_rpm: create.rate_limit_rpm,
         enabled: create.enabled,
         model_group: create.model_group.trim().to_string(),
     };
@@ -1048,6 +1055,9 @@ struct LogQueryParams {
 }
 
 /// 请求日志条目 wire 契约：完整 body 以 base64 编码（二进制安全）。
+///
+/// `GET /logs` 列表不读 BLOB，`request_body` / `response_body` 为 null；
+/// `GET /logs/{id}` 才返回落库的 body。
 #[derive(Debug, Serialize)]
 struct LogEntry {
     id: i64,
@@ -1146,6 +1156,72 @@ async fn query_logs(
         total,
         unsettled_total,
     }))
+}
+
+/// 按 id 读取一条请求日志（含 body）。不存在或 id 非法返回 404。
+async fn get_log(
+    State(deps): State<AdminDeps>,
+    Path(raw): Path<String>,
+) -> Result<Json<LogEntry>, AdminError> {
+    let id = parse_log_id(&raw)?;
+    let log = store::get_request_log(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
+    Ok(Json(LogEntry::from_store_log(log)))
+}
+
+/// 解析路径中的日志 id；非整数视为不存在。
+fn parse_log_id(raw: &str) -> Result<i64, AdminError> {
+    raw.parse()
+        .map_err(|_| AdminError::NotFound(format!("日志 {raw} 不存在")))
+}
+
+/// 对未结算日志补扣：按行上费用写入余额（允许透支），再标为已结算。
+async fn settle_log(
+    State(deps): State<AdminDeps>,
+    Path(raw): Path<String>,
+) -> Result<Json<LogEntry>, AdminError> {
+    close_unsettled_log(&deps, &raw, true).await
+}
+
+/// 豁免未结算日志：只翻 `settled`，不改余额。
+async fn waive_log(
+    State(deps): State<AdminDeps>,
+    Path(raw): Path<String>,
+) -> Result<Json<LogEntry>, AdminError> {
+    close_unsettled_log(&deps, &raw, false).await
+}
+
+/// 未结算闭环：`charge` 为 true 时补扣，否则豁免。
+async fn close_unsettled_log(
+    deps: &AdminDeps,
+    raw: &str,
+    charge: bool,
+) -> Result<Json<LogEntry>, AdminError> {
+    let id = parse_log_id(raw)?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let outcome = if charge {
+        store::settle_unsettled_log(&mut tx, id).await
+    } else {
+        store::waive_unsettled_log(&mut tx, id).await
+    }
+    .map_err(AdminError::Store)?;
+    match outcome {
+        store::UnsettledLogAction::NotFound => {
+            return Err(AdminError::NotFound(format!("日志 {id} 不存在")));
+        }
+        store::UnsettledLogAction::AlreadySettled => {
+            return Err(AdminError::Conflict(format!("日志 {id} 已结算")));
+        }
+        store::UnsettledLogAction::Closed => {}
+    }
+    tx.commit().await.map_err(db_err)?;
+    let log = store::get_request_log(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
+    Ok(Json(LogEntry::from_store_log(log)))
 }
 
 /// `/system-logs` 查询参数：关键字、时间窗、级别与目标可选。
@@ -1330,10 +1406,15 @@ async fn get_stats(
 }
 
 /// `/stats/lifetime` 响应：全量累计，不受时间窗影响。
+///
+/// `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 只计 HTTP 2xx
+/// 且已结算的费用。两套口径并列时不要把 token 合计当成已入账费用的用量。
 #[derive(Debug, Serialize)]
 struct LifetimeStatsView {
     request_count: u64,
+    /// 已结算的成功请求费用合计（micro-USD）。
     cost_usd_micros: i64,
+    /// 全部请求日志的四分量 token 合计（含未结算行）。
     total_tokens: u64,
 }
 
@@ -1798,6 +1879,13 @@ fn validate_token(token: &Token) -> Result<(), AdminError> {
     {
         return Err(AdminError::InvalidBody(
             "limit_usd_micros 不能为负".to_string(),
+        ));
+    }
+    if let Some(rpm) = token.rate_limit_rpm
+        && i64::try_from(rpm).is_err()
+    {
+        return Err(AdminError::InvalidBody(
+            "rate_limit_rpm 超出范围".to_string(),
         ));
     }
     if token.model_group.trim().is_empty() {

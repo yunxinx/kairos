@@ -57,7 +57,14 @@ pub(super) enum Outbound {
     },
 }
 
+/// 指数退避的随机抖动幅度：最终等待为计算值的 80%–120%。
+const RETRY_JITTER_MIN: f64 = 0.8;
+const RETRY_JITTER_MAX: f64 = 1.2;
+
 /// 同渠道下一次重试前等待的时长。
+///
+/// 有 `Retry-After` 时用其值（仍受 `after_cap` 封顶），不加抖动——那是上游指定的
+/// 等待。无则走指数退避，并施加 ±20% 抖动，避免 429 恢复瞬间所有在途重试同拍。
 pub(super) fn retry_delay(
     attempt_no: usize,
     retry_after: Option<Duration>,
@@ -66,8 +73,19 @@ pub(super) fn retry_delay(
     if let Some(after) = retry_after {
         return after.min(backoff.after_cap);
     }
+    jitter_delay(exponential_delay(attempt_no, backoff)).min(backoff.cap)
+}
+
+/// 无抖动的指数退避：`base * 2^attempt`，封顶 `cap`。
+fn exponential_delay(attempt_no: usize, backoff: RetryBackoff) -> Duration {
     let shift = u32::try_from(attempt_no).unwrap_or(u32::MAX).min(16);
     backoff.base.saturating_mul(1u32 << shift).min(backoff.cap)
+}
+
+/// 把等待乘以 `[0.8, 1.2]` 均匀随机因子。
+fn jitter_delay(base: Duration) -> Duration {
+    let factor: f64 = rand::random_range(RETRY_JITTER_MIN..=RETRY_JITTER_MAX);
+    base.mul_f64(factor)
 }
 
 /// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
@@ -158,7 +176,7 @@ pub(super) fn upstream_error_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{RetryBackoff, retry_delay};
+    use super::{RetryBackoff, exponential_delay, jitter_delay, retry_delay};
     use std::time::Duration;
 
     fn default_backoff() -> RetryBackoff {
@@ -166,12 +184,17 @@ mod tests {
     }
 
     #[test]
-    fn retry_delay_is_exponential_and_capped() {
+    fn exponential_delay_is_exponential_and_capped() {
         let backoff = default_backoff();
-        assert_eq!(retry_delay(0, None, backoff), Duration::from_millis(200));
-        assert_eq!(retry_delay(1, None, backoff), Duration::from_millis(400));
-        assert_eq!(retry_delay(2, None, backoff), Duration::from_millis(800));
-        assert_eq!(retry_delay(16, None, backoff), Duration::from_secs(5));
+        assert_eq!(exponential_delay(0, backoff), Duration::from_millis(200));
+        assert_eq!(exponential_delay(1, backoff), Duration::from_millis(400));
+        assert_eq!(exponential_delay(2, backoff), Duration::from_millis(800));
+        assert_eq!(exponential_delay(16, backoff), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_without_jitter() {
+        let backoff = default_backoff();
         assert_eq!(
             retry_delay(0, Some(Duration::from_secs(3)), backoff),
             Duration::from_secs(3)
@@ -183,13 +206,43 @@ mod tests {
     }
 
     #[test]
+    fn jitter_delay_does_not_exceed_cap() {
+        let backoff = default_backoff();
+        for _ in 0..32 {
+            let delay = retry_delay(16, None, backoff);
+            assert!(
+                delay <= backoff.cap,
+                "抖动后等待 {delay:?} 不应超过封顶 {:?}",
+                backoff.cap
+            );
+        }
+    }
+
+    #[test]
     fn retry_delay_uses_configured_base_and_caps() {
         let backoff = RetryBackoff::from_ms(100, 1_000, 10);
-        assert_eq!(retry_delay(0, None, backoff), Duration::from_millis(100));
-        assert_eq!(retry_delay(4, None, backoff), Duration::from_millis(1_000));
+        assert_eq!(exponential_delay(0, backoff), Duration::from_millis(100));
+        assert_eq!(exponential_delay(4, backoff), Duration::from_millis(1_000));
         assert_eq!(
             retry_delay(0, Some(Duration::from_secs(30)), backoff),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn jitter_delay_stays_within_plus_minus_20_percent() {
+        let base = Duration::from_millis(200);
+        let lo = Duration::from_millis(160);
+        let hi = Duration::from_millis(240);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            let got = jitter_delay(base);
+            assert!(
+                got >= lo && got <= hi,
+                "jitter {got:?} 应在 [{lo:?}, {hi:?}]"
+            );
+            seen.insert(got);
+        }
+        assert!(seen.len() > 1, "±20% 抖动应产生多于一个等待值");
     }
 }

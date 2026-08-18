@@ -29,7 +29,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -47,6 +47,7 @@ use crate::{
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
 use super::logging::{Billing, log_request, unix_millis};
+use super::rate_limit::{RequestRateLimiter, effective_rate_limit_rpm};
 use super::sse::{
     OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
     take_frame,
@@ -62,6 +63,7 @@ pub struct Deps {
     pub(super) client: reqwest::Client,
     pub(super) snapshot: SnapshotHandle,
     pub(super) auth_throttle: AuthThrottle,
+    pub(super) request_rate: RequestRateLimiter,
 }
 
 /// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
@@ -78,6 +80,7 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         client,
         snapshot,
         auth_throttle: AuthThrottle::new(),
+        request_rate: RequestRateLimiter::new(),
     };
 
     // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
@@ -179,6 +182,19 @@ async fn list_models(
             .await;
         }
     };
+    if let Err(retry_after) = token_rate_limited(&deps, token, &snapshot) {
+        return too_many_token_requests(
+            &deps,
+            snapshot.full_body,
+            Some(token),
+            None,
+            started,
+            inbound_protocol,
+            None,
+            retry_after,
+        )
+        .await;
+    }
     let ids = store::resources::visible_model_ids(
         &snapshot.model_groups,
         &snapshot.unified_models,
@@ -324,6 +340,20 @@ async fn handle_request(
         }
     };
 
+    if let Err(retry_after) = token_rate_limited(&deps, token, &snapshot) {
+        return too_many_token_requests(
+            &deps,
+            full_body,
+            Some(token),
+            None,
+            started,
+            inbound_protocol,
+            None,
+            retry_after,
+        )
+        .await;
+    }
+
     // 2. 入站请求体上限：先看 Content-Length，声明即超限则不读 body；无
     // Content-Length（chunked）或声明未超限时，再按同一上限流式读取。
     if let Some(declared) = declared_content_length(&headers)
@@ -368,8 +398,8 @@ async fn handle_request(
         }
     };
 
-    // 仅放行后的请求才为 full_body 预取请求字节，避免超限请求白分配一份待丢弃的拷贝。
-    let request_body_for_log = full_body.then(|| body.to_vec());
+    // 仅放行后的请求才为 full_body 预取请求字节；`Bytes` 克隆只增加引用计数。
+    let request_body_for_log = full_body.then(|| body.clone());
 
     // 3. 解码入站请求为 IR（同时用于准入与出站路径选择）。
     let parsed: Value = match serde_json::from_slice(&body) {
@@ -462,11 +492,14 @@ async fn handle_request(
             .await;
         }
     };
-    // 余额独立存 token_balance 表：令牌定义不含初始余额，首次出现按 0 建行，
-    // 运营经管理 API 充值后按实际余额准入。
-    let balance = match store::ensure_token_balance(&mut conn, &token.token_key, 0.0, started).await
-    {
-        Ok(balance) => balance,
+    // 余额独立存 token_balance 表：建行发生在创建令牌时，准入只读、不写。
+    // 行缺失视为 0（与「首次出现按 0」一致），由后续 402 挡住，不在热路径 INSERT。
+    let balance = match store::get_token_balance(&mut conn, &token.token_key).await {
+        Ok(Some(balance)) => balance,
+        Ok(None) => store::TokenBalance {
+            balance_usd_micros: 0,
+            settled_usd_micros: 0,
+        },
         Err(err) => {
             return db_error_response(
                 &deps,
@@ -520,23 +553,53 @@ async fn handle_request(
         )
         .await;
     }
-    // 通过计费准入即视为一次使用：刷新最后使用时间（被余额/上限拒绝的请求不算）。
-    if let Err(err) = store::resources::touch_token_used(&mut conn, &token.token_key, started).await
-    {
-        return db_error_response(
-            &deps,
-            full_body,
-            token,
-            &request.model,
-            started,
-            err,
-            inbound_protocol,
-            request_body_for_log,
-        )
-        .await;
+    if let Some(max_tokens) = request.max_tokens.filter(|&n| n > 0) {
+        let estimate = estimate_admission_cost_micros(&hops, &snapshot, max_tokens);
+        if estimate > balance.balance_usd_micros {
+            let message = format!(
+                "令牌 {} 预估费用超过余额（预估 {:.2} USD，当前 {:.2} USD）",
+                token.name,
+                estimate as f64 / 1_000_000.0,
+                balance.balance_usd_micros as f64 / 1_000_000.0
+            );
+            return error_response(
+                StatusCode::PAYMENT_REQUIRED,
+                &message,
+                &deps,
+                full_body,
+                Some(token),
+                Some(&request.model),
+                started,
+                inbound_protocol,
+                request_body_for_log,
+            )
+            .await;
+        }
+        if let Some(limit) = token.limit_usd_micros
+            && balance.settled_usd_micros.saturating_add(estimate) > limit
+        {
+            let message = format!(
+                "令牌 {} 预估费用将超过累计结算上限（limit_usd_micros = {limit}）",
+                token.name
+            );
+            return error_response(
+                StatusCode::PAYMENT_REQUIRED,
+                &message,
+                &deps,
+                full_body,
+                Some(token),
+                Some(&request.model),
+                started,
+                inbound_protocol,
+                request_body_for_log,
+            )
+            .await;
+        }
     }
-    // 准入连接只服务余额检查与 last_used；出站/结算另取连接，避免整段请求占着池槽。
+    // 准入连接只服务余额读取；last_used 在落日志提交后尽力刷新。
     drop(conn);
+
+    let inbound_anthropic_version = headers.get("anthropic-version");
 
     // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。
     //
@@ -557,6 +620,7 @@ async fn handle_request(
             inbound_protocol,
             &body,
             request_body_for_log.clone(),
+            inbound_anthropic_version,
         )
         .await;
         if response.status().is_success() {
@@ -639,6 +703,22 @@ fn billed_price(snapshot: &RuntimeSnapshot, record: &ChannelRecord, model: &str)
         .expect("准入已过滤无价格渠道")
 }
 
+/// 候选跳里最高的 output 单价 × `max_tokens`，挡住极端输出上限。
+fn estimate_admission_cost_micros(
+    hops: &[RouteHop],
+    snapshot: &RuntimeSnapshot,
+    max_tokens: u32,
+) -> i64 {
+    let mut max_output = 0i64;
+    for hop in hops {
+        for record in &hop.route.channels {
+            let price = billed_price(snapshot, record, &hop.routed_model);
+            max_output = max_output.max(price.output_micros);
+        }
+    }
+    billing::estimate_max_output_cost_micros(max_tokens, max_output)
+}
+
 /// 解析本次请求的出站跳序列。
 ///
 /// 命中统一模型时按成员顺序收集已定价可路由的跳；一条都没有则 503，文案说明
@@ -702,7 +782,7 @@ struct CallCtx<'a> {
     started: i64,
     /// 入站 wire 协议：响应重编码与错误格式按此分派。
     inbound_protocol: Protocol,
-    request_body: Option<Vec<u8>>,
+    request_body: Option<Bytes>,
 }
 
 /// 按一条跳的渠道路由发起出站：直通或 IR，遇可重试错误在该跳内 failover。
@@ -716,7 +796,8 @@ async fn dispatch_hop(
     started: i64,
     inbound_protocol: Protocol,
     raw_body: &[u8],
-    request_body_for_log: Option<Vec<u8>>,
+    request_body_for_log: Option<Bytes>,
+    inbound_anthropic_version: Option<&HeaderValue>,
 ) -> Response {
     // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
     // 任一渠道命中别名、或统一模型成员名与入站名不同时也回落 IR：直通无法改写请求体模型名。
@@ -735,6 +816,7 @@ async fn dispatch_hop(
             raw_body,
             inbound_protocol,
             request_body: request_body_for_log,
+            inbound_anthropic_version,
         };
         return passthrough_with_failover(&passthrough_ctx, &hop.route).await;
     }
@@ -767,7 +849,7 @@ async fn outbound_with_failover(
     token: &Token,
     started: i64,
     inbound_protocol: Protocol,
-    request_body_for_log: Option<Vec<u8>>,
+    request_body_for_log: Option<Bytes>,
 ) -> Response {
     run_failover(
         route,
@@ -840,7 +922,9 @@ struct PassthroughCtx<'a> {
     raw_body: &'a [u8],
     /// 入站 wire 协议（直通时与出站同协议）。
     inbound_protocol: Protocol,
-    request_body: Option<Vec<u8>>,
+    request_body: Option<Bytes>,
+    /// 直通时转发下游的 `anthropic-version`；缺省则出站用官方默认。
+    inbound_anthropic_version: Option<&'a HeaderValue>,
 }
 
 /// 直通快路径：按渠道路由顺序发起同协议出站调用，遇可重试错误自动 failover。
@@ -910,7 +994,7 @@ async fn passthrough_stream_completion(
         ctx.deps
             .client
             .post(&upstream_url)
-            .apply_outbound_auth(channel)
+            .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
             .header("content-type", "application/json")
             .body(outbound)
             .send(),
@@ -1007,7 +1091,7 @@ async fn passthrough_non_stream_completion(
         ctx.deps
             .client
             .post(&upstream_url)
-            .apply_outbound_auth(channel)
+            .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
             .header("content-type", "application/json")
             .body(outbound)
             .send(),
@@ -1157,7 +1241,7 @@ struct PassthroughStreamTask {
     price: PriceSnapshot,
     /// 直通协议（与入站同协议），用于 usage 嗅探与终止哨兵。
     protocol: Protocol,
-    request_body: Option<Vec<u8>>,
+    request_body: Option<Bytes>,
     response_body: Vec<u8>,
 }
 
@@ -1179,9 +1263,11 @@ async fn pipe_passthrough_stream<S>(
     let mut usage = Usage::default();
     let mut sse_buffer: Vec<u8> = Vec::new();
     let mut downstream_open = true;
+    let mut truncated = false;
     let mut done_filter = OpenAiDoneFilter::default();
     let idle = channel_idle(ctx.channel.timeout_ms);
     let mut byte_stream = Box::pin(byte_stream);
+    let log_body_max = ctx.snapshot.log_body_max();
 
     loop {
         let chunk = match tokio::time::timeout(idle, byte_stream.next()).await {
@@ -1201,6 +1287,7 @@ async fn pipe_passthrough_stream<S>(
                     &tx,
                     forwarded,
                     ctx.snapshot.full_body,
+                    log_body_max,
                     &mut ctx.response_body,
                 )
                 .await
@@ -1223,6 +1310,7 @@ async fn pipe_passthrough_stream<S>(
             }
         }
         if sse_buffer.len() > ctx.snapshot.sse_reassembly_max() {
+            truncated = true;
             break;
         }
     }
@@ -1233,6 +1321,7 @@ async fn pipe_passthrough_stream<S>(
                 &tx,
                 trailing,
                 ctx.snapshot.full_body,
+                log_body_max,
                 &mut ctx.response_body,
             )
             .await
@@ -1242,11 +1331,29 @@ async fn pipe_passthrough_stream<S>(
             }
         }
     }
+    if truncated && downstream_open {
+        let frame = inbound_stream_error_frame(ctx.protocol, SSE_REASSEMBLY_OVERFLOW_MESSAGE);
+        let wire = Bytes::from(frame_to_wire(&frame));
+        if !send_passthrough_chunk(
+            &tx,
+            wire,
+            ctx.snapshot.full_body,
+            log_body_max,
+            &mut ctx.response_body,
+        )
+        .await
+        {
+            downstream_open = false;
+        }
+    }
     // OpenAI 协议约定以 `data: [DONE]` 终止；哨兵也是入站响应的一部分，
     // full_body 开启时在实际下发前记入（结算先于哨兵，日志此时能带全）。
     if ctx.snapshot.full_body && downstream_open && ctx.protocol == Protocol::OpenAiChat {
-        ctx.response_body
-            .extend_from_slice(&data_frame_to_wire("[DONE]"));
+        append_logged_body(
+            &mut ctx.response_body,
+            &data_frame_to_wire("[DONE]"),
+            log_body_max,
+        );
     }
     // 流结束：按嗅探累积的 usage 结算并落日志。
     let cost = billing::cost_micros(&usage, &ctx.price);
@@ -1277,16 +1384,17 @@ async fn pipe_passthrough_stream<S>(
     }
 }
 
-/// 下发一个直通块；full_body 仅保留已被响应通道接受的字节。
+/// 下发一个直通块；full_body 仅保留已被响应通道接受的字节，并按日志上限封顶。
 async fn send_passthrough_chunk(
     tx: &tokio::sync::mpsc::Sender<bytes::Bytes>,
     chunk: bytes::Bytes,
     full_body: bool,
+    max_bytes: usize,
     response_body: &mut Vec<u8>,
 ) -> bool {
     let response_body_len = response_body.len();
     if full_body {
-        response_body.extend_from_slice(&chunk);
+        append_logged_body(response_body, &chunk, max_bytes);
     }
     if tx.send(chunk).await.is_ok() {
         true
@@ -1548,7 +1656,7 @@ struct StreamTask {
     price: PriceSnapshot,
     /// 入站 wire 协议：响应重编码按此分派。
     inbound_protocol: Protocol,
-    request_body: Option<Vec<u8>>,
+    request_body: Option<Bytes>,
     response_body: Vec<u8>,
 }
 
@@ -1574,6 +1682,7 @@ async fn pipe_stream<S>(
     let mut sse_buffer: Vec<u8> = Vec::new();
     let mut saw_finish = false;
     let mut downstream_open = true;
+    let mut truncated = false;
     let idle = channel_idle(ctx.channel.timeout_ms);
     let mut byte_stream = Box::pin(byte_stream);
 
@@ -1632,6 +1741,7 @@ async fn pipe_stream<S>(
             Ok(Some(Ok(bytes))) => {
                 sse_buffer.extend_from_slice(&bytes);
                 if sse_buffer.len() > ctx.snapshot.sse_reassembly_max() {
+                    truncated = true;
                     break;
                 }
             }
@@ -1639,9 +1749,19 @@ async fn pipe_stream<S>(
         }
     }
 
+    if truncated && downstream_open {
+        let frame =
+            inbound_stream_error_frame(ctx.inbound_protocol, SSE_REASSEMBLY_OVERFLOW_MESSAGE);
+        record_frame_wire(&mut ctx, &frame);
+        if tx.send(event_from_frame(&frame)).await.is_err() {
+            downstream_open = false;
+        }
+    }
+
     // 流结束：若上游未发 finish 帧（异常中断），补发一个。
+    // 缓冲超限已向下游发过错误事件，不再合成 Finish，以免被当成完整成功。
     let response = accumulator.finish();
-    if !saw_finish && downstream_open {
+    if !saw_finish && downstream_open && !truncated {
         let finish_event = StreamEvent::Finish {
             finish_reason: response.finish_reason.clone(),
             usage: response.usage.clone(),
@@ -1660,8 +1780,11 @@ async fn pipe_stream<S>(
         && ctx.snapshot.full_body
         && let Some(terminator) = terminator.as_ref()
     {
-        ctx.response_body
-            .extend_from_slice(&data_frame_to_wire(terminator));
+        append_logged_body(
+            &mut ctx.response_body,
+            &data_frame_to_wire(terminator),
+            ctx.snapshot.log_body_max(),
+        );
     }
     // 先结算再发终止哨兵：下游读到终止时计费必定已落库。
     settle_and_log(&ctx, response).await;
@@ -1674,7 +1797,33 @@ async fn pipe_stream<S>(
 /// full_body 开启时把一个即将下发的入站协议帧记入响应字节；关闭时无操作。
 fn record_frame_wire(ctx: &mut StreamTask, frame: &SseFrame) {
     if ctx.snapshot.full_body {
-        ctx.response_body.extend_from_slice(&frame_to_wire(frame));
+        append_logged_body(
+            &mut ctx.response_body,
+            &frame_to_wire(frame),
+            ctx.snapshot.log_body_max(),
+        );
+    }
+}
+
+/// SSE 重装缓冲超限时写入日志与下游错误事件的固定文案。
+const SSE_REASSEMBLY_OVERFLOW_MESSAGE: &str = "SSE 重装缓冲超过上限，流已截断";
+
+/// 把即将落库的响应字节封顶追加，达到 `log_body_max_bytes` 后停止。
+fn append_logged_body(buf: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) {
+    if buf.len() >= max_bytes {
+        return;
+    }
+    let take = (max_bytes - buf.len()).min(chunk.len());
+    buf.extend_from_slice(&chunk[..take]);
+}
+
+/// 流中途失败时的入站协议错误 SSE 帧，让下游能感知截断。
+fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
+    let body = protocol::encode_error(500, message, protocol);
+    let data = serde_json::to_string(&body).unwrap_or_else(|_| message.to_string());
+    match protocol {
+        Protocol::OpenAiChat => SseFrame::data(data),
+        Protocol::OpenAiResponses | Protocol::AnthropicMessages => SseFrame::named("error", data),
     }
 }
 
@@ -1724,14 +1873,26 @@ fn authenticate<'a>(
 fn extract_key(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get("authorization") {
         let value = value.to_str().ok()?;
-        if let Some(key) = value.strip_prefix("Bearer ") {
-            return Some(key.trim().to_string());
+        if let Some(key) = extract_bearer(value) {
+            return Some(key.to_string());
         }
     }
     headers
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.trim().to_string())
+}
+
+/// 从 `Authorization` 头值取出 Bearer token；scheme 大小写不敏感（RFC 9110）。
+pub(super) fn extract_bearer(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let (scheme, rest) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        let key = rest.trim();
+        if key.is_empty() { None } else { Some(key) }
+    } else {
+        None
+    }
 }
 
 /// 判断上游 HTTP 状态码是否可重试：网络错误与 429/5xx 允许 failover。
@@ -1792,21 +1953,40 @@ fn outbound_model_for_channel_name<'a>(
         .map(|record| routing::outbound_model(&record.channel, inbound))
 }
 
+/// Anthropic 出站在下游未带版本头时使用的官方默认。
+const DEFAULT_ANTHROPIC_VERSION: HeaderValue = HeaderValue::from_static("2023-06-01");
+
 /// 按渠道协议设置出站认证头。
 ///
 /// OpenAI 用 `Authorization: Bearer`；Anthropic 用 `x-api-key` 并带
-/// `anthropic-version`（官方 SDK 默认头）。
+/// `anthropic-version`。直通路径转发下游版本头，避免强行降级；IR / 探测仍钉默认。
 pub(super) trait OutboundAuth {
     fn apply_outbound_auth(self, channel: &Channel) -> Self;
+    fn apply_outbound_auth_with_version(
+        self,
+        channel: &Channel,
+        inbound_version: Option<&HeaderValue>,
+    ) -> Self;
 }
 
 impl OutboundAuth for reqwest::RequestBuilder {
     fn apply_outbound_auth(self, channel: &Channel) -> Self {
+        self.apply_outbound_auth_with_version(channel, None)
+    }
+
+    fn apply_outbound_auth_with_version(
+        self,
+        channel: &Channel,
+        inbound_version: Option<&HeaderValue>,
+    ) -> Self {
         match channel.protocol {
             Protocol::OpenAiChat | Protocol::OpenAiResponses => self.bearer_auth(&channel.api_key),
-            Protocol::AnthropicMessages => self
-                .header("x-api-key", &channel.api_key)
-                .header("anthropic-version", "2023-06-01"),
+            Protocol::AnthropicMessages => self.header("x-api-key", &channel.api_key).header(
+                "anthropic-version",
+                inbound_version
+                    .cloned()
+                    .unwrap_or(DEFAULT_ANTHROPIC_VERSION),
+            ),
         }
     }
 }
@@ -1836,7 +2016,7 @@ async fn error_response(
     model: Option<&str>,
     started: i64,
     inbound_protocol: Protocol,
-    request_body: Option<Vec<u8>>,
+    request_body: Option<Bytes>,
 ) -> Response {
     let body = protocol::encode_error(status.as_u16(), message, inbound_protocol);
     if let (Some(token), Some(model)) = (token, model) {
@@ -1863,6 +2043,49 @@ async fn error_response(
     (status, Json(body)).into_response()
 }
 
+/// 令牌生效 RPM：缺省跟随全局兜底，令牌写出的值（含 `0`）覆盖全局。
+fn token_rate_limited(
+    deps: &Deps,
+    token: &Token,
+    snapshot: &RuntimeSnapshot,
+) -> Result<(), Duration> {
+    deps.request_rate.try_acquire(
+        &token.token_key,
+        effective_rate_limit_rpm(token.rate_limit_rpm, snapshot.rate_limit_rpm),
+    )
+}
+
+/// 令牌 RPM 超限：429 + `Retry-After`。
+#[allow(clippy::too_many_arguments)]
+async fn too_many_token_requests(
+    deps: &Deps,
+    full_body: bool,
+    token: Option<&Token>,
+    model: Option<&str>,
+    started: i64,
+    inbound_protocol: Protocol,
+    request_body: Option<Bytes>,
+    retry_after: Duration,
+) -> Response {
+    let mut response = error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "令牌请求过于频繁",
+        deps,
+        full_body,
+        token,
+        model,
+        started,
+        inbound_protocol,
+        request_body,
+    )
+    .await;
+    let secs = retry_after.as_secs().max(1);
+    if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 /// 准入阶段数据库错误：500 + OpenAI 错误格式 + 落日志。
 #[allow(clippy::too_many_arguments)]
 async fn db_error_response(
@@ -1873,7 +2096,7 @@ async fn db_error_response(
     started: i64,
     err: impl std::fmt::Display,
     inbound_protocol: Protocol,
-    request_body: Option<Vec<u8>>,
+    request_body: Option<Bytes>,
 ) -> Response {
     let message = format!("计费状态读取失败: {err}");
     error_response(
@@ -1888,4 +2111,41 @@ async fn db_error_response(
         request_body,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_logged_body, extract_bearer, inbound_stream_error_frame};
+    use crate::config::Protocol;
+
+    #[test]
+    fn extract_bearer_is_case_insensitive() {
+        assert_eq!(extract_bearer("Bearer sk-abc"), Some("sk-abc"));
+        assert_eq!(extract_bearer("bearer sk-abc"), Some("sk-abc"));
+        assert_eq!(extract_bearer("BEARER sk-abc"), Some("sk-abc"));
+        assert_eq!(extract_bearer("Bearer  sk-abc  "), Some("sk-abc"));
+        assert_eq!(extract_bearer("Basic sk-abc"), None);
+        assert_eq!(extract_bearer("Bearer"), None);
+        assert_eq!(extract_bearer("Bearer "), None);
+    }
+
+    #[test]
+    fn append_logged_body_stops_at_cap() {
+        let mut buf = Vec::new();
+        append_logged_body(&mut buf, b"hello ", 8);
+        append_logged_body(&mut buf, b"world!!!", 8);
+        assert_eq!(buf, b"hello wo");
+        append_logged_body(&mut buf, b"more", 8);
+        assert_eq!(buf, b"hello wo");
+    }
+
+    #[test]
+    fn inbound_stream_error_frame_names_responses_event() {
+        let chat = inbound_stream_error_frame(Protocol::OpenAiChat, "截断");
+        assert!(chat.event.is_none(), "Chat Completions 只用 data 行");
+        let responses = inbound_stream_error_frame(Protocol::OpenAiResponses, "截断");
+        assert_eq!(responses.event.as_deref(), Some("error"));
+        let anthropic = inbound_stream_error_frame(Protocol::AnthropicMessages, "截断");
+        assert_eq!(anthropic.event.as_deref(), Some("error"));
+    }
 }

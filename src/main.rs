@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
     // 启动时从库加载全部运行时资源进内存快照；请求路径读快照，管理 API 写库后
     // 原子替换，使新资源即时生效。
     let snapshot = runtime::load_snapshot(&pool).await?;
+    let catalog_sync_interval_days = snapshot.catalog_sync_interval_days;
     let snapshot = runtime::snapshot_handle(snapshot);
 
     // 可选的管理面：配置了 `admin_listen` 才启动独立管理监听；未配置即管理面
@@ -53,6 +54,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             kairos::catalog::run_sync_loop(catalog_pool, catalog_client).await;
         });
+    } else if catalog_sync_interval_days > 0 {
+        tracing::warn!(
+            catalog_sync_interval_days,
+            "未配置 admin_listen，价格目录定时同步不会启动"
+        );
     }
 
     let listen = format!("{}:{}", cfg.listen.host, cfg.listen.port);

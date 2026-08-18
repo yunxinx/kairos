@@ -2,6 +2,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
+
 use crate::{
     config::Protocol,
     core::{billing::PriceSnapshot, ir::Usage},
@@ -19,25 +21,46 @@ pub(super) struct Billing {
     pub(super) usage: Usage,
     pub(super) price: PriceSnapshot,
     pub(super) cost_usd_micros: i64,
-    pub(super) request_body: Option<Vec<u8>>,
+    pub(super) request_body: Option<Bytes>,
     pub(super) response_body: Option<Vec<u8>>,
 }
 
 /// 按独立的日志 body 上限截断落库字节，避免 full_body 把库撑爆。
+///
+/// 流式封顶可能恰好停在字符中间且 `len == max`，因此无论是否超限都按 UTF-8
+/// 边界下取整。非法 UTF-8（二进制 body）仍按字节截断。
 fn clip_logged_body(body: Option<Vec<u8>>, max_bytes: u64) -> Option<Vec<u8>> {
     body.map(|mut bytes| {
         let max = max_bytes.min(usize::MAX as u64) as usize;
-        if bytes.len() > max {
-            bytes.truncate(max);
-        }
+        bytes.truncate(utf8_prefix_len(&bytes, max));
         bytes
     })
 }
 
-/// 尽量在同一事务内结算并插入请求日志。
+/// 不超过 `max` 的前缀长度：完整 UTF-8 字符边界，或无法判定时的字节上限。
+///
+/// `max` 大于切片长度时仍检查整段：末尾不完整序列退到 `valid_up_to`。
+fn utf8_prefix_len(bytes: &[u8], max: usize) -> usize {
+    let end = max.min(bytes.len());
+    if end == 0 {
+        return 0;
+    }
+    match std::str::from_utf8(&bytes[..end]) {
+        Ok(_) => end,
+        Err(err) if err.error_len().is_none() => err.valid_up_to(),
+        Err(_) => end,
+    }
+}
+
+/// 尽量在同一事务内结算并插入请求日志；最后使用时间在提交后再尽力刷新。
+///
+/// `channel` 非空表示该请求已通过计费准入并选定出站渠道：此时刷新
+/// `last_used_at`。准入拒绝（402）与尚未路由的错误 `channel` 为空，不刷新。
+/// `last_used_at` 只是展示元数据，失败不得回滚已成功的扣费与日志。
 ///
 /// 结算成功后若插入失败，回滚扣费并尽力单独写入 `settled = false` 的请求日志。
 /// 开事务或结算失败时同样尽力留下未结算请求日志，并记入系统日志。
+/// HTTP 2xx 且 usage 四分量全零时另记一条 warn 系统日志，使上游漏报 usage 可观测。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn log_request(
     deps: &Deps,
@@ -52,6 +75,17 @@ pub(super) async fn log_request(
 ) {
     let now = unix_millis();
     let max_bytes = deps.snapshot.read().await.log_body_max_bytes;
+    if (200..300).contains(&status) && billing.usage.is_zero() {
+        store::record_system_warn(
+            &deps.pool,
+            "billing",
+            &format!(
+                "上游未回报 usage，本次按零计费（token={} model={model} channel={channel}）",
+                token.name
+            ),
+        )
+        .await;
+    }
     let mut log = store::RequestLog {
         id: 0,
         created_at: now,
@@ -70,7 +104,7 @@ pub(super) async fn log_request(
         price: billing.price,
         cost_usd_micros: billing.cost_usd_micros,
         settled: billing.cost_usd_micros <= 0,
-        request_body: clip_logged_body(billing.request_body, max_bytes),
+        request_body: clip_logged_body(billing.request_body.map(|bytes| bytes.to_vec()), max_bytes),
         response_body: clip_logged_body(billing.response_body, max_bytes),
     };
 
@@ -121,6 +155,38 @@ pub(super) async fn log_request(
             &format!("结算/日志提交失败: {err}"),
         )
         .await;
+        return;
+    }
+
+    touch_last_used_best_effort(&deps.pool, &log).await;
+}
+
+/// 已出站的请求刷新 `last_used_at`；尚未路由则跳过。失败只记系统日志。
+async fn touch_last_used_best_effort(pool: &sqlx::SqlitePool, log: &store::RequestLog) {
+    if log.channel.is_empty() {
+        return;
+    }
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            store::record_system_warn(
+                pool,
+                "request_log",
+                &format!("刷新令牌最后使用时间失败: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if let Err(err) =
+        store::resources::touch_token_used(&mut conn, &log.token_key, log.created_at).await
+    {
+        store::record_system_warn(
+            pool,
+            "request_log",
+            &format!("刷新令牌最后使用时间失败: {err}"),
+        )
+        .await;
     }
 }
 
@@ -149,6 +215,7 @@ async fn write_unsettled_request_log(
 ) {
     match store::insert_request_log(&deps.pool, &log).await {
         Ok(_) => {
+            touch_last_used_best_effort(&deps.pool, &log).await;
             store::record_system_error(&deps.pool, system_target, reason).await;
         }
         Err(err) => {
@@ -177,4 +244,42 @@ pub(super) fn unix_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clip_logged_body, utf8_prefix_len};
+
+    #[test]
+    fn clip_logged_body_stops_on_utf8_char_boundary() {
+        // 「世」是 3 字节 E4 B8 96；截在第 7 字节会切断该字。
+        let body = "hello 世界".as_bytes().to_vec();
+        assert_eq!(utf8_prefix_len(&body, 7), 6);
+        let clipped = clip_logged_body(Some(body), 7).expect("应有截断结果");
+        assert_eq!(clipped, b"hello ");
+    }
+
+    /// 流式封顶可能让缓冲恰好停在字符中间且长度等于上限，仍须退下完整字符。
+    #[test]
+    fn clip_logged_body_floors_incomplete_utf8_at_exact_max() {
+        let mut body = b"hello ".to_vec();
+        body.push(0xe4);
+        assert_eq!(body.len(), 7);
+        assert_eq!(utf8_prefix_len(&body, 7), 6);
+        let clipped = clip_logged_body(Some(body), 7).expect("应有截断结果");
+        assert_eq!(clipped, b"hello ");
+        assert_eq!(std::str::from_utf8(&clipped), Ok("hello "));
+    }
+
+    #[test]
+    fn clip_logged_body_keeps_ascii_and_binary() {
+        assert_eq!(
+            clip_logged_body(Some(b"abcdef".to_vec()), 4).as_deref(),
+            Some(b"abcd".as_slice())
+        );
+        assert_eq!(
+            clip_logged_body(Some(vec![0xff, 0xfe, 0x00, 0x01]), 3).as_deref(),
+            Some([0xff, 0xfe, 0x00].as_slice())
+        );
+    }
 }

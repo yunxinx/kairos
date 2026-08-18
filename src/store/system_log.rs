@@ -84,6 +84,14 @@ pub async fn record_system_error(pool: &SqlitePool, target: &str, message: &str)
     }
 }
 
+/// 记录一条 warn 级系统日志，同时打 tracing；落库失败只再记 tracing，避免递归。
+pub async fn record_system_warn(pool: &SqlitePool, target: &str, message: &str) {
+    tracing::warn!(target, "{message}");
+    if let Err(err) = insert_system_log(pool, "warn", target, message).await {
+        tracing::error!(target: "system_log", "系统日志落库失败: {err}");
+    }
+}
+
 /// 分页查询系统日志（时间倒序）。
 pub async fn query_system_log_page(
     pool: &SqlitePool,

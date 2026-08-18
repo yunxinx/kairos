@@ -222,6 +222,20 @@ async fn unauthenticated_admin_request_is_401() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
+/// 管理面 Bearer scheme 大小写不敏感。
+#[tokio::test]
+async fn admin_accepts_lowercase_bearer_scheme() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/tokens", gw.admin_base_url()))
+        .header("Authorization", format!("bearer {TEST_ADMIN_KEY}"))
+        .send()
+        .await
+        .expect("应可请求管理面");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
 /// 令牌 CRUD 往返 + 写后即时生效：新建立刻可用、删除立刻失效；key 由系统生成。
 #[tokio::test]
 async fn token_crud_roundtrip_and_immediate_effect() {
@@ -1634,6 +1648,7 @@ async fn settings_write_takes_effect_immediately() {
     assert_eq!(settings["retry_backoff_ms"], 200);
     assert_eq!(settings["retry_backoff_cap_ms"], 5_000);
     assert_eq!(settings["retry_after_cap_secs"], 60);
+    assert_eq!(settings["rate_limit_rpm"], 0);
 
     // 写设置：body 上限压到 100 字节，返回变更后设置。
     let resp = admin_put(
@@ -1679,7 +1694,8 @@ async fn settings_gateway_knobs_roundtrip_and_validation() {
             "sse_reassembly_max_bytes": 4_000_000,
             "retry_backoff_ms": 100,
             "retry_backoff_cap_ms": 1_000,
-            "retry_after_cap_secs": 10
+            "retry_after_cap_secs": 10,
+            "rate_limit_rpm": 90
         }),
     )
     .await;
@@ -1691,6 +1707,7 @@ async fn settings_gateway_knobs_roundtrip_and_validation() {
     assert_eq!(settings["retry_backoff_ms"], 100);
     assert_eq!(settings["retry_backoff_cap_ms"], 1_000);
     assert_eq!(settings["retry_after_cap_secs"], 10);
+    assert_eq!(settings["rate_limit_rpm"], 90);
 
     let got: Value = admin_get(&gw, "/settings")
         .await
@@ -1793,7 +1810,7 @@ async fn settings_toggle_full_body_enables_body_logging() {
     assert!(request_body.is_some(), "开启 full_body 后应落请求 body");
     assert!(response_body.is_some(), "开启 full_body 后应落响应 body");
 
-    // /logs 的 body 以 base64 返回。
+    // 列表不带 body；详情按 id 以 base64 返回。
     let resp = client
         .get(format!("{admin}/logs?page_size=1"))
         .bearer_auth(TEST_ADMIN_KEY)
@@ -1802,9 +1819,19 @@ async fn settings_toggle_full_body_enables_body_logging() {
         .expect("应可查日志");
     let page: Value = resp.json().await.expect("日志应可解析");
     let entry = &page["items"][0];
-    let request_b64 = entry["request_body"]
+    assert!(entry["request_body"].is_null(), "列表不应返回 request_body");
+    let id = entry["id"].as_i64().expect("应有日志 id");
+    let resp = client
+        .get(format!("{admin}/logs/{id}"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可查日志详情");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let detail: Value = resp.json().await.expect("详情应可解析");
+    let request_b64 = detail["request_body"]
         .as_str()
-        .expect("request_body 应为字符串");
+        .expect("详情 request_body 应为字符串");
     let decoded = base64::prelude::BASE64_STANDARD
         .decode(request_b64)
         .expect("request_body 应为合法 base64");
@@ -1812,6 +1839,16 @@ async fn settings_toggle_full_body_enables_body_logging() {
         String::from_utf8_lossy(&decoded).contains("model"),
         "解码后的请求体应含 model 字段"
     );
+}
+
+/// 不存在的日志 id 返回 404。
+#[tokio::test]
+async fn get_log_unknown_id_is_404() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let resp = admin_get(&gw, "/logs/999999").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "not_found");
 }
 
 /// 余额调整为相对量：扣减至零余额 → 计费准入拒绝（402）；充值后恢复可用。
@@ -2207,6 +2244,137 @@ async fn logs_filter_settled_and_report_unsettled_total() {
     assert_eq!(closed["total"], 1);
     assert_eq!(closed["unsettled_total"], 1);
     assert_eq!(closed["items"][0]["settled"], true);
+}
+
+/// 未结算日志可补扣（允许透支）或豁免（不改余额）；已结算再操作 409。
+#[tokio::test]
+async fn unsettled_log_can_be_settled_or_waived() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let mut row = store::RequestLog {
+        id: 0,
+        created_at: 1,
+        token_name: "dev".to_string(),
+        token_key: TEST_TOKEN_KEY.to_string(),
+        inbound_protocol: "openai_chat".to_string(),
+        model: "m".to_string(),
+        outbound_model: None,
+        channel: "c".to_string(),
+        status_code: 200,
+        latency_ms: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        price: kairos::core::billing::PriceSnapshot::default(),
+        cost_usd_micros: 1_000_000,
+        settled: false,
+        request_body: None,
+        response_body: None,
+    };
+    let settle_id = store::insert_request_log(&gw.pool, &row)
+        .await
+        .expect("应能写待补扣日志");
+    row.created_at = 2;
+    let waive_id = store::insert_request_log(&gw.pool, &row)
+        .await
+        .expect("应能写待豁免日志");
+
+    let before: (i64,) =
+        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+            .bind(TEST_TOKEN_KEY)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能读余额");
+    assert_eq!(before.0, 5_000_000);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/logs/{settle_id}/settle", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应能补扣");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let settled: Value = resp.json().await.expect("补扣响应应可解析");
+    assert_eq!(settled["settled"], true);
+    let after_settle: (i64,) =
+        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+            .bind(TEST_TOKEN_KEY)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能读余额");
+    assert_eq!(after_settle.0, 4_000_000);
+
+    let again = reqwest::Client::new()
+        .post(format!("{}/logs/{settle_id}/settle", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应能再请求");
+    assert_eq!(again.status(), reqwest::StatusCode::CONFLICT);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/logs/{waive_id}/waive", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应能豁免");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let waived: Value = resp.json().await.expect("豁免响应应可解析");
+    assert_eq!(waived["settled"], true);
+    let after_waive: (i64,) =
+        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+            .bind(TEST_TOKEN_KEY)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能读余额");
+    assert_eq!(after_waive.0, 4_000_000, "豁免不应再扣余额");
+}
+
+/// 全局 RPM 兜底拦住未单独配置的令牌；令牌显式 `0` 可超过全局上限。
+#[tokio::test]
+async fn token_rate_limit_uses_global_fallback_and_token_override() {
+    let mut gw = TestGateway::start_with_admin(|base| {
+        let mut seed = common::test_seed(base);
+        seed.settings.insert("rate_limit_rpm".to_string(), json!(1));
+        seed
+    })
+    .await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+
+    let first = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    let second = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(second.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        second.headers().get("retry-after").is_some(),
+        "超限应带 Retry-After"
+    );
+
+    let resp = admin_put(
+        &gw,
+        &format!("/tokens/{TEST_TOKEN_KEY}"),
+        json!({
+            "token_key": TEST_TOKEN_KEY,
+            "name": "dev",
+            "limit_usd_micros": null,
+            "rate_limit_rpm": 0,
+            "enabled": true,
+            "model_group": "default"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let third = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        third.status(),
+        reqwest::StatusCode::OK,
+        "令牌显式 0 应覆盖全局兜底"
+    );
 }
 
 /// GET `/system-logs` 分页返回运维事件。

@@ -134,6 +134,35 @@ async fn accepts_x_api_key_header() {
     );
 }
 
+/// RFC 9110：Authorization scheme 大小写不敏感。
+#[tokio::test]
+async fn accepts_lowercase_bearer_scheme() {
+    let mut gw = TestGateway::start().await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-1", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .header("Authorization", format!("bearer {TEST_TOKEN_KEY}"))
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "小写 bearer scheme 应通过认证"
+    );
+}
+
 /// 模型无任何候选渠道：准入时拒绝，503 + OpenAI 错误格式 + 可读消息。
 #[tokio::test]
 async fn model_without_channel_is_503() {

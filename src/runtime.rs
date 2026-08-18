@@ -18,14 +18,15 @@ use crate::store::StoreError;
 use crate::store::resources::{
     self, SETTING_AUTH_THROTTLE_MAX_FAILURES, SETTING_AUTH_THROTTLE_WINDOW_SECS,
     SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_LOG_BODY_MAX_BYTES,
-    SETTING_MAX_REQUEST_BYTES, SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS,
-    SETTING_RETRY_BACKOFF_MS, SETTING_SSE_REASSEMBLY_MAX_BYTES,
+    SETTING_MAX_REQUEST_BYTES, SETTING_RATE_LIMIT_RPM, SETTING_RETRY_AFTER_CAP_SECS,
+    SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS, SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
 
 pub use crate::store::resources::{
     DEFAULT_AUTH_THROTTLE_MAX_FAILURES, DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
-    DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_RETRY_AFTER_CAP_SECS,
-    DEFAULT_RETRY_BACKOFF_CAP_MS, DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+    DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_RATE_LIMIT_RPM,
+    DEFAULT_RETRY_AFTER_CAP_SECS, DEFAULT_RETRY_BACKOFF_CAP_MS, DEFAULT_RETRY_BACKOFF_MS,
+    DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
 };
 
 /// 网关运行时资源的内存快照：不可变整体，原子替换。
@@ -64,6 +65,8 @@ pub struct RuntimeSnapshot {
     pub retry_backoff_cap_ms: u64,
     /// 上游 `Retry-After` 最大等待（秒）。
     pub retry_after_cap_secs: u64,
+    /// 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
+    pub rate_limit_rpm: u64,
 }
 
 impl RuntimeSnapshot {
@@ -82,6 +85,11 @@ impl RuntimeSnapshot {
         usize::try_from(self.sse_reassembly_max_bytes).unwrap_or(usize::MAX)
     }
 
+    /// 请求日志 body 截断上限（与 `Vec` 长度比较用）。
+    pub fn log_body_max(&self) -> usize {
+        usize::try_from(self.log_body_max_bytes).unwrap_or(usize::MAX)
+    }
+
     /// 把快照中的运行时开关聚合成管理 API 的 Settings 契约。
     pub fn to_settings(&self) -> resources::Settings {
         resources::Settings {
@@ -95,6 +103,7 @@ impl RuntimeSnapshot {
             retry_backoff_ms: self.retry_backoff_ms,
             retry_backoff_cap_ms: self.retry_backoff_cap_ms,
             retry_after_cap_secs: self.retry_after_cap_secs,
+            rate_limit_rpm: self.rate_limit_rpm,
         }
     }
 }
@@ -181,6 +190,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
             SETTING_RETRY_AFTER_CAP_SECS,
             DEFAULT_RETRY_AFTER_CAP_SECS,
         ),
+        rate_limit_rpm: load_u64(&settings, SETTING_RATE_LIMIT_RPM, DEFAULT_RATE_LIMIT_RPM),
     })
 }
 
@@ -277,6 +287,7 @@ mod tests {
         assert_eq!(snap.retry_backoff_ms, DEFAULT_RETRY_BACKOFF_MS);
         assert_eq!(snap.retry_backoff_cap_ms, DEFAULT_RETRY_BACKOFF_CAP_MS);
         assert_eq!(snap.retry_after_cap_secs, DEFAULT_RETRY_AFTER_CAP_SECS);
+        assert_eq!(snap.rate_limit_rpm, DEFAULT_RATE_LIMIT_RPM);
     }
 
     /// 播种资源与开关后加载：快照反映库内状态。
@@ -311,6 +322,7 @@ mod tests {
                 name: "dev".to_string(),
                 limit_usd_micros: None,
                 enabled: true,
+                rate_limit_rpm: None,
                 model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
             },
             1,

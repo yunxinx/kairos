@@ -36,6 +36,20 @@ pub fn cost_micros(usage: &Usage, price: &PriceSnapshot) -> i64 {
         + component_cost(usage.cache_write_tokens, price.cache_write_micros)
 }
 
+/// 用 `max_tokens` 作为 output 用量的粗估费用，挡住极端输出上限。
+pub fn estimate_max_output_cost_micros(max_tokens: u32, output_micros_per_1m: i64) -> i64 {
+    cost_micros(
+        &Usage {
+            output_tokens: u64::from(max_tokens),
+            ..Usage::default()
+        },
+        &PriceSnapshot {
+            output_micros: output_micros_per_1m,
+            ..PriceSnapshot::default()
+        },
+    )
+}
+
 /// 单分量费用：`tokens × 单价 / 1M`，用 i128 防大 token 数溢出。
 fn component_cost(tokens: u64, micros_per_1m: i64) -> i64 {
     (tokens as i128 * micros_per_1m as i128 / 1_000_000) as i64
@@ -125,6 +139,15 @@ mod tests {
         // 1M input → 0.15 USD = 150_000 微元。
         let u = usage(1_000_000, 0, 0, 0);
         assert_eq!(cost_micros(&u, &price), 150_000);
+    }
+
+    #[test]
+    fn estimate_max_output_uses_output_tier_only() {
+        assert_eq!(
+            estimate_max_output_cost_micros(600_000, 10_000_000),
+            6_000_000
+        );
+        assert_eq!(estimate_max_output_cost_micros(0, 10_000_000), 0);
     }
 
     /// 快照构造不依赖 JSON 序列化，且缓存档缺省为 0 确定。

@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { useQuery } from '@tanstack/vue-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { LogQuery } from '@/api/types';
+import type { LogQuery, LogEntry } from '@/api/types';
 import DateRangePicker from '@/components/ui/DateRangePicker.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
@@ -20,8 +20,11 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow from '@/features/logs/LogTableRow.vue';
 import { useLogListControls } from '@/features/logs/useLogListControls';
+import { useToast } from '@/composables/useToast';
 
 const { t } = useI18n();
+const { error, success } = useToast();
+const queryClient = useQueryClient();
 const {
   draftKeyword,
   appliedKeyword,
@@ -39,6 +42,9 @@ const {
 } = useLogListControls();
 const appliedSettled = ref<string[]>([]);
 const expandedIds = ref<Set<number>>(new Set());
+const details = ref<Map<number, LogEntry>>(new Map());
+const detailLoading = ref<Set<number>>(new Set());
+const detailErrors = ref<Map<number, string>>(new Map());
 
 const settledOptions = computed(() => [
   { value: 'true', label: t('logs.settledYes') },
@@ -47,6 +53,9 @@ const settledOptions = computed(() => [
 
 watch(page, () => {
   expandedIds.value = new Set();
+  details.value = new Map();
+  detailLoading.value = new Set();
+  detailErrors.value = new Map();
 });
 
 watch(appliedSettled, resetResults);
@@ -77,6 +86,24 @@ const logsQuery = useQuery({
   queryFn: () => apiClient.queryLogs(buildQuery()),
 });
 
+const closeMutation = useMutation({
+  mutationFn: ({ id, action }: { id: number; action: 'settle' | 'waive' }) =>
+    action === 'settle' ? apiClient.settleLog(id) : apiClient.waiveLog(id),
+  onSuccess: async (_entry, vars) => {
+    success(vars.action === 'settle' ? t('logs.settleSuccess') : t('logs.waiveSuccess'));
+    details.value.delete(vars.id);
+    await queryClient.invalidateQueries({ queryKey: ['logs'] });
+    await queryClient.invalidateQueries({ queryKey: ['tokens'] });
+  },
+  onError: (err) => {
+    error(extractApiError(err).message);
+  },
+});
+
+const closingId = computed(() =>
+  closeMutation.isPending.value ? (closeMutation.variables.value?.id ?? null) : null,
+);
+
 const items = computed(() => logsQuery.data.value?.items ?? []);
 const total = computed(() => logsQuery.data.value?.total ?? 0);
 const unsettledTotal = computed(() => logsQuery.data.value?.unsettled_total ?? 0);
@@ -88,16 +115,43 @@ function clearFilters() {
   appliedSettled.value = [];
   clearBaseFilters();
   expandedIds.value = new Set();
+  details.value = new Map();
+  detailLoading.value = new Set();
+  detailErrors.value = new Map();
 }
 
-function toggleExpand(id: number) {
+async function toggleExpand(id: number) {
   const next = new Set(expandedIds.value);
   if (next.has(id)) {
     next.delete(id);
-  } else {
-    next.add(id);
+    expandedIds.value = next;
+    return;
   }
+  next.add(id);
   expandedIds.value = next;
+  if (details.value.has(id) || detailLoading.value.has(id)) {
+    return;
+  }
+  const loading = new Set(detailLoading.value);
+  loading.add(id);
+  detailLoading.value = loading;
+  try {
+    const entry = await apiClient.getLog(id);
+    const nextDetails = new Map(details.value);
+    nextDetails.set(id, entry);
+    details.value = nextDetails;
+    const nextErrors = new Map(detailErrors.value);
+    nextErrors.delete(id);
+    detailErrors.value = nextErrors;
+  } catch (err) {
+    const nextErrors = new Map(detailErrors.value);
+    nextErrors.set(id, extractApiError(err).message);
+    detailErrors.value = nextErrors;
+  } finally {
+    const done = new Set(detailLoading.value);
+    done.delete(id);
+    detailLoading.value = done;
+  }
 }
 
 function isExpanded(id: number): boolean {
@@ -179,8 +233,14 @@ function isExpanded(id: number): boolean {
             :key="entry.id"
             :entry="entry"
             :expanded="isExpanded(entry.id)"
+            :detail="details.get(entry.id) ?? null"
+            :detail-loading="detailLoading.has(entry.id)"
+            :detail-error="detailErrors.get(entry.id) ?? ''"
             :detail-col-span="8"
+            :closing="closingId === entry.id"
             @toggle-expand="toggleExpand(entry.id)"
+            @settle="closeMutation.mutate({ id: entry.id, action: 'settle' })"
+            @waive="closeMutation.mutate({ id: entry.id, action: 'waive' })"
           />
           <TableRow v-if="items.length === 0">
             <TableCell :colspan="8" class="h-24 whitespace-normal">
