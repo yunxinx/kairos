@@ -21,7 +21,7 @@ pub const DEFAULT_CONFIG_PATH: &str = ".kairos/config.json";
 pub struct Config {
     pub listen: Listen,
     pub database: Database,
-    /// 管理 API 静态密钥（Bearer 认证）；未配置管理监听地址时虽不生效，仍为必填，避免形态漂移。
+    /// 管理 API 静态密钥（Bearer 认证）；必须非空（trim 后），未配置管理监听时虽不生效，仍为必填，避免形态漂移。
     pub admin_key: String,
     /// 可选的管理监听地址；配置了才启动管理面，否则管理 API 整体关闭。
     #[serde(default)]
@@ -68,6 +68,8 @@ pub enum ConfigError {
         path: String,
         source: serde_json::Error,
     },
+    #[error("配置文件 {path} 无效: {message}")]
+    Invalid { path: String, message: String },
 }
 
 impl Config {
@@ -81,6 +83,12 @@ impl Config {
             path: path.display().to_string(),
             source,
         })?;
+        if config.admin_key.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                path: path.display().to_string(),
+                message: "admin_key 不能为空".to_string(),
+            });
+        }
         config.resolve_paths(path);
         Ok(config)
     }
@@ -194,5 +202,40 @@ mod tests {
             ConfigError::Read { .. } => {}
             other => panic!("应报 Read 错误，实际 {other:?}"),
         }
+    }
+
+    /// 空 admin_key 拒绝启动：否则 Bearer 后接空串即可通过管理面认证。
+    #[test]
+    fn empty_admin_key_is_rejected() {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let cfg_path = dir.path().join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_key":""}"#,
+        )
+        .expect("应能写配置");
+        let err = Config::load(&cfg_path).expect_err("空 admin_key 应报错");
+        match err {
+            ConfigError::Invalid { message, .. } => {
+                assert!(
+                    message.contains("admin_key"),
+                    "错误应点明 admin_key，实际 {message}"
+                );
+            }
+            other => panic!("应报 Invalid 错误，实际 {other:?}"),
+        }
+    }
+
+    /// 纯空白 admin_key 与空串同属未配置，拒绝启动。
+    #[test]
+    fn whitespace_admin_key_is_rejected() {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let cfg_path = dir.path().join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_key":"   "}"#,
+        )
+        .expect("应能写配置");
+        assert!(Config::load(&cfg_path).is_err(), "空白 admin_key 应报错");
     }
 }

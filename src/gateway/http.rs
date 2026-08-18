@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -25,6 +25,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use bytes::BytesMut;
 use futures_util::Stream;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -72,10 +73,10 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         snapshot,
     };
 
-    // 禁用 axum 默认的 2MB 请求体上限：入站请求体上限由运行时开关 `max_request_bytes`
-    // 在 `handle_request` 内统一施加（超限返回入站协议格式 413）。若不禁用，axum 会在
-    // `Bytes` 提取器内以 2MB 提前拒绝大请求，使运行时设置失效。`layer` 只作用于其之前
-    // 已添加的路由，故先注册路由再挂层。
+    // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
+    // 由 handler 按 Content-Length 提前 413，再对流式读取施加同一字节上限。若不禁用，
+    // 使用 `Bytes`/`Json` 等提取器的路径会被 2MB 截住，使大于 2MB 的合法运行时上限失效。
+    // `layer` 只作用于其之前已添加的路由，故先注册路由再挂层。
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
@@ -92,30 +93,18 @@ async fn not_found() -> (StatusCode, &'static str) {
 }
 
 /// Chat Completions 入站端点。
-async fn chat_completions(
-    State(deps): State<Deps>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    handle_request(deps, Protocol::OpenAiChat, headers, body).await
+async fn chat_completions(State(deps): State<Deps>, request: Request) -> Response {
+    handle_request(deps, Protocol::OpenAiChat, request).await
 }
 
 /// Anthropic Messages 入站端点。
-async fn messages(
-    State(deps): State<Deps>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    handle_request(deps, Protocol::AnthropicMessages, headers, body).await
+async fn messages(State(deps): State<Deps>, request: Request) -> Response {
+    handle_request(deps, Protocol::AnthropicMessages, request).await
 }
 
 /// OpenAI Responses 入站端点。
-async fn responses(
-    State(deps): State<Deps>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    handle_request(deps, Protocol::OpenAiResponses, headers, body).await
+async fn responses(State(deps): State<Deps>, request: Request) -> Response {
+    handle_request(deps, Protocol::OpenAiResponses, request).await
 }
 
 /// 下游标准模型列表：`GET /v1/models`。
@@ -163,40 +152,123 @@ fn list_models_protocol(headers: &HeaderMap) -> Protocol {
     }
 }
 
+/// 入站 body 读取超出 `max_request_bytes` 或底层读失败。
+enum LimitedBodyError {
+    TooLarge,
+    ReadFailed,
+}
+
+/// 从 `Content-Length` 头解析声明长度；缺失或无法解析则视为未知（走流式封顶）。
+fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// 按字节上限流式读取请求体；超过上限立即停止，不把超限块并入缓冲。
+async fn read_body_with_limit(
+    body: Body,
+    max_bytes: u64,
+) -> Result<bytes::Bytes, LimitedBodyError> {
+    use futures_util::StreamExt as _;
+
+    let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut collected = BytesMut::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| LimitedBodyError::ReadFailed)?;
+        if collected.len().saturating_add(chunk.len()) > max {
+            return Err(LimitedBodyError::TooLarge);
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected.freeze())
+}
+
+/// 入站协议格式的 413：超限时尚无令牌可归因，不落请求日志。
+async fn payload_too_large(
+    deps: &Deps,
+    full_body: bool,
+    started: i64,
+    inbound_protocol: Protocol,
+    max_request_bytes: u64,
+) -> Response {
+    let message = format!("请求体超过上限 {max_request_bytes} 字节");
+    error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &message,
+        deps,
+        full_body,
+        None,
+        None,
+        started,
+        inbound_protocol,
+        None,
+    )
+    .await
+}
+
 /// 入站端点公共处理：认证 → 解码 → 准入 →（直通快路径 | IR 完整路径）。
 ///
 /// `inbound_protocol` 决定入站解码/响应编码与错误格式；出站侧按渠道 `protocol`
 /// 分派。同协议且未命中别名时走直通快路径（响应字节流直通、逐帧嗅探 usage
 /// 计费），否则经 IR 完整路径。
-async fn handle_request(
-    deps: Deps,
-    inbound_protocol: Protocol,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
+async fn handle_request(deps: Deps, inbound_protocol: Protocol, request: Request) -> Response {
     let started = unix_millis();
     // 准入时刻抓取快照引用：在途请求持有该引用直到结束，不受后续原子替换影响。
     let snapshot = deps.snapshot.read().await.clone();
     let full_body = snapshot.full_body;
+    let max_request_bytes = snapshot.max_request_bytes;
 
-    // 0. 入站请求体上限：`Bytes` 提取器已把整个请求体缓冲进内存，此处按运行时开关
-    // `max_request_bytes` 的长度上限决定取舍，超限以入站协议错误格式拒绝（413）。
-    // 超限请求尚无令牌可归因，不落请求日志。
-    if body.len() as u64 > snapshot.max_request_bytes {
-        let message = format!("请求体超过上限 {} 字节", snapshot.max_request_bytes);
-        return error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &message,
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
+
+    // 0. 入站请求体上限：先看 Content-Length，声明即超限则不读 body（避免按声明长度
+    // 分配）；无 Content-Length（chunked）或声明未超限时，再按同一上限流式读取。
+    // 超限以入站协议错误格式拒绝（413）。超限请求尚无令牌可归因，不落请求日志。
+    if let Some(declared) = declared_content_length(&headers)
+        && declared > max_request_bytes
+    {
+        return payload_too_large(
             &deps,
             full_body,
-            None,
-            None,
             started,
             inbound_protocol,
-            None,
+            max_request_bytes,
         )
         .await;
     }
+    let body = match read_body_with_limit(body, max_request_bytes).await {
+        Ok(bytes) => bytes,
+        Err(LimitedBodyError::TooLarge) => {
+            return payload_too_large(
+                &deps,
+                full_body,
+                started,
+                inbound_protocol,
+                max_request_bytes,
+            )
+            .await;
+        }
+        Err(LimitedBodyError::ReadFailed) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "读取请求体失败",
+                &deps,
+                full_body,
+                None,
+                None,
+                started,
+                inbound_protocol,
+                None,
+            )
+            .await;
+        }
+    };
 
     // 仅放行后的请求才为 full_body 预取请求字节，避免超限请求白分配一份待丢弃的拷贝。
     let request_body_for_log = full_body.then(|| body.to_vec());
