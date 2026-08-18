@@ -486,10 +486,22 @@ function handleSave() {
               :error="fieldError('apiKey')"
             >
               <template #default="{ hintId, invalid }">
+                <FormTextInput
+                  v-if="initial === null"
+                  :id="apiKeyInputId"
+                  v-model="editorApiKey"
+                  type="text"
+                  autocomplete="off"
+                  :invalid="invalid"
+                  :hint-id="hintId"
+                  v-on="fieldInputHandlers('apiKey')"
+                />
                 <FormPasswordInput
+                  v-else
                   :id="apiKeyInputId"
                   v-model="editorApiKey"
                   autocomplete="off"
+                  mask-while-hidden
                   :invalid="invalid"
                   :hint-id="hintId"
                   v-on="fieldInputHandlers('apiKey')"

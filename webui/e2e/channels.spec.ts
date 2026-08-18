@@ -1,5 +1,6 @@
 import { authedTest as test, expect } from './fixtures';
 import { E2E_ADMIN_KEY, E2E_PROTOCOL_PORT } from './helpers/gateway';
+import { seedChannel } from './helpers/models';
 import { clickRowAction } from './helpers/table';
 import { startProbeUpstream } from './helpers/upstream';
 
@@ -635,5 +636,28 @@ test.describe('channel editor model overflow', () => {
     await expect(form.getByTestId('channel-model-count')).toHaveText('9');
     await expect(form.getByTestId('overflow-more')).toHaveCount(0);
     await expect(form.getByTestId('channel-model-chip')).toHaveCount(9);
+  });
+
+  test('create form shows api key in plaintext; edit masks until unlocked', async ({ page }) => {
+    const longKey = `sk-${'a'.repeat(40)}`;
+    await seedChannel(page, {
+      name: 'mask-key-channel',
+      models: ['gpt-4o'],
+      api_key: longKey,
+    });
+
+    await page.goto('/channel');
+    await page.getByTestId('create-channel').click();
+    await expect(page.locator('[id^="channel-editor-api-key"]')).toHaveAttribute('type', 'text');
+    await page.getByRole('button', { name: /cancel|取消/i }).click();
+
+    await page.getByTestId('channels-search').fill('mask-key-channel');
+    await page.getByTestId('channel-edit').click();
+    await expect(page.getByTestId('secret-input-masked')).toHaveValue(
+      `${longKey.slice(0, 8)}******${longKey.slice(-8)}`,
+    );
+    await page.getByTestId('secret-reveal').click();
+    await expect(page.locator('[id^="channel-editor-api-key"]')).toHaveValue(longKey);
+    await expect(page.locator('[id^="channel-editor-api-key"]')).toHaveAttribute('type', 'text');
   });
 });
