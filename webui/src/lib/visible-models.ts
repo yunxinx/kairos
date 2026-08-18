@@ -1,6 +1,30 @@
-import type { ChannelView, ModelGroup, UnifiedModel } from '@/api/types';
+import type { ChannelView, ModelGroup, UnifiedMember, UnifiedModel } from '@/api/types';
 
 export const DEFAULT_MODEL_GROUP = 'default';
+
+export function groupDisplayName(name: string, ungroupedLabel: string): string {
+  return name === DEFAULT_MODEL_GROUP ? ungroupedLabel : name;
+}
+
+/** 令牌/渠道下拉：内置 default 显示为未分组，其余按名列出。 */
+export function groupSelectOptions(
+  groups: ModelGroup[],
+  current: string,
+  ungroupedLabel: string,
+): { value: string; label: string }[] {
+  const options = [
+    { value: DEFAULT_MODEL_GROUP, label: ungroupedLabel },
+    ...groups
+      .filter((group) => group.name !== DEFAULT_MODEL_GROUP)
+      .map((group) => group.name)
+      .sort((left, right) => left.localeCompare(right))
+      .map((name) => ({ value: name, label: name })),
+  ];
+  if (current && !options.some((item) => item.value === current)) {
+    options.push({ value: current, label: current });
+  }
+  return options;
+}
 
 /** 渠道已登记的可调用名：各渠道 `models` ∪ 别名 key（含禁用渠道）。 */
 export function registeredCallableNames(channels: ChannelView[]): Set<string> {
@@ -27,7 +51,7 @@ export function groupAllows(groups: ModelGroup[], groupName: string, model: stri
 
 export interface VisibleUnified {
   id: string;
-  models: string[];
+  models: UnifiedMember[];
   hide: boolean;
   hiddenMembers: string[];
 }
@@ -61,7 +85,13 @@ export function previewVisibleModels(
     .filter((model) => allowedSet.has(model.id))
     .sort((left, right) => left.id.localeCompare(right.id))
     .map((model) => {
-      const hiddenMembers = model.hide ? model.models.filter((member) => member !== model.id) : [];
+      const hiddenMembers = model.hide
+        ? [
+            ...new Set(
+              model.models.map((member) => member.model).filter((name) => name !== model.id),
+            ),
+          ]
+        : [];
       return {
         id: model.id,
         models: [...model.models],

@@ -1,9 +1,8 @@
 import { authedTest as test, expect } from './fixtures';
 import { E2E_ADMIN_KEY } from './helpers/gateway';
-import { seedChannel, seedModelGroup, seedPrice, seedToken } from './helpers/models';
+import { seedCatalog, seedChannel, seedModelGroup, seedPrice, seedToken } from './helpers/models';
 import { seedRequestLogs } from './helpers/seed-logs';
 import { clickRowAction } from './helpers/table';
-import { MODELS_DEV_CATALOG_URL } from '../src/lib/catalog';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -197,7 +196,7 @@ test.describe('models page', () => {
     await expect(canonRow.getByTestId('inventory-unpriced')).toHaveCount(0);
   });
 
-  test('catalog fill previews, requires a provider pick, overwrites selected tiers, and keeps unchecked ones', async ({
+  test('catalog fill previews, requires a provider pick, and fills blank tiers only', async ({
     page,
   }) => {
     const catChannel = await seedChannel(page, {
@@ -212,34 +211,26 @@ test.describe('models page', () => {
       cache_read_micros: null,
       cache_write_micros: null,
     });
-    await page.route(MODELS_DEV_CATALOG_URL, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          openai: {
-            id: 'openai',
-            name: 'OpenAI',
-            models: {
-              'e2e-cat-mini': {
-                id: 'e2e-cat-mini',
-                cost: { input: 0.15, output: 0.6, cache_read: 0.075 },
-              },
-            },
-          },
-          cortecs: {
-            id: 'cortecs',
-            name: 'Cortecs',
-            models: {
-              'e2e-cat-mini': {
-                id: 'e2e-cat-mini',
-                cost: { input: 0.159, output: 0.638, cache_read: 0.081 },
-              },
-            },
-          },
-        }),
-      });
-    });
+    await seedCatalog(page, [
+      {
+        provider_id: 'openai',
+        provider_name: 'OpenAI',
+        model_id: 'e2e-cat-mini',
+        input_micros: 150_000,
+        output_micros: 600_000,
+        cache_read_micros: 75_000,
+        cache_write_micros: null,
+      },
+      {
+        provider_id: 'cortecs',
+        provider_name: 'Cortecs',
+        model_id: 'e2e-cat-mini',
+        input_micros: 159_000,
+        output_micros: 638_000,
+        cache_read_micros: 81_000,
+        cache_write_micros: null,
+      },
+    ]);
 
     await page.goto('/models');
     const row = page.locator('[data-testid="inventory-row"][data-model="e2e-cat-mini"]');
@@ -249,14 +240,13 @@ test.describe('models page', () => {
     await expect(page.getByTestId('catalog-preview-status')).toHaveText(/pick a provider/i);
     await expect(page.getByTestId('catalog-confirm')).toBeDisabled();
 
-    await page.getByTestId('catalog-tier-input').click();
     await page.getByTestId('catalog-host-select').click();
     await page.getByRole('option', { name: 'OpenAI', exact: true }).click();
     await expect(page.getByTestId('catalog-preview-status')).toHaveText(/will write/i);
     await page.getByTestId('catalog-confirm').click();
 
     await expect(row.getByTestId('price-input')).toHaveText('9');
-    await expect(row.getByTestId('price-output')).toHaveText('0.6');
+    await expect(row.getByTestId('price-output')).toHaveText('8');
     await expect(row.getByTestId('price-cache-read')).toHaveText('0.075');
     await expect(row.getByTestId('price-cache-write')).toHaveText('—');
   });
@@ -289,19 +279,26 @@ test.describe('models page', () => {
     await page.getByTestId('models-tab-unified').click();
     await page.getByTestId('unified-create').click();
     await page.getByTestId('unified-editor-id').fill('coding');
-    await page.getByTestId('unified-add-select').click();
-    await page.getByRole('option', { name: 'e2e-code-mini', exact: true }).click();
-    await page.getByTestId('unified-add-member').click();
-    await page.getByTestId('unified-add-select').click();
-    await page.getByRole('option', { name: 'e2e-code-haiku', exact: true }).click();
-    await page.getByTestId('unified-add-member').click();
+    await page
+      .locator('[data-testid="unified-pick"][data-model="e2e-code-mini"]')
+      .getByTestId('unified-pick-check')
+      .click();
+    await page
+      .locator('[data-testid="unified-pick"][data-model="e2e-code-haiku"]')
+      .getByTestId('unified-pick-check')
+      .click();
     await page.getByTestId('unified-member-down').first().click();
     await page.getByTestId('unified-hide-switch').click();
     await page.getByTestId('unified-save').click();
     const unifiedRow = page.locator('[data-testid="unified-row"][data-unified-id="coding"]');
     await expect(unifiedRow).toBeVisible();
-    await expect(unifiedRow.getByTestId('unified-members')).toHaveText(
-      'e2e-code-haiku → e2e-code-mini',
+    await expect(unifiedRow.locator('[data-testid="unified-member-line"]').nth(0)).toHaveAttribute(
+      'data-member',
+      'e2e-code-haiku',
+    );
+    await expect(unifiedRow.locator('[data-testid="unified-member-line"]').nth(1)).toHaveAttribute(
+      'data-member',
+      'e2e-code-mini',
     );
     await unifiedRow.getByTestId('unified-model-name').click();
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('coding');
@@ -323,9 +320,10 @@ test.describe('models page', () => {
     await page.getByTestId('models-tab-groups').click();
     await page.getByTestId('group-create').click();
     await page.getByTestId('group-editor-name').fill('coding');
-    await page.getByTestId('group-add-select').click();
-    await page.getByRole('option', { name: 'coding', exact: true }).click();
-    await page.getByTestId('group-add-member').click();
+    await page
+      .locator('[data-testid="group-pick"][data-model="coding"]')
+      .getByTestId('group-pick-check')
+      .click();
     await expect(
       page.locator('[data-testid="group-model-option"][data-model="coding"]'),
     ).toBeVisible();
@@ -529,8 +527,9 @@ test.describe('models page', () => {
 
     await page.goto('/models');
     await page.getByTestId('models-tab-groups').click();
-    const defaultRow = page.locator('[data-testid="group-row"][data-group-name="default"]');
-    await expect(defaultRow.getByTestId('group-delete')).toHaveCount(0);
+    await expect(page.locator('[data-testid="group-row"][data-group-name="default"]')).toHaveCount(
+      0,
+    );
 
     const groupRow = page.locator('[data-testid="group-row"][data-group-name="e2e-force-group"]');
     await clickRowAction(groupRow, page, 'group-delete');

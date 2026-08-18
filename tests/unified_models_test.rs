@@ -10,7 +10,7 @@ use common::{
     UpstreamBehavior,
 };
 use kairos::config;
-use kairos::store::resources::{Channel, Price, UnifiedModel};
+use kairos::store::resources::{Channel, Price, UnifiedMember, UnifiedModel};
 use serde_json::{Value, json};
 
 /// 带 `TEST_ADMIN_KEY` 认证的 GET。
@@ -92,29 +92,60 @@ async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
     row.0
 }
 
+fn member(channel_id: i64, model: &str) -> UnifiedMember {
+    UnifiedMember {
+        channel_id,
+        model: model.to_string(),
+    }
+}
+
+fn member_json(channel_id: i64, model: &str) -> Value {
+    json!({ "channel_id": channel_id, "model": model })
+}
+
+async fn first_channel_id(gw: &TestGateway) -> i64 {
+    let channels: Value = admin_get(gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    channels[0]["id"].as_i64().expect("应有渠道 id")
+}
+
 /// CRUD：新建、列出、更新、删除；重名 409；空成员/未登记成员 400。
 #[tokio::test]
 async fn unified_model_crud_roundtrip() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = first_channel_id(&gw).await;
 
     let created = admin_json(
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": "coding", "models": ["gpt-4o", "fast"], "hide": false }),
+        json!({
+            "id": "coding",
+            "models": [member_json(channel_id, "gpt-4o"), member_json(channel_id, "fast")],
+            "hide": false
+        }),
     )
     .await;
     assert_eq!(created.status(), reqwest::StatusCode::CREATED);
     let body: Value = created.json().await.expect("创建响应应可解析");
     assert_eq!(body["id"], "coding");
-    assert_eq!(body["models"], json!(["gpt-4o", "fast"]));
+    assert_eq!(
+        body["models"],
+        json!([
+            member_json(channel_id, "gpt-4o"),
+            member_json(channel_id, "fast")
+        ])
+    );
     assert_eq!(body["hide"], false);
 
     let dup = admin_json(
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": "coding", "models": ["gpt-4o"] }),
+        json!({ "id": "coding", "models": [member_json(channel_id, "gpt-4o")] }),
     )
     .await;
     assert_eq!(dup.status(), reqwest::StatusCode::CONFLICT);
@@ -132,13 +163,22 @@ async fn unified_model_crud_roundtrip() {
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": "ghost", "models": ["not-registered"] }),
+        json!({ "id": "ghost", "models": [member_json(channel_id, "not-registered")] }),
     )
     .await;
     assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = unknown.json().await.expect("错误体应可解析");
     let msg = body["error"]["message"].as_str().expect("应有消息");
     assert!(msg.contains("已登记"), "应提示未登记，实际 {msg}");
+
+    let missing_channel = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/unified-models",
+        json!({ "id": "ghost-ch", "models": [member_json(9_999, "gpt-4o")] }),
+    )
+    .await;
+    assert_eq!(missing_channel.status(), reqwest::StatusCode::BAD_REQUEST);
 
     let list: Value = admin_get(&gw, "/unified-models")
         .await
@@ -152,20 +192,30 @@ async fn unified_model_crud_roundtrip() {
         &gw,
         reqwest::Method::PUT,
         "/unified-models/coding",
-        json!({ "id": "ignored", "models": ["fast", "gpt-4o"], "hide": true }),
+        json!({
+            "id": "ignored",
+            "models": [member_json(channel_id, "fast"), member_json(channel_id, "gpt-4o")],
+            "hide": true
+        }),
     )
     .await;
     assert_eq!(updated.status(), reqwest::StatusCode::OK);
     let body: Value = updated.json().await.expect("更新应可解析");
     assert_eq!(body["id"], "coding", "路径权威");
-    assert_eq!(body["models"], json!(["fast", "gpt-4o"]));
+    assert_eq!(
+        body["models"],
+        json!([
+            member_json(channel_id, "fast"),
+            member_json(channel_id, "gpt-4o")
+        ])
+    );
     assert_eq!(body["hide"], true);
 
     let missing = admin_json(
         &gw,
         reqwest::Method::PUT,
         "/unified-models/nope",
-        json!({ "id": "nope", "models": ["gpt-4o"] }),
+        json!({ "id": "nope", "models": [member_json(channel_id, "gpt-4o")] }),
     )
     .await;
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
@@ -184,12 +234,13 @@ async fn unified_model_crud_roundtrip() {
 #[tokio::test]
 async fn unhidden_id_colliding_with_registered_name_is_rejected() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = first_channel_id(&gw).await;
 
     let resp = admin_json(
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": TEST_MODEL, "models": [TEST_MODEL], "hide": false }),
+        json!({ "id": TEST_MODEL, "models": [member_json(channel_id, TEST_MODEL)], "hide": false }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
@@ -201,7 +252,7 @@ async fn unhidden_id_colliding_with_registered_name_is_rejected() {
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": "fast", "models": ["gpt-4o"], "hide": false }),
+        json!({ "id": "fast", "models": [member_json(channel_id, "gpt-4o")], "hide": false }),
     )
     .await;
     assert_eq!(alias.status(), reqwest::StatusCode::CONFLICT);
@@ -210,7 +261,11 @@ async fn unhidden_id_colliding_with_registered_name_is_rejected() {
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": TEST_MODEL, "models": [TEST_MODEL, "fast"], "hide": true }),
+        json!({
+            "id": TEST_MODEL,
+            "models": [member_json(channel_id, TEST_MODEL), member_json(channel_id, "fast")],
+            "hide": true
+        }),
     )
     .await;
     assert_eq!(hidden.status(), reqwest::StatusCode::CREATED);
@@ -245,7 +300,7 @@ async fn token_group_and_unified_id_may_share_the_same_string() {
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": "coding", "models": ["gpt-4o"], "hide": false }),
+        json!({ "id": "coding", "models": [member_json(first_channel_id(&gw).await, "gpt-4o")], "hide": false }),
     )
     .await;
     assert_eq!(unified.status(), reqwest::StatusCode::CREATED);
@@ -255,11 +310,12 @@ async fn token_group_and_unified_id_may_share_the_same_string() {
 #[tokio::test]
 async fn channel_save_rejects_unhidden_unified_id_collision() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = first_channel_id(&gw).await;
     admin_json(
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": "bundle", "models": ["gpt-4o"], "hide": false }),
+        json!({ "id": "bundle", "models": [member_json(channel_id, "gpt-4o")], "hide": false }),
     )
     .await;
 
@@ -292,6 +348,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             timeout_ms: 1000,
             max_retries: 0,
             enabled: true,
+            model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
         },
         Channel {
             name: "ch-pricey".to_string(),
@@ -305,6 +362,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             timeout_ms: 1000,
             max_retries: 0,
             enabled: true,
+            model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
         },
     ];
     seed.prices = vec![
@@ -327,7 +385,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
     ];
     seed.unified_models = vec![UnifiedModel {
         id: "bundle".to_string(),
-        models: vec!["cheap".to_string(), "pricey".to_string()],
+        models: vec![member(1, "cheap"), member(2, "pricey")],
         hide: false,
     }];
     seed
@@ -348,6 +406,39 @@ async fn ordered_failover_tries_one_member_at_a_time() {
     assert_eq!(ups[1].received().len(), 1, "cheap 失败后再打 pricey");
     assert_eq!(ups[0].received()[0]["model"], "cheap");
     assert_eq!(ups[1].received()[0]["model"], "pricey");
+}
+
+/// 同名挂两条渠道是两条独立成员：只打钉死的渠道，失败不扩到同名另一条。
+#[tokio::test]
+async fn same_name_on_two_channels_are_independent_members() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = two_member_seed(bases);
+        seed.channels[0].models = vec!["gpt-4o".to_string()];
+        seed.channels[1].models = vec!["gpt-4o".to_string()];
+        seed.prices[0].model = "gpt-4o".to_string();
+        seed.prices[1].model = "gpt-4o".to_string();
+        seed.unified_models = vec![UnifiedModel {
+            id: "bundle".to_string(),
+            models: vec![member(1, "gpt-4o"), member(2, "gpt-4o")],
+            hide: false,
+        }];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Status429);
+    ups[1].set_behavior(UpstreamBehavior::Json(completion_body("gpt-4o", 1000, 0)));
+
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "bundle").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(ups[0].received().len(), 1, "先打渠道 1");
+    assert_eq!(ups[1].received().len(), 1, "渠道 1 失败后再打渠道 2");
+    assert_eq!(ups[0].received()[0]["model"], "gpt-4o");
+    assert_eq!(ups[1].received()[0]["model"], "gpt-4o");
+    assert_eq!(
+        balance_micros(&gw, TEST_TOKEN_KEY).await,
+        5_000_000 - 10_000,
+        "应按渠道 2 的单价扣费"
+    );
 }
 
 /// 按实际打到的成员计价；统一 ID 无价格行不 503；失败跳不扣费。
@@ -403,7 +494,7 @@ async fn hidden_colliding_id_is_served_as_unified_model() {
         seed.prices[0].model = "gpt-4o".to_string();
         seed.unified_models = vec![UnifiedModel {
             id: "gpt-4o".to_string(),
-            models: vec!["gpt-4o".to_string(), "pricey".to_string()],
+            models: vec![member(1, "gpt-4o"), member(2, "pricey")],
             hide: true,
         }];
         seed
@@ -426,7 +517,7 @@ async fn invalid_members_return_gateway_reason_not_acl() {
         let mut seed = common::test_seed(base);
         seed.unified_models = vec![UnifiedModel {
             id: "bundle".to_string(),
-            models: vec!["missing".to_string()],
+            models: vec![member(1, "missing")],
             hide: false,
         }];
         seed
@@ -454,11 +545,8 @@ async fn invalid_members_return_gateway_reason_not_acl() {
 async fn stale_member_is_skipped_then_next_serves() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
         let mut seed = two_member_seed(bases);
-        seed.unified_models[0].models = vec![
-            "gone".to_string(),
-            "cheap".to_string(),
-            "pricey".to_string(),
-        ];
+        seed.unified_models[0].models =
+            vec![member(1, "gone"), member(1, "cheap"), member(2, "pricey")];
         seed
     })
     .await;

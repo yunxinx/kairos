@@ -56,6 +56,10 @@ export function prefetchAdminRoute(to: string): void {
         queryKey: ['settings'],
         queryFn: () => apiClient.getSettings(),
       });
+      void queryClient.prefetchQuery({
+        queryKey: ['catalog-meta'],
+        queryFn: () => apiClient.getCatalogMeta(),
+      });
       return;
     case '/requests':
       void queryClient.prefetchQuery({

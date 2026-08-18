@@ -425,6 +425,37 @@ enum HopDeny {
     NoPrice,
 }
 
+/// 为钉死的统一成员构造一条出站跳：只走该渠道，不按同名扩到其他渠道。
+fn hop_for_member(
+    snapshot: &RuntimeSnapshot,
+    member: &crate::store::resources::UnifiedMember,
+) -> Result<RouteHop, HopDeny> {
+    let Some(record) = snapshot
+        .channels
+        .iter()
+        .find(|record| record.id == member.channel_id)
+    else {
+        return Err(HopDeny::NoRoute);
+    };
+    if !record.channel.enabled
+        || !crate::store::resources::channel_lists_callable(&record.channel, &member.model)
+    {
+        return Err(HopDeny::NoRoute);
+    }
+    if snapshot
+        .price_for_channel(record.id, &member.model)
+        .is_none()
+    {
+        return Err(HopDeny::NoPrice);
+    }
+    Ok(RouteHop {
+        routed_model: member.model.clone(),
+        route: routing::Route {
+            channels: vec![record.clone()],
+        },
+    })
+}
+
 /// 为可调用名构造一条出站跳：须有启用且已定价的渠道。
 fn hop_for_callable(snapshot: &RuntimeSnapshot, model: &str) -> Result<RouteHop, HopDeny> {
     let mut route = routing::route(&snapshot.channels, model).ok_or(HopDeny::NoRoute)?;
@@ -460,7 +491,7 @@ fn resolve_route_hops(
         let mut hops = Vec::new();
         let mut reasons = Vec::new();
         for member in &unified.models {
-            match hop_for_callable(snapshot, member) {
+            match hop_for_member(snapshot, member) {
                 Ok(hop) => hops.push(hop),
                 Err(HopDeny::NoRoute) => {
                     reasons.push(format!("成员 {member} 没有可用渠道"));

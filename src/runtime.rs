@@ -14,7 +14,9 @@ use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
 use crate::store::StoreError;
-use crate::store::resources::{self, SETTING_FULL_BODY, SETTING_MAX_REQUEST_BYTES};
+use crate::store::resources::{
+    self, SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_MAX_REQUEST_BYTES,
+};
 
 /// 入站请求体大小上限的默认值（字节）：覆盖常规 base64 图片，与参考网关 bifrost
 /// 的 `max_request_body_size_mb: 100` 对齐；运营可经管理 API 在线调整。
@@ -40,6 +42,8 @@ pub struct RuntimeSnapshot {
     pub full_body: bool,
     /// 入站请求体大小上限（字节，来自 `max_request_bytes` 开关）。
     pub max_request_bytes: u64,
+    /// 价格目录自动同步间隔（天，来自 `catalog_sync_interval_days`；`0` 为只手动）。
+    pub catalog_sync_interval_days: u64,
 }
 
 impl RuntimeSnapshot {
@@ -95,6 +99,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         unified_models,
         full_body: load_full_body(&settings),
         max_request_bytes: load_max_request_bytes(&settings),
+        catalog_sync_interval_days: load_catalog_sync_interval_days(&settings),
     })
 }
 
@@ -112,6 +117,14 @@ fn load_max_request_bytes(settings: &HashMap<String, Value>) -> u64 {
         .get(SETTING_MAX_REQUEST_BYTES)
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+}
+
+/// 从开关表解析 `catalog_sync_interval_days`：缺省 0（只手动）。
+fn load_catalog_sync_interval_days(settings: &HashMap<String, Value>) -> u64 {
+    settings
+        .get(SETTING_CATALOG_SYNC_INTERVAL_DAYS)
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
 }
 
 /// 把一个库加载出的快照包装成原子替换句柄。
@@ -160,6 +173,7 @@ mod tests {
             snap.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES,
             "body 上限缺省用默认值"
         );
+        assert_eq!(snap.catalog_sync_interval_days, 0, "目录同步缺省只手动");
     }
 
     /// 播种资源与开关后加载：快照反映库内状态。
@@ -182,6 +196,7 @@ mod tests {
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,
+                model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
             },
         )
         .await
@@ -216,7 +231,10 @@ mod tests {
             &mut conn,
             &resources::UnifiedModel {
                 id: "coding".to_string(),
-                models: vec!["gpt-4o".to_string()],
+                models: vec![resources::UnifiedMember {
+                    channel_id,
+                    model: "gpt-4o".to_string(),
+                }],
                 hide: false,
             },
         )
@@ -247,7 +265,13 @@ mod tests {
             snap.model_groups
                 .contains_key(resources::DEFAULT_MODEL_GROUP)
         );
-        assert_eq!(snap.unified_models["coding"].models, vec!["gpt-4o"]);
+        assert_eq!(
+            snap.unified_models["coding"].models,
+            vec![resources::UnifiedMember {
+                channel_id,
+                model: "gpt-4o".to_string(),
+            }]
+        );
         assert!(snap.full_body, "开关应生效");
         assert_eq!(snap.max_request_bytes, 8_000_000);
     }

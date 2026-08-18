@@ -51,7 +51,7 @@ type InventorySectionRow = InventoryRow & { aliasChipItems: AliasChip[] };
 type InventoryWindowPayload =
   | { kind: 'editor'; row: InventoryRow }
   | { kind: 'delete'; row: InventoryRow; channelName: string }
-  | { kind: 'catalog'; rows: InventoryRow[] }
+  | { kind: 'catalog' }
   | BulkDeletePayload;
 
 const { t } = useI18n();
@@ -313,13 +313,22 @@ function openBulkDelete() {
   if (entry) deleteErrors.value[entry.id] = '';
 }
 
+/** 价格同步浮窗跟清单勾选实时同步，打开时不再快照行。 */
 function openCatalog() {
   const existing = windows.value.find((entry) => entry.payload.kind === 'catalog');
   if (existing) {
     bringToFront(existing.id);
     return;
   }
-  openWindow(takePendingAnchor(), { kind: 'catalog', rows: selectedRows.value });
+  openWindow(takePendingAnchor(), { kind: 'catalog' });
+}
+
+/** 编辑价格「在线同步」：勾上当前行并打开/聚焦共用的价格同步浮窗。 */
+function openCatalogForRow(row: InventoryRow) {
+  const latest =
+    inventory.value.find((item) => inventoryRowKey(item) === inventoryRowKey(row)) ?? row;
+  selection.setMany([inventoryRowKey(latest)], true);
+  openCatalog();
 }
 
 function formatOptionalAmount(value: number | null): string {
@@ -525,10 +534,11 @@ function loadErrorMessage(): string {
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @catalog-sync="openCatalogForRow(win.payload.row)"
       />
       <CatalogFillWindow
         v-else-if="win.payload.kind === 'catalog'"
-        :rows="win.payload.rows"
+        :rows="selectedRows"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"

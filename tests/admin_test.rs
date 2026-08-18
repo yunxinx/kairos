@@ -146,6 +146,8 @@ const PROTOCOL_FORBIDDEN_ADMIN_GETS: &[&str] = &[
     "/pricing",
     "/models",
     "/unified-models",
+    "/catalog",
+    "/catalog/meta",
     "/config",
     "/requests",
     "/metrics",

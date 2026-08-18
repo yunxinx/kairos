@@ -304,6 +304,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             timeout_ms: 1000,
             max_retries: 0,
             enabled: true,
+            model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
         }],
         tokens: vec![SeedToken {
             token_key: TEST_TOKEN_KEY.to_string(),

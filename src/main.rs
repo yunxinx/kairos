@@ -42,6 +42,13 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .expect("管理面服务应运行");
         });
+        let catalog_pool = pool.clone();
+        let catalog_client = reqwest::Client::builder()
+            .build()
+            .expect("未配置会失败的 ClientBuilder 选项，rustls 客户端应能构建");
+        tokio::spawn(async move {
+            kairos::catalog::run_sync_loop(catalog_pool, catalog_client).await;
+        });
     }
 
     let listen = format!("{}:{}", cfg.listen.host, cfg.listen.port);

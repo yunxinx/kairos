@@ -28,6 +28,7 @@ import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import TokenEditorWindow from '@/features/tokens/TokenEditorWindow.vue';
 import { formatUnixMillis, formatUsdMicros, maskTokenKey, relativeTimeParts } from '@/lib/format';
+import { groupDisplayName } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type TokenWindowPayload =
@@ -341,7 +342,7 @@ function openBulkDelete() {
               />
               <TableCell class="font-medium">{{ token.name }}</TableCell>
               <TableCell class="font-mono text-sm" data-testid="token-model-group">
-                {{ token.model_group }}
+                {{ groupDisplayName(token.model_group, t('models.ungrouped')) }}
               </TableCell>
               <TableCell>
                 <span class="inline-flex items-center gap-1">

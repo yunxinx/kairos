@@ -17,6 +17,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import OverflowChips from '@/components/ui/OverflowChips.vue';
+import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
 import { DEFAULT_MODEL_GROUP, previewVisibleSections } from '@/lib/visible-models';
 
 const { t } = useI18n();
@@ -35,11 +36,15 @@ const channelsQuery = useQuery({
   queryKey: ['channels'],
   queryFn: () => apiClient.listChannels(),
 });
+const pricesQuery = useQuery({
+  queryKey: ['prices'],
+  queryFn: () => apiClient.listPrices(),
+});
 
 const groupOptions = computed(() =>
   (groupsQuery.data.value ?? []).map((group) => ({
     value: group.name,
-    label: group.name === DEFAULT_MODEL_GROUP ? t('models.visibleUnbound') : group.name,
+    label: group.name === DEFAULT_MODEL_GROUP ? t('models.ungrouped') : group.name,
   })),
 );
 
@@ -62,9 +67,7 @@ const sections = computed(() => {
       return {
         groupName: section.groupName,
         label:
-          section.groupName === DEFAULT_MODEL_GROUP
-            ? t('models.visibleUnbound')
-            : section.groupName,
+          section.groupName === DEFAULT_MODEL_GROUP ? t('models.ungrouped') : section.groupName,
         rows,
       };
     })
@@ -83,23 +86,30 @@ const showTableSkeleton = computed(
   () =>
     (groupsQuery.isPending.value && !groupsQuery.data.value) ||
     (unifiedQuery.isPending.value && !unifiedQuery.data.value) ||
-    (channelsQuery.isPending.value && !channelsQuery.data.value),
+    (channelsQuery.isPending.value && !channelsQuery.data.value) ||
+    (pricesQuery.isPending.value && !pricesQuery.data.value),
 );
 
 const loadError = computed(
-  () => groupsQuery.isError.value || unifiedQuery.isError.value || channelsQuery.isError.value,
+  () =>
+    groupsQuery.isError.value ||
+    unifiedQuery.isError.value ||
+    channelsQuery.isError.value ||
+    pricesQuery.isError.value,
 );
 
 function loadErrorMessage(): string {
   if (groupsQuery.isError.value) return extractApiError(groupsQuery.error.value).message;
   if (unifiedQuery.isError.value) return extractApiError(unifiedQuery.error.value).message;
-  return extractApiError(channelsQuery.error.value).message;
+  if (channelsQuery.isError.value) return extractApiError(channelsQuery.error.value).message;
+  return extractApiError(pricesQuery.error.value).message;
 }
 
 function refetchAll() {
   void groupsQuery.refetch();
   void unifiedQuery.refetch();
   void channelsQuery.refetch();
+  void pricesQuery.refetch();
 }
 </script>
 
@@ -172,13 +182,12 @@ function refetchAll() {
                   <CopyableName :text="row.id" test-id="visible-model-name" />
                 </TableCell>
                 <TableCell>
-                  <span
-                    v-if="row.unified"
-                    class="font-mono text-sm"
-                    data-testid="visible-unified-order"
-                  >
-                    {{ row.unified.models.join(' → ') }}
-                  </span>
+                  <div v-if="row.unified" data-testid="visible-unified-order">
+                    <UnifiedJumpOrder
+                      :members="row.unified.models"
+                      :channels="channelsQuery.data.value ?? []"
+                    />
+                  </div>
                   <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
                 </TableCell>
                 <TableCell

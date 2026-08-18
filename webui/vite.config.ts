@@ -14,6 +14,7 @@ const adminApiPrefixes = [
   '/prices',
   '/model-groups',
   '/unified-models',
+  '/catalog',
   '/settings',
   '/logs',
   '/stats',

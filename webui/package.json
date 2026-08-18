@@ -20,6 +20,7 @@
     "@tanstack/vue-query": "^5.101.0",
     "@tanstack/vue-router": "^1.170.15",
     "@tanstack/vue-table": "^8.21.3",
+    "@tanstack/vue-virtual": "^3.13.35",
     "@vueuse/core": "^14.3.0",
     "echarts": "^6.1.0",
     "reka-ui": "^2.9.10",

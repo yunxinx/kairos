@@ -8,6 +8,7 @@ import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import CopyableName from '@/components/ui/CopyableName.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
+import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
@@ -27,7 +28,8 @@ import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDele
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import UnifiedEditorWindow from '@/features/models/UnifiedEditorWindow.vue';
-import { buildInventory } from '@/lib/inventory';
+import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
+import { unifiedUsesChannel } from '@/lib/unified-sources';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type UnifiedWindowPayload =
@@ -38,6 +40,8 @@ type UnifiedWindowPayload =
 const { t } = useI18n();
 const queryClient = useQueryClient();
 const searchText = ref('');
+const statusFilter = ref<string[]>([]);
+const selectedChannels = ref<string[]>([]);
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
@@ -70,25 +74,49 @@ const pricesQuery = useQuery({
   queryFn: () => apiClient.listPrices(),
 });
 
-const memberOptions = computed(() => [
-  ...new Set(
-    buildInventory(channelsQuery.data.value ?? [], pricesQuery.data.value ?? []).map(
-      (row) => row.name,
-    ),
-  ),
-]);
-
+const channels = computed(() => channelsQuery.data.value ?? []);
+const prices = computed(() => pricesQuery.data.value ?? []);
 const models = computed(() => unifiedQuery.data.value ?? []);
 const showTableSkeleton = computed(() => unifiedQuery.isPending.value && !unifiedQuery.data.value);
 
+const statusOptions = computed(() => [
+  { value: 'hidden', label: t('models.unifiedHideOn') },
+  { value: 'listed', label: t('models.unifiedHideOff') },
+]);
+
+const channelOptions = computed(() =>
+  [...channels.value]
+    .map((channel) => ({ value: channel.name, label: channel.name }))
+    .sort((left, right) => left.label.localeCompare(right.label)),
+);
+
 const filtered = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  if (!q) return models.value;
-  return models.value.filter(
-    (model) =>
+  const statuses = new Set(statusFilter.value);
+  const channelNames = new Set(selectedChannels.value);
+  return models.value.filter((model) => {
+    if (statuses.size > 0) {
+      const flag = model.hide ? 'hidden' : 'listed';
+      if (!statuses.has(flag)) return false;
+    }
+    if (
+      channelNames.size > 0 &&
+      ![...channelNames].some((name) => unifiedUsesChannel(model.models, channels.value, name))
+    ) {
+      return false;
+    }
+    if (!q) return true;
+    return (
       model.id.toLowerCase().includes(q) ||
-      model.models.some((member) => member.toLowerCase().includes(q)),
-  );
+      model.models.some(
+        (member) =>
+          member.model.toLowerCase().includes(q) ||
+          (channels.value.find((channel) => channel.id === member.channel_id)?.name ?? '')
+            .toLowerCase()
+            .includes(q),
+      )
+    );
+  });
 });
 
 const selection = useRowSelection<string>();
@@ -190,6 +218,18 @@ function openBulkDelete() {
               :placeholder="t('models.search')"
               :aria-label="t('models.search')"
             />
+            <FacetedFilter
+              v-model="statusFilter"
+              :title="t('models.statusFilter')"
+              :options="statusOptions"
+              test-id="unified-status-filter"
+            />
+            <FacetedFilter
+              v-model="selectedChannels"
+              :title="t('models.channels')"
+              :options="channelOptions"
+              test-id="unified-channel-filter"
+            />
             <template #actions>
               <button
                 type="button"
@@ -238,8 +278,8 @@ function openBulkDelete() {
               <TableCell class="font-mono font-medium">
                 <CopyableName :text="model.id" test-id="unified-model-name" />
               </TableCell>
-              <TableCell class="font-mono text-sm" data-testid="unified-members">
-                {{ model.models.join(' → ') }}
+              <TableCell>
+                <UnifiedJumpOrder :members="model.models" :channels="channels" />
               </TableCell>
               <TableCell>
                 <span class="badge" :class="model.hide ? 'badge-warn' : 'badge-neutral'">
@@ -305,7 +345,8 @@ function openBulkDelete() {
       <UnifiedEditorWindow
         v-if="win.payload.kind === 'editor'"
         :initial="win.payload.model"
-        :member-options="memberOptions"
+        :channels="channels"
+        :prices="prices"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"

@@ -24,7 +24,8 @@ export type IconName =
   | 'search'
   | 'copy'
   | 'pencil'
-  | 'grip-vertical';
+  | 'grip-vertical'
+  | 'loader-circle';
 
 export type IconDef = {
   viewBox?: string;
@@ -204,5 +205,12 @@ export const iconDefs: Record<IconName, IconDef> = {
       { cx: 15, cy: 12, r: 1 },
       { cx: 15, cy: 19, r: 1 },
     ],
+  },
+  /** 加载中。路径来自 Lucide「loader-circle」(ISC)。 */
+  'loader-circle': {
+    paths: ['M21 12a9 9 0 1 1-6.219-8.56'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
   },
 };

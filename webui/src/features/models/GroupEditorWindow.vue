@@ -4,20 +4,17 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { ModelGroup } from '@/api/types';
+import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
-import EmptyState from '@/components/ui/EmptyState.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
-import UiSelect from '@/components/ui/UiSelect.vue';
-import Table from '@/components/ui/table/Table.vue';
-import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
-import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
+import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
@@ -45,7 +42,6 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const uid = useId();
 const nameInputId = `group-editor-name-${uid}`;
-const addInputId = `group-editor-add-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
@@ -61,7 +57,11 @@ const editorName = ref(initialName);
 const editorModels = ref([...initialModels]);
 const editorError = ref('');
 const searchText = ref('');
-const editorAdd = ref('');
+
+/** 组内表：模型名用百分比，避免 `auto` + truncate 把列挤没。 */
+const memberColumns = [{ width: '85%' }, { width: '3.5rem' }];
+/** 可用表：勾选固定，模型名用百分比。 */
+const pickColumns = [{ width: '2.5rem' }, { width: '90%' }];
 
 const dirty = computed(
   () =>
@@ -70,36 +70,21 @@ const dirty = computed(
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
-const filteredMembers = computed(() => {
+const pickerRows = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  const names = [...editorModels.value];
-  if (!q) return names;
-  return names.filter((name) => name.toLowerCase().includes(q));
-});
-
-const addOptions = computed(() =>
-  props.callableNames
+  return props.callableNames
     .filter((name) => !editorModels.value.includes(name))
-    .sort((left, right) => left.localeCompare(right))
-    .map((name) => ({ value: name, label: name })),
-);
-
-const addSelection = computed({
-  get: () => {
-    const options = addOptions.value;
-    if (options.some((item) => item.value === editorAdd.value)) return editorAdd.value;
-    return options[0]?.value ?? '';
-  },
-  set: (value: string) => {
-    editorAdd.value = value;
-  },
+    .filter((name) => !q || name.toLowerCase().includes(q))
+    .sort((left, right) => left.localeCompare(right));
 });
 
-function addModel() {
-  const name = addSelection.value.trim();
+function addModel(name: string) {
   if (!name || editorModels.value.includes(name)) return;
   editorModels.value = [...editorModels.value, name];
-  editorAdd.value = '';
+}
+
+function onPickCheck(name: string, checked: boolean) {
+  if (checked) addModel(name);
 }
 
 function removeModel(name: string) {
@@ -171,76 +156,82 @@ function handleSave() {
         <p v-if="isDefault" class="text-fg-muted text-xs">{{ t('models.groupDefaultHint') }}</p>
 
         <div>
+          <p class="form-field-label mb-2">{{ t('models.groupMembers') }}</p>
+          <DataTablePanel class="h-56">
+            <VirtualTable
+              class="h-full"
+              :rows="editorModels"
+              :colspan="2"
+              :columns="memberColumns"
+              data-testid="group-model-list"
+              :get-row-key="(name) => name"
+              :empty-title="t('models.groupModelsEmpty')"
+            >
+              <template #header>
+                <TableRow>
+                  <TableHead>{{ t('pricing.model') }}</TableHead>
+                  <TableHead align="center">{{ t('common.actions') }}</TableHead>
+                </TableRow>
+              </template>
+              <template #row="{ row: name }">
+                <TableRow data-testid="group-model-option" :data-model="name">
+                  <TableCell truncate class="font-mono text-sm" :title="name">{{ name }}</TableCell>
+                  <TableCell align="center">
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-icon"
+                      data-testid="group-model-remove"
+                      :aria-label="t('models.groupRemoveModel', { name })"
+                      @click="removeModel(name)"
+                    >
+                      <UiIcon name="close" :size="14" />
+                    </button>
+                  </TableCell>
+                </TableRow>
+              </template>
+            </VirtualTable>
+          </DataTablePanel>
+        </div>
+
+        <div>
           <p class="form-field-label mb-2">{{ t('models.groupModels') }}</p>
           <SearchInput
             :id="`group-editor-search-${uid}`"
             v-model="searchText"
             class="mb-2 max-w-sm"
             data-testid="group-editor-search"
-            :placeholder="t('models.groupSearch')"
-            :aria-label="t('models.groupSearch')"
+            :placeholder="t('models.search')"
+            :aria-label="t('models.search')"
           />
-          <DataTablePanel>
-            <div class="seed-scrollbar max-h-56 overflow-y-auto">
-              <Table data-testid="group-model-list">
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>{{ t('pricing.model') }}</TableHead>
-                    <TableHead align="center">{{ t('common.actions') }}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <TableRow
-                    v-for="name in filteredMembers"
-                    :key="name"
-                    data-testid="group-model-option"
-                    :data-model="name"
-                  >
-                    <TableCell class="font-mono text-sm">{{ name }}</TableCell>
-                    <TableCell align="center">
-                      <button
-                        type="button"
-                        class="btn btn-ghost btn-icon"
-                        data-testid="group-model-remove"
-                        :aria-label="t('models.groupRemoveModel', { name })"
-                        @click="removeModel(name)"
-                      >
-                        <UiIcon name="close" :size="14" />
-                      </button>
-                    </TableCell>
-                  </TableRow>
-                  <TableRow v-if="filteredMembers.length === 0">
-                    <TableCell :colspan="2" class="h-20 whitespace-normal">
-                      <EmptyState :title="t('models.groupModelsEmpty')" />
-                    </TableCell>
-                  </TableRow>
-                </TableBody>
-              </Table>
-            </div>
+          <DataTablePanel class="h-56" data-testid="group-pick-list">
+            <VirtualTable
+              class="h-full"
+              :rows="pickerRows"
+              :colspan="2"
+              :columns="pickColumns"
+              :get-row-key="(name) => name"
+              :empty-title="t('models.groupPickEmpty')"
+            >
+              <template #header>
+                <TableRow>
+                  <TableHead class="w-10" />
+                  <TableHead>{{ t('pricing.model') }}</TableHead>
+                </TableRow>
+              </template>
+              <template #row="{ row: name }">
+                <TableRow data-testid="group-pick" :data-model="name">
+                  <TableCell>
+                    <Checkbox
+                      :model-value="false"
+                      data-testid="group-pick-check"
+                      @update:model-value="(value) => onPickCheck(name, value)"
+                    />
+                  </TableCell>
+                  <TableCell truncate class="font-mono text-sm" :title="name">{{ name }}</TableCell>
+                </TableRow>
+              </template>
+            </VirtualTable>
           </DataTablePanel>
-          <div v-if="addOptions.length > 0" class="mt-2 flex items-end gap-2">
-            <FormField
-              class="min-w-0 flex-1"
-              field-name="addModel"
-              :label="t('models.groupAddModel')"
-              :input-id="addInputId"
-            >
-              <UiSelect
-                :id="addInputId"
-                v-model="addSelection"
-                :options="addOptions"
-                data-testid="group-add-select"
-              />
-            </FormField>
-            <button
-              type="button"
-              class="btn mb-0.5"
-              data-testid="group-add-member"
-              @click="addModel"
-            >
-              {{ t('models.groupAdd') }}
-            </button>
-          </div>
         </div>
 
         <p v-if="editorError" class="text-danger text-sm" data-testid="group-editor-error">

@@ -28,12 +28,14 @@ use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 use crate::{
+    catalog,
     config::Protocol,
     core::ir::{ChatRequest, ContentPart, Message, Role},
     runtime, store,
     store::StoreError,
+    store::catalog::{CatalogMeta, CatalogModel, CatalogView},
     store::resources::{
-        Channel, ChannelRecord, ModelGroup, Price, Settings, Token, UnifiedModel,
+        Channel, ChannelRecord, ModelGroup, Price, Settings, Token, UnifiedMember, UnifiedModel,
         channel_lists_callable,
     },
 };
@@ -102,6 +104,9 @@ pub fn router(
             put(update_unified_model).delete(delete_unified_model),
         )
         .route("/settings", get(get_settings).put(update_settings))
+        .route("/catalog", get(get_catalog).put(put_catalog))
+        .route("/catalog/meta", get(get_catalog_meta))
+        .route("/catalog/sync", post(sync_catalog))
         .route("/logs", get(query_logs))
         .route("/stats", get(get_stats))
         .route("/stats/lifetime", get(get_lifetime_stats))
@@ -332,8 +337,10 @@ async fn create_channel(
     State(deps): State<AdminDeps>,
     body: Result<Json<Channel>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<ChannelView>), AdminError> {
-    let channel = body.map_err(AdminError::bad_body)?;
+    let mut channel = body.map_err(AdminError::bad_body)?;
+    normalize_channel_group(&mut channel);
     validate_channel(&channel)?;
+    reject_unknown_group(&deps, &channel.model_group).await?;
     {
         let snapshot = deps.snapshot.read().await;
         if snapshot
@@ -360,6 +367,7 @@ async fn create_channel(
     let id = crate::store::resources::insert_channel(&mut tx, &channel)
         .await
         .map_err(AdminError::Store)?;
+    enroll_channel_models(&mut tx, None, &channel).await?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_channel_record(&deps, id).await?;
@@ -375,9 +383,11 @@ async fn update_channel(
     body: Result<Json<Channel>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ChannelView>, AdminError> {
     let id = parse_channel_id(raw_id)?;
-    let channel = body.map_err(AdminError::bad_body)?;
+    let mut channel = body.map_err(AdminError::bad_body)?;
+    normalize_channel_group(&mut channel);
     validate_channel(&channel)?;
-    {
+    reject_unknown_group(&deps, &channel.model_group).await?;
+    let previous = {
         let snapshot = deps.snapshot.read().await;
         let current = snapshot
             .channels
@@ -404,7 +414,8 @@ async fn update_channel(
             snapshot.unified_models.values(),
             None,
         )?;
-    }
+        current.channel.clone()
+    };
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::update_channel(&mut tx, id, &channel)
         .await
@@ -416,6 +427,7 @@ async fn update_channel(
     )
     .await
     .map_err(AdminError::Store)?;
+    enroll_channel_models(&mut tx, Some(&previous), &channel).await?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_channel_record(&deps, id).await?;
@@ -628,6 +640,9 @@ async fn delete_model_group(
             .await
             .map_err(AdminError::Store)?;
     }
+    crate::store::resources::rebind_channels_to_default(&mut tx, &name)
+        .await
+        .map_err(AdminError::Store)?;
     crate::store::resources::delete_model_group(&mut tx, &name)
         .await
         .map_err(AdminError::Store)?;
@@ -775,7 +790,103 @@ async fn read_settings(deps: &AdminDeps) -> Result<Settings, AdminError> {
     Ok(Settings {
         full_body: snapshot.full_body,
         max_request_bytes: snapshot.max_request_bytes,
+        catalog_sync_interval_days: snapshot.catalog_sync_interval_days,
     })
+}
+
+/// 目录写入契约：整表替换缓存行；同步时刻由服务端填写。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogPut {
+    models: Vec<CatalogModel>,
+}
+
+/// `GET /catalog` 查询参数。两个都缺省（或空串）时返回全表，兼容 PUT 后 roundtrip。
+///
+/// `provider_id` 为逗号分隔的提供方 id。axum 标准 `Query` 走 `serde_urlencoded`，
+/// 同一键重复（`?provider_id=a&provider_id=b`）不会反序列化成 `Vec`（那是
+/// `axum_extra::extract::Query`）；故用单个字符串。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogQuery {
+    q: Option<String>,
+    provider_id: Option<String>,
+}
+
+/// 把逗号分隔的 `provider_id` 拆成精确匹配列表；空段丢弃。
+fn parse_catalog_provider_ids(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 读价格目录缓存；可按 `q` / `provider_id` 过滤。
+async fn get_catalog(
+    State(deps): State<AdminDeps>,
+    query: Result<Query<CatalogQuery>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<CatalogView>, AdminError> {
+    let params = query
+        .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
+        .0;
+    let q = params
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|keyword| !keyword.is_empty());
+    let provider_ids = parse_catalog_provider_ids(params.provider_id.as_deref());
+    let view = crate::store::catalog::load_catalog_view(&deps.pool, q, &provider_ids)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(view))
+}
+
+/// 读目录元数据：上次同步时刻与提供方列表，不返回模型行。
+async fn get_catalog_meta(State(deps): State<AdminDeps>) -> Result<Json<CatalogMeta>, AdminError> {
+    let meta = crate::store::catalog::load_catalog_meta(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(meta))
+}
+
+/// 整表替换价格目录缓存（供导入与测试播种）；同步时刻记为现在。
+async fn put_catalog(
+    State(deps): State<AdminDeps>,
+    body: Result<Json<CatalogPut>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<CatalogView>, AdminError> {
+    let Json(CatalogPut { models }) = body.map_err(AdminError::bad_body)?;
+    let synced_at = super::logging::unix_millis();
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    crate::store::catalog::replace_catalog_models(&mut tx, &models)
+        .await
+        .map_err(AdminError::Store)?;
+    crate::store::catalog::set_catalog_synced_at(&mut tx, synced_at)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(Json(CatalogView {
+        synced_at: Some(synced_at),
+        models,
+    }))
+}
+
+/// 从 models.dev 拉取并替换价格目录缓存。
+async fn sync_catalog(State(deps): State<AdminDeps>) -> Result<Json<CatalogView>, AdminError> {
+    let view =
+        catalog::fetch_and_replace(&deps.pool, &deps.client, catalog::MODELS_DEV_CATALOG_URL)
+            .await
+            .map_err(catalog_err)?;
+    Ok(Json(view))
+}
+
+/// 目录拉取失败视为上游错误；存储失败保持 500。
+fn catalog_err(err: catalog::CatalogError) -> AdminError {
+    match err {
+        catalog::CatalogError::Store(err) => AdminError::Store(err),
+        other => AdminError::Upstream(other.to_string()),
+    }
 }
 
 // --- 令牌余额调整 ---
@@ -1302,6 +1413,7 @@ async fn list_upstream_models(
         timeout_ms: draft.timeout_ms,
         max_retries: 0,
         enabled: true,
+        model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
     };
     let url = format!(
         "{}{}",
@@ -1478,6 +1590,29 @@ async fn reject_unknown_group(deps: &AdminDeps, group: &str) -> Result<(), Admin
     }
 }
 
+/// 渠道默认组：空白视为不自动入组。
+fn normalize_channel_group(channel: &mut Channel) {
+    channel.model_group = channel.model_group.trim().to_string();
+    if channel.model_group.is_empty() {
+        channel.model_group = crate::store::resources::DEFAULT_MODEL_GROUP.to_string();
+    }
+}
+
+/// 把本次新加入渠道的可调用名并入渠道默认组；`default` 不入组。
+async fn enroll_channel_models(
+    conn: &mut sqlx::SqliteConnection,
+    previous: Option<&Channel>,
+    next: &Channel,
+) -> Result<(), AdminError> {
+    if next.model_group == crate::store::resources::DEFAULT_MODEL_GROUP {
+        return Ok(());
+    }
+    let added = crate::store::resources::newly_callable_names(previous, next);
+    crate::store::resources::union_names_into_group(conn, &next.model_group, &added)
+        .await
+        .map_err(AdminError::Store)
+}
+
 // --- 输入校验 ---
 
 /// 校验令牌字段：键/名非空、累计上限非负。
@@ -1511,7 +1646,7 @@ fn normalize_model_group(group: &mut ModelGroup) -> Result<(), AdminError> {
     Ok(())
 }
 
-/// 规整统一模型：ID 去空白；成员须非空、为已登记模型、保序去重。
+/// 规整统一模型：ID 去空白；成员须非空、钉在已有渠道的已登记名上、保序去重。
 fn normalize_unified_model(
     model: &mut UnifiedModel,
     snapshot: &crate::runtime::RuntimeSnapshot,
@@ -1520,23 +1655,48 @@ fn normalize_unified_model(
     if model.id.is_empty() {
         return Err(AdminError::InvalidBody("id 不能为空".to_string()));
     }
-    model.models = normalize_callable_names(std::mem::take(&mut model.models))?;
+    model.models = normalize_unified_members(std::mem::take(&mut model.models), snapshot)?;
     if model.models.is_empty() {
         return Err(AdminError::InvalidBody(
             "统一模型至少要有一个已登记成员".to_string(),
         ));
     }
-    let registered = crate::store::resources::registered_callable_names(
-        snapshot.channels.iter().map(|record| &record.channel),
-    );
-    for member in &model.models {
-        if !registered.contains(member) {
+    Ok(())
+}
+
+/// 规整统一成员：trim 模型名、拒绝空名、渠道必须存在且已登记该名、保序去重。
+fn normalize_unified_members(
+    members: Vec<UnifiedMember>,
+    snapshot: &crate::runtime::RuntimeSnapshot,
+) -> Result<Vec<UnifiedMember>, AdminError> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(members.len());
+    for mut member in members {
+        member.model = member.model.trim().to_string();
+        if member.model.is_empty() {
+            return Err(AdminError::InvalidBody("models 不能含空名".to_string()));
+        }
+        let Some(record) = snapshot
+            .channels
+            .iter()
+            .find(|record| record.id == member.channel_id)
+        else {
             return Err(AdminError::InvalidBody(format!(
-                "成员 {member} 不是已登记模型"
+                "渠道 {} 不存在",
+                member.channel_id
+            )));
+        };
+        if !channel_lists_callable(&record.channel, &member.model) {
+            return Err(AdminError::InvalidBody(format!(
+                "成员 {} 不是渠道 {} 的已登记模型",
+                member.model, record.channel.name
             )));
         }
+        if seen.insert((member.channel_id, member.model.clone())) {
+            out.push(member);
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// 规整可调用名列表：trim、拒绝空名、保序去重。

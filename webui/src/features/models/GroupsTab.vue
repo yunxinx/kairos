@@ -77,7 +77,9 @@ const callableNames = computed(() => {
   return [...names].sort((left, right) => left.localeCompare(right));
 });
 
-const groups = computed(() => groupsQuery.data.value ?? []);
+const groups = computed(() =>
+  (groupsQuery.data.value ?? []).filter((group) => group.name !== DEFAULT_MODEL_GROUP),
+);
 const showTableSkeleton = computed(() => groupsQuery.isPending.value && !groupsQuery.data.value);
 
 const filtered = computed(() => {
@@ -90,9 +92,7 @@ const filtered = computed(() => {
   );
 });
 
-const selectableIds = computed(() =>
-  filtered.value.filter((group) => group.name !== DEFAULT_MODEL_GROUP).map((group) => group.name),
-);
+const selectableIds = computed(() => filtered.value.map((group) => group.name));
 
 const selection = useRowSelection<string>();
 const allVisibleSelected = computed({
@@ -127,6 +127,7 @@ const deleteMutation = useMutation({
     if (entry) closeWindow(entry.id);
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
+    await queryClient.invalidateQueries({ queryKey: ['channels'] });
   },
   onError: (err, { name }) => {
     const { message, code } = extractApiError(err);
@@ -241,7 +242,7 @@ function openBulkDelete() {
               </div>
             </TableHead>
             <TableHead>{{ t('models.groupName') }}</TableHead>
-            <TableHead>{{ t('models.groupModels') }}</TableHead>
+            <TableHead>{{ t('models.groupMembers') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
@@ -256,23 +257,12 @@ function openBulkDelete() {
               :data-state="selection.isSelected(group.name) ? 'selected' : undefined"
             >
               <SelectCell
-                v-if="group.name !== DEFAULT_MODEL_GROUP"
                 :checked="selection.isSelected(group.name)"
                 test-id="group-select"
                 @toggle="selection.toggle(group.name)"
               />
-              <TableCell v-else class="w-10" />
               <TableCell class="font-mono font-medium">
-                <span class="inline-flex items-center gap-2">
-                  {{ group.name }}
-                  <span
-                    v-if="group.name === DEFAULT_MODEL_GROUP"
-                    class="badge badge-neutral"
-                    data-testid="group-builtin"
-                  >
-                    {{ t('models.groupBuiltin') }}
-                  </span>
-                </span>
+                {{ group.name }}
               </TableCell>
               <TableCell data-testid="group-models">
                 <OverflowChips :items="group.models" />
@@ -290,7 +280,7 @@ function openBulkDelete() {
                   >
                     <UiIcon name="pencil" :size="16" />
                   </button>
-                  <DataTableRowActions v-if="group.name !== DEFAULT_MODEL_GROUP">
+                  <DataTableRowActions>
                     <DataTableMenuItem
                       danger
                       data-testid="group-delete"

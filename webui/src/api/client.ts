@@ -11,6 +11,10 @@ import type {
   LogEntry,
   ModelGroup,
   Price,
+  CatalogModel,
+  CatalogView,
+  CatalogMeta,
+  CatalogQuery,
   Settings,
   StatsView,
   LifetimeStats,
@@ -26,6 +30,11 @@ function buildQuery(params: object): string {
   const search = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === '') continue;
+    if (Array.isArray(value)) {
+      const joined = value.filter((item) => item !== undefined && item !== '').join(',');
+      if (joined) search.set(key, joined);
+      continue;
+    }
     if (typeof value !== 'string' && typeof value !== 'number') continue;
     search.set(key, String(value));
   }
@@ -195,6 +204,23 @@ export const apiClient = {
 
   updateSettings(body: Settings): Promise<Settings> {
     return apiFetch('/settings', { method: 'PUT', body: JSON.stringify(body) });
+  },
+
+  getCatalog(params?: CatalogQuery): Promise<CatalogView> {
+    if (!params) return apiFetch('/catalog');
+    return apiFetch(`/catalog${buildQuery(params)}`);
+  },
+
+  getCatalogMeta(): Promise<CatalogMeta> {
+    return apiFetch('/catalog/meta');
+  },
+
+  replaceCatalog(models: CatalogModel[]): Promise<CatalogView> {
+    return apiFetch('/catalog', { method: 'PUT', body: JSON.stringify({ models }) });
+  },
+
+  syncCatalog(): Promise<CatalogView> {
+    return apiFetch('/catalog/sync', { method: 'POST' });
   },
 
   queryLogs(query: LogQuery = {}): Promise<Page<LogEntry>> {

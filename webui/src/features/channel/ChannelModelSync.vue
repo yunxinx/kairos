@@ -12,17 +12,14 @@ import { apiClient, extractApiError } from '@/api/client';
 import type { Protocol } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
-import EmptyState from '@/components/ui/EmptyState.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import SelectCell from '@/components/ui/data-table/SelectCell.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
-import Table from '@/components/ui/table/Table.vue';
-import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
-import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
+import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { commitSyncListing, compareModels } from '@/lib/model-list';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -90,6 +87,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** 保存并返回即提交：勾选模型（含别名）与别名映射一并写回草稿，保存仍由父级表单触发。 */
   back: [models: string[], aliases: Record<string, string>];
+  /** 丢弃同步草稿，回到表单。 */
+  cancel: [];
 }>();
 
 const { t } = useI18n();
@@ -315,6 +314,14 @@ const filteredSyncRows = computed(() => {
   });
 });
 
+/** 勾选/别名/状态固定窄宽；模型名用百分比，避免 `auto` + truncate 把列挤没。 */
+const syncColumns = [
+  { width: '2.5rem' },
+  { width: '40%' },
+  { width: '9.5rem' },
+  { width: '7rem' },
+];
+
 const syncEmptyTitle = computed(() => {
   if (syncRows.value.length > 0) return t('channel.syncEmptySearch');
   if (!hasSynced.value) return t('channel.syncNotSynced');
@@ -469,7 +476,16 @@ function closeSync() {
 </script>
 
 <template>
-  <div class="card-body space-y-3" data-testid="channel-sync-view">
+  <div class="card-body flex h-full min-h-0 flex-1 flex-col gap-3" data-testid="channel-sync-view">
+    <button
+      type="button"
+      class="btn btn-sm inline-flex w-fit items-center gap-1"
+      data-testid="channel-sync-back-form"
+      @click="emit('cancel')"
+    >
+      <UiIcon name="chevron-left" :size="14" />
+      {{ t('channel.syncBackToForm') }}
+    </button>
     <!-- 未聚焦保持短宽，给同步模型/筛选/全选留位；聚焦后铺开以便输入长模型名。 -->
     <div class="flex items-center gap-2">
       <button
@@ -478,7 +494,6 @@ function closeSync() {
         data-testid="channel-sync-back"
         @click="closeSync"
       >
-        <UiIcon name="chevron-left" :size="14" />
         {{ t('channel.syncBack') }}
       </button>
       <SearchInput
@@ -609,9 +624,18 @@ function closeSync() {
     >
       {{ listingConflictMessage }}
     </p>
-    <DataTablePanel>
-      <Table>
-        <TableHeader>
+    <DataTablePanel class="flex min-h-0 flex-1 flex-col">
+      <VirtualTable
+        class="min-h-0 flex-1"
+        :rows="filteredSyncRows"
+        :colspan="4"
+        :columns="syncColumns"
+        :estimate-size="48"
+        :loading="syncMutation.isPending.value && filteredSyncRows.length === 0"
+        :get-row-key="(row) => row.name"
+        :empty-title="syncEmptyTitle"
+      >
+        <template #header>
           <TableRow>
             <TableHead class="w-10">
               <div class="flex items-center justify-center">
@@ -641,11 +665,9 @@ function closeSync() {
               t('channel.syncColStatus')
             }}</TableHead>
           </TableRow>
-        </TableHeader>
-        <TableBody>
+        </template>
+        <template #row="{ row }">
           <TableRow
-            v-for="row in filteredSyncRows"
-            :key="row.name"
             :class="row.aliasOnly && 'sync-row-alias-only'"
             :data-state="row.selected ? 'selected' : undefined"
             data-testid="channel-sync-row"
@@ -656,8 +678,18 @@ function closeSync() {
               test-id="channel-sync-checkbox"
               @toggle="toggleSyncRow(row.name)"
             />
-            <TableCell class="font-mono text-xs" data-testid="channel-sync-model-name">
-              <span :class="row.aliasOnly ? 'model-name-deleted' : undefined">{{ row.name }}</span>
+            <TableCell
+              truncate
+              class="font-mono text-xs"
+              :title="row.name"
+              data-testid="channel-sync-model-name"
+            >
+              <span
+                class="block truncate"
+                :class="row.aliasOnly ? 'model-name-deleted' : undefined"
+              >
+                {{ row.name }}
+              </span>
             </TableCell>
             <TableCell class="sync-col-alias">
               <input
@@ -686,20 +718,8 @@ function closeSync() {
               </span>
             </TableCell>
           </TableRow>
-          <TableRow v-if="filteredSyncRows.length === 0">
-            <TableCell :colspan="4" class="h-24 whitespace-normal">
-              <p
-                v-if="syncMutation.isPending.value"
-                class="text-fg-muted px-4 py-6 text-center text-sm"
-                role="status"
-              >
-                {{ t('common.loading') }}
-              </p>
-              <EmptyState v-else :title="syncEmptyTitle" />
-            </TableCell>
-          </TableRow>
-        </TableBody>
-      </Table>
+        </template>
+      </VirtualTable>
     </DataTablePanel>
   </div>
 

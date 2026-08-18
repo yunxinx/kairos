@@ -64,3 +64,20 @@ export async function seedToken(
   expect(resp.ok(), await resp.text()).toBeTruthy();
   return (await resp.json()) as { token_key: string };
 }
+
+/** 经管理 API 整表替换价格目录缓存。 */
+export async function seedCatalog(
+  page: Page,
+  models: Array<{
+    provider_id: string;
+    provider_name: string;
+    model_id: string;
+    input_micros: number | null;
+    output_micros: number | null;
+    cache_read_micros: number | null;
+    cache_write_micros: number | null;
+  }>,
+): Promise<void> {
+  const resp = await page.request.put('/catalog', { headers, data: { models } });
+  expect(resp.ok(), await resp.text()).toBeTruthy();
+}

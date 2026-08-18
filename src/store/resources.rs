@@ -41,6 +41,9 @@ pub struct Channel {
     pub max_retries: u32,
     /// 是否启用：禁用的渠道不参与路由候选与失败切换。
     pub enabled: bool,
+    /// 添加可调用名时并入的模型组；[`DEFAULT_MODEL_GROUP`] 表示不自动入组。
+    #[serde(default = "default_model_group")]
+    pub model_group: String,
 }
 
 /// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
@@ -71,7 +74,7 @@ pub struct Token {
 /// 模型组：令牌的可调用名允许名单（渠道模型、别名 key、统一模型 ID）。
 ///
 /// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
-/// 错误直接报错而非静默忽略。不对渠道分组。
+/// 错误直接报错而非静默忽略。渠道可指定默认组以便添加时入组，但组本身不按渠道划分。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelGroup {
@@ -79,7 +82,23 @@ pub struct ModelGroup {
     pub models: Vec<String>,
 }
 
-/// 统一模型：一个下游可调用名，按顺序尝试若干已登记模型（ADR-0004）。
+/// 统一模型的一条成员：钉在某一渠道上的已登记可调用名。
+///
+/// 同一名字挂在不同渠道上是不同成员。管理 API 以其 JSON 形态作为 wire 契约。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnifiedMember {
+    pub channel_id: i64,
+    pub model: String,
+}
+
+impl std::fmt::Display for UnifiedMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}（渠道 {}）", self.model, self.channel_id)
+    }
+}
+
+/// 统一模型：一个下游可调用名，按顺序尝试若干钉渠道的成员（ADR-0004）。
 ///
 /// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
 /// 错误直接报错而非静默忽略。统一 ID 本身没有价格行。
@@ -88,8 +107,8 @@ pub struct ModelGroup {
 pub struct UnifiedModel {
     /// 下游请求的可调用名。
     pub id: String,
-    /// 有序的已登记模型列表（渠道 `models` 或别名 key）；一次请求只出站一条。
-    pub models: Vec<String>,
+    /// 有序成员（渠道 × 可调用名）；一次请求只出站一条。
+    pub models: Vec<UnifiedMember>,
     /// 开隐藏则同名已登记模型在组内只表示本统一模型；默认影响下游列表。
     #[serde(default)]
     pub hide: bool,
@@ -105,6 +124,55 @@ pub fn channel_callable_names(channel: &Channel) -> HashSet<String> {
 /// 该渠道是否把 `model` 当作可调用名（清单条目或别名 key）。
 pub fn channel_lists_callable(channel: &Channel, model: &str) -> bool {
     channel.models.iter().any(|name| name == model) || channel.model_aliases.contains_key(model)
+}
+
+/// 相对上一版渠道新出现的可调用名（清单 ∪ 别名 key）。
+///
+/// `previous` 为 `None` 时全部视为新增（新建渠道）。
+pub fn newly_callable_names(previous: Option<&Channel>, next: &Channel) -> Vec<String> {
+    let next_names = channel_callable_names(next);
+    let previous_names = previous.map(channel_callable_names).unwrap_or_default();
+    let mut added: Vec<String> = next_names.difference(&previous_names).cloned().collect();
+    added.sort();
+    added
+}
+
+/// 把名字并入指定模型组的显式名单（已在组内的跳过，保序追加）。
+///
+/// 组不存在返回 [`StoreError::InvalidResource`]。
+pub async fn union_names_into_group(
+    conn: &mut SqliteConnection,
+    group_name: &str,
+    names: &[String],
+) -> Result<(), StoreError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let Some(mut group) = get_model_group(conn, group_name).await? else {
+        return Err(StoreError::InvalidResource(format!(
+            "模型组 {group_name} 不存在"
+        )));
+    };
+    let mut seen: HashSet<String> = group.models.iter().cloned().collect();
+    for name in names {
+        if seen.insert(name.clone()) {
+            group.models.push(name.clone());
+        }
+    }
+    upsert_model_group(conn, &group).await
+}
+
+/// 按名读一个模型组；不存在返回 `None`。
+pub async fn get_model_group(
+    conn: &mut SqliteConnection,
+    name: &str,
+) -> Result<Option<ModelGroup>, StoreError> {
+    let row = sqlx::query("SELECT name, models_json FROM model_groups WHERE name = ?")
+        .bind(name)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    row.as_ref().map(map_model_group).transpose()
 }
 
 /// 渠道已登记的可调用名：各渠道 `models` ∪ 别名 key（含禁用渠道）。
@@ -169,8 +237,9 @@ pub fn visible_model_ids<'a>(
             model
                 .models
                 .iter()
-                .filter(|member| *member != &model.id)
-                .cloned()
+                .map(|member| member.model.as_str())
+                .filter(|member| *member != model.id)
+                .map(str::to_string)
         })
         .collect();
     names.retain(|name| !hidden_members.contains(name));
@@ -210,11 +279,16 @@ pub struct Price {
 pub const SETTING_FULL_BODY: &str = "full_body";
 /// 运行时开关键：入站请求体大小上限（字节）。
 pub const SETTING_MAX_REQUEST_BYTES: &str = "max_request_bytes";
+/// 运行时开关键：价格目录自动同步间隔（天）；`0` 表示只手动同步。
+pub const SETTING_CATALOG_SYNC_INTERVAL_DAYS: &str = "catalog_sync_interval_days";
+/// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
+pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
-/// 运行时设置的聚合契约：`full_body` 与入站请求体上限。
+/// 运行时设置的聚合契约：日志开关与价格目录同步间隔。
 ///
-/// 落库时拆成两条键值记录（`settings` 表），管理 API 以其 JSON 形态作为
+/// 落库时拆成键值记录（`settings` 表），管理 API 以其 JSON 形态作为
 /// wire 契约（成对读写），故派生 `Serialize`/`Deserialize` 并拒绝未知字段。
+/// `catalog_synced_at` 不在此契约：它是目录元数据，随 `GET /catalog` 或 `GET /catalog/meta` 返回。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -222,6 +296,9 @@ pub struct Settings {
     pub full_body: bool,
     /// 入站请求体大小上限（字节）。
     pub max_request_bytes: u64,
+    /// 价格目录自动同步间隔（天）；`0` 表示只手动同步。
+    #[serde(default)]
+    pub catalog_sync_interval_days: u64,
 }
 
 /// `Protocol` 落库用的 wire 字符串。
@@ -249,7 +326,7 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
 pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord>, StoreError> {
     let rows = sqlx::query(
         "SELECT id, name, protocol, base_url, api_key, models_json, model_aliases_json, \
-         priority, weight, timeout_ms, max_retries, enabled FROM channels",
+         priority, weight, timeout_ms, max_retries, enabled, model_group FROM channels",
     )
     .fetch_all(pool)
     .await
@@ -293,6 +370,7 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             protocol: protocol_from_wire(&protocol_wire)?,
             models,
             model_aliases,
+            model_group: row.try_get("model_group").map_err(StoreError::Query)?,
         },
     })
 }
@@ -311,8 +389,8 @@ pub async fn insert_channel(
     let result = sqlx::query(
         "INSERT INTO channels \
          (name, protocol, base_url, api_key, models_json, model_aliases_json, \
-          priority, weight, timeout_ms, max_retries, enabled) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          priority, weight, timeout_ms, max_retries, enabled, model_group) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -325,6 +403,7 @@ pub async fn insert_channel(
     .bind(channel.timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
+    .bind(&channel.model_group)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -345,7 +424,8 @@ pub async fn update_channel(
         "UPDATE channels SET \
            name = ?, protocol = ?, base_url = ?, api_key = ?, \
            models_json = ?, model_aliases_json = ?, \
-           priority = ?, weight = ?, timeout_ms = ?, max_retries = ?, enabled = ? \
+           priority = ?, weight = ?, timeout_ms = ?, max_retries = ?, enabled = ?, \
+           model_group = ? \
          WHERE id = ?",
     )
     .bind(&channel.name)
@@ -359,6 +439,7 @@ pub async fn update_channel(
     .bind(channel.timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
+    .bind(&channel.model_group)
     .bind(id)
     .execute(&mut *conn)
     .await
@@ -563,7 +644,7 @@ pub async fn list_unified_models(pool: &SqlitePool) -> Result<Vec<UnifiedModel>,
 fn map_unified_model(row: &sqlx::sqlite::SqliteRow) -> Result<UnifiedModel, StoreError> {
     let id: String = row.try_get("id").map_err(StoreError::Query)?;
     let hide: i64 = row.try_get("hide").map_err(StoreError::Query)?;
-    let models: Vec<String> = serde_json::from_str(
+    let models: Vec<UnifiedMember> = serde_json::from_str(
         &row.try_get::<String, _>("models_json")
             .map_err(StoreError::Query)?,
     )
@@ -610,6 +691,20 @@ pub async fn rebind_tokens_to_default(
     from_group: &str,
 ) -> Result<(), StoreError> {
     sqlx::query("UPDATE tokens SET model_group = ? WHERE model_group = ?")
+        .bind(DEFAULT_MODEL_GROUP)
+        .bind(from_group)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 把绑定到 `from_group` 的渠道默认组改回内置 `default`。
+pub async fn rebind_channels_to_default(
+    conn: &mut SqliteConnection,
+    from_group: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE channels SET model_group = ? WHERE model_group = ?")
         .bind(DEFAULT_MODEL_GROUP)
         .bind(from_group)
         .execute(&mut *conn)
@@ -776,10 +871,10 @@ pub async fn delete_setting(conn: &mut SqliteConnection, key: &str) -> Result<()
     Ok(())
 }
 
-/// 成对写入运行时设置：`full_body` 与 `max_request_bytes` 一同落库（幂等）。
+/// 成对写入运行时设置：日志开关、入站上限与目录同步间隔一同落库（幂等）。
 ///
-/// 供管理 API 的 `/settings` 写操作使用：两条开关在同一个事务内写入，保证聚合
-/// 契约的原子性。读回经 `list_settings` 由调用方聚合。
+/// 供管理 API 的 `/settings` 写操作使用：三项在同一个事务内写入，保证聚合
+/// 契约的原子性。读回经 `list_settings` 由调用方聚合。`catalog_synced_at` 不在此写入。
 pub async fn upsert_settings(
     conn: &mut SqliteConnection,
     settings: &Settings,
@@ -789,6 +884,12 @@ pub async fn upsert_settings(
         conn,
         SETTING_MAX_REQUEST_BYTES,
         &Value::from(settings.max_request_bytes),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_CATALOG_SYNC_INTERVAL_DAYS,
+        &Value::from(settings.catalog_sync_interval_days),
     )
     .await?;
     Ok(())
@@ -828,7 +929,63 @@ mod tests {
             timeout_ms: 120_000,
             max_retries: 2,
             enabled: true,
+            model_group: DEFAULT_MODEL_GROUP.to_string(),
         }
+    }
+
+    /// 新建渠道时全部可调用名算新增；更新只算相对上一版新出现的名字。
+    #[test]
+    fn newly_callable_names_diffs_models_and_alias_keys() {
+        let previous = sample_channel();
+        let mut next = sample_channel();
+        next.models.push("gpt-5".to_string());
+        next.model_aliases
+            .insert("flash".to_string(), "gpt-4o-mini".to_string());
+        next.models.retain(|name| name != "gpt-4o");
+        assert_eq!(
+            newly_callable_names(None, &next),
+            vec![
+                "fast".to_string(),
+                "flash".to_string(),
+                "gpt-4o-mini".to_string(),
+                "gpt-5".to_string()
+            ]
+        );
+        assert_eq!(
+            newly_callable_names(Some(&previous), &next),
+            vec!["flash".to_string(), "gpt-5".to_string()]
+        );
+    }
+
+    /// 并入组时跳过已有名字、保序追加；删渠道模型不经过此路径。
+    #[tokio::test]
+    async fn union_names_into_group_appends_missing_only() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        upsert_model_group(
+            &mut conn,
+            &ModelGroup {
+                name: "coding".to_string(),
+                models: vec!["gpt-4o".to_string()],
+            },
+        )
+        .await
+        .expect("应能写组");
+        union_names_into_group(
+            &mut conn,
+            "coding",
+            &["gpt-4o".to_string(), "fast".to_string(), "mini".to_string()],
+        )
+        .await
+        .expect("应能并入");
+        let group = get_model_group(&mut conn, "coding")
+            .await
+            .expect("应能读组")
+            .expect("组应存在");
+        assert_eq!(
+            group.models,
+            vec!["gpt-4o".to_string(), "fast".to_string(), "mini".to_string()]
+        );
     }
 
     /// 渠道插入 → 读回往返一致（含库生成的 id、集合字段与协议）。
@@ -1176,7 +1333,10 @@ mod tests {
             "coding".to_string(),
             UnifiedModel {
                 id: "coding".to_string(),
-                models: vec!["gpt-4o".to_string()],
+                models: vec![UnifiedMember {
+                    channel_id: 1,
+                    model: "gpt-4o".to_string(),
+                }],
                 hide: true,
             },
         );
@@ -1232,7 +1392,16 @@ mod tests {
         let mut conn = pool.acquire().await.expect("应能获取连接");
         let model = UnifiedModel {
             id: "coding".to_string(),
-            models: vec!["gpt-4o".to_string(), "fast".to_string()],
+            models: vec![
+                UnifiedMember {
+                    channel_id: 1,
+                    model: "gpt-4o".to_string(),
+                },
+                UnifiedMember {
+                    channel_id: 1,
+                    model: "fast".to_string(),
+                },
+            ],
             hide: true,
         };
         upsert_unified_model(&mut conn, &model)
@@ -1269,6 +1438,7 @@ mod tests {
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,
+                model_group: DEFAULT_MODEL_GROUP.to_string(),
             },
         )
         .await
@@ -1406,6 +1576,7 @@ mod tests {
         let settings = Settings {
             full_body: true,
             max_request_bytes: 8_000_000,
+            catalog_sync_interval_days: 0,
         };
         upsert_settings(&mut conn, &settings)
             .await
@@ -1421,6 +1592,7 @@ mod tests {
             &Settings {
                 full_body: true,
                 max_request_bytes: 1_000,
+                catalog_sync_interval_days: 7,
             },
         )
         .await
@@ -1428,6 +1600,7 @@ mod tests {
         let map = list_settings(&pool).await.expect("应能读开关");
         assert_eq!(map[SETTING_MAX_REQUEST_BYTES], Value::from(1_000u64));
         assert_eq!(map[SETTING_FULL_BODY], Value::Bool(true));
+        assert_eq!(map[SETTING_CATALOG_SYNC_INTERVAL_DAYS], Value::from(7u64));
     }
 
     /// 事务中途失败不污染库：事务内有效写入随回滚一并撤销。

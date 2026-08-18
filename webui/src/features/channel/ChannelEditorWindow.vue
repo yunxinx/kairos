@@ -7,7 +7,7 @@
 // 勾选模型与别名映射写回草稿，右上角关闭为「不保存并返回」；保存仍走表单页签
 // 的既有流程。
 import { useId, computed, onUnmounted, ref, useTemplateRef, watch } from 'vue';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
@@ -25,6 +25,7 @@ import ChannelEditorChip from '@/features/channel/ChannelEditorChip.vue';
 import ChannelModelSync from '@/features/channel/ChannelModelSync.vue';
 import { compareModels, sameAliasMap, sameModelSet } from '@/lib/model-list';
 import { parseOptionalUint } from '@/lib/uint-parse';
+import { DEFAULT_MODEL_GROUP, groupSelectOptions } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -84,6 +85,7 @@ const apiKeyInputId = `channel-editor-api-key-${uid}`;
 const timeoutMsInputId = `channel-editor-timeout-ms-${uid}`;
 const maxRetriesInputId = `channel-editor-max-retries-${uid}`;
 const enabledInputId = `channel-editor-enabled-${uid}`;
+const groupInputId = `channel-editor-group-${uid}`;
 const addModelInputId = `channel-editor-add-model-${uid}`;
 
 const queryClient = useQueryClient();
@@ -107,6 +109,7 @@ const initialValues = {
   timeoutMs: String(props.initial?.timeout_ms ?? '30000'),
   maxRetries: String(props.initial?.max_retries ?? '0'),
   enabled: props.initial?.enabled ?? true,
+  modelGroup: props.initial?.model_group ?? DEFAULT_MODEL_GROUP,
 };
 
 const editorName = ref(initialValues.name);
@@ -119,6 +122,7 @@ const editorAliasesMap = ref<Record<string, string>>(initialValues.aliases);
 const editorTimeoutMs = ref(initialValues.timeoutMs);
 const editorMaxRetries = ref(initialValues.maxRetries);
 const editorEnabled = ref(initialValues.enabled);
+const editorGroup = ref(initialValues.modelGroup);
 const editorError = ref('');
 /** 手动添加模型 ID 的输入草稿；点添加后 trim 写入 `editorModels`。 */
 const addModelDraft = ref('');
@@ -133,9 +137,19 @@ const dirty = computed(
     !sameAliasMap(editorAliasesMap.value, initialValues.aliases) ||
     editorTimeoutMs.value !== initialValues.timeoutMs ||
     editorMaxRetries.value !== initialValues.maxRetries ||
-    editorEnabled.value !== initialValues.enabled,
+    editorEnabled.value !== initialValues.enabled ||
+    editorGroup.value !== initialValues.modelGroup,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
+
+const groupsQuery = useQuery({
+  queryKey: ['model-groups'],
+  queryFn: () => apiClient.listModelGroups(),
+});
+
+const groupOptions = computed(() =>
+  groupSelectOptions(groupsQuery.data.value ?? [], editorGroup.value, t('models.ungrouped')),
+);
 
 const saveMutation = useMutation({
   mutationFn: (body: Channel) =>
@@ -146,6 +160,7 @@ const saveMutation = useMutation({
     editorError.value = '';
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['channels'] });
+    await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
   },
   onError: (err) => {
     editorError.value = extractApiError(err).message;
@@ -371,6 +386,7 @@ function handleSave() {
       timeout_ms: timeoutMs,
       max_retries: maxRetries,
       enabled: editorEnabled.value,
+      model_group: editorGroup.value,
     });
     return;
   }
@@ -394,6 +410,7 @@ function handleSave() {
     timeout_ms: timeoutMs,
     max_retries: maxRetries,
     enabled: editorEnabled.value,
+    model_group: editorGroup.value,
   });
 }
 </script>
@@ -498,6 +515,19 @@ function handleSave() {
                   v-on="fieldInputHandlers('apiKey')"
                 />
               </template>
+            </FormField>
+            <FormField
+              field-name="modelGroup"
+              :label="t('channel.modelGroup')"
+              :input-id="groupInputId"
+              :guide="t('channel.modelGroupGuide')"
+            >
+              <UiSelect
+                :id="groupInputId"
+                v-model="editorGroup"
+                :options="groupOptions"
+                data-testid="channel-editor-group"
+              />
             </FormField>
             <fieldset class="border-seed rounded-md border p-3">
               <legend
@@ -705,6 +735,7 @@ function handleSave() {
       :timeout-ms="syncTimeoutMs"
       :stack-order="stackOrder"
       @back="handleSyncBack"
+      @cancel="leaveSyncView"
     />
   </FloatingWindow>
 </template>

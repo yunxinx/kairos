@@ -15,7 +15,7 @@ import FormTextInput from '@/components/ui/FormTextInput.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { formatUsdAmount, parseUsdToMicros } from '@/lib/format';
-import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
+import { DEFAULT_MODEL_GROUP, groupSelectOptions } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -74,16 +74,9 @@ const editorEnabled = ref(initialEnabled);
 const editorGroup = ref(initialGroup);
 const editorError = ref('');
 
-const groupOptions = computed(() => {
-  const listed = groupsQuery.data.value ?? [];
-  const names = listed.map((group) => group.name);
-  if (!names.includes(editorGroup.value)) {
-    return [{ value: editorGroup.value, label: editorGroup.value }].concat(
-      names.map((name) => ({ value: name, label: name })),
-    );
-  }
-  return names.map((name) => ({ value: name, label: name }));
-});
+const groupOptions = computed(() =>
+  groupSelectOptions(groupsQuery.data.value ?? [], editorGroup.value, t('models.ungrouped')),
+);
 
 // 余额编辑：仅编辑已有令牌时可用。计算器语义——输入框是基数（可直接改为目标余额），
 // 快捷档位累计成右侧差额，`=` 后预览结果，保存时一并生效。

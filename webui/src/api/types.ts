@@ -48,6 +48,8 @@ export interface Channel {
   max_retries: number;
   /** 是否启用：禁用的渠道不参与路由与失败切换。 */
   enabled: boolean;
+  /** 保存时把新加入的可调用名并入该组；`default` 表示不自动入组。 */
+  model_group: string;
 }
 
 /** 渠道读响应：库生成的稳定身份 + 写契约字段。 */
@@ -69,6 +71,7 @@ export function channelWriteBody(view: ChannelView): Channel {
     timeout_ms: view.timeout_ms,
     max_retries: view.max_retries,
     enabled: view.enabled,
+    model_group: view.model_group,
   };
 }
 
@@ -88,10 +91,16 @@ export interface ModelGroup {
   models: string[];
 }
 
-/** 统一模型：一个下游可调用名，按顺序尝试若干已登记模型。 */
+/** 统一模型的一条成员：钉在某一渠道上的已登记可调用名。 */
+export interface UnifiedMember {
+  channel_id: number;
+  model: string;
+}
+
+/** 统一模型：一个下游可调用名，按顺序尝试若干钉渠道的成员。 */
 export interface UnifiedModel {
   id: string;
-  models: string[];
+  models: UnifiedMember[];
   hide: boolean;
 }
 
@@ -99,6 +108,46 @@ export interface UnifiedModel {
 export interface Settings {
   full_body: boolean;
   max_request_bytes: number;
+  /** 价格目录自动同步间隔（天）；`0` 表示只手动同步。 */
+  catalog_sync_interval_days: number;
+}
+
+/** 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。 */
+export interface CatalogModel {
+  provider_id: string;
+  provider_name: string;
+  model_id: string;
+  input_micros: number | null;
+  output_micros: number | null;
+  cache_read_micros: number | null;
+  cache_write_micros: number | null;
+}
+
+/** 价格目录读视图：缓存行 + 上次成功同步时刻。 */
+export interface CatalogView {
+  /** 上次成功写入缓存的 unix 毫秒；从未同步为 null。 */
+  synced_at: number | null;
+  models: CatalogModel[];
+}
+
+/** 目录提供方摘要。 */
+export interface CatalogProvider {
+  id: string;
+  name: string;
+  count: number;
+}
+
+/** 目录元数据：同步时刻 + 提供方列表。 */
+export interface CatalogMeta {
+  synced_at: number | null;
+  providers: CatalogProvider[];
+}
+
+/** `GET /catalog` 过滤参数；都缺省时返回全表。 */
+export interface CatalogQuery {
+  q?: string;
+  /** 单个提供方 id，或多个 id（客户端会打成逗号分隔）。 */
+  provider_id?: string | string[];
 }
 
 /** 余额相对调整请求。 */

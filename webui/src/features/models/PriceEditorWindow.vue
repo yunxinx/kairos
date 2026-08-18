@@ -35,6 +35,8 @@ const emit = defineEmits<{
   close: [];
   raise: [];
   'dirty-change': [dirty: boolean];
+  /** 打开与清单多选共用的价格同步浮窗，并把当前行加入勾选。 */
+  'catalog-sync': [];
 }>();
 
 const { t } = useI18n();
@@ -128,6 +130,7 @@ function handleSave() {
     cache_write_micros: optionalMicros(editorCacheWrite.value),
   });
 }
+
 </script>
 
 <template>
@@ -141,6 +144,16 @@ function handleSave() {
     @close="emit('close')"
     @pointerdown="emit('raise')"
   >
+    <template #header-extra>
+      <button
+        type="button"
+        class="btn btn-sm h-6 py-0 text-xs"
+        data-testid="pricing-fill-from-catalog"
+        @click="emit('catalog-sync')"
+      >
+        {{ t('models.catalogFillFromDir') }}
+      </button>
+    </template>
     <form novalidate @submit.prevent="handleSave">
       <div class="card-body space-y-3">
         <FormField field-name="channel" :label="t('pricing.channel')" :input-id="channelInputId">
@@ -159,86 +172,90 @@ function handleSave() {
             <FormTextInput :id="modelInputId" :model-value="model" type="text" disabled />
           </template>
         </FormField>
-        <FormField
-          field-name="input"
-          :label="t('pricing.input')"
-          :input-id="inputInputId"
-          :error="fieldError('input')"
-          :guide="t('pricing.usdGuide')"
-        >
-          <template #default="{ hintId, invalid }">
-            <FormTextInput
-              :id="inputInputId"
-              v-model="editorInput"
-              type="text"
-              inputmode="decimal"
-              class="font-mono"
-              :invalid="invalid"
-              :hint-id="hintId"
-              v-on="fieldInputHandlers('input')"
-            />
-          </template>
-        </FormField>
-        <FormField
-          field-name="output"
-          :label="t('pricing.output')"
-          :input-id="outputInputId"
-          :error="fieldError('output')"
-          :guide="t('pricing.usdGuide')"
-        >
-          <template #default="{ hintId, invalid }">
-            <FormTextInput
-              :id="outputInputId"
-              v-model="editorOutput"
-              type="text"
-              inputmode="decimal"
-              class="font-mono"
-              :invalid="invalid"
-              :hint-id="hintId"
-              v-on="fieldInputHandlers('output')"
-            />
-          </template>
-        </FormField>
-        <FormField
-          field-name="cacheRead"
-          :label="t('pricing.cacheRead')"
-          :input-id="cacheReadInputId"
-          :error="fieldError('cacheRead')"
-          :guide="t('pricing.optionalUsdGuide')"
-        >
-          <template #default="{ hintId, invalid }">
-            <FormTextInput
-              :id="cacheReadInputId"
-              v-model="editorCacheRead"
-              type="text"
-              inputmode="decimal"
-              class="font-mono"
-              :invalid="invalid"
-              :hint-id="hintId"
-              v-on="fieldInputHandlers('cacheRead')"
-            />
-          </template>
-        </FormField>
-        <FormField
-          field-name="cacheWrite"
-          :label="t('pricing.cacheWrite')"
-          :input-id="cacheWriteInputId"
-          :error="fieldError('cacheWrite')"
-          :guide="t('pricing.optionalUsdGuide')"
-        >
-          <template #default="{ hintId, invalid }">
-            <FormTextInput
-              :id="cacheWriteInputId"
-              v-model="editorCacheWrite"
-              type="text"
-              inputmode="decimal"
-              class="font-mono"
-              :invalid="invalid"
-              :hint-id="hintId"
-              v-on="fieldInputHandlers('cacheWrite')"
-            />
-          </template>
-        </FormField>
+        <div class="settings-fields-row">
+          <FormField
+            field-name="input"
+            :label="t('pricing.input')"
+            :input-id="inputInputId"
+            :error="fieldError('input')"
+            :guide="t('pricing.usdGuide')"
+          >
+            <template #default="{ hintId, invalid }">
+              <FormTextInput
+                :id="inputInputId"
+                v-model="editorInput"
+                type="text"
+                inputmode="decimal"
+                class="font-mono"
+                :invalid="invalid"
+                :hint-id="hintId"
+                v-on="fieldInputHandlers('input')"
+              />
+            </template>
+          </FormField>
+          <FormField
+            field-name="output"
+            :label="t('pricing.output')"
+            :input-id="outputInputId"
+            :error="fieldError('output')"
+            :guide="t('pricing.usdGuide')"
+          >
+            <template #default="{ hintId, invalid }">
+              <FormTextInput
+                :id="outputInputId"
+                v-model="editorOutput"
+                type="text"
+                inputmode="decimal"
+                class="font-mono"
+                :invalid="invalid"
+                :hint-id="hintId"
+                v-on="fieldInputHandlers('output')"
+              />
+            </template>
+          </FormField>
+        </div>
+        <div class="settings-fields-row">
+          <FormField
+            field-name="cacheRead"
+            :label="t('pricing.cacheRead')"
+            :input-id="cacheReadInputId"
+            :error="fieldError('cacheRead')"
+            :guide="t('pricing.optionalUsdGuide')"
+          >
+            <template #default="{ hintId, invalid }">
+              <FormTextInput
+                :id="cacheReadInputId"
+                v-model="editorCacheRead"
+                type="text"
+                inputmode="decimal"
+                class="font-mono"
+                :invalid="invalid"
+                :hint-id="hintId"
+                v-on="fieldInputHandlers('cacheRead')"
+              />
+            </template>
+          </FormField>
+          <FormField
+            field-name="cacheWrite"
+            :label="t('pricing.cacheWrite')"
+            :input-id="cacheWriteInputId"
+            :error="fieldError('cacheWrite')"
+            :guide="t('pricing.optionalUsdGuide')"
+          >
+            <template #default="{ hintId, invalid }">
+              <FormTextInput
+                :id="cacheWriteInputId"
+                v-model="editorCacheWrite"
+                type="text"
+                inputmode="decimal"
+                class="font-mono"
+                :invalid="invalid"
+                :hint-id="hintId"
+                v-on="fieldInputHandlers('cacheWrite')"
+              />
+            </template>
+          </FormField>
+        </div>
         <p v-if="editorError" class="text-danger text-sm" data-testid="pricing-editor-error">
           {{ editorError }}
         </p>

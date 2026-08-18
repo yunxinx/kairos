@@ -4,6 +4,7 @@
 //! 余额（`token_balance`）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats`
 //! 与 `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
+pub mod catalog;
 pub mod resources;
 
 use std::path::Path;
@@ -705,7 +706,7 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
 }
 
 /// 关键字 → LIKE 子串模式：转义 `\`/`%`/`_`（配合 `ESCAPE '\'`），两端补 `%`。
-fn like_substring_pattern(keyword: &str) -> String {
+pub(crate) fn like_substring_pattern(keyword: &str) -> String {
     let mut pattern = String::with_capacity(keyword.len() + 2);
     pattern.push('%');
     for ch in keyword.chars() {
@@ -875,6 +876,7 @@ mod tests {
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,
+                model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
             },
         )
         .await
@@ -918,6 +920,11 @@ mod tests {
             (
                 "unified_models",
                 "INSERT INTO unified_models (id, models_json, hide) VALUES ('k4', x'00', 0)",
+            ),
+            (
+                "catalog_models",
+                "INSERT INTO catalog_models (provider_id, provider_name, model_id, input_micros) \
+                 VALUES ('p', 'P', 'm', 'not-a-number')",
             ),
         ];
         for (table, sql) in probes {

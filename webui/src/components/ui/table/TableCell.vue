@@ -8,10 +8,13 @@ const props = withDefaults(
   defineProps<{
     class?: string;
     align?: TableAlign;
+    /** `table-layout:fixed` 下省略过长文本；需配合列宽（`max-w-0 truncate`）。 */
+    truncate?: boolean;
   }>(),
   {
     class: '',
     align: 'left',
+    truncate: false,
   },
 );
 </script>
@@ -20,7 +23,14 @@ const props = withDefaults(
   <td
     data-slot="table-cell"
     v-bind="$attrs"
-    :class="cn('p-2 align-middle whitespace-nowrap', tableAlignClass[props.align], props.class)"
+    :class="
+      cn(
+        'p-2 align-middle whitespace-nowrap',
+        props.truncate && 'max-w-0 truncate',
+        tableAlignClass[props.align],
+        props.class,
+      )
+    "
   >
     <slot />
   </td>

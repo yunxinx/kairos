@@ -480,3 +480,217 @@ async fn name_only_in_custom_group_leaves_default() {
         "显式列入 default 后应可调"
     );
 }
+
+fn channel_body(name: &str, base_url: &str, models: Value, group: &str) -> Value {
+    json!({
+        "name": name,
+        "protocol": "openai_chat",
+        "base_url": base_url,
+        "api_key": "sk-upstream",
+        "models": models,
+        "model_aliases": { "fast": "gpt-4o-mini" },
+        "priority": 1,
+        "weight": 1,
+        "timeout_ms": 1000,
+        "max_retries": 0,
+        "enabled": true,
+        "model_group": group
+    })
+}
+
+/// 新建渠道时把清单与别名 key 并入自定义组；绑 default 不入组。
+#[tokio::test]
+async fn creating_channel_enrolls_callable_names_into_custom_group() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    let created_group = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": [] }),
+    )
+    .await;
+    assert_eq!(created_group.status(), reqwest::StatusCode::CREATED);
+
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body(
+            "enroll-ch",
+            "http://127.0.0.1:9",
+            json!(["gpt-4o", "gpt-4o-mini"]),
+            "coding",
+        ),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    let coding = group_named(&list, "coding");
+    let models = coding["models"].as_array().expect("名单应为数组");
+    let names: Vec<&str> = models.iter().filter_map(|item| item.as_str()).collect();
+    assert!(names.contains(&"gpt-4o"), "清单名应入组: {names:?}");
+    assert!(names.contains(&"gpt-4o-mini"), "清单名应入组: {names:?}");
+    assert!(names.contains(&"fast"), "别名 key 应入组: {names:?}");
+
+    let leftover = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body(
+            "default-ch",
+            "http://127.0.0.1:9",
+            json!(["orphan"]),
+            "default",
+        ),
+    )
+    .await;
+    assert_eq!(leftover.status(), reqwest::StatusCode::CREATED);
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    assert_eq!(group_named(&list, "default")["models"], json!([]));
+}
+
+/// 更新渠道只把新出现的可调用名入组；从渠道删模型不退组。
+#[tokio::test]
+async fn updating_channel_enrolls_only_new_names_and_keeps_removed() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": ["kept"] }),
+    )
+    .await;
+
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        json!({
+            "name": "enroll-upd",
+            "protocol": "openai_chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "sk-upstream",
+            "models": ["alpha"],
+            "model_aliases": {},
+            "priority": 1,
+            "weight": 1,
+            "timeout_ms": 1000,
+            "max_retries": 0,
+            "enabled": true,
+            "model_group": "coding"
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let id = created.json::<Value>().await.expect("创建响应应可解析")["id"]
+        .as_i64()
+        .expect("应有 id");
+
+    let updated = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        &format!("/channels/{id}"),
+        json!({
+            "name": "enroll-upd",
+            "protocol": "openai_chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "sk-upstream",
+            "models": ["alpha", "beta"],
+            "model_aliases": {},
+            "priority": 1,
+            "weight": 1,
+            "timeout_ms": 1000,
+            "max_retries": 0,
+            "enabled": true,
+            "model_group": "coding"
+        }),
+    )
+    .await;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+
+    let stripped = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        &format!("/channels/{id}"),
+        json!({
+            "name": "enroll-upd",
+            "protocol": "openai_chat",
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "sk-upstream",
+            "models": ["beta"],
+            "model_aliases": {},
+            "priority": 1,
+            "weight": 1,
+            "timeout_ms": 1000,
+            "max_retries": 0,
+            "enabled": true,
+            "model_group": "coding"
+        }),
+    )
+    .await;
+    assert_eq!(stripped.status(), reqwest::StatusCode::OK);
+
+    let list: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("组列表应可解析");
+    let names: Vec<&str> = group_named(&list, "coding")["models"]
+        .as_array()
+        .expect("名单应为数组")
+        .iter()
+        .filter_map(|item| item.as_str())
+        .collect();
+    assert!(names.contains(&"kept"));
+    assert!(names.contains(&"alpha"), "从渠道删模型不应退组: {names:?}");
+    assert!(names.contains(&"beta"), "新增名应入组: {names:?}");
+}
+
+/// 删自定义组前把仍绑该组的渠道改回 default，避免外键挡住删除。
+#[tokio::test]
+async fn deleting_group_rebinds_channels_to_default() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({ "name": "coding", "models": [] }),
+    )
+    .await;
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body("rebind-ch", "http://127.0.0.1:9", json!(["m"]), "coding"),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let id = created.json::<Value>().await.expect("创建响应应可解析")["id"]
+        .as_i64()
+        .expect("应有 id");
+
+    let deleted = admin_send(&gw, reqwest::Method::DELETE, "/model-groups/coding").await;
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+
+    let channels: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let channel = channels
+        .as_array()
+        .expect("应为数组")
+        .iter()
+        .find(|item| item["id"] == id)
+        .expect("渠道应仍在");
+    assert_eq!(channel["model_group"], "default");
+}

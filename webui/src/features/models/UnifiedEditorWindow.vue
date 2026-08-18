@@ -3,30 +3,36 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { UnifiedModel } from '@/api/types';
+import type { ChannelView, Price, UnifiedMember, UnifiedModel } from '@/api/types';
+import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
+import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
+import OverflowChips from '@/components/ui/OverflowChips.vue';
+import SearchInput from '@/components/ui/SearchInput.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
-import UiSelect from '@/components/ui/UiSelect.vue';
-import Table from '@/components/ui/table/Table.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
+import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import type { FieldValidationSpec } from '@/lib/form-validation';
+import { buildInventory, inventoryRowKey, type InventoryRow } from '@/lib/inventory';
 import { moveItem } from '@/lib/move-item';
+import { channelNameForMember, unifiedMemberKey } from '@/lib/unified-sources';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
 const props = withDefaults(
   defineProps<{
     initial: UnifiedModel | null;
-    memberOptions: string[];
+    channels: ChannelView[];
+    prices: Price[];
     anchor?: FloatingWindowAnchor | null;
     stackOrder?: number;
     cascade?: number;
@@ -46,7 +52,6 @@ const { t } = useI18n();
 const uid = useId();
 const idInputId = `unified-editor-id-${uid}`;
 const hideInputId = `unified-editor-hide-${uid}`;
-const addInputId = `unified-editor-add-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
@@ -58,34 +63,38 @@ const initialHide = props.initial?.hide ?? false;
 const editorId = ref(initialId);
 const editorMembers = ref([...initialMembers]);
 const editorHide = ref(initialHide);
-const editorAdd = ref('');
 const editorError = ref('');
 const dragFrom = ref<number | null>(null);
+const dropInsert = ref<number | null>(null);
+const searchText = ref('');
+const selectedChannels = ref<string[]>([]);
 
 const dirty = computed(
   () =>
     editorId.value !== initialId ||
     editorHide.value !== initialHide ||
-    editorMembers.value.join('\0') !== initialMembers.join('\0'),
+    editorMembers.value.map(unifiedMemberKey).join('\0') !==
+      initialMembers.map(unifiedMemberKey).join('\0'),
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
-const addOptions = computed(() =>
-  props.memberOptions
-    .filter((name) => !editorMembers.value.includes(name))
+const inventory = computed(() => buildInventory(props.channels, props.prices));
+
+const channelOptions = computed(() =>
+  [...new Set(inventory.value.map((row) => row.channelName))]
+    .sort((left, right) => left.localeCompare(right))
     .map((name) => ({ value: name, label: name })),
 );
 
-/** 展示值从剩余选项派生；用户选择写入 `editorAdd`。 */
-const addSelection = computed({
-  get: () => {
-    const options = addOptions.value;
-    if (options.some((item) => item.value === editorAdd.value)) return editorAdd.value;
-    return options[0]?.value ?? '';
-  },
-  set: (value: string) => {
-    editorAdd.value = value;
-  },
+/** 按渠道分行：同一名字在不同渠道上各占一行，勾选互不影响。 */
+const pickerRows = computed(() => {
+  const q = searchText.value.trim().toLowerCase();
+  const channels = new Set(selectedChannels.value);
+  return inventory.value.filter((row) => {
+    if (channels.size > 0 && !channels.has(row.channelName)) return false;
+    if (!q) return true;
+    return row.name.toLowerCase().includes(q) || row.channelName.toLowerCase().includes(q);
+  });
 });
 
 const saveMutation = useMutation({
@@ -116,32 +125,88 @@ function handleSave() {
   });
 }
 
-function addMember() {
-  const name = addSelection.value.trim();
-  if (!name || editorMembers.value.includes(name)) return;
-  editorMembers.value = [...editorMembers.value, name];
-  editorAdd.value = '';
+function isMember(row: InventoryRow): boolean {
+  return editorMembers.value.some(
+    (member) => member.channel_id === row.channelId && member.model === row.name,
+  );
 }
 
-function removeMember(name: string) {
-  editorMembers.value = editorMembers.value.filter((item) => item !== name);
+function toggleMember(row: InventoryRow, checked: boolean) {
+  if (checked) {
+    if (isMember(row)) return;
+    editorMembers.value = [...editorMembers.value, { channel_id: row.channelId, model: row.name }];
+    return;
+  }
+  editorMembers.value = editorMembers.value.filter(
+    (member) => !(member.channel_id === row.channelId && member.model === row.name),
+  );
+}
+
+function removeMember(member: UnifiedMember) {
+  editorMembers.value = editorMembers.value.filter(
+    (item) => unifiedMemberKey(item) !== unifiedMemberKey(member),
+  );
 }
 
 function moveMember(from: number, to: number) {
   editorMembers.value = moveItem(editorMembers.value, from, to);
 }
 
-function onDragStart(index: number, event: DragEvent) {
+function onHandleDragStart(index: number, event: DragEvent) {
   dragFrom.value = index;
   event.dataTransfer?.setData('text/plain', String(index));
   if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
 }
 
-function onDrop(index: number) {
-  if (dragFrom.value === null) return;
-  moveMember(dragFrom.value, index);
-  dragFrom.value = null;
+function onDragOver(index: number, event: DragEvent) {
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  const el = event.currentTarget as HTMLElement;
+  const rect = el.getBoundingClientRect();
+  dropInsert.value = event.clientY < rect.top + rect.height / 2 ? index : index + 1;
 }
+
+function onDrop() {
+  if (dragFrom.value === null || dropInsert.value === null) {
+    dragFrom.value = null;
+    dropInsert.value = null;
+    return;
+  }
+  const from = dragFrom.value;
+  let insert = dropInsert.value;
+  if (from < insert) insert -= 1;
+  moveMember(from, insert);
+  dragFrom.value = null;
+  dropInsert.value = null;
+}
+
+function onDragEnd() {
+  dragFrom.value = null;
+  dropInsert.value = null;
+}
+
+function rowDropClass(index: number): string {
+  if (dropInsert.value === index) return 'drop-insert-before';
+  if (dropInsert.value === index + 1 && index === editorMembers.value.length - 1) {
+    return 'drop-insert-after';
+  }
+  return '';
+}
+
+function pinnedChannelName(member: UnifiedMember): string {
+  return channelNameForMember(props.channels, member);
+}
+
+/** 序号/操作固定；模型名与来源用百分比，避免 `auto` + truncate 把列挤没。 */
+const memberColumns = [
+  { width: '3.5rem' },
+  { width: '40%' },
+  { width: '36%' },
+  { width: '6.5rem' },
+];
+
+/** 勾选固定；模型名与渠道对分剩余。 */
+const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
 </script>
 
 <template>
@@ -182,41 +247,65 @@ function onDrop(index: number) {
         <div>
           <p class="form-field-label mb-2">{{ t('models.unifiedMembers') }}</p>
           <DataTablePanel>
-            <div class="seed-scrollbar max-h-56 overflow-y-auto">
-              <Table data-testid="unified-member-list">
+            <div class="virtual-table-scroll seed-scrollbar bounded-table-3 overflow-auto">
+              <table
+                class="w-full table-fixed caption-bottom text-sm"
+                data-testid="unified-member-list"
+              >
+                <colgroup>
+                  <col
+                    v-for="(column, index) in memberColumns"
+                    :key="index"
+                    :style="{ width: column.width }"
+                  />
+                </colgroup>
                 <TableHeader>
                   <TableRow>
                     <TableHead class="w-10">{{ t('models.memberIndex') }}</TableHead>
                     <TableHead>{{ t('pricing.model') }}</TableHead>
+                    <TableHead>{{ t('models.unifiedSources') }}</TableHead>
                     <TableHead align="center">{{ t('common.actions') }}</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  <!-- HTML5 拖拽落点在行上；键盘重排由上/下按钮承担。 -->
-                  <!-- eslint-disable vuejs-accessibility/no-static-element-interactions -->
                   <TableRow
                     v-for="(member, index) in editorMembers"
-                    :key="member"
-                    draggable="true"
+                    :key="unifiedMemberKey(member)"
+                    :class="rowDropClass(index)"
                     data-testid="unified-member"
-                    :data-member="member"
-                    @dragstart="onDragStart(index, $event)"
-                    @dragover.prevent
-                    @drop.prevent="onDrop(index)"
+                    :data-member="member.model"
+                    :data-channel="pinnedChannelName(member)"
+                    @dragover.prevent="onDragOver(index, $event)"
+                    @drop.prevent="onDrop"
                   >
                     <TableCell class="text-fg-muted font-mono text-xs">
                       <span class="inline-flex items-center gap-1">
                         <button
                           type="button"
                           class="text-fg-muted cursor-grab"
+                          draggable="true"
                           :aria-label="t('models.unifiedDragHandle')"
+                          @dragstart="onHandleDragStart(index, $event)"
+                          @dragend="onDragEnd"
                         >
                           <UiIcon name="grip-vertical" :size="14" />
                         </button>
                         {{ index + 1 }}
                       </span>
                     </TableCell>
-                    <TableCell class="font-mono text-sm">{{ member }}</TableCell>
+                    <TableCell
+                      truncate
+                      class="font-mono text-sm select-text"
+                      :title="member.model"
+                      >{{ member.model }}</TableCell
+                    >
+                    <TableCell>
+                      <OverflowChips
+                        v-if="pinnedChannelName(member)"
+                        :items="[pinnedChannelName(member)]"
+                        chip-test-id="unified-source-channel"
+                      />
+                    </TableCell>
                     <TableCell align="center">
                       <span class="inline-flex items-center justify-center gap-0.5">
                         <button
@@ -243,7 +332,7 @@ function onDrop(index: number) {
                           type="button"
                           class="btn btn-ghost btn-icon"
                           data-testid="unified-member-remove"
-                          :aria-label="t('models.unifiedRemoveMember', { name: member })"
+                          :aria-label="t('models.unifiedRemoveMember', { name: member.model })"
                           @click="removeMember(member)"
                         >
                           <UiIcon name="close" :size="14" />
@@ -251,39 +340,72 @@ function onDrop(index: number) {
                       </span>
                     </TableCell>
                   </TableRow>
-                  <!-- eslint-enable vuejs-accessibility/no-static-element-interactions -->
                   <TableRow v-if="editorMembers.length === 0">
-                    <TableCell :colspan="3" class="h-20 whitespace-normal">
+                    <TableCell :colspan="4" class="h-20 whitespace-normal">
                       <EmptyState :title="t('models.unifiedMembersEmpty')" />
                     </TableCell>
                   </TableRow>
                 </TableBody>
-              </Table>
+              </table>
             </div>
           </DataTablePanel>
-          <div v-if="addOptions.length > 0" class="mt-2 flex items-end gap-2">
-            <FormField
-              class="min-w-0 flex-1"
-              field-name="addMember"
-              :label="t('models.unifiedAddMember')"
-              :input-id="addInputId"
-            >
-              <UiSelect
-                :id="addInputId"
-                v-model="addSelection"
-                :options="addOptions"
-                data-testid="unified-add-select"
-              />
-            </FormField>
-            <button
-              type="button"
-              class="btn mb-0.5"
-              data-testid="unified-add-member"
-              @click="addMember"
-            >
-              {{ t('models.unifiedAdd') }}
-            </button>
+        </div>
+
+        <div>
+          <p class="form-field-label mb-2">{{ t('models.unifiedPick') }}</p>
+          <div class="mb-2 flex flex-wrap items-center gap-2">
+            <SearchInput
+              :id="`unified-pick-search-${uid}`"
+              v-model="searchText"
+              class="max-w-sm"
+              data-testid="unified-pick-search"
+              :placeholder="t('models.search')"
+              :aria-label="t('models.search')"
+            />
+            <FacetedFilter
+              v-model="selectedChannels"
+              :title="t('models.channels')"
+              :options="channelOptions"
+              test-id="unified-pick-channel-filter"
+            />
           </div>
+          <DataTablePanel class="h-56" data-testid="unified-pick-list">
+            <VirtualTable
+              class="h-full"
+              :rows="pickerRows"
+              :colspan="3"
+              :columns="pickColumns"
+              :get-row-key="(row) => inventoryRowKey(row)"
+              :empty-title="t('models.unifiedPickEmpty')"
+            >
+              <template #header>
+                <TableRow>
+                  <TableHead class="w-10" />
+                  <TableHead>{{ t('pricing.model') }}</TableHead>
+                  <TableHead>{{ t('models.channels') }}</TableHead>
+                </TableRow>
+              </template>
+              <template #row="{ row }">
+                <TableRow
+                  data-testid="unified-pick"
+                  :data-model="row.name"
+                  :data-channel="row.channelName"
+                >
+                  <TableCell>
+                    <Checkbox
+                      :model-value="isMember(row)"
+                      data-testid="unified-pick-check"
+                      @update:model-value="(value) => toggleMember(row, value)"
+                    />
+                  </TableCell>
+                  <TableCell truncate class="font-mono text-sm" :title="row.name">{{
+                    row.name
+                  }}</TableCell>
+                  <TableCell truncate :title="row.channelName">{{ row.channelName }}</TableCell>
+                </TableRow>
+              </template>
+            </VirtualTable>
+          </DataTablePanel>
         </div>
 
         <FormField

@@ -226,7 +226,10 @@ onUnmounted(() => {
         <UiIcon name="close" :size="16" />
       </button>
     </div>
-    <div class="min-h-0 flex-1 overflow-y-auto">
+    <div
+      class="min-h-0 flex-1"
+      :class="lockedSize ? 'flex flex-col overflow-hidden' : 'overflow-y-auto'"
+    >
       <slot />
     </div>
   </div>

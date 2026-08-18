@@ -25,6 +25,19 @@ async fn admin_json(
         .expect("管理请求应可达")
 }
 
+async fn first_channel_id(gw: &TestGateway) -> i64 {
+    let channels: Value = reqwest::Client::new()
+        .get(format!("{}/channels", gw.admin_base_url()))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("渠道列表应可达")
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    channels[0]["id"].as_i64().expect("应有渠道 id")
+}
+
 /// 以指定令牌拉 OpenAI 形状的模型列表（Chat Completions / Responses 客户端）。
 async fn list_openai(gw: &TestGateway, token: &str) -> reqwest::Response {
     reqwest::Client::new()
@@ -196,11 +209,16 @@ async fn list_models_follows_token_group_on_all_protocols() {
 #[tokio::test]
 async fn hide_drops_collected_members_but_keeps_them_callable() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = first_channel_id(&gw).await;
     let unified = admin_json(
         &gw,
         reqwest::Method::POST,
         "/unified-models",
-        json!({ "id": "coding", "models": [TEST_MODEL], "hide": true }),
+        json!({
+            "id": "coding",
+            "models": [{ "channel_id": channel_id, "model": TEST_MODEL }],
+            "hide": true
+        }),
     )
     .await;
     assert_eq!(unified.status(), reqwest::StatusCode::CREATED);

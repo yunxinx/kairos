@@ -151,6 +151,7 @@ mod tests {
             timeout_ms: 1000,
             max_retries: 0,
             enabled: true,
+            model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
         }
     }
 

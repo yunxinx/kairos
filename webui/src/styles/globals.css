@@ -763,52 +763,24 @@ html[lang='zh-CN'] {
   padding: 16px;
 }
 
-/* 设置页：左菜单与右详情各为一张卡片，窄屏改为上下 */
-.settings-layout {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 1rem;
+.virtual-table-scroll [data-slot='table-head'] {
+  position: sticky;
+  top: 0;
+  z-index: 2;
 }
-.settings-nav {
-  display: flex;
-  flex-direction: row;
-  flex-shrink: 0;
-  overflow-x: auto;
-  padding: 6px;
-  gap: 2px;
+
+[data-slot='table-row'].drop-insert-before {
+  box-shadow: inset 0 2px 0 0 var(--seed-primary);
 }
-.settings-nav-item {
-  appearance: none;
-  flex-shrink: 0;
-  padding: 8px 12px;
-  border: none;
-  border-radius: calc(var(--seed-radius) - 1px);
-  background: transparent;
-  color: var(--fg-muted);
-  font-size: 13px;
-  font-weight: 500;
-  text-align: left;
-  cursor: pointer;
-  white-space: nowrap;
+
+[data-slot='table-row'].drop-insert-after {
+  box-shadow: inset 0 -2px 0 0 var(--seed-primary);
 }
-.settings-nav-item:hover {
-  color: var(--seed-fg);
-  background: var(--seed-surface-alt);
+
+.bounded-table-3 {
+  height: calc(2.5rem + 3 * 2.75rem);
 }
-.settings-nav-item:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-.settings-nav-item[aria-current='page'] {
-  color: var(--seed-fg);
-  font-weight: 600;
-  background: var(--seed-surface-alt);
-}
-.settings-panel {
-  min-width: 0;
-  flex: 1;
-}
+
 .settings-fields-row {
   display: grid;
   grid-template-columns: 1fr;
@@ -818,20 +790,6 @@ html[lang='zh-CN'] {
 @media (min-width: 640px) {
   .settings-fields-row {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  }
-}
-@media (min-width: 768px) {
-  .settings-layout {
-    flex-direction: row;
-    align-items: flex-start;
-  }
-  .settings-nav {
-    width: 12rem;
-    flex-direction: column;
-    overflow-x: visible;
-  }
-  .settings-nav-item {
-    width: 100%;
   }
 }
 
