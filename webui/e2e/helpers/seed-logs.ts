@@ -18,6 +18,7 @@ export interface SeedLogInput {
   input_tokens?: number;
   output_tokens?: number;
   cost_usd_micros?: number;
+  settled?: boolean;
   request_body?: Uint8Array | null;
   response_body?: Uint8Array | null;
 }
@@ -44,8 +45,8 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
          status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens,
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros,
          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros,
-         request_body, response_body
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?)`,
+         settled, request_body, response_body
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
     );
     const ids: number[] = [];
     db.exec('BEGIN');
@@ -64,8 +65,50 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
           log.input_tokens ?? 0,
           log.output_tokens ?? 0,
           log.cost_usd_micros ?? 0,
+          log.settled === false ? 0 : 1,
           log.request_body ?? null,
           log.response_body ?? null,
+        );
+        ids.push(Number(result.lastInsertRowid));
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+    return ids;
+  } finally {
+    db.close();
+  }
+}
+
+/** 播种一条系统日志时需要变化的字段。 */
+export interface SeedSystemLogInput {
+  created_at?: number;
+  level?: string;
+  target: string;
+  message: string;
+}
+
+/** 把系统日志直接写入 e2e 网关 SQLite。 */
+export function seedSystemLogs(logs: SeedSystemLogInput[]): number[] {
+  const { dbPath } = readE2eRuntime();
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec('PRAGMA busy_timeout = 5000');
+    const stmt = db.prepare(
+      `INSERT INTO system_log (created_at, level, target, message) VALUES (?, ?, ?, ?)`,
+    );
+    const ids: number[] = [];
+    const now = Date.now();
+    db.exec('BEGIN');
+    try {
+      for (const [index, log] of logs.entries()) {
+        const result = stmt.run(
+          log.created_at ?? now - index,
+          log.level ?? 'error',
+          log.target,
+          log.message,
         );
         ids.push(Number(result.lastInsertRowid));
       }

@@ -27,6 +27,7 @@ const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } 
 
 const fullBody = ref(false);
 const maxRequestMb = ref('');
+const logBodyMb = ref('');
 const catalogIntervalDays = ref('0');
 const authThrottleMax = ref('');
 const authThrottleWindow = ref('');
@@ -36,6 +37,7 @@ const retryBackoffCapMs = ref('');
 const retryAfterCapSecs = ref('');
 /** 上次从接口载入的字节值；未改 MB 文案时原样回写，避免 0.00 显示把小字节上限抹掉。 */
 const loadedMaxRequestBytes = ref<number | null>(null);
+const loadedLogBodyBytes = ref<number | null>(null);
 const loadedSseReassemblyBytes = ref<number | null>(null);
 
 const settingsQuery = useQuery({
@@ -61,6 +63,8 @@ function applySettings(settings: Settings) {
   fullBody.value = settings.full_body;
   loadedMaxRequestBytes.value = settings.max_request_bytes;
   maxRequestMb.value = formatBytesAsMb(settings.max_request_bytes);
+  loadedLogBodyBytes.value = settings.log_body_max_bytes;
+  logBodyMb.value = formatBytesAsMb(settings.log_body_max_bytes);
   catalogIntervalDays.value = String(settings.catalog_sync_interval_days);
   authThrottleMax.value = String(settings.auth_throttle_max_failures);
   authThrottleWindow.value = String(settings.auth_throttle_window_secs);
@@ -88,15 +92,29 @@ function mbUnchanged(input: string, loaded: number | null): boolean {
 
 function handleSave() {
   const requestMbSame = mbUnchanged(maxRequestMb.value, loadedMaxRequestBytes.value);
+  const logBodyMbSame = mbUnchanged(logBodyMb.value, loadedLogBodyBytes.value);
   const sseMbSame = mbUnchanged(sseReassemblyMb.value, loadedSseReassemblyBytes.value);
-  if (!requestMbSame) {
+  if (!requestMbSame || !logBodyMbSame) {
     const isValid = validate(
       [
-        {
-          name: 'maxRequestBytes',
-          value: maxRequestMb.value,
-          rules: [{ kind: 'required' }, { kind: 'mb', min: 1 }],
-        },
+        ...(!requestMbSame
+          ? [
+              {
+                name: 'maxRequestBytes',
+                value: maxRequestMb.value,
+                rules: [{ kind: 'required' as const }, { kind: 'mb' as const, min: 1 }],
+              },
+            ]
+          : []),
+        ...(!logBodyMbSame
+          ? [
+              {
+                name: 'logBodyMaxBytes',
+                value: logBodyMb.value,
+                rules: [{ kind: 'required' as const }, { kind: 'mb' as const, min: 1 }],
+              },
+            ]
+          : []),
       ],
       t,
     );
@@ -109,6 +127,10 @@ function handleSave() {
     ? loadedMaxRequestBytes.value
     : parseMbToBytes(maxRequestMb.value);
   if (maxRequestBytes === null) return;
+  const logBodyMaxBytes = logBodyMbSame
+    ? loadedLogBodyBytes.value
+    : parseMbToBytes(logBodyMb.value);
+  if (logBodyMaxBytes === null) return;
 
   const gatewayValid = validate(
     [
@@ -182,6 +204,7 @@ function handleSave() {
   saveMutation.mutate({
     full_body: fullBody.value,
     max_request_bytes: maxRequestBytes,
+    log_body_max_bytes: logBodyMaxBytes,
     catalog_sync_interval_days: Number(catalogIntervalDays.value.trim()),
     auth_throttle_max_failures: Number(authThrottleMax.value.trim()),
     auth_throttle_window_secs: Number(authThrottleWindow.value.trim()),
@@ -366,6 +389,28 @@ const tabsAria = computed(() => t('settings.sections'));
                     :invalid="invalid"
                     :hint-id="hintId"
                     v-on="fieldInputHandlers('maxRequestBytes')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="logBodyMaxBytes"
+                layout="inline"
+                :label="t('settings.logBodyMaxBytes')"
+                input-id="settings-log-body-max-bytes"
+                :error="fieldError('logBodyMaxBytes')"
+                :guide="t('settings.logBodyMaxBytesGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-log-body-max-bytes"
+                    v-model="logBodyMb"
+                    type="text"
+                    inputmode="decimal"
+                    class="font-mono"
+                    data-testid="settings-log-body-max-bytes"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('logBodyMaxBytes')"
                   />
                 </template>
               </FormField>

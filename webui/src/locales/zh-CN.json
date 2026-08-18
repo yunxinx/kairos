@@ -20,7 +20,7 @@
     "channel": "渠道",
     "models": "模型",
     "settings": "设置",
-    "logs": "请求日志",
+    "logs": "日志",
     "logout": "退出"
   },
   "auth": {
@@ -384,9 +384,11 @@
       "catalog": "目录"
     },
     "fullBody": "记录完整请求与响应 body",
-    "fullBodyGuide": "开启后，后续请求会把完整 body 写入请求日志。",
+    "fullBodyGuide": "开启后，后续请求会把完整对话 body 明文写入 SQLite 请求日志。仅排障时使用，并配合下方日志 body 上限。",
     "maxRequestBytes": "入站请求体上限（MB）",
     "maxRequestBytesGuide": "超过该上限的请求会立即以 413 拒绝。最多两位小数。",
+    "logBodyMaxBytes": "请求日志 body 上限（MB）",
+    "logBodyMaxBytesGuide": "full_body 开启时单行请求/响应 body 的截断上限，与入站请求上限独立。最多两位小数。",
     "authThrottleMax": "认证失败次数上限",
     "authThrottleMaxGuide": "同一 IP 在窗口内认证失败达到该次数后返回 429。0 表示不限流。",
     "authThrottleWindow": "认证失败窗口（秒）",
@@ -425,8 +427,30 @@
     }
   },
   "logs": {
+    "kinds": "日志类型",
+    "kind": {
+      "request": "请求日志",
+      "system": "系统日志"
+    },
     "search": "搜索",
     "searchPlaceholder": "令牌 / 名称 / 模型 / 渠道",
+    "systemSearchPlaceholder": "目标 / 消息",
+    "settledFilter": "结算",
+    "settledYes": "已结算",
+    "settledNo": "未结算",
+    "settled": "结算",
+    "unsettled": "未结算",
+    "unsettledTotal": "未结算 {count} 条",
+    "levelFilter": "级别",
+    "targetFilter": "目标",
+    "levels": {
+      "error": "错误",
+      "warn": "警告",
+      "info": "信息"
+    },
+    "level": "级别",
+    "target": "目标",
+    "message": "消息",
     "model": "模型",
     "outboundModel": "出站模型",
     "clearFilters": "清除",

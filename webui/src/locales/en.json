@@ -20,7 +20,7 @@
     "channel": "Channels",
     "models": "Models",
     "settings": "Settings",
-    "logs": "Request logs",
+    "logs": "Logs",
     "logout": "Sign out"
   },
   "auth": {
@@ -384,9 +384,11 @@
       "catalog": "Catalog"
     },
     "fullBody": "Log full request and response bodies",
-    "fullBodyGuide": "When on, subsequent requests store complete bodies on the request log.",
+    "fullBodyGuide": "When on, subsequent requests store complete conversation bodies in plaintext in SQLite. Use only for troubleshooting, and keep the log body cap below.",
     "maxRequestBytes": "Inbound body limit (MB)",
     "maxRequestBytesGuide": "Requests larger than this are rejected with 413 immediately. Up to two decimal places.",
+    "logBodyMaxBytes": "Request log body cap (MB)",
+    "logBodyMaxBytesGuide": "When full_body is on, each request/response body is truncated to this size. Independent of the inbound request limit. Up to two decimal places.",
     "authThrottleMax": "Auth failure limit",
     "authThrottleMaxGuide": "After this many auth failures from one IP in the window, respond 429. 0 disables the limit.",
     "authThrottleWindow": "Auth failure window (seconds)",
@@ -425,8 +427,30 @@
     }
   },
   "logs": {
+    "kinds": "Log kinds",
+    "kind": {
+      "request": "Request logs",
+      "system": "System logs"
+    },
     "search": "Search",
     "searchPlaceholder": "Token, name, model or channel",
+    "systemSearchPlaceholder": "Target or message",
+    "settledFilter": "Settlement",
+    "settledYes": "Settled",
+    "settledNo": "Unsettled",
+    "settled": "Settled",
+    "unsettled": "Unsettled",
+    "unsettledTotal": "{count} unsettled",
+    "levelFilter": "Level",
+    "targetFilter": "Target",
+    "levels": {
+      "error": "Error",
+      "warn": "Warning",
+      "info": "Info"
+    },
+    "level": "Level",
+    "target": "Target",
+    "message": "Message",
     "model": "Model",
     "outboundModel": "Outbound model",
     "clearFilters": "Clear",

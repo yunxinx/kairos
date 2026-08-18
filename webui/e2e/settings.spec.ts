@@ -55,5 +55,13 @@ test.describe('settings page', () => {
 
     await page.reload();
     await expect(page.getByTestId('settings-full-body')).toBeChecked();
+    await expect(page.getByTestId('settings-log-body-max-bytes')).toBeVisible();
+    await page
+      .locator('[data-form-field="fullBody"]')
+      .getByRole('button', { name: /format and requirements|格式与填写说明/ })
+      .click();
+    await expect(page.locator('#settings-full-body-guide')).toContainText(
+      /plaintext in sqlite|明文写入 sqlite/i,
+    );
   });
 });

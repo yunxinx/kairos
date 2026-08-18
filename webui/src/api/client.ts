@@ -7,8 +7,9 @@ import type {
   ChannelProbeResult,
   ChannelView,
   LogQuery,
-  Page,
-  LogEntry,
+  LogPage,
+  SystemLogQuery,
+  SystemLogPage,
   ModelGroup,
   Price,
   CatalogModel,
@@ -33,6 +34,10 @@ function buildQuery(params: object): string {
     if (Array.isArray(value)) {
       const joined = value.filter((item) => item !== undefined && item !== '').join(',');
       if (joined) search.set(key, joined);
+      continue;
+    }
+    if (typeof value === 'boolean') {
+      search.set(key, value ? 'true' : 'false');
       continue;
     }
     if (typeof value !== 'string' && typeof value !== 'number') continue;
@@ -223,8 +228,12 @@ export const apiClient = {
     return apiFetch('/catalog/sync', { method: 'POST' });
   },
 
-  queryLogs(query: LogQuery = {}): Promise<Page<LogEntry>> {
+  queryLogs(query: LogQuery = {}): Promise<LogPage> {
     return apiFetch(`/logs${buildQuery(query)}`);
+  },
+
+  querySystemLogs(query: SystemLogQuery = {}): Promise<SystemLogPage> {
+    return apiFetch(`/system-logs${buildQuery(query)}`);
   },
 
   getStats(days?: number): Promise<StatsView> {

@@ -117,6 +117,8 @@ export interface UnifiedModel {
 export interface Settings {
   full_body: boolean;
   max_request_bytes: number;
+  /** 请求日志 body 截断上限（字节）；与入站上限独立。 */
+  log_body_max_bytes: number;
   /** 价格目录自动同步间隔（天）；`0` 表示只手动同步。 */
   catalog_sync_interval_days: number;
   /** 同一 IP 窗口内允许的认证失败次数；`0` 表示关闭限流。 */
@@ -219,6 +221,11 @@ export interface Page<T> {
   total: number;
 }
 
+/** 请求日志分页：额外带未结算条数，便于对账。 */
+export interface LogPage extends Page<LogEntry> {
+  unsettled_total: number;
+}
+
 /** 日志列表查询。 */
 export interface LogQuery {
   token_key?: string;
@@ -227,8 +234,34 @@ export interface LogQuery {
   keyword?: string;
   from_created_at?: number;
   to_created_at?: number;
+  settled?: boolean;
   page?: number;
   page_size?: number;
+}
+
+/** 系统日志条目。 */
+export interface SystemLogEntry {
+  id: number;
+  created_at: number;
+  level: string;
+  target: string;
+  message: string;
+}
+
+/** 系统日志查询。`level` / `target` 为分面多选，请求时拼成逗号列表。 */
+export interface SystemLogQuery {
+  keyword?: string;
+  from_created_at?: number;
+  to_created_at?: number;
+  level?: string[];
+  target?: string[];
+  page?: number;
+  page_size?: number;
+}
+
+/** 系统日志分页：额外带当前过滤下出现过的 target，供分面筛选。 */
+export interface SystemLogPage extends Page<SystemLogEntry> {
+  targets: string[];
 }
 
 /** `/stats` 汇总卡片。 */

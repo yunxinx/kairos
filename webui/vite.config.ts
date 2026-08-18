@@ -17,6 +17,7 @@ const adminApiPrefixes = [
   '/catalog',
   '/settings',
   '/logs',
+  '/system-logs',
   '/stats',
 ];
 

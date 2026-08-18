@@ -1,5 +1,5 @@
 import { authedTest as test, expect } from './fixtures';
-import { seedRequestLogs, utf8Bytes } from './helpers/seed-logs';
+import { seedRequestLogs, seedSystemLogs, utf8Bytes } from './helpers/seed-logs';
 import { usdLabel } from './helpers/usd';
 
 test.describe.configure({ mode: 'serial' });
@@ -55,7 +55,7 @@ test.describe('request logs page', () => {
     ]);
 
     await page.goto('/requests');
-    await expect(page.getByRole('heading', { name: /request logs/i })).toBeVisible();
+    await expect(page.getByRole('tab', { name: /request logs/i })).toBeVisible();
 
     await page.locator('#logs-search').fill('sk-e2e-logs-page');
 
@@ -134,5 +134,74 @@ test.describe('request logs page', () => {
     await row.getByTestId('log-expand').click();
     await expect(page.getByTestId('log-outbound-model')).toHaveText('gpt-4o-mini');
     await expect(page.getByTestId('log-detail-channel')).toHaveText('alias-channel');
+  });
+
+  test('filters unsettled request logs and lists system logs on a separate tab', async ({
+    page,
+  }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-settled',
+        token_name: 'Settled',
+        model: 'e2e-settled-model',
+        channel: 'e2e-settled-channel',
+        status_code: 200,
+        cost_usd_micros: 100,
+        settled: true,
+      },
+      {
+        created_at: Date.now() - 1_000,
+        token_key: 'sk-e2e-unsettled',
+        token_name: 'Unsettled',
+        model: 'e2e-unsettled-model',
+        channel: 'e2e-unsettled-channel',
+        status_code: 200,
+        cost_usd_micros: 200,
+        settled: false,
+      },
+    ]);
+    seedSystemLogs([
+      {
+        level: 'error',
+        target: 'billing',
+        message: 'e2e settlement failed',
+      },
+      {
+        level: 'warn',
+        target: 'catalog',
+        message: 'e2e catalog warning',
+      },
+    ]);
+
+    await page.goto('/requests');
+    await expect(page.getByTestId('logs-unsettled-total')).toContainText('1');
+    await page.getByTestId('logs-settled-filter').click();
+    await page
+      .locator('[data-testid="logs-settled-filter-option"][data-value="false"]')
+      .click();
+    await expect(page.getByTestId('log-row')).toHaveCount(1);
+    await expect(page.getByTestId('log-unsettled')).toBeVisible();
+    await expect(page.locator('[data-testid="log-row"][data-model="e2e-unsettled-model"]')).toBeVisible();
+
+    await page.getByTestId('logs-tab-system').click();
+    await expect(page.getByTestId('system-log-row')).toHaveCount(2);
+    await page.getByTestId('system-logs-level-filter').click();
+    await page
+      .locator('[data-testid="system-logs-level-filter-option"][data-value="warn"]')
+      .click();
+    await expect(page.getByTestId('system-log-row')).toHaveCount(1);
+    await expect(page.getByTestId('system-log-target')).toHaveText('catalog');
+    await expect(page.getByTestId('system-log-message')).toContainText('e2e catalog warning');
+
+    await page.keyboard.press('Escape');
+    await page.getByTestId('system-logs-clear-filters').click();
+    await page.getByTestId('system-logs-target-filter').click();
+    await page
+      .locator('[data-testid="system-logs-target-filter-option"][data-value="billing"]')
+      .click();
+    await expect(page.getByTestId('system-log-row')).toHaveCount(1);
+    await expect(page.getByTestId('system-log-target')).toHaveText('billing');
+    await expect(page.getByTestId('system-log-message')).toContainText('e2e settlement failed');
   });
 });

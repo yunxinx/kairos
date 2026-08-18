@@ -48,7 +48,14 @@ function statusBadgeClass(statusCode: number): string {
       {{ entry.latency_ms }} ms
     </TableCell>
     <TableCell class="font-mono text-sm" data-testid="log-cost">
-      {{ formatUsdMicros(entry.cost_usd_micros) }}
+      <span>{{ formatUsdMicros(entry.cost_usd_micros) }}</span>
+      <span
+        v-if="!entry.settled"
+        class="text-fg-muted ml-1 text-xs"
+        data-testid="log-unsettled"
+      >
+        {{ t('logs.unsettled') }}
+      </span>
     </TableCell>
     <TableCell align="right" class="w-10">
       <button
