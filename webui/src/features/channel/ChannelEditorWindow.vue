@@ -606,6 +606,14 @@ function handleSave() {
                     >
                       <UiIcon name="close" :size="12" />
                     </button>
+                    <p
+                      v-if="fieldError('addModel')"
+                      :id="`${addModelInputId}-error`"
+                      class="form-field-hint"
+                      role="alert"
+                    >
+                      {{ fieldError('addModel') }}
+                    </p>
                   </div>
                   <button
                     type="button"
@@ -616,14 +624,6 @@ function handleSave() {
                     {{ t('channel.addModel') }}
                   </button>
                 </div>
-                <p
-                  v-if="fieldError('addModel')"
-                  :id="`${addModelInputId}-error`"
-                  class="form-field-hint"
-                  role="alert"
-                >
-                  {{ fieldError('addModel') }}
-                </p>
               </div>
             </fieldset>
             <FormField

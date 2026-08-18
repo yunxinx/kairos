@@ -316,15 +316,15 @@ function applyQuick(deltaUsd: number) {
                   :hint-id="`${amountInputId}-error`"
                   v-on="fieldInputHandlers('amount')"
                 />
+                <p
+                  v-if="fieldError('amount')"
+                  :id="`${amountInputId}-error`"
+                  class="form-field-hint"
+                  role="alert"
+                >
+                  {{ fieldError('amount') }}
+                </p>
               </div>
-              <p
-                v-if="fieldError('amount')"
-                :id="`${amountInputId}-error`"
-                class="form-field-hint"
-                role="alert"
-              >
-                {{ fieldError('amount') }}
-              </p>
             </div>
             <!-- 算式容器与输入框同高（2.25rem）并底对齐，数字恰好落在输入框中线上。 -->
             <div

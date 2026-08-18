@@ -1327,9 +1327,6 @@ html[lang='zh-CN'] .font-serif {
 .form-field-inline .form-field-control {
   margin-top: 0;
   flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
 }
 .form-field-inline .form-field-control :is(.input, .select) {
   width: auto;
@@ -1377,11 +1374,15 @@ html[lang='zh-CN'] .font-serif {
   outline: 1px solid color-mix(in srgb, var(--fg-muted) 35%, transparent);
   outline-offset: 1px;
 }
+/* 叠在控件下方的悬浮气泡：不占文档流，避免撑开表单；不贴到控件右侧，以免被浮窗 overflow 裁切。 */
 .form-field-hint {
-  position: relative;
-  margin-top: 6px;
-  width: 100%;
-  max-width: 16rem;
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 1;
+  width: max-content;
+  max-width: min(16rem, 100%);
+  margin: 0;
   padding: 6px 10px;
   font-size: 11px;
   line-height: 1.45;
@@ -1414,8 +1415,16 @@ html[lang='zh-CN'] .font-serif {
   border-color: transparent transparent var(--danger-bg) transparent;
 }
 
+/* 有错误气泡时抬高该字段，避免被后续控件盖住。 */
+[data-form-field]:has(.form-field-hint) {
+  position: relative;
+  z-index: 2;
+}
+
 .form-field-inline .form-field-hint {
-  max-width: min(16rem, 100%);
+  left: auto;
+  right: 0;
+  max-width: 16rem;
 }
 
 .form-field-inline .form-field-hint::before {
