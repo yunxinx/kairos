@@ -1641,6 +1641,10 @@ async fn settings_write_takes_effect_immediately() {
     let settings: Value = resp.json().await.expect("设置应可解析");
     assert_eq!(settings["full_body"], false);
     assert!(settings["max_request_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        settings["max_response_bytes"],
+        kairos::store::resources::DEFAULT_MAX_RESPONSE_BYTES
+    );
     assert_eq!(settings["log_body_max_bytes"], 1024 * 1024);
     assert_eq!(settings["auth_throttle_max_failures"], 30);
     assert_eq!(settings["auth_throttle_window_secs"], 60);
@@ -1716,6 +1720,25 @@ async fn settings_gateway_knobs_roundtrip_and_validation() {
         .expect("设置应可解析");
     assert_eq!(got["auth_throttle_max_failures"], 2);
     assert_eq!(got["sse_reassembly_max_bytes"], 4_000_000);
+
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({
+            "full_body": false,
+            "max_request_bytes": 1_000_000,
+            "max_response_bytes": 2_000_000,
+            "sse_reassembly_max_bytes": 4_000_000,
+            "retry_backoff_ms": 100,
+            "retry_backoff_cap_ms": 1_000,
+            "retry_after_cap_secs": 10,
+            "rate_limit_rpm": 90
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let settings: Value = resp.json().await.expect("设置应可解析");
+    assert_eq!(settings["max_response_bytes"], 2_000_000);
 
     let resp = admin_put(
         &gw,
@@ -2448,6 +2471,15 @@ async fn new_endpoints_structured_errors() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = resp.json().await.expect("应返回结构化错误");
     assert_eq!(body["error"]["code"], "invalid_body");
+
+    // 设置：max_response_bytes=0 → 400。
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({ "full_body": false, "max_request_bytes": 100, "max_response_bytes": 0 }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 设置：log_body_max_bytes=0 → 400。
     let resp = admin_put(

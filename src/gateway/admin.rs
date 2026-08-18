@@ -845,6 +845,11 @@ fn validate_settings(settings: &Settings) -> Result<(), AdminError> {
             "max_request_bytes 必须大于 0".to_string(),
         ));
     }
+    if settings.max_response_bytes == 0 {
+        return Err(AdminError::InvalidBody(
+            "max_response_bytes 必须大于 0".to_string(),
+        ));
+    }
     if settings.auth_throttle_window_secs == 0 {
         return Err(AdminError::InvalidBody(
             "auth_throttle_window_secs 必须大于 0".to_string(),

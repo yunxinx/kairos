@@ -119,6 +119,8 @@ export interface UnifiedModel {
 export interface Settings {
   full_body: boolean;
   max_request_bytes: number;
+  /** 上游非流式响应体上限（字节）；与入站上限独立。 */
+  max_response_bytes: number;
   /** 请求日志 body 截断上限（字节）；与入站上限独立。 */
   log_body_max_bytes: number;
   /** 价格目录自动同步间隔（天）；`0` 表示只手动同步。 */

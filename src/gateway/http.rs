@@ -256,6 +256,59 @@ async fn read_body_with_limit(
     Ok(collected.freeze())
 }
 
+/// 按字节上限读取上游响应体；声明长度或实际读取超过上限立即停止。
+async fn read_upstream_body(
+    resp: reqwest::Response,
+    max_bytes: u64,
+) -> Result<bytes::Bytes, LimitedBodyError> {
+    if let Some(declared) = resp.content_length()
+        && declared > max_bytes
+    {
+        return Err(LimitedBodyError::TooLarge);
+    }
+    use futures_util::StreamExt as _;
+    let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let mut collected = BytesMut::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| LimitedBodyError::ReadFailed)?;
+        if collected.len().saturating_add(chunk.len()) > max {
+            return Err(LimitedBodyError::TooLarge);
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    Ok(collected.freeze())
+}
+
+/// 读取上游非流式或错误响应体；超限或读失败转为可换渠道的 Retryable。
+async fn take_upstream_body(
+    resp: reqwest::Response,
+    channel: &str,
+    max_bytes: u64,
+    read_failed: &str,
+) -> Result<bytes::Bytes, Outbound> {
+    match read_upstream_body(resp, max_bytes).await {
+        Ok(body) => Ok(body),
+        Err(LimitedBodyError::TooLarge) => Err(oversized_upstream_response(channel, max_bytes)),
+        Err(LimitedBodyError::ReadFailed) => Err(Outbound::Retryable {
+            channel: channel.to_string(),
+            status: None,
+            retry_after: None,
+            message: read_failed.to_string(),
+        }),
+    }
+}
+
+/// 上游响应超过 `max_response_bytes`：可换渠道重试，不把超大体读进内存。
+fn oversized_upstream_response(channel: &str, max_bytes: u64) -> Outbound {
+    Outbound::Retryable {
+        channel: channel.to_string(),
+        status: None,
+        retry_after: None,
+        message: format!("上游响应超过上限 {max_bytes} 字节"),
+    }
+}
+
 /// 入站协议格式的 413。认证之后调用时可归因到令牌；认证前调用则不落日志。
 async fn payload_too_large(
     deps: &Deps,
@@ -1059,8 +1112,18 @@ async fn passthrough_stream_completion(
     let status_code = resp.status().as_u16();
     if !resp.status().is_success() {
         let retry_after = parse_retry_after(resp.headers());
-        let upstream_body = resp.text().await.unwrap_or_default();
-        let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+        let upstream_body = match take_upstream_body(
+            resp,
+            &channel.name,
+            ctx.snapshot.max_response_bytes,
+            "直通流式上游读体失败",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(outbound) => return outbound,
+        };
+        let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
         if is_retryable_status(status_code) {
             return Outbound::Retryable {
                 channel: channel.name.clone(),
@@ -1163,16 +1226,15 @@ async fn passthrough_non_stream_completion(
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
     let retry_after = parse_retry_after(resp.headers());
     let idle = channel_idle(channel.timeout_ms);
-    let upstream_body = match tokio::time::timeout(idle, resp.bytes()).await {
+    let max_bytes = ctx.snapshot.max_response_bytes;
+    let upstream_body = match tokio::time::timeout(
+        idle,
+        take_upstream_body(resp, &channel.name, max_bytes, "直通非流式上游读体失败"),
+    )
+    .await
+    {
         Ok(Ok(body)) => body,
-        Ok(Err(_)) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "直通非流式上游读体失败".to_string(),
-            };
-        }
+        Ok(Err(outbound)) => return outbound,
         Err(_) => {
             return Outbound::Retryable {
                 channel: channel.name.clone(),
@@ -1494,8 +1556,18 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
     let status = resp.status();
     let status_code = status.as_u16();
     let retry_after = parse_retry_after(resp.headers());
-    let upstream_body = resp.text().await.unwrap_or_default();
-    let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+    let upstream_body = match take_upstream_body(
+        resp,
+        &channel.name,
+        snapshot.max_response_bytes,
+        "上游读体失败",
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(outbound) => return outbound,
+    };
+    let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
 
     if status.is_success() {
         // 解码上游响应为 IR，结算费用，再重编码为入站协议返回。
@@ -1633,8 +1705,18 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
     // 上游非 2xx：SSE 流此时尚未开始，直接按错误处理。
     if !status.is_success() {
         let retry_after = parse_retry_after(resp.headers());
-        let upstream_body = resp.text().await.unwrap_or_default();
-        let parsed = serde_json::from_str::<Value>(&upstream_body).unwrap_or(Value::Null);
+        let upstream_body = match take_upstream_body(
+            resp,
+            &channel.name,
+            ctx.snapshot.max_response_bytes,
+            "流式上游读体失败",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(outbound) => return outbound,
+        };
+        let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
         if is_retryable_status(status_code) {
             return Outbound::Retryable {
                 channel: channel.name.clone(),

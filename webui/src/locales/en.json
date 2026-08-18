@@ -389,6 +389,8 @@
     "fullBodyGuide": "When on, subsequent requests store complete conversation bodies in plaintext in SQLite. Use only for troubleshooting, and keep the log body cap below.",
     "maxRequestBytes": "Inbound body limit (MB)",
     "maxRequestBytesGuide": "Requests larger than this are rejected with 413 immediately. Up to two decimal places.",
+    "maxResponseBytes": "Outbound response body limit (MB)",
+    "maxResponseBytesGuide": "Oversized non-stream upstream bodies fail over to the next channel instead of being read into memory. Up to two decimal places.",
     "logBodyMaxBytes": "Request log body cap (MB)",
     "logBodyMaxBytesGuide": "When full_body is on, each request/response body is truncated to this size. Independent of the inbound request limit. Up to two decimal places.",
     "authThrottleMax": "Auth failure limit",

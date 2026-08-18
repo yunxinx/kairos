@@ -27,6 +27,7 @@ const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } 
 
 const fullBody = ref(false);
 const maxRequestMb = ref('');
+const maxResponseMb = ref('');
 const logBodyMb = ref('');
 const catalogIntervalDays = ref('0');
 const authThrottleMax = ref('');
@@ -38,6 +39,7 @@ const retryAfterCapSecs = ref('');
 const rateLimitRpm = ref('');
 /** 上次从接口载入的字节值；未改 MB 文案时原样回写，避免 0.00 显示把小字节上限抹掉。 */
 const loadedMaxRequestBytes = ref<number | null>(null);
+const loadedMaxResponseBytes = ref<number | null>(null);
 const loadedLogBodyBytes = ref<number | null>(null);
 const loadedSseReassemblyBytes = ref<number | null>(null);
 
@@ -64,6 +66,8 @@ function applySettings(settings: Settings) {
   fullBody.value = settings.full_body;
   loadedMaxRequestBytes.value = settings.max_request_bytes;
   maxRequestMb.value = formatBytesAsMb(settings.max_request_bytes);
+  loadedMaxResponseBytes.value = settings.max_response_bytes;
+  maxResponseMb.value = formatBytesAsMb(settings.max_response_bytes);
   loadedLogBodyBytes.value = settings.log_body_max_bytes;
   logBodyMb.value = formatBytesAsMb(settings.log_body_max_bytes);
   catalogIntervalDays.value = String(settings.catalog_sync_interval_days);
@@ -96,6 +100,7 @@ function handleSave() {
   const requestMbSame = mbUnchanged(maxRequestMb.value, loadedMaxRequestBytes.value);
   const logBodyMbSame = mbUnchanged(logBodyMb.value, loadedLogBodyBytes.value);
   const sseMbSame = mbUnchanged(sseReassemblyMb.value, loadedSseReassemblyBytes.value);
+  const responseMbSame = mbUnchanged(maxResponseMb.value, loadedMaxResponseBytes.value);
   if (!requestMbSame || !logBodyMbSame) {
     const isValid = validate(
       [
@@ -155,6 +160,15 @@ function handleSave() {
             },
           ]
         : []),
+      ...(!responseMbSame
+        ? [
+            {
+              name: 'maxResponseBytes',
+              value: maxResponseMb.value,
+              rules: [{ kind: 'required' as const }, { kind: 'mb' as const, min: 1 }],
+            },
+          ]
+        : []),
       {
         name: 'retryBackoffMs',
         value: retryBackoffMs.value,
@@ -186,6 +200,10 @@ function handleSave() {
     ? loadedSseReassemblyBytes.value
     : parseMbToBytes(sseReassemblyMb.value);
   if (sseReassemblyMax === null) return;
+  const maxResponseBytes = responseMbSame
+    ? loadedMaxResponseBytes.value
+    : parseMbToBytes(maxResponseMb.value);
+  if (maxResponseBytes === null) return;
   const backoffMs = Number(retryBackoffMs.value.trim());
   const backoffCapMs = Number(retryBackoffCapMs.value.trim());
   if (backoffCapMs < backoffMs) {
@@ -211,6 +229,7 @@ function handleSave() {
   saveMutation.mutate({
     full_body: fullBody.value,
     max_request_bytes: maxRequestBytes,
+    max_response_bytes: maxResponseBytes,
     log_body_max_bytes: logBodyMaxBytes,
     catalog_sync_interval_days: Number(catalogIntervalDays.value.trim()),
     auth_throttle_max_failures: Number(authThrottleMax.value.trim()),
@@ -467,6 +486,28 @@ const tabsAria = computed(() => t('settings.sections'));
                     :invalid="invalid"
                     :hint-id="hintId"
                     v-on="fieldInputHandlers('authThrottleWindow')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="maxResponseBytes"
+                layout="inline"
+                :label="t('settings.maxResponseBytes')"
+                input-id="settings-max-response-bytes"
+                :error="fieldError('maxResponseBytes')"
+                :guide="t('settings.maxResponseBytesGuide')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="settings-max-response-bytes"
+                    v-model="maxResponseMb"
+                    type="text"
+                    inputmode="decimal"
+                    class="font-mono"
+                    data-testid="settings-max-response-bytes"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('maxResponseBytes')"
                   />
                 </template>
               </FormField>

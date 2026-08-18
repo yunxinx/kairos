@@ -389,6 +389,8 @@
     "fullBodyGuide": "开启后，后续请求会把完整对话 body 明文写入 SQLite 请求日志。仅排障时使用，并配合下方日志 body 上限。",
     "maxRequestBytes": "入站请求体上限（MB）",
     "maxRequestBytesGuide": "超过该上限的请求会立即以 413 拒绝。最多两位小数。",
+    "maxResponseBytes": "出站响应体上限（MB）",
+    "maxResponseBytesGuide": "上游非流式响应超过该上限时换渠道重试，不把超大体读进内存。最多两位小数。",
     "logBodyMaxBytes": "请求日志 body 上限（MB）",
     "logBodyMaxBytesGuide": "full_body 开启时单行请求/响应 body 的截断上限，与入站请求上限独立。最多两位小数。",
     "authThrottleMax": "认证失败次数上限",
