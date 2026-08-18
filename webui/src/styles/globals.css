@@ -37,7 +37,7 @@
   --danger: #dc2626;
   --danger-bg: #fef2f2;
   --danger-filled: #dc2626;
-  --warn: #eab308;
+  --warn: #b45309;
   --warn-bg: #fefce8;
   --info: #3b82f6;
   --info-bg: #eff6ff;
@@ -58,14 +58,14 @@
   --focus-ring: 0 0 0 3px color-mix(in srgb, var(--seed-primary) 22%, transparent);
 }
 
-/* 深色：抬升表面层级与次要文字亮度，避免与背景融成一片 */
+/* 深色：底板保持原色；层次靠抬升次级表面与更实的硬阴影 */
 .dark {
   color-scheme: dark;
   --seed-bg: #111827;
   --seed-fg: #f3f4f8;
   --seed-surface: #1e293b;
-  --seed-surface-alt: #273548;
-  --seed-border: #475569;
+  --seed-surface-alt: #2a3a4f;
+  --seed-border: #52657c;
   --fg-muted: #cbd5e1;
   --fg-subtle: #94a3b8;
   --success: #4ade80;
@@ -78,16 +78,16 @@
   --info: #93c5fd;
   --info-bg: #1e3a8a;
   --proto-chat: #2dd4bf;
-  --proto-chat-bg: #134e4a;
+  --proto-chat-bg: color-mix(in srgb, var(--proto-chat) 16%, var(--seed-surface));
   --proto-responses: #a5b4fc;
-  --proto-responses-bg: #312e81;
+  --proto-responses-bg: color-mix(in srgb, var(--proto-responses) 16%, var(--seed-surface));
   --proto-anthropic: #fdba74;
-  --proto-anthropic-bg: #7c2d12;
+  --proto-anthropic-bg: color-mix(in srgb, var(--proto-anthropic) 16%, var(--seed-surface));
   /* 点阵：略弱于边框，但仍可感知 */
   --dot-color: color-mix(in srgb, var(--seed-border) 28%, var(--seed-bg));
   --primary-hover: #60a5fa;
   --primary-shadow: #1d4ed8;
-  --card-shadow: rgba(15, 23, 42, 0.45);
+  --card-shadow: rgba(0, 0, 0, 0.72);
   --blue-light: #60a5fa;
   --blue-lighter: #1e40af;
 }
@@ -198,6 +198,10 @@ html[lang='zh-CN'] {
 .font-serif {
   font-family: var(--font-serif);
   letter-spacing: -0.025em;
+}
+
+html[lang='zh-CN'] .font-serif {
+  letter-spacing: normal;
 }
 
 .font-serif:is(h1, h2, .home-title, .page-header-title) {
@@ -1324,8 +1328,8 @@ html[lang='zh-CN'] {
   margin-top: 0;
   flex-shrink: 0;
   display: flex;
-  align-items: center;
-  justify-content: flex-end;
+  flex-direction: column;
+  align-items: flex-end;
 }
 .form-field-inline .form-field-control :is(.input, .select) {
   width: auto;
@@ -1374,12 +1378,10 @@ html[lang='zh-CN'] {
   outline-offset: 1px;
 }
 .form-field-hint {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 1;
-  width: max-content;
-  max-width: min(100%, 16rem);
+  position: relative;
+  margin-top: 6px;
+  width: 100%;
+  max-width: 16rem;
   padding: 6px 10px;
   font-size: 11px;
   line-height: 1.45;
@@ -1412,55 +1414,18 @@ html[lang='zh-CN'] {
   border-color: transparent transparent var(--danger-bg) transparent;
 }
 
-@media (min-width: 640px) {
-  .form-field-hint {
-    top: 50%;
-    left: calc(100% + 8px);
-    max-width: 10rem;
-    transform: translateY(-50%);
-  }
+.form-field-inline .form-field-hint {
+  max-width: min(16rem, 100%);
+}
 
-  .form-field-hint::before {
-    left: -7px;
-    top: 50%;
-    transform: translateY(-50%);
-    border-width: 6px 7px 6px 0;
-    border-color: transparent var(--danger) transparent transparent;
-  }
+.form-field-inline .form-field-hint::before {
+  left: auto;
+  right: 12px;
+}
 
-  .form-field-hint::after {
-    left: -4px;
-    top: 50%;
-    transform: translateY(-50%);
-    border-width: 4px 5px 4px 0;
-    border-color: transparent var(--danger-bg) transparent transparent;
-  }
-
-  .form-field-inline .form-field-hint {
-    top: calc(100% + 6px);
-    left: auto;
-    right: 0;
-    max-width: min(16rem, calc(100vw - 32px));
-    transform: none;
-  }
-
-  .form-field-inline .form-field-hint::before {
-    left: auto;
-    right: 12px;
-    top: -7px;
-    transform: none;
-    border-width: 0 6px 7px 6px;
-    border-color: transparent transparent var(--danger) transparent;
-  }
-
-  .form-field-inline .form-field-hint::after {
-    left: auto;
-    right: 14px;
-    top: -4px;
-    transform: none;
-    border-width: 0 4px 5px 4px;
-    border-color: transparent transparent var(--danger-bg) transparent;
-  }
+.form-field-inline .form-field-hint::after {
+  left: auto;
+  right: 14px;
 }
 
 .form-hint-enter-active,
@@ -1473,13 +1438,6 @@ html[lang='zh-CN'] {
 .form-hint-leave-to {
   opacity: 0;
   transform: translateY(-4px);
-}
-
-@media (min-width: 640px) {
-  .form-hint-enter-from,
-  .form-hint-leave-to {
-    transform: translateY(-50%) translateX(-4px);
-  }
 }
 
 .select {

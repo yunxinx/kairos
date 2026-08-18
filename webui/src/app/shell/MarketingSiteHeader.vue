@@ -14,7 +14,7 @@ const { showMarketingChrome } = useShellMode();
     v-if="showMarketingChrome"
     class="site-header max-w-content px-page-x h-topnav mx-auto flex w-full items-center justify-between"
   >
-    <Link to="/" class="site-brand font-serif text-lg tracking-tight">{{ t('app.title') }}</Link>
+    <Link to="/" class="site-brand font-serif text-lg">{{ t('app.title') }}</Link>
     <div class="flex items-center gap-3">
       <LocaleToggle />
       <ThemeToggle />

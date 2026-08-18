@@ -46,7 +46,7 @@ onUnmounted(() => {
         >
           {{ t('home.kicker') }}
         </p>
-        <h1 class="home-title font-serif font-normal tracking-tight" data-reveal>
+        <h1 class="home-title font-serif font-normal" data-reveal>
           {{ t('home.headline') }}
         </h1>
         <p class="home-lead text-fg-muted" data-reveal>
