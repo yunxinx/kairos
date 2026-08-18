@@ -279,6 +279,8 @@ pub struct Price {
 pub const SETTING_FULL_BODY: &str = "full_body";
 /// 运行时开关键：入站请求体大小上限（字节）。
 pub const SETTING_MAX_REQUEST_BYTES: &str = "max_request_bytes";
+/// 运行时开关键：请求日志 body 截断上限（字节），与入站请求上限独立。
+pub const SETTING_LOG_BODY_MAX_BYTES: &str = "log_body_max_bytes";
 /// 运行时开关键：价格目录自动同步间隔（天）；`0` 表示只手动同步。
 pub const SETTING_CATALOG_SYNC_INTERVAL_DAYS: &str = "catalog_sync_interval_days";
 /// 运行时开关键：同一 IP 窗口内允许的认证失败次数；`0` 表示关闭限流。
@@ -299,6 +301,9 @@ pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 /// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片，与参考网关 bifrost
 /// 的 `max_request_body_size_mb: 100` 对齐。
 pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 100 * 1024 * 1024;
+/// 请求日志 body 截断缺省值（字节）：full_body 开启时单行日志的封顶，避免复用
+/// 入站 100MB 上限把 SQLite 撑慢。
+pub const DEFAULT_LOG_BODY_MAX_BYTES: u64 = 1024 * 1024;
 /// 认证失败限流次数缺省值。
 pub const DEFAULT_AUTH_THROTTLE_MAX_FAILURES: u64 = 30;
 /// 认证失败计数窗口缺省值（秒）。
@@ -336,6 +341,10 @@ fn default_retry_backoff_cap_ms() -> u64 {
 fn default_retry_after_cap_secs() -> u64 {
     DEFAULT_RETRY_AFTER_CAP_SECS
 }
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_log_body_max_bytes() -> u64 {
+    DEFAULT_LOG_BODY_MAX_BYTES
+}
 
 /// 运行时设置的聚合契约：日志、网关保护与价格目录同步间隔。
 ///
@@ -350,6 +359,9 @@ pub struct Settings {
     pub full_body: bool,
     /// 入站请求体大小上限（字节）。
     pub max_request_bytes: u64,
+    /// 请求日志 body 截断上限（字节）；与 `max_request_bytes` 独立。
+    #[serde(default = "default_log_body_max_bytes")]
+    pub log_body_max_bytes: u64,
     /// 价格目录自动同步间隔（天）；`0` 表示只手动同步。
     #[serde(default)]
     pub catalog_sync_interval_days: u64,
@@ -378,6 +390,7 @@ impl Default for Settings {
         Self {
             full_body: false,
             max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            log_body_max_bytes: DEFAULT_LOG_BODY_MAX_BYTES,
             catalog_sync_interval_days: 0,
             auth_throttle_max_failures: DEFAULT_AUTH_THROTTLE_MAX_FAILURES,
             auth_throttle_window_secs: DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
@@ -972,6 +985,12 @@ pub async fn upsert_settings(
         conn,
         SETTING_MAX_REQUEST_BYTES,
         &Value::from(settings.max_request_bytes),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_LOG_BODY_MAX_BYTES,
+        &Value::from(settings.log_body_max_bytes),
     )
     .await?;
     set_setting(

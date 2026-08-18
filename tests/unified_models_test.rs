@@ -408,6 +408,19 @@ async fn ordered_failover_tries_one_member_at_a_time() {
     assert_eq!(ups[1].received()[0]["model"], "pricey");
 }
 
+/// 首成员返回 400（请求本身有问题）时不再 hop 到下一成员。
+#[tokio::test]
+async fn client_error_400_does_not_try_next_member() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, two_member_seed).await;
+    ups[0].set_behavior(UpstreamBehavior::Status(400));
+    ups[1].set_behavior(UpstreamBehavior::Json(completion_body("pricey", 1000, 0)));
+
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, "bundle").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(ups[0].received().len(), 1, "先打 cheap");
+    assert_eq!(ups[1].received().len(), 0, "400 不应 hop 到下一成员");
+}
+
 /// 同名挂两条渠道是两条独立成员：只打钉死的渠道，失败不扩到同名另一条。
 #[tokio::test]
 async fn same_name_on_two_channels_are_independent_members() {

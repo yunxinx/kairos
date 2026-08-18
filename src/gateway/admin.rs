@@ -118,6 +118,7 @@ pub fn router(
         .route("/catalog/meta", get(get_catalog_meta))
         .route("/catalog/sync", post(sync_catalog))
         .route("/logs", get(query_logs))
+        .route("/system-logs", get(query_system_logs))
         .route("/stats", get(get_stats))
         .route("/stats/lifetime", get(get_lifetime_stats))
         .route_layer(middleware::from_fn_with_state(
@@ -295,7 +296,8 @@ async fn create_token(
 
 /// 整体替换令牌（按路径 `token_key`，路径权威）：写库 + 换快照 + 返回新令牌。
 ///
-/// upsert 的冲突分支不触碰创建时间与最后使用时间，属性编辑不重置生命周期元数据。
+/// 不存在则 404，不借 PUT 隐式创建（与 POST 只生成系统 key 对齐）。upsert 的冲突
+/// 分支不触碰创建时间与最后使用时间，属性编辑不重置生命周期元数据。
 async fn update_token(
     State(deps): State<AdminDeps>,
     Path(token_key): Path<String>,
@@ -306,6 +308,7 @@ async fn update_token(
     token.model_group = token.model_group.trim().to_string();
     validate_token(&token)?;
     reject_unknown_group(&deps, &token.model_group).await?;
+    read_token_record(&deps, &token.token_key).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_token(&mut tx, &token, super::logging::unix_millis())
         .await
@@ -865,6 +868,11 @@ fn validate_settings(settings: &Settings) -> Result<(), AdminError> {
             "retry_after_cap_secs 必须大于 0".to_string(),
         ));
     }
+    if settings.log_body_max_bytes == 0 {
+        return Err(AdminError::InvalidBody(
+            "log_body_max_bytes 必须大于 0".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -893,8 +901,8 @@ struct CatalogQuery {
     provider_id: Option<String>,
 }
 
-/// 把逗号分隔的 `provider_id` 拆成精确匹配列表；空段丢弃。
-fn parse_catalog_provider_ids(raw: Option<&str>) -> Vec<String> {
+/// 把逗号分隔的查询参数拆成精确匹配列表；空段丢弃。
+fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
     raw.unwrap_or("")
         .split(',')
         .map(str::trim)
@@ -916,7 +924,7 @@ async fn get_catalog(
         .as_deref()
         .map(str::trim)
         .filter(|keyword| !keyword.is_empty());
-    let provider_ids = parse_catalog_provider_ids(params.provider_id.as_deref());
+    let provider_ids = parse_comma_list(params.provider_id.as_deref());
     let view = crate::store::catalog::load_catalog_view(&deps.pool, q, &provider_ids)
         .await
         .map_err(AdminError::Store)?;
@@ -1034,6 +1042,7 @@ struct LogQueryParams {
     keyword: Option<String>,
     from_created_at: Option<i64>,
     to_created_at: Option<i64>,
+    settled: Option<bool>,
     page: Option<u64>,
     page_size: Option<u64>,
 }
@@ -1103,6 +1112,8 @@ struct LogPage {
     page: u64,
     page_size: u64,
     total: u64,
+    /// 当前过滤条件下 `settled = false` 的条数（忽略 settled 查询维）。
+    unsettled_total: u64,
 }
 
 /// 分页查询请求日志（时间倒序），按令牌/模型/综合关键字/时间范围过滤，只读。
@@ -1123,16 +1134,88 @@ async fn query_logs(
     filter.keyword = params.keyword.filter(|keyword| !keyword.trim().is_empty());
     filter.from_created_at = params.from_created_at;
     filter.to_created_at = params.to_created_at;
+    filter.settled = params.settled;
 
-    let (rows, total) = store::query_request_log_page(&deps.pool, &filter)
+    let (rows, total, unsettled_total) = store::query_request_log_page(&deps.pool, &filter)
         .await
         .map_err(AdminError::Store)?;
-    let items = rows.into_iter().map(LogEntry::from_store_log).collect();
     Ok(Json(LogPage {
-        items,
+        items: rows.into_iter().map(LogEntry::from_store_log).collect(),
         page: filter.page,
         page_size: filter.page_size,
         total,
+        unsettled_total,
+    }))
+}
+
+/// `/system-logs` 查询参数：关键字、时间窗、级别与目标可选。
+///
+/// `level` / `target` 为逗号分隔列表；axum 标准 `Query` 不会把重复键收成 `Vec`。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SystemLogQueryParams {
+    keyword: Option<String>,
+    from_created_at: Option<i64>,
+    to_created_at: Option<i64>,
+    level: Option<String>,
+    target: Option<String>,
+    page: Option<u64>,
+    page_size: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemLogEntry {
+    id: i64,
+    created_at: i64,
+    level: String,
+    target: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SystemLogPage {
+    items: Vec<SystemLogEntry>,
+    page: u64,
+    page_size: u64,
+    total: u64,
+    /// 当前关键字/时间/级别下出现过的 target，供分面筛选。
+    targets: Vec<String>,
+}
+
+/// 分页查询系统日志（时间倒序）。
+async fn query_system_logs(
+    State(deps): State<AdminDeps>,
+    query: Result<Query<SystemLogQueryParams>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<SystemLogPage>, AdminError> {
+    let params = query
+        .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
+        .0;
+    let mut filter =
+        store::SystemLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
+    filter.keyword = params.keyword.filter(|keyword| !keyword.trim().is_empty());
+    filter.from_created_at = params.from_created_at;
+    filter.to_created_at = params.to_created_at;
+    filter.levels = parse_comma_list(params.level.as_deref());
+    filter.targets = parse_comma_list(params.target.as_deref());
+    let page = store::query_system_log_page(&deps.pool, &filter)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(SystemLogPage {
+        items: page
+            .items
+            .into_iter()
+            .map(|log| SystemLogEntry {
+                id: log.id,
+                created_at: log.created_at,
+                level: log.level,
+                target: log.target,
+                message: log.message,
+            })
+            .collect(),
+        page: filter.page,
+        page_size: filter.page_size,
+        total: page.total,
+        targets: page.targets,
     }))
 }
 
@@ -1697,10 +1780,15 @@ async fn enroll_channel_models(
 
 // --- 输入校验 ---
 
-/// 校验令牌字段：键/名非空、累计上限非负。
+/// 校验令牌字段：键/名非空、key 仅 ASCII 字母数字与 `._-`、累计上限非负。
 fn validate_token(token: &Token) -> Result<(), AdminError> {
     if token.token_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("token_key 不能为空".to_string()));
+    }
+    if !token_key_charset_ok(&token.token_key) {
+        return Err(AdminError::InvalidBody(
+            "token_key 仅允许 ASCII 字母、数字与 ._-".to_string(),
+        ));
     }
     if token.name.trim().is_empty() {
         return Err(AdminError::InvalidBody("name 不能为空".to_string()));
@@ -1716,6 +1804,12 @@ fn validate_token(token: &Token) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody("model_group 不能为空".to_string()));
     }
     Ok(())
+}
+
+/// 令牌 key 字符集：系统生成的 `ks-` + 字母数字，以及测试/存量 ASCII key。
+fn token_key_charset_ok(key: &str) -> bool {
+    key.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// 规整模型组：名字去空白；可调用名去空白、拒空串、保序去重。
@@ -1870,13 +1964,16 @@ fn reject_non_http_url(raw: &str) -> Result<(), AdminError> {
     }
 }
 
-/// 与 Web UI `maskTokenKey` 同款：长度大于 16 时保留前后 8 位，中间固定六个 `*`。
+/// 与 Web UI `maskTokenKey` 同款：按 Unicode 标量计长度，大于 16 时保留前后 8 个字符。
 fn mask_token_key(key: &str) -> String {
     const EDGE: usize = 8;
-    if key.len() <= EDGE * 2 {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= EDGE * 2 {
         key.to_string()
     } else {
-        format!("{}******{}", &key[..EDGE], &key[key.len() - EDGE..])
+        let prefix: String = chars[..EDGE].iter().collect();
+        let suffix: String = chars[chars.len() - EDGE..].iter().collect();
+        format!("{prefix}******{suffix}")
     }
 }
 

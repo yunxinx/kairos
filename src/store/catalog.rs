@@ -6,9 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
-use super::StoreError;
-use super::like_substring_pattern;
 use super::resources::{SETTING_CATALOG_SYNCED_AT, set_setting};
+use super::{StoreError, like_substring_pattern, push_column_in, push_where_cond};
 
 /// 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。
 ///
@@ -83,19 +82,14 @@ async fn list_catalog_models(
                 input_micros, output_micros, cache_read_micros, cache_write_micros \
          FROM catalog_models",
     );
+    let mut first = true;
     if let Some(keyword) = keyword {
         let pattern = like_substring_pattern(keyword);
-        qb.push(" WHERE model_id LIKE ");
+        push_where_cond(&mut qb, &mut first, "model_id LIKE ");
         qb.push_bind(pattern);
         qb.push(" ESCAPE '\\'");
-        if !provider_ids.is_empty() {
-            qb.push(" AND ");
-            push_provider_id_in(&mut qb, provider_ids);
-        }
-    } else if !provider_ids.is_empty() {
-        qb.push(" WHERE ");
-        push_provider_id_in(&mut qb, provider_ids);
     }
+    push_column_in(&mut qb, &mut first, "provider_id", provider_ids);
     qb.push(" ORDER BY provider_id, model_id");
 
     let rows = qb
@@ -104,16 +98,6 @@ async fn list_catalog_models(
         .await
         .map_err(StoreError::Query)?;
     rows.iter().map(map_catalog_model_row).collect()
-}
-
-/// 拼接 `provider_id IN (...)`；调用方负责前置 `WHERE` / `AND`。
-fn push_provider_id_in(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, provider_ids: &[String]) {
-    qb.push("provider_id IN (");
-    let mut separated = qb.separated(", ");
-    for id in provider_ids {
-        separated.push_bind(id);
-    }
-    separated.push_unseparated(")");
 }
 
 /// 按提供方名排序汇总目录提供方与模型数。

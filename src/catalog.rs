@@ -8,6 +8,7 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 use thiserror::Error;
 
+use crate::store;
 use crate::store::StoreError;
 use crate::store::catalog::{
     CatalogModel, CatalogView, catalog_synced_at, replace_catalog_models, set_catalog_synced_at,
@@ -171,7 +172,8 @@ async fn sync_if_due(
 pub async fn run_sync_loop(pool: SqlitePool, client: reqwest::Client) {
     loop {
         if let Err(err) = sync_if_due(&pool, &client).await {
-            eprintln!("价格目录定时同步失败: {err}");
+            store::record_system_error(&pool, "catalog", &format!("价格目录定时同步失败: {err}"))
+                .await;
         }
         tokio::time::sleep(SYNC_CHECK_INTERVAL).await;
     }

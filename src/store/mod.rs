@@ -1,11 +1,18 @@
 //! SQLite 存储层：版本化迁移 + 请求日志落库 + 令牌余额结算。
 //!
-//! 本模块承载请求日志（`request_log`）、冒烟记录（`smoke_probe`）与令牌计费
-//! 余额（`token_balance`）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats`
-//! 与 `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
+//! 本模块承载请求日志（`request_log`）、系统日志（`system_log`）、冒烟记录
+//! （`smoke_probe`）与令牌计费余额（`token_balance`）。金额一律整数 micro-USD
+//! （ADR-0002）。管理面 `/stats` 与 `/stats/lifetime` 聚合也在此查询（时间窗夹取
+//! 与日志分页同一惯例）。
 
 pub mod catalog;
 pub mod resources;
+mod system_log;
+
+pub use system_log::{
+    SystemLog, SystemLogList, SystemLogQuery, insert_system_log, query_system_log_page,
+    record_system_error,
+};
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -119,6 +126,15 @@ pub struct RequestLog {
 
 /// 落一条请求日志，返回插入的自增 id。
 pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i64, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    insert_request_log_on(&mut conn, log).await
+}
+
+/// 在已有连接/事务上插入请求日志，供结算与日志同事务提交。
+pub async fn insert_request_log_on(
+    conn: &mut SqliteConnection,
+    log: &RequestLog,
+) -> Result<i64, StoreError> {
     let result = sqlx::query(
         "INSERT INTO request_log \
          (created_at, token_name, token_key, inbound_protocol, model, outbound_model, channel, \
@@ -149,7 +165,7 @@ pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i
     .bind(log.settled as i64)
     .bind(&log.request_body)
     .bind(&log.response_body)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
 
@@ -290,6 +306,8 @@ pub struct RequestLogQuery {
     pub from_created_at: Option<i64>,
     /// 只返回 `created_at <= to_created_at`。
     pub to_created_at: Option<i64>,
+    /// 按是否已写入 `token_balance` 过滤；`None` 表示不限。
+    pub settled: Option<bool>,
     /// 页码，从 1 起。
     pub page: u64,
     /// 每页条数。
@@ -299,9 +317,10 @@ pub struct RequestLogQuery {
 impl RequestLogQuery {
     /// 用必填的分页参数构造查询，过滤维度缺省为空。
     pub fn new(page: u64, page_size: u64) -> Self {
+        let (page, page_size) = clamp_page(page, page_size);
         Self {
-            page: page.max(1),
-            page_size: page_size.clamp(1, 200),
+            page,
+            page_size,
             ..Self::default()
         }
     }
@@ -321,18 +340,7 @@ async fn query_request_logs_on(
     );
     push_request_log_filters(&mut qb, filter);
     qb.push(" ORDER BY id DESC");
-    // 分页参数在查询边界防御：`page`/`page_size` 可能为 0（`Default` 派生或
-    // 结构体字面量绕过构造器夹取），用 saturating 运算避免下溢。offset 再夹到
-    // `i64::MAX` 上限再转 i64，防止超大页码（如外部传入 u64::MAX）经 `as i64`
-    // 回绕成负偏移（SQLite 拒绝负 OFFSET 报错）；超大偏移只返回空页，优雅降级。
-    let page_size = filter.page_size.max(1);
-    let offset = filter
-        .page
-        .saturating_sub(1)
-        .saturating_mul(page_size)
-        .min(i64::MAX as u64);
-    qb.push(" LIMIT ").push_bind(page_size as i64);
-    qb.push(" OFFSET ").push_bind(offset as i64);
+    push_limit_offset(&mut qb, filter.page, filter.page_size);
 
     let rows = qb
         .build()
@@ -356,16 +364,22 @@ pub async fn query_request_logs(
     query_request_logs_on(&mut conn, filter).await
 }
 
-/// 在同一事务内读本页条目与总数，避免两次查询之间被新行插入导致 total 与 items 对不齐。
+/// 在同一事务内读本页条目、过滤总数与未结算条数。
+///
+/// 未结算计数套用同一套令牌/模型/关键字/时间过滤，但忽略 `settled` 维，
+/// 便于列表在「看全部」时仍提示有多少条待对账。
 pub async fn query_request_log_page(
     pool: &SqlitePool,
     filter: &RequestLogQuery,
-) -> Result<(Vec<RequestLog>, u64), StoreError> {
+) -> Result<(Vec<RequestLog>, u64, u64), StoreError> {
     let mut tx = pool.begin().await.map_err(StoreError::Query)?;
     let logs = query_request_logs_on(&mut tx, filter).await?;
     let total = count_request_logs_on(&mut tx, filter).await?;
+    let mut unsettled_filter = filter.clone();
+    unsettled_filter.settled = Some(false);
+    let unsettled_total = count_request_logs_on(&mut tx, &unsettled_filter).await?;
     tx.commit().await.map_err(StoreError::Query)?;
-    Ok((logs, total))
+    Ok((logs, total, unsettled_total))
 }
 
 /// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
@@ -382,7 +396,7 @@ async fn count_request_logs_on(
         .await
         .map_err(StoreError::Query)?;
     let count: i64 = row.try_get("cnt").map_err(StoreError::Query)?;
-    Ok(count.max(0) as u64)
+    Ok(as_count(count))
 }
 
 /// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
@@ -696,8 +710,78 @@ async fn count_rows(pool: &SqlitePool, sql: &'static str) -> Result<u64, StoreEr
 }
 
 /// SQLite 聚合整数转计数；负值视为 0。
-fn as_count(value: i64) -> u64 {
+pub(crate) fn as_count(value: i64) -> u64 {
     value.max(0) as u64
+}
+
+/// 页码从 1 起，每页条数夹到 `[1, 200]`。请求日志与系统日志共用。
+pub(crate) fn clamp_page(page: u64, page_size: u64) -> (u64, u64) {
+    (page.max(1), page_size.clamp(1, 200))
+}
+
+/// 向查询拼接一个条件：首个条件以 `WHERE` 开头，其余以 `AND` 连接。
+pub(crate) fn push_where_cond(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    first: &mut bool,
+    condition: &str,
+) {
+    qb.push(if *first { " WHERE " } else { " AND " });
+    *first = false;
+    qb.push(condition);
+}
+
+/// 可选时间窗：`created_at >= from` 与 `created_at <= to`。
+pub(crate) fn push_created_at_range(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    first: &mut bool,
+    from: Option<i64>,
+    to: Option<i64>,
+) {
+    if let Some(from) = from {
+        push_where_cond(qb, first, "created_at >= ");
+        qb.push_bind(from);
+    }
+    if let Some(to) = to {
+        push_where_cond(qb, first, "created_at <= ");
+        qb.push_bind(to);
+    }
+}
+
+/// 非空时拼接 `column IN (...)`。`column` 仅允许调用方硬编码的标识符。
+pub(crate) fn push_column_in(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    first: &mut bool,
+    column: &'static str,
+    values: &[String],
+) {
+    if values.is_empty() {
+        return;
+    }
+    push_where_cond(qb, first, column);
+    qb.push(" IN (");
+    let mut separated = qb.separated(", ");
+    for value in values {
+        separated.push_bind(value);
+    }
+    separated.push_unseparated(")");
+}
+
+/// 分页 LIMIT/OFFSET：页码与每页条数在边界防御，超大偏移只返回空页。
+pub(crate) fn push_limit_offset(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    page: u64,
+    page_size: u64,
+) {
+    // `page`/`page_size` 可能为 0（`Default` 派生或结构体字面量绕过构造器夹取），
+    // saturating 避免下溢。offset 夹到 `i64::MAX` 再转 i64，防止超大页码经
+    // `as i64` 回绕成负偏移（SQLite 拒绝负 OFFSET）。
+    let page_size = page_size.max(1);
+    let offset = page
+        .saturating_sub(1)
+        .saturating_mul(page_size)
+        .min(i64::MAX as u64);
+    qb.push(" LIMIT ").push_bind(page_size as i64);
+    qb.push(" OFFSET ").push_bind(offset as i64);
 }
 
 /// 把 `filter` 中非空条件以 AND 拼入 WHERE 子句。
@@ -728,13 +812,10 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
         qb.push_bind(pattern);
         qb.push(" ESCAPE '\\')");
     }
-    if let Some(from) = filter.from_created_at {
-        push_where_cond(qb, &mut first, "created_at >= ");
-        qb.push_bind(from);
-    }
-    if let Some(to) = filter.to_created_at {
-        push_where_cond(qb, &mut first, "created_at <= ");
-        qb.push_bind(to);
+    push_created_at_range(qb, &mut first, filter.from_created_at, filter.to_created_at);
+    if let Some(settled) = filter.settled {
+        push_where_cond(qb, &mut first, "settled = ");
+        qb.push_bind(settled as i64);
     }
 }
 
@@ -750,13 +831,6 @@ pub(crate) fn like_substring_pattern(keyword: &str) -> String {
     }
     pattern.push('%');
     pattern
-}
-
-/// 向查询拼接一个条件：首个条件以 `WHERE` 开头，其余以 `AND` 连接。
-fn push_where_cond(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, first: &mut bool, condition: &str) {
-    qb.push(if *first { " WHERE " } else { " AND " });
-    *first = false;
-    qb.push(condition);
 }
 
 /// 把请求日志行映射为 `RequestLog`。
@@ -1537,5 +1611,89 @@ mod tests {
 
         let lifetime = query_lifetime_stats(&pool).await.expect("应能聚合");
         assert_eq!(lifetime.cost_usd_micros, 100, "未结算费用不应计入");
+    }
+
+    fn sample_log(created_at: i64, settled: bool) -> RequestLog {
+        RequestLog {
+            id: 0,
+            created_at,
+            token_name: "t".to_string(),
+            token_key: "sk-a".to_string(),
+            inbound_protocol: "openai_chat".to_string(),
+            model: "m".to_string(),
+            outbound_model: None,
+            channel: "c".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            price: PriceSnapshot::default(),
+            cost_usd_micros: 1,
+            settled,
+            request_body: None,
+            response_body: None,
+        }
+    }
+
+    /// 请求日志分页的 settled 过滤；未结算计数忽略 settled 维。
+    #[tokio::test]
+    async fn request_log_page_filters_settled_and_counts_unsettled() {
+        let (_dir, pool) = test_pool().await;
+        insert_request_log(&pool, &sample_log(1, false))
+            .await
+            .expect("应能写未结算日志");
+        insert_request_log(&pool, &sample_log(2, true))
+            .await
+            .expect("应能写已结算日志");
+
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.settled = Some(false);
+        let (rows, total, unsettled_total) = query_request_log_page(&pool, &filter)
+            .await
+            .expect("应能分页");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].settled);
+        assert_eq!(total, 1);
+        assert_eq!(unsettled_total, 1);
+    }
+
+    /// 系统日志分页与关键字过滤。
+    #[tokio::test]
+    async fn system_log_page_filters_by_keyword() {
+        let (_dir, pool) = test_pool().await;
+        insert_system_log(&pool, "error", "billing", "结算失败")
+            .await
+            .expect("应能写系统日志");
+        insert_system_log(&pool, "error", "catalog", "目录同步失败")
+            .await
+            .expect("应能写系统日志");
+
+        let mut filter = SystemLogQuery::new(1, 10);
+        filter.keyword = Some("billing".to_string());
+        let page = query_system_log_page(&pool, &filter)
+            .await
+            .expect("应能查询系统日志");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].target, "billing");
+        assert_eq!(page.items[0].message, "结算失败");
+        assert_eq!(page.targets, vec!["billing".to_string()]);
+
+        let mut by_level = SystemLogQuery::new(1, 10);
+        by_level.levels = vec!["warn".to_string()];
+        let empty = query_system_log_page(&pool, &by_level)
+            .await
+            .expect("应能按级别过滤");
+        assert_eq!(empty.total, 0);
+
+        let mut by_target = SystemLogQuery::new(1, 10);
+        by_target.targets = vec!["catalog".to_string()];
+        let catalog = query_system_log_page(&pool, &by_target)
+            .await
+            .expect("应能按目标过滤");
+        assert_eq!(catalog.total, 1);
+        assert_eq!(catalog.items[0].target, "catalog");
     }
 }

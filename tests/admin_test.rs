@@ -139,6 +139,7 @@ const PROTOCOL_FORBIDDEN_ADMIN_GETS: &[&str] = &[
     "/model-groups",
     "/settings",
     "/logs",
+    "/system-logs",
     "/stats",
     "/stats/lifetime",
     "/token",
@@ -395,6 +396,39 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
         reqwest::StatusCode::OK,
         "重新启用的令牌应立即可用"
     );
+}
+
+/// PUT 不存在的令牌返回 404，不隐式创建；非法字符 key 返回 400。
+#[tokio::test]
+async fn update_missing_token_is_404_and_invalid_key_charset_is_400() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let resp = admin_put(
+        &gw,
+        "/tokens/does-not-exist",
+        json!({
+            "token_key": "does-not-exist",
+            "name": "x",
+            "limit_usd_micros": null,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let resp = admin_put(
+        &gw,
+        "/tokens/sk-bad!key",
+        json!({
+            "token_key": "sk-bad!key",
+            "name": "x",
+            "limit_usd_micros": null,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "invalid_body");
 }
 
 /// 渠道与价格写后即时生效：渠道可路由、价格增减即时反映在计费准入。
@@ -1593,6 +1627,7 @@ async fn settings_write_takes_effect_immediately() {
     let settings: Value = resp.json().await.expect("设置应可解析");
     assert_eq!(settings["full_body"], false);
     assert!(settings["max_request_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(settings["log_body_max_bytes"], 1024 * 1024);
     assert_eq!(settings["auth_throttle_max_failures"], 30);
     assert_eq!(settings["auth_throttle_window_secs"], 60);
     assert_eq!(settings["sse_reassembly_max_bytes"], 8 * 1024 * 1024);
@@ -1882,6 +1917,7 @@ async fn logs_paginate_and_filter() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let page: Value = resp.json().await.expect("日志应可解析");
     assert_eq!(page["total"], 3);
+    assert_eq!(page["unsettled_total"], 0);
     assert_eq!(page["items"].as_array().unwrap().len(), 3);
     assert_eq!(page["items"][0]["model"], TEST_MODEL);
     assert_eq!(
@@ -2058,6 +2094,170 @@ async fn logs_redact_long_token_keys() {
     assert_eq!(long_entry["settled"], true);
 }
 
+/// GET `/logs` 按 Unicode 标量掩码多字节 token_key，不会按字节切片 panic。
+#[tokio::test]
+async fn logs_mask_multibyte_token_keys_without_panic() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let long_key = "测".repeat(20);
+    store::insert_request_log(
+        &gw.pool,
+        &store::RequestLog {
+            id: 0,
+            created_at: 1,
+            token_name: "mb".to_string(),
+            token_key: long_key.clone(),
+            inbound_protocol: "openai_chat".to_string(),
+            model: "m".to_string(),
+            outbound_model: None,
+            channel: "c".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            price: kairos::core::billing::PriceSnapshot::default(),
+            cost_usd_micros: 0,
+            settled: true,
+            request_body: None,
+            response_body: None,
+        },
+    )
+    .await
+    .expect("应能写多字节 key 日志");
+
+    let page: Value = admin_get(&gw, "/logs?page_size=10")
+        .await
+        .json()
+        .await
+        .expect("日志应可解析");
+    let items = page["items"].as_array().expect("应有 items");
+    let entry = items
+        .iter()
+        .find(|item| item["token_name"] == "mb")
+        .expect("应有多字节 key 行");
+    let chars: Vec<char> = long_key.chars().collect();
+    let expected: String = chars[..8]
+        .iter()
+        .chain(['*', '*', '*', '*', '*', '*'].iter())
+        .chain(chars[chars.len() - 8..].iter())
+        .collect();
+    assert_eq!(entry["token_key"], expected);
+}
+
+/// GET `/logs?settled=` 过滤，且 `unsettled_total` 忽略 settled 维。
+#[tokio::test]
+async fn logs_filter_settled_and_report_unsettled_total() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let mut row = store::RequestLog {
+        id: 0,
+        created_at: 1,
+        token_name: "u".to_string(),
+        token_key: "sk-unsettled".to_string(),
+        inbound_protocol: "openai_chat".to_string(),
+        model: "m".to_string(),
+        outbound_model: None,
+        channel: "c".to_string(),
+        status_code: 200,
+        latency_ms: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        price: kairos::core::billing::PriceSnapshot::default(),
+        cost_usd_micros: 9,
+        settled: false,
+        request_body: None,
+        response_body: None,
+    };
+    store::insert_request_log(&gw.pool, &row)
+        .await
+        .expect("应能写未结算日志");
+    row.created_at = 2;
+    row.token_name = "s".to_string();
+    row.token_key = "sk-settled".to_string();
+    row.settled = true;
+    store::insert_request_log(&gw.pool, &row)
+        .await
+        .expect("应能写已结算日志");
+
+    let all: Value = admin_get(&gw, "/logs?page_size=10")
+        .await
+        .json()
+        .await
+        .expect("日志应可解析");
+    assert_eq!(all["total"], 2);
+    assert_eq!(all["unsettled_total"], 1);
+
+    let open: Value = admin_get(&gw, "/logs?settled=false&page_size=10")
+        .await
+        .json()
+        .await
+        .expect("日志应可解析");
+    assert_eq!(open["total"], 1);
+    assert_eq!(open["unsettled_total"], 1);
+    assert_eq!(open["items"][0]["settled"], false);
+    assert_eq!(open["items"][0]["token_name"], "u");
+
+    let closed: Value = admin_get(&gw, "/logs?settled=true&page_size=10")
+        .await
+        .json()
+        .await
+        .expect("日志应可解析");
+    assert_eq!(closed["total"], 1);
+    assert_eq!(closed["unsettled_total"], 1);
+    assert_eq!(closed["items"][0]["settled"], true);
+}
+
+/// GET `/system-logs` 分页返回运维事件。
+#[tokio::test]
+async fn system_logs_list_inserted_rows() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    store::insert_system_log(&gw.pool, "error", "billing", "结算失败")
+        .await
+        .expect("应能写系统日志");
+    store::insert_system_log(&gw.pool, "error", "catalog", "目录同步失败")
+        .await
+        .expect("应能写系统日志");
+    store::insert_system_log(&gw.pool, "warn", "throttle", "限流触发")
+        .await
+        .expect("应能写系统日志");
+
+    let page: Value = admin_get(&gw, "/system-logs?keyword=billing")
+        .await
+        .json()
+        .await
+        .expect("系统日志应可解析");
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["items"][0]["target"], "billing");
+    assert_eq!(page["items"][0]["message"], "结算失败");
+    assert_eq!(page["targets"], json!(["billing"]));
+
+    let by_level: Value = admin_get(&gw, "/system-logs?level=error")
+        .await
+        .json()
+        .await
+        .expect("系统日志应可解析");
+    assert_eq!(by_level["total"], 2);
+    assert_eq!(by_level["targets"], json!(["billing", "catalog"]));
+
+    let by_warn: Value = admin_get(&gw, "/system-logs?level=warn")
+        .await
+        .json()
+        .await
+        .expect("系统日志应可解析");
+    assert_eq!(by_warn["total"], 1);
+    assert_eq!(by_warn["items"][0]["target"], "throttle");
+
+    let by_target: Value = admin_get(&gw, "/system-logs?target=catalog")
+        .await
+        .json()
+        .await
+        .expect("系统日志应可解析");
+    assert_eq!(by_target["total"], 1);
+    assert_eq!(by_target["items"][0]["target"], "catalog");
+}
+
 /// 新端点的非法输入返回结构化错误：设置上限为 0、未知设置字段、余额调不存在令牌、
 /// 日志非法查询参数。
 #[tokio::test]
@@ -2076,6 +2276,15 @@ async fn new_endpoints_structured_errors() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = resp.json().await.expect("应返回结构化错误");
     assert_eq!(body["error"]["code"], "invalid_body");
+
+    // 设置：log_body_max_bytes=0 → 400。
+    let resp = admin_put(
+        &gw,
+        "/settings",
+        json!({ "full_body": false, "max_request_bytes": 100, "log_body_max_bytes": 0 }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 设置：未知字段 → 400（deny_unknown_fields）。
     let resp = admin_put(

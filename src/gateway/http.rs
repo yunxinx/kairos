@@ -236,13 +236,14 @@ async fn read_body_with_limit(
     Ok(collected.freeze())
 }
 
-/// 入站协议格式的 413：超限时尚无令牌可归因，不落请求日志。
+/// 入站协议格式的 413。认证之后调用时可归因到令牌；认证前调用则不落日志。
 async fn payload_too_large(
     deps: &Deps,
     full_body: bool,
     started: i64,
     inbound_protocol: Protocol,
     max_request_bytes: u64,
+    token: Option<&Token>,
 ) -> Response {
     let message = format!("请求体超过上限 {max_request_bytes} 字节");
     error_response(
@@ -250,7 +251,7 @@ async fn payload_too_large(
         &message,
         deps,
         full_body,
-        None,
+        token,
         None,
         started,
         inbound_protocol,
@@ -279,53 +280,8 @@ async fn handle_request(
     let (parts, body) = request.into_parts();
     let headers = parts.headers;
 
-    // 0. 入站请求体上限：先看 Content-Length，声明即超限则不读 body（避免按声明长度
-    // 分配）；无 Content-Length（chunked）或声明未超限时，再按同一上限流式读取。
-    // 超限以入站协议错误格式拒绝（413）。超限请求尚无令牌可归因，不落请求日志。
-    if let Some(declared) = declared_content_length(&headers)
-        && declared > max_request_bytes
-    {
-        return payload_too_large(
-            &deps,
-            full_body,
-            started,
-            inbound_protocol,
-            max_request_bytes,
-        )
-        .await;
-    }
-    let body = match read_body_with_limit(body, max_request_bytes).await {
-        Ok(bytes) => bytes,
-        Err(LimitedBodyError::TooLarge) => {
-            return payload_too_large(
-                &deps,
-                full_body,
-                started,
-                inbound_protocol,
-                max_request_bytes,
-            )
-            .await;
-        }
-        Err(LimitedBodyError::ReadFailed) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "读取请求体失败",
-                &deps,
-                full_body,
-                None,
-                None,
-                started,
-                inbound_protocol,
-                None,
-            )
-            .await;
-        }
-    };
-
-    // 仅放行后的请求才为 full_body 预取请求字节，避免超限请求白分配一份待丢弃的拷贝。
-    let request_body_for_log = full_body.then(|| body.to_vec());
-
-    // 1. 认证：Bearer 或 x-api-key 两种头都接受。认证先行，未认证不出站。
+    // 1. 认证：只看请求头。限流与认证必须在缓冲 body 之前，避免未认证请求占满
+    // 最多 `max_request_bytes` 的内存，也让失败计数不必等 body 读完。
     if deps.auth_throttle.is_blocked(
         peer,
         snapshot.auth_throttle_max_failures,
@@ -340,7 +296,7 @@ async fn handle_request(
             None,
             started,
             inbound_protocol,
-            request_body_for_log,
+            None,
         )
         .await;
     }
@@ -362,13 +318,60 @@ async fn handle_request(
                 None,
                 started,
                 inbound_protocol,
-                request_body_for_log,
+                None,
             )
             .await;
         }
     };
 
-    // 2. 解码入站请求为 IR（同时用于准入与出站路径选择）。
+    // 2. 入站请求体上限：先看 Content-Length，声明即超限则不读 body；无
+    // Content-Length（chunked）或声明未超限时，再按同一上限流式读取。
+    if let Some(declared) = declared_content_length(&headers)
+        && declared > max_request_bytes
+    {
+        return payload_too_large(
+            &deps,
+            full_body,
+            started,
+            inbound_protocol,
+            max_request_bytes,
+            Some(token),
+        )
+        .await;
+    }
+    let body = match read_body_with_limit(body, max_request_bytes).await {
+        Ok(bytes) => bytes,
+        Err(LimitedBodyError::TooLarge) => {
+            return payload_too_large(
+                &deps,
+                full_body,
+                started,
+                inbound_protocol,
+                max_request_bytes,
+                Some(token),
+            )
+            .await;
+        }
+        Err(LimitedBodyError::ReadFailed) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "读取请求体失败",
+                &deps,
+                full_body,
+                Some(token),
+                None,
+                started,
+                inbound_protocol,
+                None,
+            )
+            .await;
+        }
+    };
+
+    // 仅放行后的请求才为 full_body 预取请求字节，避免超限请求白分配一份待丢弃的拷贝。
+    let request_body_for_log = full_body.then(|| body.to_vec());
+
+    // 3. 解码入站请求为 IR（同时用于准入与出站路径选择）。
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => {
@@ -535,8 +538,13 @@ async fn handle_request(
     // 准入连接只服务余额检查与 last_used；出站/结算另取连接，避免整段请求占着池槽。
     drop(conn);
 
-    // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。失败再下一条，成功即停。
-    // 同协议且该跳所有候选都不改写出站名时走直通快路径，否则经 IR 完整路径。
+    // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。
+    //
+    // 同渠道 failover 由 `run_failover` 处理（429/5xx 可重试，其它 4xx 为 Fatal
+    // 立即返回）。统一模型 hop 之间对齐 one-api `shouldRetry`：400 视为请求本身
+    // 有问题，不再打后续成员（bifrost 对 400/404/422 也不做 key 轮换）；429/5xx
+    // 及其余非 2xx 继续下一成员。hop 间不等待——成员钉在不同渠道，换成员不是
+    // 同渠道退避。
     let mut last_failure: Option<Response> = None;
     for hop in &hops {
         let response = dispatch_hop(
@@ -552,6 +560,9 @@ async fn handle_request(
         )
         .await;
         if response.status().is_success() {
+            return response;
+        }
+        if !should_try_next_hop(response.status()) {
             return response;
         }
         last_failure = Some(response);
@@ -1058,7 +1069,6 @@ async fn passthrough_non_stream_completion(
         let usage = protocol::sniff_usage(&parsed, channel.protocol).unwrap_or_default();
         let price = billed_price(ctx.snapshot, record, ctx.routed_model);
         let cost = billing::cost_micros(&usage, &price);
-        let settled = try_settle(&ctx.deps.pool, &ctx.token.token_key, cost).await;
         log_request(
             ctx.deps,
             ctx.token,
@@ -1071,7 +1081,6 @@ async fn passthrough_non_stream_completion(
                 usage,
                 price,
                 cost_usd_micros: cost,
-                settled,
                 request_body: ctx.request_body.clone(),
                 response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
             },
@@ -1241,7 +1250,6 @@ async fn pipe_passthrough_stream<S>(
     }
     // 流结束：按嗅探累积的 usage 结算并落日志。
     let cost = billing::cost_micros(&usage, &ctx.price);
-    let settled = try_settle(&ctx.deps.pool, &ctx.token.token_key, cost).await;
     log_request(
         &ctx.deps,
         &ctx.token,
@@ -1254,7 +1262,6 @@ async fn pipe_passthrough_stream<S>(
             usage,
             price: ctx.price,
             cost_usd_micros: cost,
-            settled,
             request_body: ctx.request_body.clone(),
             response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
@@ -1355,7 +1362,6 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                 ir.warnings.extend(request_warnings);
                 let usage = &ir.usage;
                 let cost = billing::cost_micros(usage, &price);
-                let settled = try_settle(&deps.pool, &token.token_key, cost).await;
                 let inbound = protocol::encode_response(&ir, inbound_protocol);
                 // full_body 记录实际返回下游的入站响应字节（重编码结果）；
                 // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
@@ -1374,7 +1380,6 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                         usage: usage.clone(),
                         price,
                         cost_usd_micros: cost,
-                        settled,
                         request_body: ctx.request_body.clone(),
                         response_body: inbound_wire,
                     },
@@ -1677,7 +1682,6 @@ fn record_frame_wire(ctx: &mut StreamTask, frame: &SseFrame) {
 async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
     let usage = &response.usage;
     let cost = billing::cost_micros(usage, &ctx.price);
-    let settled = try_settle(&ctx.deps.pool, &ctx.token.token_key, cost).await;
     log_request(
         &ctx.deps,
         &ctx.token,
@@ -1690,7 +1694,6 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
             usage: response.usage.clone(),
             price: ctx.price,
             cost_usd_micros: cost,
-            settled,
             request_body: ctx.request_body.clone(),
             response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
@@ -1736,6 +1739,19 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
+/// 统一模型 hop 是否继续下一成员。对齐 one-api `shouldRetry`：400 不换下一成员，
+/// 429/5xx 换；其余非 2xx（如 401/403）也换，因为可能是该成员渠道的密钥/权限问题。
+fn should_try_next_hop(status: StatusCode) -> bool {
+    let code = status.as_u16();
+    if is_retryable_status(code) {
+        return true;
+    }
+    if code == 400 || (200..300).contains(&code) {
+        return false;
+    }
+    true
+}
+
 /// 只解析 `Retry-After` 的 delta-seconds；HTTP-date 忽略。上限由设置
 /// `retry_after_cap_secs` 在退避时施加。
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -1756,26 +1772,6 @@ fn retry_backoff(snapshot: &RuntimeSnapshot) -> RetryBackoff {
 /// 流式空闲超时与非流式读体超时：渠道 `timeout_ms`，至少 1ms。
 fn channel_idle(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.max(1))
-}
-
-/// 尝试把费用写入 `token_balance`。`cost <= 0` 视为无需结算（已结清）。
-async fn try_settle(pool: &SqlitePool, token_key: &str, cost: i64) -> bool {
-    if cost <= 0 {
-        return true;
-    }
-    match pool.acquire().await {
-        Ok(mut conn) => match store::settle_charge(&mut conn, token_key, cost).await {
-            Ok(_) => true,
-            Err(err) => {
-                eprintln!("结算失败: {err}");
-                false
-            }
-        },
-        Err(err) => {
-            eprintln!("结算连接失败: {err}");
-            false
-        }
-    }
 }
 
 /// 日志用的出站模型名：按该渠道自己的别名表改写。
@@ -1857,7 +1853,6 @@ async fn error_response(
                 usage: Usage::default(),
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
-                settled: true,
                 request_body,
                 response_body: response_wire,
             },

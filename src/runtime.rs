@@ -17,15 +17,15 @@ use tokio::sync::RwLock;
 use crate::store::StoreError;
 use crate::store::resources::{
     self, SETTING_AUTH_THROTTLE_MAX_FAILURES, SETTING_AUTH_THROTTLE_WINDOW_SECS,
-    SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_MAX_REQUEST_BYTES,
-    SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS,
-    SETTING_SSE_REASSEMBLY_MAX_BYTES,
+    SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_LOG_BODY_MAX_BYTES,
+    SETTING_MAX_REQUEST_BYTES, SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS,
+    SETTING_RETRY_BACKOFF_MS, SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
 
 pub use crate::store::resources::{
     DEFAULT_AUTH_THROTTLE_MAX_FAILURES, DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
-    DEFAULT_MAX_REQUEST_BYTES, DEFAULT_RETRY_AFTER_CAP_SECS, DEFAULT_RETRY_BACKOFF_CAP_MS,
-    DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+    DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_RETRY_AFTER_CAP_SECS,
+    DEFAULT_RETRY_BACKOFF_CAP_MS, DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
 };
 
 /// 网关运行时资源的内存快照：不可变整体，原子替换。
@@ -48,6 +48,8 @@ pub struct RuntimeSnapshot {
     pub full_body: bool,
     /// 入站请求体大小上限（字节，来自 `max_request_bytes` 开关）。
     pub max_request_bytes: u64,
+    /// 请求日志 body 截断上限（字节，来自 `log_body_max_bytes` 开关）。
+    pub log_body_max_bytes: u64,
     /// 价格目录自动同步间隔（天，来自 `catalog_sync_interval_days`；`0` 为只手动）。
     pub catalog_sync_interval_days: u64,
     /// 同一 IP 窗口内允许的认证失败次数（`0` 关闭限流）。
@@ -85,6 +87,7 @@ impl RuntimeSnapshot {
         resources::Settings {
             full_body: self.full_body,
             max_request_bytes: self.max_request_bytes,
+            log_body_max_bytes: self.log_body_max_bytes,
             catalog_sync_interval_days: self.catalog_sync_interval_days,
             auth_throttle_max_failures: self.auth_throttle_max_failures,
             auth_throttle_window_secs: self.auth_throttle_window_secs,
@@ -142,6 +145,11 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         unified_models,
         full_body: load_full_body(&settings),
         max_request_bytes: load_max_request_bytes(&settings),
+        log_body_max_bytes: load_u64(
+            &settings,
+            SETTING_LOG_BODY_MAX_BYTES,
+            DEFAULT_LOG_BODY_MAX_BYTES,
+        ),
         catalog_sync_interval_days: load_catalog_sync_interval_days(&settings),
         auth_throttle_max_failures: load_u64(
             &settings,
@@ -248,6 +256,10 @@ mod tests {
         assert_eq!(
             snap.max_request_bytes, DEFAULT_MAX_REQUEST_BYTES,
             "body 上限缺省用默认值"
+        );
+        assert_eq!(
+            snap.log_body_max_bytes, DEFAULT_LOG_BODY_MAX_BYTES,
+            "日志 body 上限缺省 1MB"
         );
         assert_eq!(snap.catalog_sync_interval_days, 0, "目录同步缺省只手动");
         assert_eq!(

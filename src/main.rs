@@ -16,6 +16,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     let cfg = config::Config::load(&cli.config)?;
 
