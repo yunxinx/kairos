@@ -767,10 +767,14 @@ html[lang='zh-CN'] .font-serif {
   padding: 16px;
 }
 
-.virtual-table-scroll [data-slot='table-head'] {
-  position: sticky;
-  top: 0;
-  z-index: 2;
+/* 表头在滚动容器外：底边拉通到滚动条 gutter，避免与表体行边框叠成双线。 */
+[data-slot='split-table-header'] {
+  background: var(--seed-surface-alt);
+  border-bottom: 1px solid var(--seed-border);
+}
+
+[data-slot='split-table-header'] [data-slot='table-row'] {
+  border-bottom-width: 0;
 }
 
 [data-slot='table-row'].drop-insert-before {
@@ -1066,8 +1070,11 @@ html[lang='zh-CN'] .font-serif {
 }
 
 [data-slot='table-cell'].whitespace-normal,
-[data-slot='table-cell'] .whitespace-normal {
+[data-slot='table-cell'] .whitespace-normal,
+[data-slot='table-head'].whitespace-normal {
   white-space: normal;
+  height: auto;
+  min-height: 2.5rem;
 }
 
 /* ── Data table row menu（Reka DropdownMenu；视觉对齐 shadcn-admin）── */
@@ -2399,4 +2406,20 @@ html[lang='zh-CN'] .font-serif {
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.01em;
+}
+
+/* 零高占位行：只用来钉住 colgroup，不占视觉空间。 */
+[data-slot='table-row'].split-table-sizer,
+[data-slot='table-row'].split-table-sizer:hover {
+  height: 0;
+  border-width: 0;
+  pointer-events: none;
+  background: transparent;
+}
+[data-slot='table-row'].split-table-sizer [data-slot='table-cell'] {
+  height: 0;
+  padding: 0;
+  border-width: 0;
+  line-height: 0;
+  overflow: hidden;
 }

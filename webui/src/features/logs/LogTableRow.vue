@@ -40,7 +40,7 @@ function statusBadgeClass(statusCode: number): string {
     <TableCell class="text-fg-muted font-mono text-xs">
       {{ formatUnixMillis(entry.created_at, locale) }}
     </TableCell>
-    <TableCell class="max-w-0 truncate" :title="entry.token_key">
+    <TableCell truncate :title="entry.token_key">
       {{ entry.token_name }}
     </TableCell>
     <TableCell data-testid="log-model">{{ entry.model }}</TableCell>

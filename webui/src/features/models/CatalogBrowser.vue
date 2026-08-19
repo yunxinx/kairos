@@ -9,6 +9,7 @@ import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
+import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
@@ -171,9 +172,13 @@ function onRowKeydown(model: CatalogModel, event: KeyboardEvent) {
             <TableCell truncate class="font-mono text-sm" :title="model.model_id">{{
               model.model_id
             }}</TableCell>
-            <TableCell truncate class="text-xs" :title="model.provider_name">{{
-              model.provider_name
-            }}</TableCell>
+            <TableCell class="max-w-0">
+              <Tooltip :text="model.provider_name">
+                <span class="badge badge-info max-w-full min-w-0 truncate">{{
+                  model.provider_name
+                }}</span>
+              </Tooltip>
+            </TableCell>
             <TableCell class="font-mono">{{ formatTier(model.input_micros) }}</TableCell>
             <TableCell class="font-mono">{{ formatTier(model.output_micros) }}</TableCell>
             <TableCell class="font-mono">{{ formatTier(model.cache_read_micros) }}</TableCell>

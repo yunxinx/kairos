@@ -3,6 +3,7 @@
 import { computed, ref, useId } from 'vue';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
+import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 
 export interface FacetedFilterOption {
@@ -111,7 +112,9 @@ function clear() {
             >
               <UiIcon name="check" :size="10" />
             </span>
-            <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
+            <Tooltip :text="option.label">
+              <span class="min-w-0 flex-1 truncate">{{ option.label }}</span>
+            </Tooltip>
             <span v-if="option.count !== undefined" class="sync-filter-count">{{
               option.count
             }}</span>

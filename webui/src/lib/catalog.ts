@@ -14,11 +14,6 @@ export interface CatalogFillSource {
 
 export type CatalogFillStatus = 'will-write' | 'no-match' | 'need-host' | 'unchanged';
 
-export interface CatalogHostOption {
-  value: string;
-  label: string;
-}
-
 /** 运营者为人选的目录行：提供方 + 模型 id。 */
 export interface CatalogPick {
   providerId: string;
@@ -31,8 +26,7 @@ export interface CatalogFillPreview {
   channelName: string;
   lookupId: string;
   hits: CatalogModel[];
-  hostOptions: CatalogHostOption[];
-  /** 唯一提供方时的展示名；多个提供方或未命中为 null。 */
+  /** 已选定提供方的展示名；未选或多命中未点选时为 null。 */
   hostName: string | null;
   selected: CatalogPick | null;
   nextPrice: Price | null;
@@ -47,7 +41,7 @@ export function catalogRowKey(model: Pick<CatalogModel, 'provider_id' | 'model_i
   return `${model.provider_id}:${model.model_id}`;
 }
 
-/** 按 model_id 收集全部提供方命中；多个提供方必须由运营者人选。 */
+/** 按 model_id 收集全部提供方命中；多个提供方须在价格目录里人选，不在预览表下拉。 */
 export function findCatalogHits(catalog: CatalogModel[], modelId: string): CatalogModel[] {
   return catalog
     .filter((item) => item.model_id === modelId)
@@ -124,17 +118,8 @@ function pricesEqual(left: Price, right: Price): boolean {
   );
 }
 
-function hostPresentation(hits: CatalogModel[]): {
-  hostOptions: CatalogHostOption[];
-  hostName: string | null;
-} {
-  return {
-    hostOptions: hits.map((hit) => ({
-      value: hit.provider_id,
-      label: hit.provider_name,
-    })),
-    hostName: hits.length === 1 ? (hits[0]?.provider_name ?? null) : null,
-  };
+function uniqueHostName(hits: CatalogModel[]): string | null {
+  return hits.length === 1 ? (hits[0]?.provider_name ?? null) : null;
 }
 
 function resolvePicked(
@@ -153,7 +138,7 @@ function resolvePicked(
   return null;
 }
 
-/** 为清单行生成目录填价预览；多个提供方未选则标 `need-host`，对不上则 `no-match`。 */
+/** 为清单行生成目录填价预览；多个提供方未在目录里点选则标 `need-host`，对不上则 `no-match`。 */
 export function buildCatalogFillPreview(
   sources: CatalogFillSource[],
   catalog: CatalogModel[],
@@ -162,7 +147,6 @@ export function buildCatalogFillPreview(
 ): CatalogFillPreview[] {
   return sources.map((source) => {
     const hits = findCatalogHits(catalog, source.lookupId);
-    const hosts = hostPresentation(hits);
     const identity = {
       model: source.model,
       channelId: source.channelId,
@@ -175,7 +159,7 @@ export function buildCatalogFillPreview(
       return {
         ...identity,
         hits,
-        ...hosts,
+        hostName: uniqueHostName(hits),
         selected: null,
         nextPrice: null,
         status: (hits.length > 1 ? 'need-host' : 'no-match') as CatalogFillStatus,
@@ -187,7 +171,7 @@ export function buildCatalogFillPreview(
     return {
       ...identity,
       hits,
-      ...hosts,
+      hostName: picked.provider_name,
       selected: { providerId: picked.provider_id, modelId: picked.model_id },
       nextPrice,
       status: nextPrice === null ? 'no-match' : unchanged ? 'unchanged' : 'will-write',

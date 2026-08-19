@@ -211,7 +211,7 @@ function openBulkDelete() {
       @retry="() => unifiedQuery.refetch()"
     />
     <div v-else class="flex flex-col">
-      <DataTable :busy="showTableSkeleton">
+      <DataTable class="[&_[data-slot=table]]:table-fixed" :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
             <SearchInput
@@ -258,10 +258,10 @@ function openBulkDelete() {
                 />
               </div>
             </TableHead>
-            <TableHead>{{ t('models.unifiedId') }}</TableHead>
-            <TableHead>{{ t('models.unifiedMembers') }}</TableHead>
-            <TableHead>{{ t('models.unifiedHide') }}</TableHead>
-            <TableHead align="center">{{ t('common.actions') }}</TableHead>
+            <TableHead class="w-[36%]">{{ t('models.unifiedId') }}</TableHead>
+            <TableHead class="w-[46%]">{{ t('models.unifiedMembers') }}</TableHead>
+            <TableHead class="w-32 whitespace-normal">{{ t('models.unifiedHide') }}</TableHead>
+            <TableHead align="center" class="w-24">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>

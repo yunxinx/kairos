@@ -46,7 +46,7 @@ function chipClass(chip: OverflowChip): string {
 function chipTooltip(chip: OverflowChip): string {
   if (chip.canonical) return t('models.canonicalChipTooltip', { name: chip.name });
   if (chip.actualRequest) return t('models.canonicalChipTooltip', { name: chip.actualRequest });
-  return chip.tooltip ?? '';
+  return chip.tooltip ? chip.tooltip : chip.name;
 }
 </script>
 
@@ -61,7 +61,6 @@ function chipTooltip(chip: OverflowChip): string {
           :data-testid="chipTestId"
           :data-model="chip.name"
           :data-canonical="isActualRequest(chip) ? 'true' : undefined"
-          :title="chipTooltip(chip) === '' ? chip.name : undefined"
         >
           {{ chip.name }}
         </span>
@@ -103,7 +102,6 @@ function chipTooltip(chip: OverflowChip): string {
                     :data-testid="chipTestId"
                     :data-model="chip.name"
                     :data-canonical="isActualRequest(chip) ? 'true' : undefined"
-                    :title="chipTooltip(chip) === '' ? chip.name : undefined"
                   >
                     {{ chip.name }}
                   </span>

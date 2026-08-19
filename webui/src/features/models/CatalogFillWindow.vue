@@ -12,14 +12,14 @@ import InlineError from '@/components/ui/InlineError.vue';
 import { useToast } from '@/composables/useToast';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
-import UiSelect from '@/components/ui/UiSelect.vue';
-import TableBody from '@/components/ui/table/TableBody.vue';
+import Tooltip from '@/components/ui/Tooltip.vue';
+import SplitTable from '@/components/ui/table/SplitTable.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
-import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import CatalogBrowser from '@/features/models/CatalogBrowser.vue';
+import CatalogFillPriceCell from '@/features/models/CatalogFillPriceCell.vue';
 import {
   buildCatalogFillPreview,
   catalogSourceKey,
@@ -27,7 +27,6 @@ import {
   type CatalogFillPreview,
   type CatalogPick,
 } from '@/lib/catalog';
-import { formatUsdAmount } from '@/lib/format';
 import { catalogLookupId, sectionInventory, type InventoryRow } from '@/lib/inventory';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -155,25 +154,30 @@ function statusLabel(row: CatalogFillPreview): string {
   return t('models.catalogWillWrite');
 }
 
-function formatTier(value: number | null | undefined): string {
-  if (value === null || value === undefined) return t('common.emptyCell');
-  return formatUsdAmount(value);
+function statusBadgeClass(status: CatalogFillPreview['status']): string {
+  if (status === 'will-write') return 'badge-success';
+  if (status === 'need-host') return 'badge-warn';
+  if (status === 'no-match') return 'badge-danger';
+  return 'badge-neutral';
 }
 
-/** 模型名/对照名省略；单价与状态列固定百分比，避免长名撑开。 */
+/** 模型名省略；单价列略宽以容纳覆盖删除线。 */
 const fillColumns = [
-  { width: '20%' },
-  { width: '14%' },
+  { width: '22%' },
   { width: '16%' },
-  { width: '10%' },
-  { width: '10%' },
-  { width: '10%' },
-  { width: '10%' },
+  { width: '13%' },
+  { width: '13%' },
+  { width: '13%' },
+  { width: '13%' },
   { width: '10%' },
 ];
 
 function previewOf(row: InventoryRow): CatalogFillPreview | undefined {
   return previewByKey.value.get(catalogSourceKey(row.channelId, row.name));
+}
+
+function willOverwrite(row: InventoryRow): boolean {
+  return fillMode.value === 'overwrite' && previewOf(row)?.status === 'will-write';
 }
 
 const writeMutation = useMutation({
@@ -202,13 +206,6 @@ const writeMutation = useMutation({
 
 function handleConfirm() {
   writeMutation.mutate(preview.value);
-}
-
-function pickHost(channelId: number, model: string, lookupId: string, providerId: string) {
-  picks.value = {
-    ...picks.value,
-    [catalogSourceKey(channelId, model)]: { providerId, modelId: lookupId },
-  };
 }
 
 function openBrowse(row: InventoryRow) {
@@ -288,15 +285,10 @@ function handleWindowClose() {
     <template v-else>
       <div class="card-body space-y-3">
         <div class="flex flex-wrap items-center gap-2">
-          <SegmentSwitch
-            v-model="fillMode"
-            :options="modeOptions"
-            :aria-label="t('models.catalogMode')"
-          />
           <SearchInput
             :id="`catalog-fill-search-${uid}`"
             v-model="searchText"
-            class="max-w-sm"
+            class="max-w-sm min-w-0"
             data-testid="catalog-search"
             :placeholder="t('models.search')"
             :aria-label="t('models.search')"
@@ -313,128 +305,131 @@ function handleWindowClose() {
             :options="channelOptions"
             test-id="catalog-channel-filter"
           />
+          <div class="ml-auto">
+            <SegmentSwitch
+              v-model="fillMode"
+              :options="modeOptions"
+              :aria-label="t('models.catalogMode')"
+            />
+          </div>
         </div>
         <InlineError
           v-if="catalogQuery.isError.value"
           :message="t('models.catalogError')"
           @retry="() => catalogQuery.refetch()"
         />
-        <DataTablePanel v-else data-testid="catalog-preview">
-          <div class="virtual-table-scroll seed-scrollbar max-h-96 overflow-auto">
-            <table class="w-full table-fixed caption-bottom text-sm">
-              <colgroup>
-                <col
-                  v-for="(column, index) in fillColumns"
-                  :key="index"
-                  :style="{ width: column.width }"
-                />
-              </colgroup>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>{{ t('pricing.model') }}</TableHead>
-                  <TableHead>{{ t('models.catalogLookup') }}</TableHead>
-                  <TableHead>{{ t('models.catalogHost') }}</TableHead>
-                  <TableHead>{{ t('pricing.inputUsd') }}</TableHead>
-                  <TableHead>{{ t('pricing.outputUsd') }}</TableHead>
-                  <TableHead>{{ t('pricing.cacheReadUsd') }}</TableHead>
-                  <TableHead>{{ t('pricing.cacheWriteUsd') }}</TableHead>
-                  <TableHead>{{ t('channel.status') }}</TableHead>
+        <DataTablePanel v-else class="h-96" data-testid="catalog-preview">
+          <SplitTable :columns="fillColumns" class="h-full">
+            <template #header>
+              <TableRow>
+                <TableHead>{{ t('pricing.model') }}</TableHead>
+                <TableHead>{{ t('models.catalogHost') }}</TableHead>
+                <TableHead>{{ t('pricing.inputUsd') }}</TableHead>
+                <TableHead>{{ t('pricing.outputUsd') }}</TableHead>
+                <TableHead>{{ t('pricing.cacheReadUsd') }}</TableHead>
+                <TableHead>{{ t('pricing.cacheWriteUsd') }}</TableHead>
+                <TableHead>{{ t('channel.status') }}</TableHead>
+              </TableRow>
+            </template>
+            <TableRowsSkeleton v-if="catalogQuery.isPending.value" :columns="7" />
+            <template v-else>
+              <template v-for="section in sections" :key="section.channelName">
+                <TableRow
+                  class="inventory-section-row"
+                  data-testid="catalog-preview-section"
+                  :data-channel="section.channelName"
+                >
+                  <TableCell :colspan="7" class="inventory-section-cell">
+                    {{ t('models.sectionChannel', { name: section.channelName }) }}
+                  </TableCell>
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                <TableRowsSkeleton v-if="catalogQuery.isPending.value" :columns="8" />
-                <template v-else>
-                  <template v-for="section in sections" :key="section.channelName">
-                    <TableRow
-                      class="inventory-section-row"
-                      data-testid="catalog-preview-section"
-                      :data-channel="section.channelName"
+                <TableRow
+                  v-for="row in section.rows"
+                  :key="catalogSourceKey(row.channelId, row.name)"
+                  data-testid="catalog-preview-row"
+                  :data-model="row.name"
+                  :data-channel="row.channelName"
+                >
+                  <TableCell truncate class="font-medium" :title="row.name">{{
+                    row.name
+                  }}</TableCell>
+                  <TableCell>
+                    <span
+                      v-if="previewOf(row)?.selected"
+                      class="inline-flex min-w-0 items-center gap-1"
                     >
-                      <TableCell :colspan="8" class="inventory-section-cell">
-                        {{ t('models.sectionChannel', { name: section.channelName }) }}
-                      </TableCell>
-                    </TableRow>
-                    <TableRow
-                      v-for="row in section.rows"
-                      :key="catalogSourceKey(row.channelId, row.name)"
-                      data-testid="catalog-preview-row"
-                      :data-model="row.name"
-                      :data-channel="row.channelName"
+                      <Tooltip :text="previewOf(row)!.hostName ?? ''">
+                        <span
+                          class="badge badge-info max-w-[9rem] truncate"
+                          data-testid="catalog-host-name"
+                          >{{ previewOf(row)!.hostName }}</span
+                        >
+                      </Tooltip>
+                      <button
+                        type="button"
+                        class="btn btn-ghost btn-sm shrink-0"
+                        data-testid="catalog-change-host"
+                        @click="openBrowse(row)"
+                      >
+                        {{ t('models.catalogChangeHost') }}
+                      </button>
+                    </span>
+                    <button
+                      v-else
+                      type="button"
+                      class="btn btn-sm"
+                      data-testid="catalog-pick-from-dir"
+                      @click="openBrowse(row)"
                     >
-                      <TableCell truncate class="font-medium" :title="row.name">{{
-                        row.name
-                      }}</TableCell>
-                      <TableCell truncate class="font-mono text-xs" :title="catalogLookupId(row)">{{
-                        catalogLookupId(row)
-                      }}</TableCell>
-                      <TableCell>
-                        <template v-if="previewOf(row)">
-                          <UiSelect
-                            v-if="previewOf(row)!.hits.length > 1"
-                            :id="`catalog-host-${row.channelId}-${row.name}`"
-                            :model-value="previewOf(row)!.selected?.providerId ?? ''"
-                            :options="previewOf(row)!.hostOptions"
-                            data-testid="catalog-host-select"
-                            @update:model-value="
-                              (value) =>
-                                pickHost(row.channelId, row.name, catalogLookupId(row), value)
-                            "
-                          />
-                          <span
-                            v-else-if="previewOf(row)!.hits.length === 1"
-                            class="inline-flex min-w-0 items-center gap-2"
-                          >
-                            <span
-                              class="truncate text-xs"
-                              :title="previewOf(row)!.hostName ?? ''"
-                              >{{ previewOf(row)!.hostName }}</span
-                            >
-                            <button
-                              type="button"
-                              class="btn btn-ghost btn-sm shrink-0"
-                              data-testid="catalog-change-host"
-                              @click="openBrowse(row)"
-                            >
-                              {{ t('models.catalogChangeHost') }}
-                            </button>
-                          </span>
-                          <button
-                            v-else
-                            type="button"
-                            class="btn btn-ghost btn-sm"
-                            data-testid="catalog-pick-from-dir"
-                            @click="openBrowse(row)"
-                          >
-                            {{ t('models.catalogPickFromDir') }}
-                          </button>
-                        </template>
-                      </TableCell>
-                      <TableCell class="font-mono">{{
-                        formatTier(previewOf(row)?.nextPrice?.input_micros)
-                      }}</TableCell>
-                      <TableCell class="font-mono">{{
-                        formatTier(previewOf(row)?.nextPrice?.output_micros)
-                      }}</TableCell>
-                      <TableCell class="font-mono">
-                        {{ formatTier(previewOf(row)?.nextPrice?.cache_read_micros) }}
-                      </TableCell>
-                      <TableCell class="font-mono">
-                        {{ formatTier(previewOf(row)?.nextPrice?.cache_write_micros) }}
-                      </TableCell>
-                      <TableCell data-testid="catalog-preview-status">{{
-                        previewOf(row) ? statusLabel(previewOf(row)!) : t('common.emptyCell')
-                      }}</TableCell>
-                    </TableRow>
-                  </template>
-                  <TableRow v-if="sections.length === 0">
-                    <TableCell :colspan="8" class="h-24 whitespace-normal">
-                      <EmptyState :title="t('models.catalogEmpty')" />
-                    </TableCell>
-                  </TableRow>
-                </template>
-              </TableBody>
-            </table>
-          </div>
+                      {{ t('models.catalogPickFromDir') }}
+                    </button>
+                  </TableCell>
+                  <TableCell class="font-mono">
+                    <CatalogFillPriceCell
+                      :current="row.price?.input_micros"
+                      :next="previewOf(row)?.nextPrice?.input_micros"
+                      :overwrite="willOverwrite(row)"
+                    />
+                  </TableCell>
+                  <TableCell class="font-mono">
+                    <CatalogFillPriceCell
+                      :current="row.price?.output_micros"
+                      :next="previewOf(row)?.nextPrice?.output_micros"
+                      :overwrite="willOverwrite(row)"
+                    />
+                  </TableCell>
+                  <TableCell class="font-mono">
+                    <CatalogFillPriceCell
+                      :current="row.price?.cache_read_micros"
+                      :next="previewOf(row)?.nextPrice?.cache_read_micros"
+                      :overwrite="willOverwrite(row)"
+                    />
+                  </TableCell>
+                  <TableCell class="font-mono">
+                    <CatalogFillPriceCell
+                      :current="row.price?.cache_write_micros"
+                      :next="previewOf(row)?.nextPrice?.cache_write_micros"
+                      :overwrite="willOverwrite(row)"
+                    />
+                  </TableCell>
+                  <TableCell data-testid="catalog-preview-status">
+                    <span
+                      v-if="previewOf(row)"
+                      class="badge"
+                      :class="statusBadgeClass(previewOf(row)!.status)"
+                      >{{ statusLabel(previewOf(row)!) }}</span
+                    >
+                    <template v-else>{{ t('common.emptyCell') }}</template>
+                  </TableCell>
+                </TableRow>
+              </template>
+              <TableRow v-if="sections.length === 0">
+                <TableCell :colspan="7" class="h-24 whitespace-normal">
+                  <EmptyState :title="t('models.catalogEmpty')" />
+                </TableCell>
+              </TableRow>
+            </template>
+          </SplitTable>
         </DataTablePanel>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">

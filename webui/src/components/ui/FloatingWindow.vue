@@ -2,6 +2,7 @@
 // 浮窗：就近锚定触发点打开、标题栏整行可拖拽（按钮区域除外）、非模态；由调用方 v-if 挂载，随路由卸载。
 import { onMounted, onScopeDispose, onUnmounted, reactive, ref, useId, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
+import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -212,9 +213,11 @@ onUnmounted(() => {
       @pointercancel="endDrag"
     >
       <div class="flex min-w-0 flex-1 items-center gap-2">
-        <h2 :id="titleId" class="min-w-0 truncate font-serif text-base font-semibold">
-          {{ title }}
-        </h2>
+        <Tooltip :text="title">
+          <h2 :id="titleId" class="min-w-0 truncate font-serif text-base font-semibold">
+            {{ title }}
+          </h2>
+        </Tooltip>
         <slot name="header-extra" />
       </div>
       <button

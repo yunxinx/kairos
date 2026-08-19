@@ -186,11 +186,7 @@ function clearFilters() {
             <TableCell class="font-mono text-sm" data-testid="system-log-target">
               {{ entry.target }}
             </TableCell>
-            <TableCell
-              class="max-w-0 truncate"
-              :title="entry.message"
-              data-testid="system-log-message"
-            >
+            <TableCell truncate :title="entry.message" data-testid="system-log-message">
               {{ entry.message }}
             </TableCell>
           </TableRow>

@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
 import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
+import Tooltip from '@/components/ui/Tooltip.vue';
 import { formatCount, formatPercent, formatUsdMicros } from '@/lib/format';
 
 interface OverviewShareItem {
@@ -117,7 +118,9 @@ function nameBinding(name: string): Record<string, string> {
           :data-cost-usd-micros="String(item.costUsdMicros)"
         >
           <div class="flex items-baseline justify-between gap-3 text-sm">
-            <span class="min-w-0 truncate font-medium">{{ item.name }}</span>
+            <Tooltip :text="item.name">
+              <span class="min-w-0 truncate font-medium">{{ item.name }}</span>
+            </Tooltip>
             <span class="text-fg-muted shrink-0 font-mono text-xs">
               {{ formatUsdMicros(item.costUsdMicros) }}
             </span>

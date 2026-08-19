@@ -1,25 +1,19 @@
 <script setup lang="ts">
-// 表格单元格：普通名是「模型名 + 来源渠道」；统一模型先出身份徽章，再展开成员与状态。超出条数收进 +N。
+// 组员列对齐渠道「模型清单」：双栏 gap-1.5，每个成员一行，+N 跟在下一格。
+// 统一模型在列表里只出身份名；成员构成去编辑器看。
 import { computed } from 'vue';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
-import type { ChannelView } from '@/api/types';
-import OverflowChips, { type OverflowChip } from '@/components/ui/OverflowChips.vue';
-import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
-import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
-import UnifiedNameChip from '@/features/models/UnifiedNameChip.vue';
-import {
-  memberSourceI18nKey,
-  type CallableSourceLine,
-  type SourceChannel,
-} from '@/lib/unified-sources';
+import type { CallableSourceLine } from '@/lib/unified-sources';
+import ModelSourceLine from '@/features/models/ModelSourceLine.vue';
 
-const VISIBLE_COUNT = 3;
+const GRID_COLUMNS = 2;
+const GRID_ROWS = 7;
+const GRID_SLOTS = GRID_COLUMNS * GRID_ROWS;
 
 const props = withDefaults(
   defineProps<{
     lines: CallableSourceLine[];
-    channels: ChannelView[];
     chipTestId?: string;
   }>(),
   { chipTestId: 'group-source-channel' },
@@ -27,96 +21,60 @@ const props = withDefaults(
 
 const { t } = useI18n();
 
-const visible = computed(() => props.lines.slice(0, VISIBLE_COUNT));
-const hidden = computed(() => props.lines.slice(VISIBLE_COUNT));
+const visible = computed(() => {
+  if (props.lines.length <= GRID_SLOTS) return props.lines;
+  return props.lines.slice(0, GRID_SLOTS - 1);
+});
+const hidden = computed(() => {
+  if (props.lines.length <= GRID_SLOTS) return [];
+  return props.lines.slice(GRID_SLOTS - 1);
+});
 const hiddenCount = computed(() => hidden.value.length);
-
-function ordinaryChips(channels: SourceChannel[]): OverflowChip[] {
-  return channels.map((channel) => {
-    const key = memberSourceI18nKey(channel.kind);
-    if (key === undefined) return { name: channel.name };
-    return { name: channel.name, aside: t(key), asideKind: channel.kind };
-  });
-}
 </script>
 
 <template>
-  <div v-if="lines.length > 0" class="flex flex-col gap-1" data-testid="model-source-lines">
-    <div
+  <ul
+    v-if="lines.length > 0"
+    class="m-0 grid max-w-full list-none grid-cols-2 gap-1.5 p-0"
+    data-testid="model-source-lines"
+  >
+    <ModelSourceLine
       v-for="line in visible"
       :key="line.name"
-      class="flex flex-wrap items-center gap-2"
-      data-testid="group-member-line"
-      :data-model="line.name"
-      :data-unified="line.isUnified ? 'true' : undefined"
-    >
-      <template v-if="line.isUnified">
-        <div class="flex min-w-0 flex-col gap-1">
-          <UnifiedNameChip :name="line.name" />
-          <UnifiedJumpOrder :members="line.unifiedMembers" :channels="channels" hide-index />
-        </div>
-      </template>
-      <template v-else>
-        <span class="font-mono text-sm">{{ line.name }}</span>
-        <OverflowChips
-          v-if="line.channels.length > 0"
-          :items="ordinaryChips(line.channels)"
-          :chip-test-id="chipTestId"
-        />
-        <ChannelSourceMark v-else kind="unlisted" />
-      </template>
-    </div>
-    <PopoverRoot v-if="hiddenCount > 0">
-      <PopoverTrigger as-child>
-        <button
-          type="button"
-          class="badge badge-neutral w-fit cursor-pointer"
-          data-testid="overflow-more"
-          :aria-label="t('common.moreCount', { count: hiddenCount })"
-        >
-          {{ t('common.moreCount', { count: hiddenCount }) }}
-        </button>
-      </PopoverTrigger>
-      <PopoverPortal>
-        <PopoverContent
-          align="start"
-          :side-offset="4"
-          class="data-table-menu overflow-chip-menu seed-scrollbar"
-          data-testid="overflow-chip-menu"
-        >
-          <div class="flex flex-col gap-2 p-1">
-            <div
-              v-for="line in hidden"
-              :key="line.name"
-              class="flex flex-wrap items-center gap-2"
-              data-testid="group-member-line"
-              :data-model="line.name"
-              :data-unified="line.isUnified ? 'true' : undefined"
-            >
-              <template v-if="line.isUnified">
-                <div class="flex min-w-0 flex-col gap-1">
-                  <UnifiedNameChip :name="line.name" />
-                  <UnifiedJumpOrder
-                    :members="line.unifiedMembers"
-                    :channels="channels"
-                    hide-index
-                  />
-                </div>
-              </template>
-              <template v-else>
-                <span class="font-mono text-sm">{{ line.name }}</span>
-                <OverflowChips
-                  v-if="line.channels.length > 0"
-                  :items="ordinaryChips(line.channels)"
-                  :chip-test-id="chipTestId"
-                />
-                <ChannelSourceMark v-else kind="unlisted" />
-              </template>
-            </div>
-          </div>
-        </PopoverContent>
-      </PopoverPortal>
-    </PopoverRoot>
-  </div>
+      :line="line"
+      :chip-test-id="chipTestId"
+    />
+    <li v-if="hiddenCount > 0" class="flex items-center">
+      <PopoverRoot>
+        <PopoverTrigger as-child>
+          <button
+            type="button"
+            class="badge badge-neutral cursor-pointer"
+            data-testid="overflow-more"
+            :aria-label="t('common.moreCount', { count: hiddenCount })"
+          >
+            {{ t('common.moreCount', { count: hiddenCount }) }}
+          </button>
+        </PopoverTrigger>
+        <PopoverPortal>
+          <PopoverContent
+            align="start"
+            :side-offset="4"
+            class="data-table-menu overflow-chip-menu seed-scrollbar"
+            data-testid="overflow-chip-menu"
+          >
+            <ul class="m-0 grid list-none grid-cols-2 gap-1.5 p-1">
+              <ModelSourceLine
+                v-for="line in hidden"
+                :key="line.name"
+                :line="line"
+                :chip-test-id="chipTestId"
+              />
+            </ul>
+          </PopoverContent>
+        </PopoverPortal>
+      </PopoverRoot>
+    </li>
+  </ul>
   <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
 </template>

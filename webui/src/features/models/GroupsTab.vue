@@ -228,7 +228,7 @@ function openBulkDelete() {
       @retry="() => groupsQuery.refetch()"
     />
     <div v-else class="flex flex-col">
-      <DataTable :busy="showTableSkeleton">
+      <DataTable class="[&_[data-slot=table]]:table-fixed" :busy="showTableSkeleton">
         <template #toolbar>
           <DataTableToolbar>
             <SearchInput
@@ -263,9 +263,9 @@ function openBulkDelete() {
                 />
               </div>
             </TableHead>
-            <TableHead>{{ t('models.groupName') }}</TableHead>
-            <TableHead>{{ t('models.groupMembers') }}</TableHead>
-            <TableHead align="center">{{ t('common.actions') }}</TableHead>
+            <TableHead class="w-[28%]">{{ t('models.groupName') }}</TableHead>
+            <TableHead class="w-[58%]">{{ t('models.groupMembers') }}</TableHead>
+            <TableHead align="center" class="w-24">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -283,13 +283,12 @@ function openBulkDelete() {
                 test-id="group-select"
                 @toggle="selection.toggle(group.name)"
               />
-              <TableCell class="font-mono font-medium">
+              <TableCell class="font-mono font-medium" truncate :title="group.name">
                 {{ group.name }}
               </TableCell>
-              <TableCell data-testid="group-models">
+              <TableCell class="whitespace-normal" data-testid="group-models">
                 <ModelSourceLines
                   :lines="memberLinesByGroup.get(group.name) ?? []"
-                  :channels="channels"
                   chip-test-id="group-source-channel"
                 />
               </TableCell>

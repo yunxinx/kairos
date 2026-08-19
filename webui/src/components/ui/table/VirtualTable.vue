@@ -1,15 +1,18 @@
 <script setup lang="ts" generic="T">
-// 虚拟滚动表：外层 overflow 容器滚动，thead sticky，tbody 只渲染可见行 + 上下占位。
-// 不套 Table.vue 的 overflow-x-auto 包装，否则 sticky 会失效。
-import { computed, ref } from 'vue';
+// 虚拟滚动表：表头在滚动容器外（滚动条只在表体），tbody 只渲染可见行 + 上下占位。
+// 官方 sticky-thead 示例会把滚动条拉到表头右侧；拆表头后虚拟器偏移从 0 起算，也不再需要 paddingStart。
+import { computed, useTemplateRef } from 'vue';
 import { useVirtualizer } from '@tanstack/vue-virtual';
 import EmptyState from '@/components/ui/EmptyState.vue';
-import TableBody from '@/components/ui/table/TableBody.vue';
+import SplitTable from '@/components/ui/table/SplitTable.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
-import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
-import { cn } from '@/lib/cn';
+
+/** 与 SplitTable `defineExpose` 对齐；不从 SFC 再导出类型，避免 eslint 解析失败。 */
+type SplitTableHandle = {
+  getScrollElement: () => HTMLElement | null;
+};
 
 const props = withDefaults(
   defineProps<{
@@ -33,12 +36,12 @@ const props = withDefaults(
   },
 );
 
-const scrollRef = ref<HTMLElement | null>(null);
+const splitTable = useTemplateRef<SplitTableHandle>('splitTable');
 
 const virtualizer = useVirtualizer(
   computed(() => ({
     count: props.loading ? 0 : props.rows.length,
-    getScrollElement: () => scrollRef.value,
+    getScrollElement: () => splitTable.value?.getScrollElement() ?? null,
     estimateSize: () => props.estimateSize,
     overscan: props.overscan,
     getItemKey: (index: number) => {
@@ -71,43 +74,28 @@ const paddingBottom = computed(() => {
 </script>
 
 <template>
-  <div
-    ref="scrollRef"
-    data-slot="virtual-table"
-    :class="cn('virtual-table-scroll seed-scrollbar min-h-0 overflow-auto', props.class)"
-  >
-    <table class="w-full table-fixed caption-bottom text-sm">
-      <colgroup>
-        <col v-for="(column, index) in columns" :key="index" :style="{ width: column.width }" />
-      </colgroup>
-      <TableHeader>
-        <slot name="header" />
-      </TableHeader>
-      <TableBody>
-        <TableRowsSkeleton v-if="loading" :columns="colspan" />
-        <template v-else-if="rows.length > 0">
-          <TableRow v-if="paddingTop > 0" aria-hidden="true" class="pointer-events-none border-0">
-            <TableCell :colspan="colspan" class="p-0" :style="{ height: `${paddingTop}px` }" />
-          </TableRow>
-          <template v-for="item in visibleRows" :key="item.key">
-            <slot name="row" :row="item.row" :index="item.index" />
-          </template>
-          <TableRow
-            v-if="paddingBottom > 0"
-            aria-hidden="true"
-            class="pointer-events-none border-0"
-          >
-            <TableCell :colspan="colspan" class="p-0" :style="{ height: `${paddingBottom}px` }" />
-          </TableRow>
-        </template>
-        <TableRow v-else>
-          <TableCell :colspan="colspan" class="h-24 whitespace-normal">
-            <slot name="empty">
-              <EmptyState v-if="emptyTitle" :title="emptyTitle" />
-            </slot>
-          </TableCell>
-        </TableRow>
-      </TableBody>
-    </table>
-  </div>
+  <SplitTable ref="splitTable" :columns="columns" :class="props.class">
+    <template #header>
+      <slot name="header" />
+    </template>
+    <TableRowsSkeleton v-if="loading" :columns="colspan" />
+    <template v-else-if="rows.length > 0">
+      <TableRow v-if="paddingTop > 0" aria-hidden="true" class="pointer-events-none border-0">
+        <TableCell :colspan="colspan" class="p-0" :style="{ height: `${paddingTop}px` }" />
+      </TableRow>
+      <template v-for="item in visibleRows" :key="item.key">
+        <slot name="row" :row="item.row" :index="item.index" />
+      </template>
+      <TableRow v-if="paddingBottom > 0" aria-hidden="true" class="pointer-events-none border-0">
+        <TableCell :colspan="colspan" class="p-0" :style="{ height: `${paddingBottom}px` }" />
+      </TableRow>
+    </template>
+    <TableRow v-else>
+      <TableCell :colspan="colspan" class="h-24 whitespace-normal">
+        <slot name="empty">
+          <EmptyState v-if="emptyTitle" :title="emptyTitle" />
+        </slot>
+      </TableCell>
+    </TableRow>
+  </SplitTable>
 </template>

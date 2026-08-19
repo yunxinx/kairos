@@ -1,5 +1,6 @@
 <script setup lang="ts">
 // 编辑器模型清单的一枚 chip：点击复制、叉号删除；别名互指走 tooltip，底色由 hasAliasRelation 显式决定。
+import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
@@ -17,6 +18,10 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 
+const hint = computed(() =>
+  props.tooltip === '' ? props.name : `${props.name} · ${props.tooltip}`,
+);
+
 /** 仅 chip 本体聚焦时复制，内部删除按钮的按键不拦截。 */
 function onChipKeydown(event: KeyboardEvent) {
   if (event.target !== event.currentTarget) return;
@@ -26,7 +31,7 @@ function onChipKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <Tooltip :text="props.tooltip">
+  <Tooltip :text="hint">
     <div
       role="button"
       tabindex="0"

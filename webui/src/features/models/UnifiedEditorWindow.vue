@@ -14,11 +14,11 @@ import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
+import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
-import TableBody from '@/components/ui/table/TableBody.vue';
+import SplitTable from '@/components/ui/table/SplitTable.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
-import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
@@ -258,107 +258,90 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
 
         <div>
           <p class="form-field-label mb-2">{{ t('models.unifiedMembers') }}</p>
-          <DataTablePanel>
-            <div class="virtual-table-scroll seed-scrollbar bounded-table-3 overflow-auto">
-              <table
-                class="w-full table-fixed caption-bottom text-sm"
-                data-testid="unified-member-list"
+          <DataTablePanel class="bounded-table-3">
+            <SplitTable class="h-full" :columns="memberColumns" data-testid="unified-member-list">
+              <template #header>
+                <TableRow>
+                  <TableHead class="w-10">{{ t('models.memberIndex') }}</TableHead>
+                  <TableHead>{{ t('pricing.model') }}</TableHead>
+                  <TableHead>{{ t('models.unifiedSources') }}</TableHead>
+                  <TableHead align="center">{{ t('common.actions') }}</TableHead>
+                </TableRow>
+              </template>
+              <TableRow
+                v-for="(member, index) in editorMembers"
+                :key="unifiedMemberKey(member)"
+                :class="rowDropClass(index)"
+                data-testid="unified-member"
+                :data-member="member.model"
+                :data-channel="pinnedChannelName(member)"
+                @dragover.prevent="onDragOver(index, $event)"
+                @drop.prevent="onDrop"
               >
-                <colgroup>
-                  <col
-                    v-for="(column, index) in memberColumns"
-                    :key="index"
-                    :style="{ width: column.width }"
-                  />
-                </colgroup>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead class="w-10">{{ t('models.memberIndex') }}</TableHead>
-                    <TableHead>{{ t('pricing.model') }}</TableHead>
-                    <TableHead>{{ t('models.unifiedSources') }}</TableHead>
-                    <TableHead align="center">{{ t('common.actions') }}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <TableRow
-                    v-for="(member, index) in editorMembers"
-                    :key="unifiedMemberKey(member)"
-                    :class="rowDropClass(index)"
-                    data-testid="unified-member"
-                    :data-member="member.model"
-                    :data-channel="pinnedChannelName(member)"
-                    @dragover.prevent="onDragOver(index, $event)"
-                    @drop.prevent="onDrop"
-                  >
-                    <TableCell class="text-fg-muted font-mono text-xs">
-                      <span class="inline-flex items-center gap-1">
-                        <button
-                          type="button"
-                          class="text-fg-muted cursor-grab"
-                          draggable="true"
-                          :aria-label="t('models.unifiedDragHandle')"
-                          @dragstart="onHandleDragStart(index, $event)"
-                          @dragend="onDragEnd"
-                        >
-                          <UiIcon name="grip-vertical" :size="14" />
-                        </button>
-                        {{ index + 1 }}
-                      </span>
-                    </TableCell>
-                    <TableCell
-                      truncate
-                      class="font-mono text-sm select-text"
-                      :title="member.model"
-                      >{{ member.model }}</TableCell
+                <TableCell class="text-fg-muted font-mono text-xs">
+                  <span class="inline-flex items-center gap-1">
+                    <button
+                      type="button"
+                      class="text-fg-muted cursor-grab"
+                      draggable="true"
+                      :aria-label="t('models.unifiedDragHandle')"
+                      @dragstart="onHandleDragStart(index, $event)"
+                      @dragend="onDragEnd"
                     >
-                    <TableCell>
-                      <ChannelSourceMark
-                        :channel-name="pinnedChannelName(member)"
-                        :kind="memberSourceKind(member, channels)"
-                      />
-                    </TableCell>
-                    <TableCell align="center">
-                      <span class="inline-flex items-center justify-center gap-0.5">
-                        <button
-                          type="button"
-                          class="btn btn-ghost btn-icon"
-                          data-testid="unified-member-up"
-                          :disabled="index === 0"
-                          :aria-label="t('models.unifiedMoveUp')"
-                          @click="moveMember(index, index - 1)"
-                        >
-                          <UiIcon name="chevron-up" :size="14" />
-                        </button>
-                        <button
-                          type="button"
-                          class="btn btn-ghost btn-icon"
-                          data-testid="unified-member-down"
-                          :disabled="index === editorMembers.length - 1"
-                          :aria-label="t('models.unifiedMoveDown')"
-                          @click="moveMember(index, index + 1)"
-                        >
-                          <UiIcon name="chevron-down" :size="14" />
-                        </button>
-                        <button
-                          type="button"
-                          class="btn btn-ghost btn-icon"
-                          data-testid="unified-member-remove"
-                          :aria-label="t('models.unifiedRemoveMember', { name: member.model })"
-                          @click="removeMember(member)"
-                        >
-                          <UiIcon name="close" :size="14" />
-                        </button>
-                      </span>
-                    </TableCell>
-                  </TableRow>
-                  <TableRow v-if="editorMembers.length === 0">
-                    <TableCell :colspan="4" class="h-20 whitespace-normal">
-                      <EmptyState :title="t('models.unifiedMembersEmpty')" />
-                    </TableCell>
-                  </TableRow>
-                </TableBody>
-              </table>
-            </div>
+                      <UiIcon name="grip-vertical" :size="14" />
+                    </button>
+                    {{ index + 1 }}
+                  </span>
+                </TableCell>
+                <TableCell truncate class="font-mono text-sm select-text" :title="member.model">{{
+                  member.model
+                }}</TableCell>
+                <TableCell>
+                  <ChannelSourceMark
+                    :channel-name="pinnedChannelName(member)"
+                    :kind="memberSourceKind(member, channels)"
+                  />
+                </TableCell>
+                <TableCell align="center">
+                  <span class="inline-flex items-center justify-center gap-0.5">
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-icon"
+                      data-testid="unified-member-up"
+                      :disabled="index === 0"
+                      :aria-label="t('models.unifiedMoveUp')"
+                      @click="moveMember(index, index - 1)"
+                    >
+                      <UiIcon name="chevron-up" :size="14" />
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-icon"
+                      data-testid="unified-member-down"
+                      :disabled="index === editorMembers.length - 1"
+                      :aria-label="t('models.unifiedMoveDown')"
+                      @click="moveMember(index, index + 1)"
+                    >
+                      <UiIcon name="chevron-down" :size="14" />
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-ghost btn-icon"
+                      data-testid="unified-member-remove"
+                      :aria-label="t('models.unifiedRemoveMember', { name: member.model })"
+                      @click="removeMember(member)"
+                    >
+                      <UiIcon name="close" :size="14" />
+                    </button>
+                  </span>
+                </TableCell>
+              </TableRow>
+              <TableRow v-if="editorMembers.length === 0">
+                <TableCell :colspan="4" class="h-20 whitespace-normal">
+                  <EmptyState :title="t('models.unifiedMembersEmpty')" />
+                </TableCell>
+              </TableRow>
+            </SplitTable>
           </DataTablePanel>
         </div>
 
@@ -414,7 +397,9 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
                   }}</TableCell>
                   <TableCell>
                     <span class="inline-flex max-w-full items-center gap-1">
-                      <span class="truncate" :title="row.channelName">{{ row.channelName }}</span>
+                      <Tooltip :text="row.channelName">
+                        <span class="truncate">{{ row.channelName }}</span>
+                      </Tooltip>
                       <ChannelSourceMark
                         v-if="pickSourceKind(row) !== 'ok'"
                         :kind="pickSourceKind(row)"
