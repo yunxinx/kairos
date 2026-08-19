@@ -27,7 +27,8 @@ import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
 import GroupEditorWindow from '@/features/models/GroupEditorWindow.vue';
-import OverflowChips from '@/components/ui/OverflowChips.vue';
+import ModelSourceLines from '@/features/models/ModelSourceLines.vue';
+import { callableSourceLine, type CallableSourceLine } from '@/lib/unified-sources';
 import { DEFAULT_MODEL_GROUP, registeredCallableNames } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -79,19 +80,37 @@ const callableNames = computed(() => {
   return [...names].sort((left, right) => left.localeCompare(right));
 });
 
+const channels = computed(() => channelsQuery.data.value ?? []);
+const unifiedModels = computed(() => unifiedQuery.data.value ?? []);
+
 const groups = computed(() =>
   (groupsQuery.data.value ?? []).filter((group) => group.name !== DEFAULT_MODEL_GROUP),
 );
 const showTableSkeleton = computed(() => groupsQuery.isPending.value && !groupsQuery.data.value);
 
+const memberLinesByGroup = computed(() => {
+  const map = new Map<string, CallableSourceLine[]>();
+  for (const group of groups.value) {
+    map.set(
+      group.name,
+      group.models.map((name) => callableSourceLine(name, channels.value, unifiedModels.value)),
+    );
+  }
+  return map;
+});
+
 const filtered = computed(() => {
   const q = searchText.value.trim().toLowerCase();
   if (!q) return groups.value;
-  return groups.value.filter(
-    (group) =>
-      group.name.toLowerCase().includes(q) ||
-      group.models.some((model) => model.toLowerCase().includes(q)),
-  );
+  return groups.value.filter((group) => {
+    if (group.name.toLowerCase().includes(q)) return true;
+    const lines = memberLinesByGroup.value.get(group.name) ?? [];
+    return lines.some(
+      (line) =>
+        line.name.toLowerCase().includes(q) ||
+        line.channels.some((channel) => channel.name.toLowerCase().includes(q)),
+    );
+  });
 });
 
 const selectableIds = computed(() => filtered.value.map((group) => group.name));
@@ -268,7 +287,11 @@ function openBulkDelete() {
                 {{ group.name }}
               </TableCell>
               <TableCell data-testid="group-models">
-                <OverflowChips :items="group.models" />
+                <ModelSourceLines
+                  :lines="memberLinesByGroup.get(group.name) ?? []"
+                  :channels="channels"
+                  chip-test-id="group-source-channel"
+                />
               </TableCell>
               <TableCell align="center">
                 <span class="inline-flex items-center justify-center gap-1">
@@ -330,6 +353,8 @@ function openBulkDelete() {
         v-if="win.payload.kind === 'editor'"
         :initial="win.payload.group"
         :callable-names="callableNames"
+        :channels="channelsQuery.data.value ?? []"
+        :unified-models="unifiedQuery.data.value ?? []"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"

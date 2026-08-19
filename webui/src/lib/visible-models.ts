@@ -53,7 +53,8 @@ export interface VisibleUnified {
   id: string;
   models: UnifiedMember[];
   hide: boolean;
-  hiddenMembers: string[];
+  /** hide 开启时被从下游列表拿掉的成员（保留钉死渠道，不含与统一 ID 同名的成员）。 */
+  hiddenMembers: UnifiedMember[];
 }
 
 export interface VisiblePreview {
@@ -86,11 +87,7 @@ export function previewVisibleModels(
     .sort((left, right) => left.id.localeCompare(right.id))
     .map((model) => {
       const hiddenMembers = model.hide
-        ? [
-            ...new Set(
-              model.models.map((member) => member.model).filter((name) => name !== model.id),
-            ),
-          ]
+        ? model.models.filter((member) => member.model !== model.id)
         : [];
       return {
         id: model.id,
@@ -100,10 +97,12 @@ export function previewVisibleModels(
       };
     });
 
-  const hiddenMembers = new Set(
-    unifiedInGroup.flatMap((model) => (model.hide ? model.hiddenMembers : [])),
+  const hiddenNames = new Set(
+    unifiedInGroup.flatMap((model) =>
+      model.hide ? model.hiddenMembers.map((member) => member.model) : [],
+    ),
   );
-  const visibleIds = allowed.filter((name) => !hiddenMembers.has(name)).sort();
+  const visibleIds = allowed.filter((name) => !hiddenNames.has(name)).sort();
 
   return { visibleIds, unified: unifiedInGroup };
 }

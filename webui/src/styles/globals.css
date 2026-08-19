@@ -834,6 +834,11 @@ html[lang='zh-CN'] .font-serif {
   background: var(--seed-surface-alt);
   color: var(--fg-muted);
 }
+/** 组内的统一模型名：用主色浅底，区别于渠道 chip（info）和别名虚线框。 */
+.badge-unified {
+  background: color-mix(in srgb, var(--seed-primary) 14%, var(--seed-surface));
+  color: var(--seed-primary);
+}
 .badge-proto-chat {
   background: var(--proto-chat-bg);
   color: var(--proto-chat);
@@ -845,6 +850,23 @@ html[lang='zh-CN'] .font-serif {
 .badge-proto-anthropic {
   background: var(--proto-anthropic-bg);
   color: var(--proto-anthropic);
+}
+
+/* 请求路由 hop 序号：描边圆点，不用实心底色，避免和模型名、chip 抢视觉。 */
+.route-index {
+  display: inline-flex;
+  width: 1.125rem;
+  height: 1.125rem;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--seed-border);
+  border-radius: 999px;
+  color: var(--fg-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  user-select: none;
 }
 
 /* ── Button ── */

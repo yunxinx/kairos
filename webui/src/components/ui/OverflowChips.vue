@@ -15,6 +15,10 @@ export interface OverflowChip {
   actualRequest?: string;
   /** 额外提示（例如主模型上挂着的别名）。 */
   tooltip?: string;
+  /** 渠道名右侧的状态标文案（已翻译）。 */
+  aside?: string;
+  /** 状态标 data-kind（unlisted / disabled / gone）。 */
+  asideKind?: string;
 }
 
 const props = defineProps<{
@@ -49,18 +53,28 @@ function chipTooltip(chip: OverflowChip): string {
 <template>
   <span v-if="chips.length === 0" class="text-fg-muted">{{ t('common.emptyCell') }}</span>
   <span v-else class="inline-flex max-w-full items-center gap-1">
-    <Tooltip v-for="chip in visible" :key="chip.name" :text="chipTooltip(chip)">
+    <span v-for="chip in visible" :key="chip.name" class="inline-flex min-w-0 items-center gap-1">
+      <Tooltip :text="chipTooltip(chip)">
+        <span
+          class="badge max-w-[9rem] truncate"
+          :class="chipClass(chip)"
+          :data-testid="chipTestId"
+          :data-model="chip.name"
+          :data-canonical="isActualRequest(chip) ? 'true' : undefined"
+          :title="chipTooltip(chip) === '' ? chip.name : undefined"
+        >
+          {{ chip.name }}
+        </span>
+      </Tooltip>
       <span
-        class="badge max-w-[9rem] truncate"
-        :class="chipClass(chip)"
-        :data-testid="chipTestId"
-        :data-model="chip.name"
-        :data-canonical="isActualRequest(chip) ? 'true' : undefined"
-        :title="chipTooltip(chip) === '' ? chip.name : undefined"
+        v-if="chip.aside"
+        class="badge badge-danger"
+        data-testid="member-source-status"
+        :data-kind="chip.asideKind"
       >
-        {{ chip.name }}
+        {{ chip.aside }}
       </span>
-    </Tooltip>
+    </span>
     <PopoverRoot v-if="hiddenCount > 0">
       <PopoverTrigger as-child>
         <button
@@ -81,18 +95,28 @@ function chipTooltip(chip: OverflowChip): string {
         >
           <ul class="overflow-chip-grid">
             <li v-for="chip in hidden" :key="chip.name" class="min-w-0">
-              <Tooltip :text="chipTooltip(chip)">
+              <span class="inline-flex max-w-full items-center gap-1">
+                <Tooltip :text="chipTooltip(chip)">
+                  <span
+                    class="badge max-w-full min-w-0 truncate"
+                    :class="chipClass(chip)"
+                    :data-testid="chipTestId"
+                    :data-model="chip.name"
+                    :data-canonical="isActualRequest(chip) ? 'true' : undefined"
+                    :title="chipTooltip(chip) === '' ? chip.name : undefined"
+                  >
+                    {{ chip.name }}
+                  </span>
+                </Tooltip>
                 <span
-                  class="badge max-w-full min-w-0 truncate"
-                  :class="chipClass(chip)"
-                  :data-testid="chipTestId"
-                  :data-model="chip.name"
-                  :data-canonical="isActualRequest(chip) ? 'true' : undefined"
-                  :title="chipTooltip(chip) === '' ? chip.name : undefined"
+                  v-if="chip.aside"
+                  class="badge badge-danger"
+                  data-testid="member-source-status"
+                  :data-kind="chip.asideKind"
                 >
-                  {{ chip.name }}
+                  {{ chip.aside }}
                 </span>
-              </Tooltip>
+              </span>
             </li>
           </ul>
         </PopoverContent>

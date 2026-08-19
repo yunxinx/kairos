@@ -16,8 +16,9 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
-import OverflowChips from '@/components/ui/OverflowChips.vue';
+import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
 import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
+import { callableRouteMembers } from '@/lib/unified-sources';
 import { DEFAULT_MODEL_GROUP, previewVisibleSections } from '@/lib/visible-models';
 
 const { t } = useI18n();
@@ -48,22 +49,28 @@ const groupOptions = computed(() =>
   })),
 );
 
+const channels = computed(() => channelsQuery.data.value ?? []);
+
 const sections = computed(() => {
   const q = searchText.value.trim().toLowerCase();
   return previewVisibleSections(
     groupsQuery.data.value ?? [],
     unifiedQuery.data.value ?? [],
-    channelsQuery.data.value ?? [],
+    channels.value,
     selectedGroups.value,
   )
     .map((section) => {
       const byId = new Map(section.unified.map((item) => [item.id, item]));
       const rows = section.visibleIds
         .filter((id) => !q || id.toLowerCase().includes(q))
-        .map((id) => ({
-          id,
-          unified: byId.get(id),
-        }));
+        .map((id) => {
+          const unified = byId.get(id);
+          return {
+            id,
+            unified,
+            callableRoute: unified ? [] : callableRouteMembers(id, channels.value),
+          };
+        });
       return {
         groupName: section.groupName,
         label:
@@ -183,12 +190,15 @@ function refetchAll() {
                 </TableCell>
                 <TableCell>
                   <div v-if="row.unified" data-testid="visible-unified-order">
-                    <UnifiedJumpOrder
-                      :members="row.unified.models"
-                      :channels="channelsQuery.data.value ?? []"
-                    />
+                    <UnifiedJumpOrder :members="row.unified.models" :channels="channels" />
                   </div>
-                  <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
+                  <div
+                    v-else-if="row.callableRoute.length > 0"
+                    data-testid="visible-callable-order"
+                  >
+                    <UnifiedJumpOrder :members="row.callableRoute" :channels="channels" />
+                  </div>
+                  <ChannelSourceMark v-else kind="unlisted" />
                 </TableCell>
                 <TableCell
                   :data-testid="
@@ -197,9 +207,11 @@ function refetchAll() {
                       : undefined
                   "
                 >
-                  <OverflowChips
+                  <UnifiedJumpOrder
                     v-if="row.unified && row.unified.hiddenMembers.length > 0"
-                    :items="row.unified.hiddenMembers"
+                    :members="row.unified.hiddenMembers"
+                    :channels="channels"
+                    :hide-index="true"
                   />
                   <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
                 </TableCell>

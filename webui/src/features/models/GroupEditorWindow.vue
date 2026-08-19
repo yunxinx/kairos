@@ -3,7 +3,7 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { ModelGroup } from '@/api/types';
+import type { ChannelView, ModelGroup, UnifiedModel } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
@@ -17,6 +17,9 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import CallableSourceCell from '@/features/models/CallableSourceCell.vue';
+import UnifiedNameChip from '@/features/models/UnifiedNameChip.vue';
+import { callableSourceLine } from '@/lib/unified-sources';
 import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
@@ -25,6 +28,8 @@ const props = withDefaults(
   defineProps<{
     initial: ModelGroup | null;
     callableNames: string[];
+    channels: ChannelView[];
+    unifiedModels: UnifiedModel[];
     anchor?: FloatingWindowAnchor | null;
     stackOrder?: number;
     cascade?: number;
@@ -59,10 +64,10 @@ const editorName = ref(initialName);
 const editorModels = ref([...initialModels]);
 const searchText = ref('');
 
-/** 组内表：模型名用百分比，避免 `auto` + truncate 把列挤没。 */
-const memberColumns = [{ width: '85%' }, { width: '3.5rem' }];
-/** 可用表：勾选固定，模型名用百分比。 */
-const pickColumns = [{ width: '2.5rem' }, { width: '90%' }];
+/** 组内表：模型名与来源用百分比，操作列固定。 */
+const memberColumns = [{ width: '40%' }, { width: '45%' }, { width: '3.5rem' }];
+/** 可用表：勾选固定，模型名与来源对分剩余。 */
+const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '55%' }];
 
 const dirty = computed(
   () =>
@@ -71,12 +76,25 @@ const dirty = computed(
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
+function lineFor(name: string) {
+  return callableSourceLine(name, props.channels, props.unifiedModels);
+}
+
+const memberRows = computed(() => editorModels.value.map(lineFor));
+
 const pickerRows = computed(() => {
   const q = searchText.value.trim().toLowerCase();
   return props.callableNames
     .filter((name) => !editorModels.value.includes(name))
-    .filter((name) => !q || name.toLowerCase().includes(q))
-    .sort((left, right) => left.localeCompare(right));
+    .map(lineFor)
+    .filter((row) => {
+      if (!q) return true;
+      return (
+        row.name.toLowerCase().includes(q) ||
+        row.channels.some((channel) => channel.name.toLowerCase().includes(q))
+      );
+    })
+    .sort((left, right) => left.name.localeCompare(right.name));
 });
 
 function addModel(name: string) {
@@ -159,29 +177,36 @@ function handleSave() {
           <DataTablePanel class="h-56">
             <VirtualTable
               class="h-full"
-              :rows="editorModels"
-              :colspan="2"
+              :rows="memberRows"
+              :colspan="3"
               :columns="memberColumns"
               data-testid="group-model-list"
-              :get-row-key="(name) => name"
+              :get-row-key="(row) => row.name"
               :empty-title="t('models.groupModelsEmpty')"
             >
               <template #header>
                 <TableRow>
                   <TableHead>{{ t('pricing.model') }}</TableHead>
+                  <TableHead>{{ t('models.unifiedSources') }}</TableHead>
                   <TableHead align="center">{{ t('common.actions') }}</TableHead>
                 </TableRow>
               </template>
-              <template #row="{ row: name }">
-                <TableRow data-testid="group-model-option" :data-model="name">
-                  <TableCell truncate class="font-mono text-sm" :title="name">{{ name }}</TableCell>
+              <template #row="{ row }">
+                <TableRow data-testid="group-model-option" :data-model="row.name">
+                  <TableCell truncate :title="row.name">
+                    <UnifiedNameChip v-if="row.isUnified" :name="row.name" />
+                    <span v-else class="font-mono text-sm">{{ row.name }}</span>
+                  </TableCell>
+                  <TableCell>
+                    <CallableSourceCell :line="row" :channels="channels" />
+                  </TableCell>
                   <TableCell align="center">
                     <button
                       type="button"
                       class="btn btn-ghost btn-icon"
                       data-testid="group-model-remove"
-                      :aria-label="t('models.groupRemoveModel', { name })"
-                      @click="removeModel(name)"
+                      :aria-label="t('models.groupRemoveModel', { name: row.name })"
+                      @click="removeModel(row.name)"
                     >
                       <UiIcon name="close" :size="14" />
                     </button>
@@ -206,27 +231,34 @@ function handleSave() {
             <VirtualTable
               class="h-full"
               :rows="pickerRows"
-              :colspan="2"
+              :colspan="3"
               :columns="pickColumns"
-              :get-row-key="(name) => name"
+              :get-row-key="(row) => row.name"
               :empty-title="t('models.groupPickEmpty')"
             >
               <template #header>
                 <TableRow>
                   <TableHead class="w-10" />
                   <TableHead>{{ t('pricing.model') }}</TableHead>
+                  <TableHead>{{ t('models.channels') }}</TableHead>
                 </TableRow>
               </template>
-              <template #row="{ row: name }">
-                <TableRow data-testid="group-pick" :data-model="name">
+              <template #row="{ row }">
+                <TableRow data-testid="group-pick" :data-model="row.name">
                   <TableCell>
                     <Checkbox
                       :model-value="false"
                       data-testid="group-pick-check"
-                      @update:model-value="(value) => onPickCheck(name, value)"
+                      @update:model-value="(value) => onPickCheck(row.name, value)"
                     />
                   </TableCell>
-                  <TableCell truncate class="font-mono text-sm" :title="name">{{ name }}</TableCell>
+                  <TableCell truncate :title="row.name">
+                    <UnifiedNameChip v-if="row.isUnified" :name="row.name" />
+                    <span v-else class="font-mono text-sm">{{ row.name }}</span>
+                  </TableCell>
+                  <TableCell>
+                    <CallableSourceCell :line="row" :channels="channels" />
+                  </TableCell>
                 </TableRow>
               </template>
             </VirtualTable>

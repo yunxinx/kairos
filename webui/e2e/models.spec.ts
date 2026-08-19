@@ -1,10 +1,66 @@
 import { authedTest as test, expect } from './fixtures';
+import type { Locator, Page } from '@playwright/test';
 import { E2E_ADMIN_KEY } from './helpers/gateway';
-import { seedCatalog, seedChannel, seedModelGroup, seedPrice, seedToken } from './helpers/models';
+import {
+  seedCatalog,
+  seedChannel,
+  seedModelGroup,
+  seedPrice,
+  seedToken,
+  seedUnifiedModel,
+  updateChannel,
+  deleteChannel,
+} from './helpers/models';
 import { seedRequestLogs } from './helpers/seed-logs';
 import { clickRowAction } from './helpers/table';
 
 test.describe.configure({ mode: 'serial' });
+
+async function expectSourceStatus(
+  host: Locator,
+  kind: 'unlisted' | 'disabled' | 'gone',
+  channel: string | null,
+  chipTestId = 'unified-source-channel',
+): Promise<void> {
+  const status = host.getByTestId('member-source-status');
+  await expect(status).toHaveAttribute('data-kind', kind);
+  await expect(status).toHaveClass(/badge-danger/);
+  if (channel === null) {
+    await expect(host.getByTestId(chipTestId)).toHaveCount(0);
+    return;
+  }
+  await expect(host.getByTestId(chipTestId)).toHaveText(channel);
+  expect(
+    await host.evaluate((el, testId) => {
+      const chip = el.querySelector(`[data-testid="${testId}"]`);
+      const badge = el.querySelector('[data-testid="member-source-status"]');
+      if (chip === null || badge === null) return false;
+      return (chip.compareDocumentPosition(badge) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    }, chipTestId),
+  ).toBe(true);
+}
+
+async function assertSourceKind(
+  page: Page,
+  kind: 'unlisted' | 'disabled' | 'gone',
+  channel: string | null,
+): Promise<void> {
+  await page.getByTestId('models-tab-unified').click();
+  const unifiedRow = page.locator('[data-testid="unified-row"][data-unified-id="e2e-src-u"]');
+  await expectSourceStatus(unifiedRow.getByTestId('unified-member-line'), kind, channel);
+
+  await unifiedRow.getByTestId('unified-edit').click();
+  await expectSourceStatus(
+    page.locator('[data-testid="unified-member"][data-member="e2e-src-m"]'),
+    kind,
+    channel,
+  );
+  await page.getByRole('button', { name: /^cancel$/i }).click();
+
+  await page.getByTestId('models-tab-visible').click();
+  const visibleRow = page.locator('[data-testid="visible-model"][data-model="e2e-src-u"]');
+  await expectSourceStatus(visibleRow.getByTestId('unified-member-line'), kind, channel);
+}
 
 test.describe('models page', () => {
   test('four parallel tabs default to inventory; selection does not cross tabs', async ({
@@ -316,6 +372,14 @@ test.describe('models page', () => {
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('coding');
     await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-haiku');
     await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-mini');
+    await expect(
+      page
+        .getByTestId('visible-hidden-members')
+        .locator('[data-testid="unified-member-line"][data-member="e2e-code-haiku"]'),
+    ).toHaveAttribute('data-channel', 'e2e-coding-channel');
+    await expect(
+      page.getByTestId('visible-hidden-members').getByTestId('unified-member-index'),
+    ).toHaveCount(0);
 
     await page.getByTestId('models-tab-groups').click();
     await page.getByTestId('group-create').click();
@@ -327,8 +391,29 @@ test.describe('models page', () => {
     await expect(
       page.locator('[data-testid="group-model-option"][data-model="coding"]'),
     ).toBeVisible();
+    await expect(
+      page
+        .locator('[data-testid="group-model-option"][data-model="coding"]')
+        .getByTestId('group-unified-chip'),
+    ).toHaveText('coding');
+    await expect(
+      page
+        .locator('[data-testid="group-model-option"][data-model="coding"]')
+        .getByTestId('group-source-channel'),
+    ).toHaveCount(0);
     await page.getByTestId('group-save').click();
-    await expect(page.locator('[data-testid="group-row"][data-group-name="coding"]')).toBeVisible();
+    const codingGroup = page.locator('[data-testid="group-row"][data-group-name="coding"]');
+    await expect(codingGroup).toBeVisible();
+    await expect(codingGroup.getByTestId('group-member-line')).toHaveAttribute(
+      'data-model',
+      'coding',
+    );
+    await expect(codingGroup.getByTestId('group-unified-chip')).toHaveText('coding');
+    await expect(codingGroup.getByTestId('group-source-channel')).toHaveCount(0);
+    await expect(codingGroup.getByTestId('unified-source-channel')).toHaveCount(2);
+    await expect(
+      codingGroup.locator('[data-testid="unified-member-line"][data-member="e2e-code-haiku"]'),
+    ).toHaveAttribute('data-channel', 'e2e-coding-channel');
 
     await page.getByTestId('models-tab-visible').click();
     await page.getByTestId('visible-group-filter').click();
@@ -371,10 +456,12 @@ test.describe('models page', () => {
     await seedChannel(page, {
       name: 'e2e-layout-a',
       models: ['e2e-shared', 'e2e-only-a'],
+      priority: 2,
     });
     await seedChannel(page, {
       name: 'e2e-layout-b',
       models: ['e2e-shared', 'e2e-only-b'],
+      priority: 1,
     });
     await page.goto('/models');
     await expect(page.getByTestId('inventory-channels-head')).toHaveCount(0);
@@ -418,6 +505,19 @@ test.describe('models page', () => {
         '[data-testid="inventory-row"][data-model="e2e-shared"][data-section-channel="e2e-layout-b"]',
       ),
     ).toHaveCount(0);
+
+    await page.getByTestId('models-tab-visible').click();
+    const sharedVisible = page.locator('[data-testid="visible-model"][data-model="e2e-shared"]');
+    await expect(sharedVisible.getByTestId('visible-callable-order')).toBeVisible();
+    const routeLines = sharedVisible.locator('[data-testid="unified-member-line"]');
+    await expect(routeLines).toHaveCount(2);
+    await expect(routeLines.nth(0)).toHaveAttribute('data-channel', 'e2e-layout-b');
+    await expect(routeLines.nth(1)).toHaveAttribute('data-channel', 'e2e-layout-a');
+    await expect(sharedVisible.getByTestId('unified-member-index')).toHaveCount(2);
+
+    const onlyA = page.locator('[data-testid="visible-model"][data-model="e2e-only-a"]');
+    await expect(onlyA.getByTestId('visible-callable-order')).toBeVisible();
+    await expect(onlyA.getByTestId('unified-member-index')).toHaveCount(0);
   });
 
   test('same model on two channels keeps independent prices', async ({ page }) => {
@@ -513,6 +613,76 @@ test.describe('models page', () => {
     );
     expect(leftPrice).toBeUndefined();
     expect(rightPrice?.input_micros).toBe(4_000_000);
+  });
+
+  test('source status sits after the channel chip and distinguishes unlisted, disabled, and gone', async ({
+    page,
+  }) => {
+    const channel = await seedChannel(page, {
+      name: 'e2e-src-ch',
+      models: ['e2e-src-m'],
+    });
+    await seedUnifiedModel(page, {
+      id: 'e2e-src-u',
+      hide: false,
+      models: [{ channel_id: channel.id, model: 'e2e-src-m' }],
+    });
+    await seedModelGroup(page, { name: 'e2e-src-g', models: ['e2e-src-u', 'e2e-src-m'] });
+
+    await updateChannel(page, channel.id, { enabled: false });
+    await page.goto('/models');
+    await assertSourceKind(page, 'disabled', 'e2e-src-ch');
+
+    await page.getByTestId('models-tab-groups').click();
+    const groupRow = page.locator('[data-testid="group-row"][data-group-name="e2e-src-g"]');
+    await expect(
+      groupRow.locator('[data-testid="group-member-line"][data-model="e2e-src-m"]'),
+    ).toBeVisible();
+    await expectSourceStatus(
+      groupRow.locator('[data-testid="group-member-line"][data-model="e2e-src-m"]'),
+      'disabled',
+      'e2e-src-ch',
+      'group-source-channel',
+    );
+    await expectSourceStatus(
+      groupRow.locator('[data-testid="group-member-line"][data-model="e2e-src-u"]'),
+      'disabled',
+      'e2e-src-ch',
+    );
+
+    await updateChannel(page, channel.id, { enabled: true, models: [] });
+    await page.reload();
+    await assertSourceKind(page, 'unlisted', 'e2e-src-ch');
+
+    await page.getByTestId('models-tab-groups').click();
+    await expectSourceStatus(
+      groupRow.locator('[data-testid="group-member-line"][data-model="e2e-src-u"]'),
+      'unlisted',
+      'e2e-src-ch',
+    );
+    await groupRow.getByTestId('group-edit').click();
+    const unifiedOption = page.locator(
+      '[data-testid="group-model-option"][data-model="e2e-src-u"]',
+    );
+    const ordinaryOption = page.locator(
+      '[data-testid="group-model-option"][data-model="e2e-src-m"]',
+    );
+    await expectSourceStatus(
+      unifiedOption.getByTestId('unified-member-line'),
+      'unlisted',
+      'e2e-src-ch',
+    );
+    await expectSourceStatus(ordinaryOption, 'unlisted', null);
+
+    await deleteChannel(page, channel.id);
+    await page.reload();
+    await assertSourceKind(page, 'gone', null);
+    await page.getByTestId('models-tab-groups').click();
+    await expectSourceStatus(
+      groupRow.locator('[data-testid="group-member-line"][data-model="e2e-src-u"]'),
+      'gone',
+      null,
+    );
   });
 
   test('deleting a group with bound tokens asks to force; force rebinds tokens to default', async ({

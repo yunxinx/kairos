@@ -13,7 +13,6 @@ import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
-import OverflowChips from '@/components/ui/OverflowChips.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
@@ -24,10 +23,16 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import { buildInventory, inventoryRowKey, type InventoryRow } from '@/lib/inventory';
 import { moveItem } from '@/lib/move-item';
-import { channelNameForMember, unifiedMemberKey } from '@/lib/unified-sources';
+import {
+  channelNameForMember,
+  memberSourceKind,
+  unifiedMemberKey,
+  type MemberSourceKind,
+} from '@/lib/unified-sources';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
 const props = withDefaults(
@@ -197,6 +202,13 @@ function pinnedChannelName(member: UnifiedMember): string {
   return channelNameForMember(props.channels, member);
 }
 
+function pickSourceKind(row: InventoryRow): MemberSourceKind {
+  const channel = props.channels.find((item) => item.id === row.channelId);
+  if (channel === undefined) return 'gone';
+  if (!channel.enabled) return 'disabled';
+  return 'ok';
+}
+
 /** 序号/操作固定；模型名与来源用百分比，避免 `auto` + truncate 把列挤没。 */
 const memberColumns = [
   { width: '3.5rem' },
@@ -300,10 +312,9 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
                       >{{ member.model }}</TableCell
                     >
                     <TableCell>
-                      <OverflowChips
-                        v-if="pinnedChannelName(member)"
-                        :items="[pinnedChannelName(member)]"
-                        chip-test-id="unified-source-channel"
+                      <ChannelSourceMark
+                        :channel-name="pinnedChannelName(member)"
+                        :kind="memberSourceKind(member, channels)"
                       />
                     </TableCell>
                     <TableCell align="center">
@@ -401,7 +412,15 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
                   <TableCell truncate class="font-mono text-sm" :title="row.name">{{
                     row.name
                   }}</TableCell>
-                  <TableCell truncate :title="row.channelName">{{ row.channelName }}</TableCell>
+                  <TableCell>
+                    <span class="inline-flex max-w-full items-center gap-1">
+                      <span class="truncate" :title="row.channelName">{{ row.channelName }}</span>
+                      <ChannelSourceMark
+                        v-if="pickSourceKind(row) !== 'ok'"
+                        :kind="pickSourceKind(row)"
+                      />
+                    </span>
+                  </TableCell>
                 </TableRow>
               </template>
             </VirtualTable>
