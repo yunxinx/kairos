@@ -6,13 +6,9 @@
     "themeDark": "深色"
   },
   "home": {
-    "kicker": "Provider-agnostic gateway",
     "headline": "Provider 无关的 AI 网关",
     "lead": "同协议透明转发。网关侧统一治理、计量与观测。",
-    "startCta": "开始使用",
-    "anchorRun": "Run",
-    "anchorRelay": "Relay",
-    "anchorObserve": "Observe"
+    "startCta": "开始使用"
   },
   "nav": {
     "overview": "概览",

@@ -214,7 +214,7 @@ onUnmounted(() => {
     >
       <div class="flex min-w-0 flex-1 items-center gap-2">
         <Tooltip :text="title">
-          <h2 :id="titleId" class="min-w-0 truncate font-serif text-base font-semibold">
+          <h2 :id="titleId" class="min-w-0 truncate text-base font-semibold">
             {{ title }}
           </h2>
         </Tooltip>

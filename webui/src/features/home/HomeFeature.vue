@@ -40,12 +40,6 @@ onUnmounted(() => {
 
     <div class="home-main marketing-main-stage max-w-content px-page-x mx-auto flex-col">
       <section ref="heroEl" class="home-hero">
-        <p
-          class="home-kicker text-fg-muted font-mono text-xs tracking-[0.14em] uppercase"
-          data-reveal
-        >
-          {{ t('home.kicker') }}
-        </p>
         <h1 class="home-title font-serif font-normal" data-reveal>
           {{ t('home.headline') }}
         </h1>
@@ -57,13 +51,6 @@ onUnmounted(() => {
             {{ t('home.startCta') }}
           </Link>
         </div>
-        <ul class="home-anchors text-fg-subtle font-mono text-xs" data-reveal>
-          <li>{{ t('home.anchorRun') }}</li>
-          <li aria-hidden="true">·</li>
-          <li>{{ t('home.anchorRelay') }}</li>
-          <li aria-hidden="true">·</li>
-          <li>{{ t('home.anchorObserve') }}</li>
-        </ul>
       </section>
     </div>
   </div>

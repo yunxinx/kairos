@@ -204,12 +204,12 @@ html[lang='zh-CN'] .font-serif {
   letter-spacing: normal;
 }
 
-.font-serif:is(h1, h2, .home-title, .page-header-title) {
+.font-serif:is(h1, h2, .home-title) {
   text-wrap: balance;
 }
 
 @supports (text-wrap: pretty) {
-  .font-serif:is(h1, h2, .home-title, .page-header-title) {
+  .font-serif:is(h1, h2, .home-title) {
     text-wrap: pretty;
   }
 }

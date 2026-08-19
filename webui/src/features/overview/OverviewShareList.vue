@@ -78,7 +78,7 @@ function nameBinding(name: string): Record<string, string> {
 <template>
   <div class="card overview-panel" data-testid="overview-share-panel">
     <div class="card-header">
-      <h2 class="min-w-0 truncate font-serif text-base font-semibold">
+      <h2 class="min-w-0 truncate text-base font-semibold">
         {{ t('overview.shareTabs') }}
       </h2>
       <SegmentSwitch

@@ -11,11 +11,6 @@
   text-align: left;
 }
 
-.home-kicker {
-  margin-bottom: 1.25rem;
-  letter-spacing: 0.14em;
-}
-
 .home-title {
   font-size: clamp(2.25rem, 5vw, 3.25rem);
   line-height: 1.12;
@@ -35,15 +30,6 @@
   flex-wrap: wrap;
   gap: 0.625rem;
   margin-top: 2rem;
-}
-
-.home-anchors {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.625rem;
-  margin-top: 3rem;
-  letter-spacing: 0.04em;
 }
 
 @media (min-width: 768px) {

@@ -6,13 +6,9 @@
     "themeDark": "Dark"
   },
   "home": {
-    "kicker": "Provider-agnostic gateway",
     "headline": "A provider-agnostic AI gateway",
     "lead": "Transparent same-protocol relay. Governance, metering, and observability on the gateway side.",
-    "startCta": "Get started",
-    "anchorRun": "Run",
-    "anchorRelay": "Relay",
-    "anchorObserve": "Observe"
+    "startCta": "Get started"
   },
   "nav": {
     "overview": "Overview",

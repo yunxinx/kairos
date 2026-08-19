@@ -35,7 +35,7 @@ function cellAriaLabel(cell: (typeof heatmapCells.value)[number]): string {
 <template>
   <div class="card overview-panel overview-heatmap-card">
     <div class="card-header">
-      <h2 class="font-serif text-base font-semibold">{{ t('overview.heatmap') }}</h2>
+      <h2 class="text-base font-semibold">{{ t('overview.heatmap') }}</h2>
     </div>
     <div class="card-body overview-panel-body overview-heatmap-body">
       <div
