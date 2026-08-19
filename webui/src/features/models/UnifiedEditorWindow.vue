@@ -14,7 +14,6 @@ import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
-import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import SplitTable from '@/components/ui/table/SplitTable.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
@@ -24,6 +23,7 @@ import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
+import { countedFacetOptions } from '@/lib/faceted-filter';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import { buildInventory, inventoryRowKey, type InventoryRow } from '@/lib/inventory';
 import { moveItem } from '@/lib/move-item';
@@ -88,9 +88,7 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 const inventory = computed(() => buildInventory(props.channels, props.prices));
 
 const channelOptions = computed(() =>
-  [...new Set(inventory.value.map((row) => row.channelName))]
-    .sort((left, right) => left.localeCompare(right))
-    .map((name) => ({ value: name, label: name })),
+  countedFacetOptions(inventory.value.map((row) => row.channelName)),
 );
 
 /** 按渠道分行：同一名字在不同渠道上各占一行，勾选互不影响。 */
@@ -396,15 +394,10 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
                     row.name
                   }}</TableCell>
                   <TableCell>
-                    <span class="inline-flex max-w-full items-center gap-1">
-                      <Tooltip :text="row.channelName">
-                        <span class="truncate">{{ row.channelName }}</span>
-                      </Tooltip>
-                      <ChannelSourceMark
-                        v-if="pickSourceKind(row) !== 'ok'"
-                        :kind="pickSourceKind(row)"
-                      />
-                    </span>
+                    <ChannelSourceMark
+                      :channel-name="row.channelName"
+                      :kind="pickSourceKind(row)"
+                    />
                   </TableCell>
                 </TableRow>
               </template>

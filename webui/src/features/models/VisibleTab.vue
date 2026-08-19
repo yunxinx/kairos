@@ -19,7 +19,11 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
 import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
 import { callableRouteMembers } from '@/lib/unified-sources';
-import { DEFAULT_MODEL_GROUP, previewVisibleSections } from '@/lib/visible-models';
+import {
+  DEFAULT_MODEL_GROUP,
+  previewVisibleModels,
+  previewVisibleSections,
+} from '@/lib/visible-models';
 
 const { t } = useI18n();
 const selectedGroups = ref<string[]>([]);
@@ -42,12 +46,16 @@ const pricesQuery = useQuery({
   queryFn: () => apiClient.listPrices(),
 });
 
-const groupOptions = computed(() =>
-  (groupsQuery.data.value ?? []).map((group) => ({
+const groupOptions = computed(() => {
+  const groups = groupsQuery.data.value ?? [];
+  const unified = unifiedQuery.data.value ?? [];
+  const channelList = channelsQuery.data.value ?? [];
+  return groups.map((group) => ({
     value: group.name,
     label: group.name === DEFAULT_MODEL_GROUP ? t('models.ungrouped') : group.name,
-  })),
-);
+    count: previewVisibleModels(groups, unified, channelList, group.name).visibleIds.length,
+  }));
+});
 
 const channels = computed(() => channelsQuery.data.value ?? []);
 

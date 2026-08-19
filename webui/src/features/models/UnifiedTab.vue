@@ -81,14 +81,23 @@ const prices = computed(() => pricesQuery.data.value ?? []);
 const models = computed(() => unifiedQuery.data.value ?? []);
 const showTableSkeleton = computed(() => unifiedQuery.isPending.value && !unifiedQuery.data.value);
 
-const statusOptions = computed(() => [
-  { value: 'hidden', label: t('models.unifiedHideOn') },
-  { value: 'listed', label: t('models.unifiedHideOff') },
-]);
+const statusOptions = computed(() => {
+  const hidden = models.value.filter((model) => model.hide).length;
+  return [
+    { value: 'hidden', label: t('models.unifiedHideOn'), count: hidden },
+    { value: 'listed', label: t('models.unifiedHideOff'), count: models.value.length - hidden },
+  ];
+});
 
 const channelOptions = computed(() =>
   [...channels.value]
-    .map((channel) => ({ value: channel.name, label: channel.name }))
+    .map((channel) => ({
+      value: channel.name,
+      label: channel.name,
+      count: models.value.filter((model) =>
+        unifiedUsesChannel(model.models, channels.value, channel.name),
+      ).length,
+    }))
     .sort((left, right) => left.label.localeCompare(right.label)),
 );
 

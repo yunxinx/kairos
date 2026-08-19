@@ -276,11 +276,27 @@ async fn unhidden_id_colliding_with_registered_name_is_rejected() {
 async fn token_group_and_unified_id_may_share_the_same_string() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
 
+    let channel_id = first_channel_id(&gw).await;
+    let unified = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/unified-models",
+        json!({ "id": "coding", "models": [member_json(channel_id, "gpt-4o")], "hide": false }),
+    )
+    .await;
+    assert_eq!(unified.status(), reqwest::StatusCode::CREATED);
+
     let group = admin_json(
         &gw,
         reqwest::Method::POST,
         "/model-groups",
-        json!({ "name": "coding", "models": ["coding", "gpt-4o"] }),
+        json!({
+            "name": "coding",
+            "models": [
+                { "kind": "unified", "id": "coding" },
+                { "kind": "source", "channel_id": channel_id, "model": "gpt-4o" }
+            ]
+        }),
     )
     .await;
     assert_eq!(group.status(), reqwest::StatusCode::CREATED);
@@ -295,15 +311,6 @@ async fn token_group_and_unified_id_may_share_the_same_string() {
     assert_eq!(token.status(), reqwest::StatusCode::CREATED);
     let token_body: Value = token.json().await.expect("令牌");
     assert_eq!(token_body["name"], "coding");
-
-    let unified = admin_json(
-        &gw,
-        reqwest::Method::POST,
-        "/unified-models",
-        json!({ "id": "coding", "models": [member_json(first_channel_id(&gw).await, "gpt-4o")], "hide": false }),
-    )
-    .await;
-    assert_eq!(unified.status(), reqwest::StatusCode::CREATED);
 }
 
 /// 渠道新增已登记名若撞上未隐藏统一 ID → 409。

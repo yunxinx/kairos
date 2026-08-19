@@ -77,12 +77,63 @@ pub struct Token {
 /// 模型组：令牌的可调用名允许名单（渠道模型、别名 key、统一模型 ID）。
 ///
 /// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
-/// 错误直接报错而非静默忽略。渠道可指定默认组以便添加时入组，但组本身不按渠道划分。
+/// 错误直接报错而非静默忽略。名单条目按 kind 区分：钉在某一渠道上的已登记名，
+/// 或一个统一模型 ID。同一名字挂在不同渠道上是不同条目。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelGroup {
     pub name: String,
-    pub models: Vec<String>,
+    pub models: Vec<GroupModel>,
+}
+
+/// 组名单一条：钉渠道的已登记名，或统一模型 ID。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GroupModel {
+    Source { channel_id: i64, model: String },
+    Unified { id: String },
+}
+
+/// 该条目对应的可调用名（请求 `model` / 下游列表 ID）。
+fn group_model_name(entry: &GroupModel) -> &str {
+    match entry {
+        GroupModel::Unified { id } => id,
+        GroupModel::Source { model, .. } => model,
+    }
+}
+
+fn group_model_key(entry: &GroupModel) -> (u8, i64, &str) {
+    match entry {
+        GroupModel::Unified { id } => (0, 0, id.as_str()),
+        GroupModel::Source { channel_id, model } => (1, *channel_id, model.as_str()),
+    }
+}
+
+/// 组是否收录该可调用名（统一 ID 或任一钉渠道条目）。
+fn group_has_name(group: &ModelGroup, model: &str) -> bool {
+    group
+        .models
+        .iter()
+        .any(|entry| group_model_name(entry) == model)
+}
+
+/// 自定义组对该名钉死的渠道 id；`None` 表示未钉，路由仍看全部已登记渠道。
+pub fn pinned_channel_ids(group: &ModelGroup, model: &str) -> Option<HashSet<i64>> {
+    if group.name == DEFAULT_MODEL_GROUP {
+        return None;
+    }
+    let mut ids = HashSet::new();
+    for entry in &group.models {
+        if let GroupModel::Source {
+            channel_id,
+            model: name,
+        } = entry
+            && name == model
+        {
+            ids.insert(*channel_id);
+        }
+    }
+    if ids.is_empty() { None } else { Some(ids) }
 }
 
 /// 统一模型的一条成员：钉在某一渠道上的已登记可调用名。
@@ -140,12 +191,11 @@ pub fn newly_callable_names(previous: Option<&Channel>, next: &Channel) -> Vec<S
     added
 }
 
-/// 把名字并入指定模型组的显式名单（已在组内的跳过，保序追加）。
-///
-/// 组不存在返回 [`StoreError::InvalidResource`]。
-pub async fn union_names_into_group(
+/// 把某一渠道上新出现的可调用名钉进指定组；已有同渠道同名条目跳过。
+pub async fn union_channel_callables_into_group(
     conn: &mut SqliteConnection,
     group_name: &str,
+    channel_id: i64,
     names: &[String],
 ) -> Result<(), StoreError> {
     if names.is_empty() {
@@ -156,10 +206,20 @@ pub async fn union_names_into_group(
             "模型组 {group_name} 不存在"
         )));
     };
-    let mut seen: HashSet<String> = group.models.iter().cloned().collect();
+    let mut seen: HashSet<(u8, i64, String)> = group
+        .models
+        .iter()
+        .map(|entry| {
+            let (tag, id, name) = group_model_key(entry);
+            (tag, id, name.to_string())
+        })
+        .collect();
     for name in names {
-        if seen.insert(name.clone()) {
-            group.models.push(name.clone());
+        if seen.insert((1, channel_id, name.clone())) {
+            group.models.push(GroupModel::Source {
+                channel_id,
+                model: name.clone(),
+            });
         }
     }
     upsert_model_group(conn, &group).await
@@ -203,14 +263,14 @@ pub fn unhidden_unified_id_collides(id: &str, hide: bool, registered: &HashSet<S
 /// （未指定分组的可调用名视为 default）。
 pub fn group_allows(groups: &HashMap<String, ModelGroup>, group_name: &str, model: &str) -> bool {
     if let Some(group) = groups.get(group_name)
-        && group.models.iter().any(|name| name == model)
+        && group_has_name(group, model)
     {
         return true;
     }
     if group_name == DEFAULT_MODEL_GROUP {
-        return !groups.iter().any(|(name, group)| {
-            name != DEFAULT_MODEL_GROUP && group.models.iter().any(|item| item == model)
-        });
+        return !groups
+            .iter()
+            .any(|(name, group)| name != DEFAULT_MODEL_GROUP && group_has_name(group, model));
     }
     false
 }
@@ -229,7 +289,12 @@ pub fn visible_model_ids<'a>(
     let mut names = registered_callable_names(channels);
     names.extend(unified_models.keys().cloned());
     if let Some(group) = groups.get(group_name) {
-        names.extend(group.models.iter().cloned());
+        names.extend(
+            group
+                .models
+                .iter()
+                .map(|entry| group_model_name(entry).to_string()),
+        );
     }
     names.retain(|name| group_allows(groups, group_name, name));
 
@@ -713,7 +778,7 @@ pub async fn list_model_groups(pool: &SqlitePool) -> Result<Vec<ModelGroup>, Sto
 /// 把模型组行映射为 `ModelGroup`。
 fn map_model_group(row: &sqlx::sqlite::SqliteRow) -> Result<ModelGroup, StoreError> {
     let name: String = row.try_get("name").map_err(StoreError::Query)?;
-    let models: Vec<String> = serde_json::from_str(
+    let models: Vec<GroupModel> = serde_json::from_str(
         &row.try_get::<String, _>("models_json")
             .map_err(StoreError::Query)?,
     )
@@ -1102,6 +1167,17 @@ mod tests {
         (dir, pool)
     }
 
+    fn pin(channel_id: i64, model: &str) -> GroupModel {
+        GroupModel::Source {
+            channel_id,
+            model: model.to_string(),
+        }
+    }
+
+    fn unified_entry(id: &str) -> GroupModel {
+        GroupModel::Unified { id: id.to_string() }
+    }
+
     fn sample_channel() -> Channel {
         let mut aliases = HashMap::new();
         aliases.insert("fast".to_string(), "gpt-4o-mini".to_string());
@@ -1145,34 +1221,54 @@ mod tests {
         );
     }
 
-    /// 并入组时跳过已有名字、保序追加；删渠道模型不经过此路径。
+    /// 渠道入组按 (渠道, 名字) 钉死；同名不同渠道各占一条。
     #[tokio::test]
-    async fn union_names_into_group_appends_missing_only() {
+    async fn union_channel_callables_pins_per_channel() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
         upsert_model_group(
             &mut conn,
             &ModelGroup {
                 name: "coding".to_string(),
-                models: vec!["gpt-4o".to_string()],
+                models: vec![GroupModel::Source {
+                    channel_id: 1,
+                    model: "gpt-4o".to_string(),
+                }],
             },
         )
         .await
         .expect("应能写组");
-        union_names_into_group(
+        union_channel_callables_into_group(
             &mut conn,
             "coding",
-            &["gpt-4o".to_string(), "fast".to_string(), "mini".to_string()],
+            1,
+            &["gpt-4o".to_string(), "fast".to_string()],
         )
         .await
-        .expect("应能并入");
+        .expect("应能并入渠道 1");
+        union_channel_callables_into_group(&mut conn, "coding", 2, &["gpt-4o".to_string()])
+            .await
+            .expect("应能并入渠道 2");
         let group = get_model_group(&mut conn, "coding")
             .await
             .expect("应能读组")
             .expect("组应存在");
         assert_eq!(
             group.models,
-            vec!["gpt-4o".to_string(), "fast".to_string(), "mini".to_string()]
+            vec![
+                GroupModel::Source {
+                    channel_id: 1,
+                    model: "gpt-4o".to_string(),
+                },
+                GroupModel::Source {
+                    channel_id: 1,
+                    model: "fast".to_string(),
+                },
+                GroupModel::Source {
+                    channel_id: 2,
+                    model: "gpt-4o".to_string(),
+                },
+            ]
         );
     }
 
@@ -1400,7 +1496,7 @@ mod tests {
         let mut conn = pool.acquire().await.expect("应能获取连接");
         let coding = ModelGroup {
             name: "coding".to_string(),
-            models: vec!["gpt-4o".to_string(), "fast".to_string()],
+            models: vec![pin(1, "gpt-4o"), pin(1, "fast")],
         };
         upsert_model_group(&mut conn, &coding)
             .await
@@ -1429,7 +1525,7 @@ mod tests {
             &mut conn,
             &ModelGroup {
                 name: "coding".to_string(),
-                models: vec!["gpt-4o".to_string()],
+                models: vec![pin(1, "gpt-4o")],
             },
         )
         .await
@@ -1475,14 +1571,14 @@ mod tests {
             DEFAULT_MODEL_GROUP.to_string(),
             ModelGroup {
                 name: DEFAULT_MODEL_GROUP.to_string(),
-                models: vec!["also-in-default".to_string()],
+                models: vec![pin(1, "also-in-default")],
             },
         );
         groups.insert(
             "coding".to_string(),
             ModelGroup {
                 name: "coding".to_string(),
-                models: vec!["gpt-4o".to_string(), "also-in-default".to_string()],
+                models: vec![pin(1, "gpt-4o"), pin(1, "also-in-default")],
             },
         );
         assert!(group_allows(&groups, "coding", "gpt-4o"));
@@ -1503,6 +1599,120 @@ mod tests {
         assert!(!group_allows(&groups, "ghost", "fast"));
     }
 
+    /// 钉渠道与统一 ID 按 kind 往返；同名跨渠道是不同条目。
+    #[test]
+    fn group_model_tagged_roundtrip_keeps_channel_pins() {
+        let mixed: Vec<GroupModel> = serde_json::from_value(serde_json::json!([
+            { "kind": "unified", "id": "coding" },
+            { "kind": "source", "channel_id": 1, "model": "gpt-4o" },
+            { "kind": "source", "channel_id": 2, "model": "gpt-4o" }
+        ]))
+        .expect("应能解析 tagged 名单");
+        assert_eq!(
+            mixed,
+            vec![unified_entry("coding"), pin(1, "gpt-4o"), pin(2, "gpt-4o"),]
+        );
+        let json = serde_json::to_value(&mixed).expect("应能序列化");
+        assert_eq!(json[0]["kind"], "unified");
+        assert_eq!(json[0]["id"], "coding");
+        assert_eq!(json[1]["kind"], "source");
+        assert_eq!(json[1]["channel_id"], 1);
+        assert!(
+            serde_json::from_value::<Vec<GroupModel>>(serde_json::json!(["gpt-4o"])).is_err(),
+            "不再接受裸字符串名单"
+        );
+    }
+
+    /// 存量字符串名单经迁移 0020 收成 tagged 条目后才能读库。
+    #[tokio::test]
+    async fn migration_0020_rewrites_group_name_lists_to_tagged() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let channel_id = insert_channel(&mut conn, &sample_channel())
+            .await
+            .expect("应能写渠道");
+        upsert_unified_model(
+            &mut conn,
+            &UnifiedModel {
+                id: "coding".to_string(),
+                models: vec![UnifiedMember {
+                    channel_id,
+                    model: "gpt-4o".to_string(),
+                }],
+                hide: false,
+            },
+        )
+        .await
+        .expect("应能写统一模型");
+        drop(conn);
+
+        sqlx::query("INSERT INTO model_groups (name, models_json) VALUES ('coding', ?)")
+            .bind(r#"["coding","gpt-4o","orphan"]"#)
+            .execute(&pool)
+            .await
+            .expect("应能写入旧名单");
+        sqlx::query("INSERT INTO model_groups (name, models_json) VALUES ('pins', ?)")
+            .bind(format!(
+                r#"[{{"channel_id":{channel_id},"model":"gpt-4o"}}]"#
+            ))
+            .execute(&pool)
+            .await
+            .expect("应能写入无 kind 对象");
+
+        let err = list_model_groups(&pool)
+            .await
+            .expect_err("旧名单在 tagged 契约下应拒读");
+        assert!(
+            err.to_string()
+                .contains("模型组 coding 的 models_json 非法")
+                || err.to_string().contains("模型组 pins 的 models_json 非法"),
+            "应是组 JSON 非法，实际 {err}"
+        );
+
+        sqlx::raw_sql(include_str!(
+            "../../migrations/0020_group_models_tagged.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("迁移脚本应能执行");
+
+        let groups = list_model_groups(&pool).await.expect("改写后应能读组");
+        let coding = groups
+            .iter()
+            .find(|group| group.name == "coding")
+            .expect("应有 coding");
+        assert_eq!(
+            coding.models,
+            vec![unified_entry("coding"), pin(channel_id, "gpt-4o")]
+        );
+        let pins = groups
+            .iter()
+            .find(|group| group.name == "pins")
+            .expect("应有 pins");
+        assert_eq!(pins.models, vec![pin(channel_id, "gpt-4o")]);
+    }
+
+    /// 自定义组只把钉渠道收进路由；未收录的名字与 default 不钉。
+    #[test]
+    fn pinned_channel_ids_only_when_custom_group_has_sources() {
+        let coding = ModelGroup {
+            name: "coding".to_string(),
+            models: vec![pin(2, "gpt-4o"), pin(7, "gpt-4o"), unified_entry("fast")],
+        };
+        let pinned = pinned_channel_ids(&coding, "gpt-4o").expect("应钉渠道");
+        assert_eq!(pinned, HashSet::from([2, 7]));
+        assert!(
+            pinned_channel_ids(&coding, "fast").is_none(),
+            "统一 ID 不钉已登记名的渠道"
+        );
+
+        let default = ModelGroup {
+            name: DEFAULT_MODEL_GROUP.to_string(),
+            models: vec![pin(2, "gpt-4o")],
+        };
+        assert!(pinned_channel_ids(&default, "gpt-4o").is_none());
+    }
+
     /// 列表随组过滤；隐藏拿掉被收进成员、保留统一 ID；组外名字不出现。
     #[test]
     fn visible_model_ids_filters_group_and_hide() {
@@ -1519,7 +1729,7 @@ mod tests {
             "coding".to_string(),
             ModelGroup {
                 name: "coding".to_string(),
-                models: vec!["gpt-4o".to_string(), "coding".to_string()],
+                models: vec![pin(1, "gpt-4o"), unified_entry("coding")],
             },
         );
         let mut unified = HashMap::new();

@@ -28,8 +28,8 @@ import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
 import GroupEditorWindow from '@/features/models/GroupEditorWindow.vue';
 import ModelSourceLines from '@/features/models/ModelSourceLines.vue';
-import { callableSourceLine, type CallableSourceLine } from '@/lib/unified-sources';
-import { DEFAULT_MODEL_GROUP, registeredCallableNames } from '@/lib/visible-models';
+import { groupModelDisplayLines } from '@/lib/group-models';
+import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type GroupWindowPayload =
@@ -74,12 +74,6 @@ const channelsQuery = useQuery({
   queryFn: () => apiClient.listChannels(),
 });
 
-const callableNames = computed(() => {
-  const names = registeredCallableNames(channelsQuery.data.value ?? []);
-  for (const model of unifiedQuery.data.value ?? []) names.add(model.id);
-  return [...names].sort((left, right) => left.localeCompare(right));
-});
-
 const channels = computed(() => channelsQuery.data.value ?? []);
 const unifiedModels = computed(() => unifiedQuery.data.value ?? []);
 
@@ -89,12 +83,9 @@ const groups = computed(() =>
 const showTableSkeleton = computed(() => groupsQuery.isPending.value && !groupsQuery.data.value);
 
 const memberLinesByGroup = computed(() => {
-  const map = new Map<string, CallableSourceLine[]>();
+  const map = new Map<string, ReturnType<typeof groupModelDisplayLines>>();
   for (const group of groups.value) {
-    map.set(
-      group.name,
-      group.models.map((name) => callableSourceLine(name, channels.value, unifiedModels.value)),
-    );
+    map.set(group.name, groupModelDisplayLines(group.models, channels.value, unifiedModels.value));
   }
   return map;
 });
@@ -351,7 +342,6 @@ function openBulkDelete() {
       <GroupEditorWindow
         v-if="win.payload.kind === 'editor'"
         :initial="win.payload.group"
-        :callable-names="callableNames"
         :channels="channelsQuery.data.value ?? []"
         :unified-models="unifiedQuery.data.value ?? []"
         :anchor="win.anchor"

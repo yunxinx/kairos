@@ -5,12 +5,7 @@ import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka
 import { useI18n } from 'vue-i18n';
 import Tooltip from '@/components/ui/Tooltip.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
-
-export interface FacetedFilterOption {
-  value: string;
-  label: string;
-  count?: number;
-}
+import type { FacetedFilterOption } from '@/lib/faceted-filter';
 
 const props = defineProps<{
   title: string;

@@ -1,4 +1,4 @@
-import type { ChannelView, UnifiedMember, UnifiedModel } from '@/api/types';
+import type { ChannelView, UnifiedMember } from '@/api/types';
 
 export function unifiedMemberKey(member: Pick<UnifiedMember, 'channel_id' | 'model'>): string {
   return `${member.channel_id}:${member.model}`;
@@ -80,38 +80,14 @@ export interface SourceChannel {
   kind: MemberSourceKind;
 }
 
-function sourceChannelsForCallable(name: string, channels: ChannelView[]): SourceChannel[] {
-  const byName = new Map<string, MemberSourceKind>();
-  for (const channel of channels) {
-    if (!channelListsCallable(channel, name)) continue;
-    const kind: MemberSourceKind = channel.enabled ? 'ok' : 'disabled';
-    const previous = byName.get(channel.name);
-    if (previous === undefined || previous !== 'ok') byName.set(channel.name, kind);
-  }
-  return [...byName.entries()]
-    .map(([channelName, kind]) => ({ name: channelName, kind }))
-    .sort((left, right) => left.name.localeCompare(right.name));
-}
-
-/** 组内/可选列表一行：统一模型带成员，普通名带当前来源渠道。 */
+/** 组内/可选列表一行：统一模型带成员，普通名带钉渠道。 */
 export interface CallableSourceLine {
+  /** 列表/网格去重键：须含渠道，避免同名跨渠道撞车。 */
+  key: string;
   name: string;
   isUnified: boolean;
   channels: SourceChannel[];
   unifiedMembers: UnifiedMember[];
-}
-
-export function callableSourceLine(
-  name: string,
-  channels: ChannelView[],
-  unifiedModels: UnifiedModel[],
-): CallableSourceLine {
-  const unified = unifiedModels.find((model) => model.id === name);
-  const isUnified = unified !== undefined;
-  return {
-    name,
-    isUnified,
-    channels: isUnified ? [] : sourceChannelsForCallable(name, channels),
-    unifiedMembers: unified?.models ?? [],
-  };
+  /** 没有渠道 chip 时的状态标；缺省未登记。 */
+  emptyKind?: MemberSourceKind;
 }

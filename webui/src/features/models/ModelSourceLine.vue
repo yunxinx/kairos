@@ -35,6 +35,7 @@ const ordinaryChips = computed((): OverflowChip[] =>
     class="flex min-w-0 items-center gap-1"
     data-testid="group-member-line"
     :data-model="line.name"
+    :data-channel="line.channels[0]?.name"
     :data-unified="line.isUnified ? 'true' : undefined"
   >
     <UnifiedNameChip v-if="line.isUnified" :name="line.name" />
@@ -47,7 +48,7 @@ const ordinaryChips = computed((): OverflowChip[] =>
         :items="ordinaryChips"
         :chip-test-id="chipTestId"
       />
-      <ChannelSourceMark v-else kind="unlisted" />
+      <ChannelSourceMark v-else :kind="line.emptyKind ?? 'unlisted'" />
     </template>
   </li>
 </template>

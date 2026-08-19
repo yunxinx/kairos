@@ -40,7 +40,7 @@ const hiddenCount = computed(() => hidden.value.length);
   >
     <ModelSourceLine
       v-for="line in visible"
-      :key="line.name"
+      :key="line.key"
       :line="line"
       :chip-test-id="chipTestId"
     />
@@ -66,7 +66,7 @@ const hiddenCount = computed(() => hidden.value.length);
             <ul class="m-0 grid list-none grid-cols-2 gap-1.5 p-1">
               <ModelSourceLine
                 v-for="line in hidden"
-                :key="line.name"
+                :key="line.key"
                 :line="line"
                 :chip-test-id="chipTestId"
               />

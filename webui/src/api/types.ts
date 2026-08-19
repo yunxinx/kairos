@@ -87,10 +87,15 @@ export interface Price {
   cache_write_micros: number | null;
 }
 
+/** 组名单一条：钉渠道的已登记名，或统一模型 ID。 */
+export type GroupModel =
+  | { kind: 'source'; channel_id: number; model: string }
+  | { kind: 'unified'; id: string };
+
 /** 模型组：令牌的可调用名允许名单。 */
 export interface ModelGroup {
   name: string;
-  models: string[];
+  models: GroupModel[];
 }
 
 /** 统一模型的一条成员：钉在某一渠道上的已登记可调用名。 */

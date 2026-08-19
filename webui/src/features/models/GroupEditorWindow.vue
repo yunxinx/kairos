@@ -3,9 +3,10 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { ChannelView, ModelGroup, UnifiedModel } from '@/api/types';
+import type { ChannelView, GroupModel, ModelGroup, UnifiedModel } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
+import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
@@ -18,16 +19,25 @@ import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import CallableSourceCell from '@/features/models/CallableSourceCell.vue';
+import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
 import UnifiedNameChip from '@/features/models/UnifiedNameChip.vue';
-import { callableSourceLine } from '@/lib/unified-sources';
-import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
+import { countedFacetOptions } from '@/lib/faceted-filter';
 import type { FieldValidationSpec } from '@/lib/form-validation';
+import {
+  groupMemberSourceLine,
+  groupModelKey,
+  groupPickKey,
+  groupPickRows,
+  pickRowIsMember,
+  pickRowToMember,
+  type GroupPickRow,
+} from '@/lib/group-models';
+import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
 const props = withDefaults(
   defineProps<{
     initial: ModelGroup | null;
-    callableNames: string[];
     channels: ChannelView[];
     unifiedModels: UnifiedModel[];
     anchor?: FloatingWindowAnchor | null;
@@ -58,11 +68,16 @@ const isDefault = computed(
 );
 
 const initialName = props.initial?.name ?? '';
-const initialModels = props.initial?.models ?? [];
+const initialMembers = props.initial?.models ?? [];
+const initialMemberKeys = initialMembers.map(groupModelKey).join('\0');
+
+/** 渠道筛选里把统一模型单独成档，不当成真渠道名。 */
+const UNIFIED_SOURCE_FILTER = '__unified__';
 
 const editorName = ref(initialName);
-const editorModels = ref([...initialModels]);
+const editorMembers = ref<GroupModel[]>([...initialMembers]);
 const searchText = ref('');
+const selectedChannels = ref<string[]>([]);
 
 /** 组内表：模型名与来源用百分比，操作列固定。 */
 const memberColumns = [{ width: '40%' }, { width: '45%' }, { width: '3.5rem' }];
@@ -72,42 +87,79 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '55%' }];
 const dirty = computed(
   () =>
     editorName.value !== initialName ||
-    [...editorModels.value].sort().join('\0') !== [...initialModels].sort().join('\0'),
+    editorMembers.value.map(groupModelKey).join('\0') !== initialMemberKeys,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
-function lineFor(name: string) {
-  return callableSourceLine(name, props.channels, props.unifiedModels);
-}
+const memberRows = computed(() =>
+  editorMembers.value.map((member) =>
+    groupMemberSourceLine(member, props.channels, props.unifiedModels),
+  ),
+);
 
-const memberRows = computed(() => editorModels.value.map(lineFor));
+const allPickRows = computed(() => groupPickRows(props.channels, props.unifiedModels));
+
+const availableRows = computed(() =>
+  allPickRows.value.filter((row) => !pickRowIsMember(row, editorMembers.value)),
+);
+
+const channelOptions = computed(() => {
+  const options = countedFacetOptions(
+    availableRows.value.filter((row) => row.kind === 'source').map((row) => row.channelName),
+  );
+  const unifiedCount = availableRows.value.filter((row) => row.kind === 'unified').length;
+  if (unifiedCount > 0) {
+    options.unshift({
+      value: UNIFIED_SOURCE_FILTER,
+      label: t('models.unifiedChipTooltip'),
+      count: unifiedCount,
+    });
+  }
+  return options;
+});
 
 const pickerRows = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  return props.callableNames
-    .filter((name) => !editorModels.value.includes(name))
-    .map(lineFor)
+  const channels = new Set(selectedChannels.value);
+  const unifiedLabel = t('models.unifiedChipTooltip').toLowerCase();
+  return availableRows.value
     .filter((row) => {
+      if (channels.size > 0) {
+        if (row.kind === 'unified') {
+          if (!channels.has(UNIFIED_SOURCE_FILTER)) return false;
+        } else if (!channels.has(row.channelName)) {
+          return false;
+        }
+      }
       if (!q) return true;
+      const channelHit = row.kind === 'source' && row.channelName.toLowerCase().includes(q);
       return (
         row.name.toLowerCase().includes(q) ||
-        row.channels.some((channel) => channel.name.toLowerCase().includes(q))
+        channelHit ||
+        (row.kind === 'unified' && unifiedLabel.includes(q))
       );
     })
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .sort((left, right) => {
+      const byName = left.name.localeCompare(right.name);
+      if (byName !== 0) return byName;
+      if (left.kind === 'source' && right.kind === 'source') {
+        return left.channelName.localeCompare(right.channelName);
+      }
+      return 0;
+    });
 });
 
-function addModel(name: string) {
-  if (!name || editorModels.value.includes(name)) return;
-  editorModels.value = [...editorModels.value, name];
+function addRow(row: GroupPickRow) {
+  if (pickRowIsMember(row, editorMembers.value)) return;
+  editorMembers.value = [...editorMembers.value, pickRowToMember(row)];
 }
 
-function onPickCheck(name: string, checked: boolean) {
-  if (checked) addModel(name);
+function onPickCheck(row: GroupPickRow, checked: boolean) {
+  if (checked) addRow(row);
 }
 
-function removeModel(name: string) {
-  editorModels.value = editorModels.value.filter((item) => item !== name);
+function removeByKey(key: string) {
+  editorMembers.value = editorMembers.value.filter((item) => groupModelKey(item) !== key);
 }
 
 const saveMutation = useMutation({
@@ -131,7 +183,7 @@ function handleSave() {
   if (!validate(specs, t)) return;
   saveMutation.mutate({
     name: editorName.value.trim(),
-    models: [...editorModels.value],
+    models: [...editorMembers.value],
   });
 }
 </script>
@@ -181,7 +233,7 @@ function handleSave() {
               :colspan="3"
               :columns="memberColumns"
               data-testid="group-model-list"
-              :get-row-key="(row) => row.name"
+              :get-row-key="(row) => row.key"
               :empty-title="t('models.groupModelsEmpty')"
             >
               <template #header>
@@ -192,13 +244,17 @@ function handleSave() {
                 </TableRow>
               </template>
               <template #row="{ row }">
-                <TableRow data-testid="group-model-option" :data-model="row.name">
+                <TableRow
+                  data-testid="group-model-option"
+                  :data-model="row.name"
+                  :data-channel="row.channels[0]?.name"
+                >
                   <TableCell truncate :title="row.name">
                     <UnifiedNameChip v-if="row.isUnified" :name="row.name" />
                     <span v-else class="font-mono text-sm">{{ row.name }}</span>
                   </TableCell>
                   <TableCell>
-                    <CallableSourceCell :line="row" :channels="channels" />
+                    <CallableSourceCell :line="row" />
                   </TableCell>
                   <TableCell align="center">
                     <button
@@ -206,7 +262,7 @@ function handleSave() {
                       class="btn btn-ghost btn-icon"
                       data-testid="group-model-remove"
                       :aria-label="t('models.groupRemoveModel', { name: row.name })"
-                      @click="removeModel(row.name)"
+                      @click="removeByKey(row.key)"
                     >
                       <UiIcon name="close" :size="14" />
                     </button>
@@ -219,21 +275,29 @@ function handleSave() {
 
         <div>
           <p class="form-field-label mb-2">{{ t('models.groupModels') }}</p>
-          <SearchInput
-            :id="`group-editor-search-${uid}`"
-            v-model="searchText"
-            class="mb-2 max-w-sm"
-            data-testid="group-editor-search"
-            :placeholder="t('models.search')"
-            :aria-label="t('models.search')"
-          />
+          <div class="mb-2 flex flex-wrap items-center gap-2">
+            <SearchInput
+              :id="`group-editor-search-${uid}`"
+              v-model="searchText"
+              class="max-w-sm"
+              data-testid="group-editor-search"
+              :placeholder="t('models.search')"
+              :aria-label="t('models.search')"
+            />
+            <FacetedFilter
+              v-model="selectedChannels"
+              :title="t('models.channels')"
+              :options="channelOptions"
+              test-id="group-pick-channel-filter"
+            />
+          </div>
           <DataTablePanel class="h-56" data-testid="group-pick-list">
             <VirtualTable
               class="h-full"
               :rows="pickerRows"
               :colspan="3"
               :columns="pickColumns"
-              :get-row-key="(row) => row.name"
+              :get-row-key="(row) => groupPickKey(row)"
               :empty-title="t('models.groupPickEmpty')"
             >
               <template #header>
@@ -244,20 +308,39 @@ function handleSave() {
                 </TableRow>
               </template>
               <template #row="{ row }">
-                <TableRow data-testid="group-pick" :data-model="row.name">
+                <TableRow
+                  data-testid="group-pick"
+                  :data-model="row.name"
+                  :data-channel="row.kind === 'source' ? row.channelName : undefined"
+                >
                   <TableCell>
                     <Checkbox
                       :model-value="false"
                       data-testid="group-pick-check"
-                      @update:model-value="(value) => onPickCheck(row.name, value)"
+                      @update:model-value="(value) => onPickCheck(row, value)"
                     />
                   </TableCell>
                   <TableCell truncate :title="row.name">
-                    <UnifiedNameChip v-if="row.isUnified" :name="row.name" />
+                    <UnifiedNameChip v-if="row.kind === 'unified'" :name="row.name" />
                     <span v-else class="font-mono text-sm">{{ row.name }}</span>
                   </TableCell>
                   <TableCell>
-                    <CallableSourceCell :line="row" :channels="channels" />
+                    <ChannelSourceMark
+                      v-if="row.kind === 'source'"
+                      :channel-name="row.channelName"
+                      :kind="row.channelKind"
+                      chip-test-id="group-source-channel"
+                    />
+                    <CallableSourceCell
+                      v-else
+                      :line="
+                        groupMemberSourceLine(
+                          { kind: 'unified', id: row.name },
+                          channels,
+                          unifiedModels,
+                        )
+                      "
+                    />
                   </TableCell>
                 </TableRow>
               </template>

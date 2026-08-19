@@ -526,7 +526,7 @@ async fn handle_request(
     }
 
     // 4. 准入：解析出站跳（普通模型一条；统一模型按成员顺序，只收已定价可路由的）。
-    let hops = match resolve_route_hops(&snapshot, &request.model) {
+    let hops = match resolve_route_hops(&snapshot, &request.model, &token.model_group) {
         Ok(hops) => hops,
         Err((status, message)) => {
             return error_response(
@@ -759,8 +759,22 @@ fn hop_for_member(
 }
 
 /// 为可调用名构造一条出站跳：须有启用且已定价的渠道。
-fn hop_for_callable(snapshot: &RuntimeSnapshot, model: &str) -> Result<RouteHop, HopDeny> {
+///
+/// 自定义组若把该名钉在若干渠道上，候选只留这些渠道。
+fn hop_for_callable(
+    snapshot: &RuntimeSnapshot,
+    model: &str,
+    group_name: &str,
+) -> Result<RouteHop, HopDeny> {
     let mut route = routing::route(&snapshot.channels, model).ok_or(HopDeny::NoRoute)?;
+    if let Some(group) = snapshot.model_groups.get(group_name)
+        && let Some(pinned) = store::resources::pinned_channel_ids(group, model)
+    {
+        route.channels.retain(|record| pinned.contains(&record.id));
+        if route.channels.is_empty() {
+            return Err(HopDeny::NoRoute);
+        }
+    }
     route
         .channels
         .retain(|record| snapshot.price_for_channel(record.id, model).is_some());
@@ -804,6 +818,7 @@ fn estimate_admission_cost_micros(
 fn resolve_route_hops(
     snapshot: &RuntimeSnapshot,
     model: &str,
+    group_name: &str,
 ) -> Result<Vec<RouteHop>, (StatusCode, String)> {
     if let Some(unified) = snapshot.unified_models.get(model) {
         let mut hops = Vec::new();
@@ -832,7 +847,7 @@ fn resolve_route_hops(
         }
         return Ok(hops);
     }
-    match hop_for_callable(snapshot, model) {
+    match hop_for_callable(snapshot, model, group_name) {
         Ok(hop) => Ok(vec![hop]),
         Err(HopDeny::NoRoute) => Err((
             StatusCode::SERVICE_UNAVAILABLE,

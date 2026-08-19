@@ -157,7 +157,7 @@ async fn list_models_follows_token_group_on_all_protocols() {
         &gw,
         reqwest::Method::POST,
         "/model-groups",
-        json!({ "name": "coding", "models": [TEST_MODEL] }),
+        json!({ "name": "coding", "models": [{ "kind": "source", "channel_id": first_channel_id(&gw).await, "model": TEST_MODEL }] }),
     )
     .await;
     assert_eq!(created_group.status(), reqwest::StatusCode::CREATED);
@@ -226,7 +226,13 @@ async fn hide_drops_collected_members_but_keeps_them_callable() {
         &gw,
         reqwest::Method::POST,
         "/model-groups",
-        json!({ "name": "pack", "models": ["coding", TEST_MODEL] }),
+        json!({
+            "name": "pack",
+            "models": [
+                { "kind": "unified", "id": "coding" },
+                { "kind": "source", "channel_id": channel_id, "model": TEST_MODEL }
+            ]
+        }),
     )
     .await;
     assert_eq!(group.status(), reqwest::StatusCode::CREATED);

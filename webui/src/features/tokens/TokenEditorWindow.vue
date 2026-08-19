@@ -69,7 +69,7 @@ const initialLimit =
     ? formatUsdAmount(props.initial.limit_usd_micros)
     : '';
 const initialRpm =
-  props.initial && props.initial.rate_limit_rpm !== null && props.initial.rate_limit_rpm !== undefined
+  props.initial && props.initial.rate_limit_rpm !== null
     ? String(props.initial.rate_limit_rpm)
     : '';
 const initialEnabled = props.initial ? props.initial.enabled : true;

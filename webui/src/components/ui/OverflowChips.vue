@@ -13,6 +13,8 @@ export interface OverflowChip {
   canonical?: boolean;
   /** 清单名是别名时的出站主模型，虚线边框 +「实际请求」提示。 */
   actualRequest?: string;
+  /** 组编辑器来源列：统一模型不当成渠道，用主色底。 */
+  isUnified?: boolean;
   /** 额外提示（例如主模型上挂着的别名）。 */
   tooltip?: string;
   /** 渠道名右侧的状态标文案（已翻译）。 */
@@ -40,7 +42,9 @@ function isActualRequest(chip: OverflowChip): boolean {
 }
 
 function chipClass(chip: OverflowChip): string {
-  return isActualRequest(chip) ? 'badge-canonical' : 'badge-info';
+  if (isActualRequest(chip)) return 'badge-canonical';
+  if (chip.isUnified) return 'badge-unified';
+  return 'badge-info';
 }
 
 function chipTooltip(chip: OverflowChip): string {

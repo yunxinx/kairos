@@ -1,4 +1,5 @@
 import type { ChannelView, ModelGroup, UnifiedMember, UnifiedModel } from '@/api/types';
+import { groupModelName } from '@/lib/group-models';
 
 export const DEFAULT_MODEL_GROUP = 'default';
 
@@ -42,9 +43,13 @@ export function registeredCallableNames(channels: ChannelView[]): Set<string> {
  */
 export function groupAllows(groups: ModelGroup[], groupName: string, model: string): boolean {
   const group = groups.find((item) => item.name === groupName);
-  if (group?.models.includes(model)) return true;
+  if (group?.models.some((entry) => groupModelName(entry) === model)) return true;
   if (groupName === DEFAULT_MODEL_GROUP) {
-    return !groups.some((item) => item.name !== DEFAULT_MODEL_GROUP && item.models.includes(model));
+    return !groups.some(
+      (item) =>
+        item.name !== DEFAULT_MODEL_GROUP &&
+        item.models.some((entry) => groupModelName(entry) === model),
+    );
   }
   return false;
 }
@@ -76,7 +81,7 @@ export function previewVisibleModels(
   for (const unified of unifiedModels) names.add(unified.id);
   const group = groups.find((item) => item.name === groupName);
   if (group) {
-    for (const model of group.models) names.add(model);
+    for (const entry of group.models) names.add(groupModelName(entry));
   }
 
   const allowed = [...names].filter((name) => groupAllows(groups, groupName, name));

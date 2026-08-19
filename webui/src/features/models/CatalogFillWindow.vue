@@ -27,6 +27,7 @@ import {
   type CatalogFillPreview,
   type CatalogPick,
 } from '@/lib/catalog';
+import { countedFacetOptions } from '@/lib/faceted-filter';
 import { catalogLookupId, sectionInventory, type InventoryRow } from '@/lib/inventory';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -110,17 +111,21 @@ const previewByKey = computed(() => {
 });
 
 const channelOptions = computed(() =>
-  [...new Set(props.rows.map((row) => row.channelName))]
-    .sort((left, right) => left.localeCompare(right))
-    .map((name) => ({ value: name, label: name })),
+  countedFacetOptions(props.rows.map((row) => row.channelName)),
 );
 
-const statusOptions = computed(() => [
-  { value: 'will-write', label: t('models.catalogWillWrite') },
-  { value: 'no-match', label: t('models.catalogNoMatch') },
-  { value: 'need-host', label: t('models.catalogNeedHost') },
-  { value: 'unchanged', label: t('models.catalogSkipFilled') },
-]);
+const statusOptions = computed(() => {
+  const counts = { 'will-write': 0, 'no-match': 0, 'need-host': 0, unchanged: 0 };
+  for (const row of preview.value) {
+    counts[row.status] += 1;
+  }
+  return [
+    { value: 'will-write', label: t('models.catalogWillWrite'), count: counts['will-write'] },
+    { value: 'no-match', label: t('models.catalogNoMatch'), count: counts['no-match'] },
+    { value: 'need-host', label: t('models.catalogNeedHost'), count: counts['need-host'] },
+    { value: 'unchanged', label: t('models.catalogSkipFilled'), count: counts.unchanged },
+  ];
+});
 
 const filteredRows = computed(() => {
   const q = searchText.value.trim().toLowerCase();

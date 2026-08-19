@@ -338,6 +338,16 @@ test.describe('models page', () => {
     await page.getByTestId('models-tab-unified').click();
     await page.getByTestId('unified-create').click();
     await page.getByTestId('unified-editor-id').fill('coding');
+    await expect(
+      page
+        .locator('[data-testid="unified-pick"][data-model="e2e-code-mini"]')
+        .getByTestId('unified-source-channel'),
+    ).toHaveText('e2e-coding-channel');
+    await expect(
+      page
+        .locator('[data-testid="unified-pick"][data-model="e2e-code-mini"]')
+        .getByTestId('unified-source-channel'),
+    ).toHaveClass(/badge-info/);
     await page
       .locator('[data-testid="unified-pick"][data-model="e2e-code-mini"]')
       .getByTestId('unified-pick-check')
@@ -351,6 +361,13 @@ test.describe('models page', () => {
     await page.getByTestId('unified-save').click();
     const unifiedRow = page.locator('[data-testid="unified-row"][data-unified-id="coding"]');
     await expect(unifiedRow).toBeVisible();
+    await page.getByTestId('unified-status-filter').click();
+    await expect(
+      page.locator(
+        '[data-testid="unified-status-filter-option"][data-value="hidden"] .sync-filter-count',
+      ),
+    ).toBeVisible();
+    await page.getByTestId('unified-status-filter').click();
     await expect(unifiedRow.locator('[data-testid="unified-member-line"]').nth(0)).toHaveAttribute(
       'data-member',
       'e2e-code-haiku',
@@ -387,6 +404,13 @@ test.describe('models page', () => {
     await page.getByTestId('models-tab-groups').click();
     await page.getByTestId('group-create').click();
     await page.getByTestId('group-editor-name').fill('coding');
+    await page.getByTestId('group-pick-channel-filter').click();
+    const unifiedSourceFilter = page.locator(
+      '[data-testid="group-pick-channel-filter-option"][data-value="__unified__"]',
+    );
+    await expect(unifiedSourceFilter).toBeVisible();
+    await expect(unifiedSourceFilter.locator('.sync-filter-count')).toBeVisible();
+    await page.getByTestId('group-pick-channel-filter').click();
     await page
       .locator('[data-testid="group-pick"][data-model="coding"]')
       .getByTestId('group-pick-check')
@@ -403,7 +427,7 @@ test.describe('models page', () => {
       page
         .locator('[data-testid="group-model-option"][data-model="coding"]')
         .getByTestId('group-source-channel'),
-    ).toHaveCount(0);
+    ).toHaveText('Unified model');
     await page.getByTestId('group-save').click();
     const codingGroup = page.locator('[data-testid="group-row"][data-group-name="coding"]');
     await expect(codingGroup).toBeVisible();
@@ -418,6 +442,11 @@ test.describe('models page', () => {
 
     await page.getByTestId('models-tab-visible').click();
     await page.getByTestId('visible-group-filter').click();
+    await expect(
+      page.locator(
+        '[data-testid="visible-group-filter-option"][data-value="coding"] .sync-filter-count',
+      ),
+    ).toBeVisible();
     await page.locator('[data-testid="visible-group-filter-option"][data-value="coding"]').click();
     await expect(page.getByTestId('visible-model')).toHaveCount(1);
     await expect(page.locator('[data-testid="visible-model"][data-model="coding"]')).toBeVisible();
@@ -628,7 +657,13 @@ test.describe('models page', () => {
       hide: false,
       models: [{ channel_id: channel.id, model: 'e2e-src-m' }],
     });
-    await seedModelGroup(page, { name: 'e2e-src-g', models: ['e2e-src-u', 'e2e-src-m'] });
+    await seedModelGroup(page, {
+      name: 'e2e-src-g',
+      models: [
+        { kind: 'unified', id: 'e2e-src-u' },
+        { kind: 'source', channel_id: channel.id, model: 'e2e-src-m' },
+      ],
+    });
 
     await updateChannel(page, channel.id, { enabled: false });
     await page.goto('/models');
@@ -672,12 +707,9 @@ test.describe('models page', () => {
     const ordinaryOption = page.locator(
       '[data-testid="group-model-option"][data-model="e2e-src-m"]',
     );
-    await expectSourceStatus(
-      unifiedOption.getByTestId('unified-member-line'),
-      'unlisted',
-      'e2e-src-ch',
-    );
-    await expectSourceStatus(ordinaryOption, 'unlisted', null);
+    await expect(unifiedOption.getByTestId('unified-member-line')).toHaveCount(0);
+    await expect(unifiedOption.getByTestId('group-source-channel')).toHaveText('Unified model');
+    await expectSourceStatus(ordinaryOption, 'unlisted', 'e2e-src-ch', 'group-source-channel');
 
     await deleteChannel(page, channel.id);
     await page.reload();
@@ -688,11 +720,56 @@ test.describe('models page', () => {
     ).toBeVisible();
   });
 
+  test('same name on two channels is two independent group members', async ({ page }) => {
+    await seedChannel(page, { name: 'e2e-ind-a', models: ['e2e-shared'] });
+    await seedChannel(page, { name: 'e2e-ind-b', models: ['e2e-shared'] });
+    await page.goto('/models');
+    await page.getByTestId('models-tab-groups').click();
+    await page.getByTestId('group-create').click();
+    await page.getByTestId('group-editor-name').fill('e2e-ind');
+    await page.getByTestId('group-editor-search').fill('e2e-shared');
+    await page
+      .locator('[data-testid="group-pick"][data-model="e2e-shared"][data-channel="e2e-ind-a"]')
+      .getByTestId('group-pick-check')
+      .click();
+    await expect(
+      page.locator(
+        '[data-testid="group-model-option"][data-model="e2e-shared"][data-channel="e2e-ind-a"]',
+      ),
+    ).toBeVisible();
+    await expect(
+      page.locator(
+        '[data-testid="group-model-option"][data-model="e2e-shared"][data-channel="e2e-ind-b"]',
+      ),
+    ).toHaveCount(0);
+    await expect(
+      page.locator('[data-testid="group-pick"][data-model="e2e-shared"][data-channel="e2e-ind-b"]'),
+    ).toBeVisible();
+    await page.getByTestId('group-save').click();
+    const groupRow = page.locator('[data-testid="group-row"][data-group-name="e2e-ind"]');
+    await expect(
+      groupRow.locator(
+        '[data-testid="group-member-line"][data-model="e2e-shared"][data-channel="e2e-ind-a"]',
+      ),
+    ).toBeVisible();
+    await expect(
+      groupRow.locator(
+        '[data-testid="group-member-line"][data-model="e2e-shared"][data-channel="e2e-ind-b"]',
+      ),
+    ).toHaveCount(0);
+  });
+
   test('deleting a group with bound tokens asks to force; force rebinds tokens to default', async ({
     page,
   }) => {
-    await seedChannel(page, { name: 'e2e-force-channel', models: ['e2e-force-mini'] });
-    await seedModelGroup(page, { name: 'e2e-force-group', models: ['e2e-force-mini'] });
+    const forceChannel = await seedChannel(page, {
+      name: 'e2e-force-channel',
+      models: ['e2e-force-mini'],
+    });
+    await seedModelGroup(page, {
+      name: 'e2e-force-group',
+      models: [{ kind: 'source', channel_id: forceChannel.id, model: 'e2e-force-mini' }],
+    });
     const token = await seedToken(page, {
       name: 'e2e-force-token',
       model_group: 'e2e-force-group',

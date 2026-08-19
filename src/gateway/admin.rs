@@ -36,8 +36,8 @@ use crate::{
     store::StoreError,
     store::catalog::{CatalogMeta, CatalogModel, CatalogView},
     store::resources::{
-        Channel, ChannelRecord, ModelGroup, Price, Settings, Token, UnifiedMember, UnifiedModel,
-        channel_lists_callable,
+        Channel, ChannelRecord, GroupModel, ModelGroup, Price, Settings, Token, UnifiedMember,
+        UnifiedModel, channel_lists_callable,
     },
 };
 
@@ -425,7 +425,7 @@ async fn create_channel(
     let id = crate::store::resources::insert_channel(&mut tx, &channel)
         .await
         .map_err(AdminError::Store)?;
-    enroll_channel_models(&mut tx, None, &channel).await?;
+    enroll_channel_models(&mut tx, id, None, &channel).await?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_channel_record(&deps, id).await?;
@@ -485,7 +485,7 @@ async fn update_channel(
     )
     .await
     .map_err(AdminError::Store)?;
-    enroll_channel_models(&mut tx, Some(&previous), &channel).await?;
+    enroll_channel_models(&mut tx, id, Some(&previous), &channel).await?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_channel_record(&deps, id).await?;
@@ -616,9 +616,9 @@ async fn create_model_group(
     body: Result<Json<ModelGroup>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<ModelGroup>), AdminError> {
     let mut group = body.map_err(AdminError::bad_body)?;
-    normalize_model_group(&mut group)?;
     {
         let snapshot = deps.snapshot.read().await;
+        normalize_model_group(&mut group, &snapshot)?;
         if snapshot.model_groups.contains_key(&group.name) {
             return Err(AdminError::Conflict(format!(
                 "模型组 {} 已存在",
@@ -644,9 +644,9 @@ async fn update_model_group(
 ) -> Result<Json<ModelGroup>, AdminError> {
     let mut group = body.map_err(AdminError::bad_body)?;
     group.name = name;
-    normalize_model_group(&mut group)?;
     {
         let snapshot = deps.snapshot.read().await;
+        normalize_model_group(&mut group, &snapshot)?;
         if !snapshot.model_groups.contains_key(&group.name) {
             return Err(AdminError::NotFound(format!(
                 "模型组 {} 不存在",
@@ -1849,9 +1849,10 @@ fn normalize_channel_group(channel: &mut Channel) {
     }
 }
 
-/// 把本次新加入渠道的可调用名并入渠道默认组；`default` 不入组。
+/// 把本次新加入渠道的可调用名钉进渠道默认组；`default` 不入组。
 async fn enroll_channel_models(
     conn: &mut sqlx::SqliteConnection,
+    channel_id: i64,
     previous: Option<&Channel>,
     next: &Channel,
 ) -> Result<(), AdminError> {
@@ -1859,9 +1860,14 @@ async fn enroll_channel_models(
         return Ok(());
     }
     let added = crate::store::resources::newly_callable_names(previous, next);
-    crate::store::resources::union_names_into_group(conn, &next.model_group, &added)
-        .await
-        .map_err(AdminError::Store)
+    crate::store::resources::union_channel_callables_into_group(
+        conn,
+        &next.model_group,
+        channel_id,
+        &added,
+    )
+    .await
+    .map_err(AdminError::Store)
 }
 
 // --- 输入校验 ---
@@ -1905,13 +1911,16 @@ fn token_key_charset_ok(key: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-/// 规整模型组：名字去空白；可调用名去空白、拒空串、保序去重。
-fn normalize_model_group(group: &mut ModelGroup) -> Result<(), AdminError> {
+/// 规整模型组：名字去空白；钉渠道须已登记；统一 ID 须已存在；保序去重。
+fn normalize_model_group(
+    group: &mut ModelGroup,
+    snapshot: &crate::runtime::RuntimeSnapshot,
+) -> Result<(), AdminError> {
     group.name = group.name.trim().to_string();
     if group.name.is_empty() {
         return Err(AdminError::InvalidBody("name 不能为空".to_string()));
     }
-    group.models = normalize_callable_names(std::mem::take(&mut group.models))?;
+    group.models = normalize_group_models(std::mem::take(&mut group.models), snapshot)?;
     Ok(())
 }
 
@@ -2011,17 +2020,49 @@ fn normalize_unified_members(
     Ok(out)
 }
 
-/// 规整可调用名列表：trim、拒绝空名、保序去重。
-fn normalize_callable_names(models: Vec<String>) -> Result<Vec<String>, AdminError> {
-    let mut seen = HashSet::new();
+/// 规整组名单：钉渠道须已登记；统一 ID 须已存在；保序去重。
+fn normalize_group_models(
+    models: Vec<GroupModel>,
+    snapshot: &crate::runtime::RuntimeSnapshot,
+) -> Result<Vec<GroupModel>, AdminError> {
+    let mut seen: HashSet<(u8, i64, String)> = HashSet::new();
     let mut out = Vec::with_capacity(models.len());
-    for raw in models {
-        let name = raw.trim();
-        if name.is_empty() {
-            return Err(AdminError::InvalidBody("models 不能含空名".to_string()));
-        }
-        if seen.insert(name.to_string()) {
-            out.push(name.to_string());
+    for entry in models {
+        match entry {
+            GroupModel::Unified { id } => {
+                let id = id.trim().to_string();
+                if id.is_empty() {
+                    return Err(AdminError::InvalidBody("models 不能含空名".to_string()));
+                }
+                if !snapshot.unified_models.contains_key(&id) {
+                    return Err(AdminError::InvalidBody(format!("统一模型 {id} 不存在")));
+                }
+                if seen.insert((0, 0, id.clone())) {
+                    out.push(GroupModel::Unified { id });
+                }
+            }
+            GroupModel::Source { channel_id, model } => {
+                let model = model.trim().to_string();
+                if model.is_empty() {
+                    return Err(AdminError::InvalidBody("models 不能含空名".to_string()));
+                }
+                let Some(record) = snapshot
+                    .channels
+                    .iter()
+                    .find(|record| record.id == channel_id)
+                else {
+                    return Err(AdminError::InvalidBody(format!("渠道 {channel_id} 不存在")));
+                };
+                if !channel_lists_callable(&record.channel, &model) {
+                    return Err(AdminError::InvalidBody(format!(
+                        "成员 {} 不是渠道 {} 的已登记模型",
+                        model, record.channel.name
+                    )));
+                }
+                if seen.insert((1, channel_id, model.clone())) {
+                    out.push(GroupModel::Source { channel_id, model });
+                }
+            }
         }
     }
     Ok(out)
