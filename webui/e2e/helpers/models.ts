@@ -1,6 +1,13 @@
 import { expect, type Page } from '@playwright/test';
 import { E2E_ADMIN_KEY } from './gateway';
-import type { Channel, ModelGroup, Price, UnifiedModel } from '../../src/api/types';
+import {
+  channelWriteBody,
+  type Channel,
+  type ChannelView,
+  type ModelGroup,
+  type Price,
+  type UnifiedModel,
+} from '../../src/api/types';
 
 const headers = { Authorization: `Bearer ${E2E_ADMIN_KEY}` };
 
@@ -79,5 +86,31 @@ export async function seedCatalog(
   }>,
 ): Promise<void> {
   const resp = await page.request.put('/catalog', { headers, data: { models } });
+  expect(resp.ok(), await resp.text()).toBeTruthy();
+}
+
+/** 读出当前渠道后 PATCH 式覆盖写字段。 */
+export async function updateChannel(
+  page: Page,
+  id: number,
+  patch: Partial<Channel>,
+): Promise<void> {
+  const listed = await page.request.get('/channels', { headers });
+  expect(listed.ok(), await listed.text()).toBeTruthy();
+  const channels = (await listed.json()) as ChannelView[];
+  const current = channels.find((channel) => channel.id === id);
+  if (current === undefined) {
+    throw new Error(`channel ${id} not found`);
+  }
+  const resp = await page.request.put(`/channels/${id}`, {
+    headers,
+    data: { ...channelWriteBody(current), ...patch },
+  });
+  expect(resp.ok(), await resp.text()).toBeTruthy();
+}
+
+/** 删除渠道。 */
+export async function deleteChannel(page: Page, id: number): Promise<void> {
+  const resp = await page.request.delete(`/channels/${id}`, { headers });
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }

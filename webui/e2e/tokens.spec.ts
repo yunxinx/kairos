@@ -52,6 +52,19 @@ test.describe('token resource page', () => {
     await page.getByTestId('tokens-search').fill('');
     await expect(row).toBeVisible();
 
+    await row.getByTestId('token-copy-key').click();
+    await expect(row.getByTestId('token-copy-key')).toHaveAttribute('aria-label', /copied/i);
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(tokenKey);
+
+    await page.getByTestId('tokens-status-filter').click();
+    await page
+      .locator('[data-testid="tokens-status-filter-option"][data-value="disabled"]')
+      .click();
+    await expect(row).toHaveCount(0);
+    await page.getByTestId('tokens-status-filter-clear').click();
+    await page.keyboard.press('Escape');
+    await expect(row).toBeVisible();
+
     // 快捷档位累计成差额：算式预览 `+5 = 5`，保存后才落库。
     await row.getByTestId('token-edit').click();
     await page.getByTestId('token-quick-add-5').click();

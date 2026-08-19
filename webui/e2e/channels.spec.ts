@@ -138,6 +138,15 @@ test.describe('channel resource page', () => {
       await page.getByTestId('channels-search').fill('');
       await expect(okRow).toBeVisible();
 
+      await page.getByTestId('channels-status-filter').click();
+      await page
+        .locator('[data-testid="channels-status-filter-option"][data-value="disabled"]')
+        .click();
+      await expect(okRow).toHaveCount(0);
+      await page.getByTestId('channels-status-filter-clear').click();
+      await page.keyboard.press('Escape');
+      await expect(okRow).toBeVisible();
+
       // 二次同步：别名保留、主名已选择；关闭按钮不保存并返回；别名维度筛选可用；搜索/反选作用于可见行。
       await okRow.getByTestId('channel-edit').click();
       await page.getByTestId('channel-sync-models').click();

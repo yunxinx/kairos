@@ -8,6 +8,7 @@ import PageHeader from '@/app/layout/PageHeader.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
+import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
@@ -42,12 +43,17 @@ const QUOTA_WARN_RATIO = 0.7;
 const QUOTA_DANGER_RATIO = 0.9;
 /** 相对时间展示的刷新间隔（毫秒）。 */
 const RELATIVE_TIME_TICK_MS = 30_000;
+/** 复制成功后对号停留时长，与日志 body 复制反馈对齐。 */
+const COPY_FEEDBACK_MS = 2_000;
 
 const { t, locale } = useI18n();
-const { copy, error } = useToast();
+const { error } = useToast();
 const queryClient = useQueryClient();
 
 const searchText = ref('');
+const statusFilter = ref<string[]>([]);
+const copiedKey = ref<string | null>(null);
+let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
@@ -73,12 +79,25 @@ const tokensQuery = useQuery({
 const tokens = computed(() => tokensQuery.data.value ?? []);
 const showTableSkeleton = computed(() => tokensQuery.isPending.value && !tokensQuery.data.value);
 
+const statusOptions = computed(() => {
+  const enabled = tokens.value.filter((token) => token.enabled).length;
+  return [
+    { value: 'enabled', label: t('tokens.statusEnabled'), count: enabled },
+    { value: 'disabled', label: t('tokens.statusDisabled'), count: tokens.value.length - enabled },
+  ];
+});
+
 const filteredTokens = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  if (!q) return tokens.value;
-  return tokens.value.filter(
-    (token) => token.name.toLowerCase().includes(q) || token.token_key.toLowerCase().includes(q),
-  );
+  const statuses = new Set(statusFilter.value);
+  return tokens.value.filter((token) => {
+    if (statuses.size > 0) {
+      const flag = token.enabled ? 'enabled' : 'disabled';
+      if (!statuses.has(flag)) return false;
+    }
+    if (!q) return true;
+    return token.name.toLowerCase().includes(q) || token.token_key.toLowerCase().includes(q);
+  });
 });
 
 // 行选择：全选只作用于当前可见行；被筛掉的已选行保留选择但不计入全选。
@@ -119,10 +138,20 @@ onMounted(() => {
 });
 onUnmounted(() => {
   if (relativeTimer !== undefined) clearInterval(relativeTimer);
+  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
 });
 
-function copyKey(key: string) {
-  void copy(key, t('common.copiedTokenKey'), t('common.copyFailedTokenKey'));
+async function copyKey(key: string) {
+  try {
+    await navigator.clipboard.writeText(key);
+    copiedKey.value = key;
+    if (copiedTimer !== undefined) clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => {
+      if (copiedKey.value === key) copiedKey.value = null;
+    }, COPY_FEEDBACK_MS);
+  } catch {
+    error(t('common.copyFailedTokenKey'));
+  }
 }
 
 function quotaRatio(token: TokenRow): number {
@@ -279,6 +308,12 @@ function openBulkDelete() {
               :placeholder="t('tokens.search')"
               :aria-label="t('tokens.search')"
             />
+            <FacetedFilter
+              v-model="statusFilter"
+              :title="t('tokens.status')"
+              :options="statusOptions"
+              test-id="tokens-status-filter"
+            />
             <template #actions>
               <button
                 type="button"
@@ -341,11 +376,17 @@ function openBulkDelete() {
                     type="button"
                     class="btn btn-ghost btn-icon"
                     data-testid="token-copy-key"
-                    :aria-label="t('common.copy')"
-                    :title="t('common.copy')"
+                    :aria-label="
+                      copiedKey === token.token_key ? t('common.copied') : t('common.copy')
+                    "
+                    :title="copiedKey === token.token_key ? t('common.copied') : t('common.copy')"
                     @click="copyKey(token.token_key)"
                   >
-                    <UiIcon name="copy" :size="14" />
+                    <UiIcon
+                      :name="copiedKey === token.token_key ? 'check' : 'copy'"
+                      :size="14"
+                      :class="copiedKey === token.token_key ? 'text-success' : undefined"
+                    />
                   </button>
                 </span>
               </TableCell>

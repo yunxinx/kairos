@@ -11,6 +11,7 @@ import BrandIcon from '@/components/ui/BrandIcon.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
+import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import NumberStepper from '@/components/ui/NumberStepper.vue';
@@ -80,6 +81,7 @@ const {
 
 const deleteErrors = ref<Record<number, string>>({});
 const searchText = ref('');
+const statusFilter = ref<string[]>([]);
 
 const channelsQuery = useQuery({
   queryKey: ['channels'],
@@ -91,10 +93,27 @@ const showTableSkeleton = computed(
   () => channelsQuery.isPending.value && !channelsQuery.data.value,
 );
 
+const statusOptions = computed(() => {
+  const enabled = channels.value.filter((channel) => channel.enabled).length;
+  return [
+    { value: 'enabled', label: t('channel.statusEnabled'), count: enabled },
+    {
+      value: 'disabled',
+      label: t('channel.statusDisabled'),
+      count: channels.value.length - enabled,
+    },
+  ];
+});
+
 const filteredChannels = computed(() => {
   const q = searchText.value.trim().toLowerCase();
-  if (!q) return channels.value;
+  const statuses = new Set(statusFilter.value);
   return channels.value.filter((channel) => {
+    if (statuses.size > 0) {
+      const flag = channel.enabled ? 'enabled' : 'disabled';
+      if (!statuses.has(flag)) return false;
+    }
+    if (!q) return true;
     if (channel.name.toLowerCase().includes(q)) return true;
     if (channel.base_url.toLowerCase().includes(q)) return true;
     if (channel.models.some((model) => model.toLowerCase().includes(q))) return true;
@@ -281,6 +300,12 @@ function openProbe(channel: ChannelView) {
               data-testid="channels-search"
               :placeholder="t('channel.search')"
               :aria-label="t('channel.search')"
+            />
+            <FacetedFilter
+              v-model="statusFilter"
+              :title="t('channel.status')"
+              :options="statusOptions"
+              test-id="channels-status-filter"
             />
             <template #actions>
               <button
