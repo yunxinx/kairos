@@ -179,6 +179,12 @@ function isExpanded(id: number): boolean {
             :aria-label="t('logs.search')"
             @keydown.enter="applyKeywordNow"
           />
+          <FacetedFilter
+            v-model="appliedSettled"
+            :title="t('logs.settledFilter')"
+            :options="settledOptions"
+            test-id="logs-settled-filter"
+          />
           <p
             v-if="unsettledTotal > 0"
             class="text-fg-muted text-sm"
@@ -187,12 +193,6 @@ function isExpanded(id: number): boolean {
             {{ t('logs.unsettledTotal', { count: unsettledTotal }) }}
           </p>
           <template #actions>
-            <FacetedFilter
-              v-model="appliedSettled"
-              :title="t('logs.settledFilter')"
-              :options="settledOptions"
-              test-id="logs-settled-filter"
-            />
             <DateRangePicker
               v-model="appliedRange"
               trigger-id="logs-time-range"

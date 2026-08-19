@@ -131,19 +131,19 @@ function clearFilters() {
             :aria-label="t('logs.search')"
             @keydown.enter="applyKeywordNow"
           />
+          <FacetedFilter
+            v-model="appliedLevels"
+            :title="t('logs.levelFilter')"
+            :options="levelOptions"
+            test-id="system-logs-level-filter"
+          />
+          <FacetedFilter
+            v-model="appliedTargets"
+            :title="t('logs.targetFilter')"
+            :options="targetOptions"
+            test-id="system-logs-target-filter"
+          />
           <template #actions>
-            <FacetedFilter
-              v-model="appliedLevels"
-              :title="t('logs.levelFilter')"
-              :options="levelOptions"
-              test-id="system-logs-level-filter"
-            />
-            <FacetedFilter
-              v-model="appliedTargets"
-              :title="t('logs.targetFilter')"
-              :options="targetOptions"
-              test-id="system-logs-target-filter"
-            />
             <DateRangePicker
               v-model="appliedRange"
               trigger-id="system-logs-time-range"
