@@ -1,6 +1,17 @@
 /** 渠道 wire 协议，与后端 `Protocol` serde rename 一致。 */
 export type Protocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
 
+export const PROTOCOLS: readonly Protocol[] = [
+  'openai_chat',
+  'openai_responses',
+  'anthropic_messages',
+];
+
+/** 运行时收窄日志/表单里的协议字符串。 */
+export function isProtocol(value: string): value is Protocol {
+  return (PROTOCOLS as readonly string[]).includes(value);
+}
+
 /** 出站路径段，与网关 `protocol::upstream_path` 对齐。 */
 const UPSTREAM_PATH: Record<Protocol, string> = {
   openai_chat: '/chat/completions',
@@ -89,8 +100,7 @@ export interface Price {
 
 /** 组名单一条：钉渠道的已登记名，或统一模型 ID。 */
 export type GroupModel =
-  | { kind: 'source'; channel_id: number; model: string }
-  | { kind: 'unified'; id: string };
+  { kind: 'source'; channel_id: number; model: string } | { kind: 'unified'; id: string };
 
 /** 模型组：令牌的可调用名允许名单。 */
 export interface ModelGroup {
@@ -239,15 +249,32 @@ export interface LogPage extends Page<LogEntry> {
   unsettled_total: number;
 }
 
+/** 列表排序方向。 */
+export type SortDir = 'asc' | 'desc';
+
+/** 请求日志可排序列：只含有大小关系的量，类别列走筛选。缺省 `created` 倒序。 */
+export type RequestLogSortBy = 'created' | 'tokens' | 'latency' | 'cache' | 'cost';
+
+/** 系统日志可排序列：只有时间有顺序。 */
+export type SystemLogSortBy = 'created';
+
 /** 日志列表查询。 */
 export interface LogQuery {
   token_key?: string;
+  /** 按令牌展示名精确过滤；列表里的 `token_key` 已脱敏，行内筛选用这个。 */
+  token_name?: string;
   model?: string;
+  /** 按渠道名精确过滤。 */
+  channel?: string;
   /** 综合关键字：对令牌/模型/渠道做子串匹配（OR）。 */
   keyword?: string;
   from_created_at?: number;
   to_created_at?: number;
   settled?: boolean;
+  /** 入站协议分面多选，请求时拼成逗号列表。 */
+  inbound_protocol?: string[];
+  sort_by?: RequestLogSortBy;
+  sort_dir?: SortDir;
   page?: number;
   page_size?: number;
 }
@@ -268,6 +295,8 @@ export interface SystemLogQuery {
   to_created_at?: number;
   level?: string[];
   target?: string[];
+  sort_by?: SystemLogSortBy;
+  sort_dir?: SortDir;
   page?: number;
   page_size?: number;
 }

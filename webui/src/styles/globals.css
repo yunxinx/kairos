@@ -1099,6 +1099,7 @@ html[lang='zh-CN'] .font-serif {
   box-sizing: border-box;
   display: flex;
   align-items: center;
+  gap: 8px;
   width: 100%;
   cursor: pointer;
   border-radius: calc(var(--seed-radius) - 2px);
@@ -1124,6 +1125,93 @@ html[lang='zh-CN'] .font-serif {
   height: 1px;
   margin: 4px 0;
   background: var(--seed-border);
+}
+.data-table-menu-label {
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.data-table-menu-checkbox {
+  position: relative;
+  padding-left: 1.75rem;
+}
+.data-table-menu-checkbox-indicator {
+  position: absolute;
+  left: 8px;
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  align-items: center;
+  justify-content: center;
+}
+.data-table-column-header {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.data-table-column-header:hover,
+.data-table-column-header[data-state='open'] {
+  color: var(--seed-primary);
+}
+.data-table-column-header-caret {
+  flex: none;
+  opacity: 0.45;
+  transition: opacity 120ms ease-in-out;
+}
+.data-table-column-header:hover .data-table-column-header-caret,
+.data-table-column-header[data-state='open'] .data-table-column-header-caret,
+.data-table-column-header[data-sorted] .data-table-column-header-caret {
+  opacity: 1;
+}
+
+/* 用户选的排序：表头做成可点掉的筛选态；悬停箭头换成 ×。 */
+.data-table-column-header-affordance {
+  position: relative;
+  display: inline-grid;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  place-items: center;
+}
+.data-table-column-header-affordance > * {
+  grid-area: 1 / 1;
+}
+.data-table-column-header-clear {
+  opacity: 0;
+  transition: opacity 120ms ease-in-out;
+}
+.data-table-column-header[data-clearable] {
+  padding: 2px 6px 2px 8px;
+  border-radius: var(--seed-radius);
+  background: color-mix(in srgb, var(--seed-primary) 12%, transparent);
+  color: var(--seed-primary);
+  transition:
+    color 150ms ease-in-out,
+    background 150ms ease-in-out;
+}
+.data-table-column-header[data-clearable] .data-table-column-header-caret {
+  opacity: 1;
+}
+.data-table-column-header[data-clearable]:hover,
+.data-table-column-header[data-clearable]:focus-visible {
+  background: color-mix(in srgb, var(--seed-primary) 18%, transparent);
+}
+.data-table-column-header[data-clearable]:hover .data-table-column-header-caret,
+.data-table-column-header[data-clearable]:focus-visible .data-table-column-header-caret {
+  opacity: 0;
+}
+.data-table-column-header[data-clearable]:hover .data-table-column-header-clear,
+.data-table-column-header[data-clearable]:focus-visible .data-table-column-header-clear {
+  opacity: 1;
 }
 
 /* +N 收起名单：两栏提高密度，列距留给截断 chip 呼吸 */

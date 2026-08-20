@@ -54,6 +54,18 @@ export function parseUsdToMicros(input: string): number | null {
   return negative ? -micros : micros;
 }
 
+const MICROS_PER_MILLION_TOKENS = 1_000_000n;
+
+/** 对齐后端 `billing::component_cost`：tokens × 单价 / 1M，向零截断。 */
+export function componentCostMicros(tokens: number, microsPer1m: number): number {
+  const tokenCount = Math.trunc(tokens);
+  const price = Math.trunc(microsPer1m);
+  if (!Number.isSafeInteger(tokenCount) || !Number.isSafeInteger(price)) {
+    return 0;
+  }
+  return Number((BigInt(tokenCount) * BigInt(price)) / MICROS_PER_MILLION_TOKENS);
+}
+
 /** unix 毫秒 → 本地化日期时间。 */
 export function formatUnixMillis(millis: number, locale?: string): string {
   return new Date(millis).toLocaleString(resolveNumberLocale(locale));
@@ -186,4 +198,69 @@ export function formatProbeLatency(ms: number): string {
     return `${(ms / 1_000).toFixed(2)} s`;
   }
   return `${ms} ms`;
+}
+
+/** Token 计数精简展示（例如 1.2k, 500, 1.5M）。 */
+export function formatTokensCount(tokens: number): string {
+  if (tokens < 1_000) {
+    return String(tokens);
+  }
+  if (tokens < 1_000_000) {
+    const k = (tokens / 1_000).toFixed(1).replace(/\.0$/, '');
+    return `${k}k`;
+  }
+  const m = (tokens / 1_000_000)
+    .toFixed(2)
+    .replace(/\.00$/, '')
+    .replace(/(\.\d)0$/, '$1');
+  return `${m}M`;
+}
+
+/** Token 生成速度（Tokens/s）。 */
+export function formatThroughput(outputTokens: number, latencyMs: number): string | null {
+  if (outputTokens <= 0 || latencyMs <= 0) {
+    return null;
+  }
+  const seconds = latencyMs / 1_000;
+  const speed = outputTokens / seconds;
+  return `${speed >= 100 ? speed.toFixed(0) : speed.toFixed(1)} t/s`;
+}
+
+/** 日志耗时展示：不足 1s 用整数毫秒，达到 1s 用一位小数秒。 */
+export function formatLatencyDisplay(ms: number): string {
+  if (ms < MILLIS_PER_SECOND) {
+    return `${ms}ms`;
+  }
+  return `${(ms / MILLIS_PER_SECOND).toFixed(1)}s`;
+}
+
+export type LatencyHealth = 'excellent' | 'normal' | 'slow';
+
+/** 预填充/排队预算：对齐「首字」5s 绿 / 10s 黄的绝对档。 */
+const PREFILL_EXCELLENT_MS = 5_000;
+const PREFILL_NORMAL_MS = 10_000;
+/** 生成速度基准：达到该吞吐则整段耗时仍算健康。 */
+const TPS_EXCELLENT = 30;
+const TPS_NORMAL = 10;
+
+/**
+ * 评估耗时健康度。
+ *
+ * 日志没有独立的首字耗时，色带只能标整段墙钟时间。预算 = 预填充档 + 按输出量估算的生成时间：
+ * 输出越多允许越久，同时仍受生成速度约束。无输出时退化为 5s / 10s 绝对档。
+ */
+export function evaluateLatencyHealth(latencyMs: number, outputTokens: number): LatencyHealth {
+  const generationExcellentMs =
+    outputTokens > 0 ? (outputTokens / TPS_EXCELLENT) * MILLIS_PER_SECOND : 0;
+  const generationNormalMs = outputTokens > 0 ? (outputTokens / TPS_NORMAL) * MILLIS_PER_SECOND : 0;
+  if (latencyMs <= PREFILL_EXCELLENT_MS + generationExcellentMs) return 'excellent';
+  if (latencyMs <= PREFILL_NORMAL_MS + generationNormalMs) return 'normal';
+  return 'slow';
+}
+
+/** 计算缓存命中率（百分比）。 */
+export function computeCacheHitRatio(readTokens: number, inputTokens: number): number {
+  const total = inputTokens + readTokens;
+  if (total <= 0 || readTokens <= 0) return 0;
+  return Math.round((readTokens / total) * 100);
 }

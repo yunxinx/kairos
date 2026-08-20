@@ -3,12 +3,10 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { channelWriteBody, type Channel, type ChannelView, type Protocol } from '@/api/types';
-import anthropicIcon from '@lobehub/icons-static-svg/icons/anthropic.svg';
-import openaiIcon from '@lobehub/icons-static-svg/icons/openai.svg';
+import { channelWriteBody, type Channel, type ChannelView } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
-import BrandIcon from '@/components/ui/BrandIcon.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
+import ProtocolBadge from '@/components/ui/ProtocolBadge.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
@@ -44,19 +42,6 @@ type ChannelWindowPayload =
   | { kind: 'delete'; channel: ChannelView }
   | { kind: 'probe'; channel: ChannelView }
   | BulkDeletePayload;
-
-/** 协议徽章着色：三协议各自独立配色，见 globals.css 的 --proto-* 变量。 */
-const PROTOCOL_BADGE_CLASS: Record<Protocol, string> = {
-  openai_chat: 'badge-proto-chat',
-  openai_responses: 'badge-proto-responses',
-  anthropic_messages: 'badge-proto-anthropic',
-};
-
-const PROTOCOL_ICON_SRC: Record<Protocol, string> = {
-  openai_chat: openaiIcon,
-  openai_responses: openaiIcon,
-  anthropic_messages: anthropicIcon,
-};
 
 const { t } = useI18n();
 const { error } = useToast();
@@ -357,10 +342,7 @@ function openProbe(channel: ChannelView) {
               />
               <TableCell class="font-medium">{{ channel.name }}</TableCell>
               <TableCell>
-                <span class="badge gap-1" :class="PROTOCOL_BADGE_CLASS[channel.protocol]">
-                  <BrandIcon :src="PROTOCOL_ICON_SRC[channel.protocol]" :size="12" />
-                  {{ t(`protocol.${channel.protocol}`) }}
-                </span>
+                <ProtocolBadge :protocol="channel.protocol" />
               </TableCell>
               <TableCell data-testid="channel-models">
                 <OverflowChips

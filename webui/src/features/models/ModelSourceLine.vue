@@ -6,10 +6,7 @@ import OverflowChips, { type OverflowChip } from '@/components/ui/OverflowChips.
 import Tooltip from '@/components/ui/Tooltip.vue';
 import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
 import UnifiedNameChip from '@/features/models/UnifiedNameChip.vue';
-import {
-  memberSourceI18nKey,
-  type CallableSourceLine,
-} from '@/lib/unified-sources';
+import { memberSourceI18nKey, type CallableSourceLine } from '@/lib/unified-sources';
 
 const props = withDefaults(
   defineProps<{

@@ -1,32 +1,94 @@
 <script setup lang="ts">
+import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import type { LogEntry } from '@/api/types';
+import ProtocolBadge from '@/components/ui/ProtocolBadge.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
-import LogBodyPanel from '@/features/logs/LogBodyPanel.vue';
-import { formatUnixMillis, formatUsdMicros } from '@/lib/format';
+import LatencyMeter from '@/features/logs/LatencyMeter.vue';
+import {
+  formatUnixMillis,
+  formatUsdMicros,
+  formatTokensCount,
+  maskTokenKey,
+  computeCacheHitRatio,
+} from '@/lib/format';
+import { resolveOutboundProtocol } from '@/lib/protocol';
 
-defineProps<{
-  entry: LogEntry;
-  expanded: boolean;
-  detailColSpan: number;
-  detail?: LogEntry | null;
-  detailLoading?: boolean;
-  detailError?: string;
-  closing?: boolean;
-}>();
+export type RequestLogVisibleColumns = {
+  token: boolean;
+  model: boolean;
+  channel: boolean;
+  inboundProtocol: boolean;
+  tokens: boolean;
+  latency: boolean;
+  cache: boolean;
+  cost: boolean;
+};
+
+const props = withDefaults(
+  defineProps<{
+    entry: LogEntry;
+    visible: RequestLogVisibleColumns;
+    active?: boolean;
+    channelProtocolMap?: Map<string, string> | null;
+  }>(),
+  {
+    active: false,
+    channelProtocolMap: null,
+  },
+);
 
 const emit = defineEmits<{
-  toggleExpand: [];
-  settle: [];
-  waive: [];
+  openDetail: [event: MouseEvent, entry: LogEntry];
+  filterModel: [model: string];
+  filterChannel: [channel: string];
+  filterToken: [token: string];
 }>();
 
 const { t, locale } = useI18n();
 
-function statusBadgeClass(statusCode: number): string {
-  return statusCode >= 200 && statusCode < 300 ? 'badge-success' : 'badge-danger';
+const outbound = computed(() =>
+  resolveOutboundProtocol(
+    props.entry.inbound_protocol,
+    props.entry.channel,
+    props.channelProtocolMap,
+  ),
+);
+
+const isFailed = computed(() => props.entry.status_code >= 400);
+
+const totalTokens = computed(
+  () =>
+    props.entry.input_tokens +
+    props.entry.output_tokens +
+    props.entry.cache_read_tokens +
+    props.entry.cache_write_tokens,
+);
+
+const hasCache = computed(
+  () => props.entry.cache_read_tokens > 0 || props.entry.cache_write_tokens > 0,
+);
+
+const cacheHitRatio = computed(() =>
+  computeCacheHitRatio(props.entry.cache_read_tokens, props.entry.input_tokens),
+);
+
+const rowClass = computed(() => {
+  if (isFailed.value) {
+    return props.active
+      ? 'bg-[color-mix(in_srgb,var(--danger)_16%,var(--seed-surface))] font-medium hover:bg-[color-mix(in_srgb,var(--danger)_22%,var(--seed-surface))]'
+      : 'bg-[color-mix(in_srgb,var(--danger)_10%,var(--seed-surface))] hover:bg-[color-mix(in_srgb,var(--danger)_16%,var(--seed-surface))]';
+  }
+  return props.active
+    ? 'bg-[var(--seed-surface-alt)]/50 font-medium hover:bg-[var(--seed-surface-alt)]/60'
+    : 'hover:bg-[var(--seed-surface-alt)]/60';
+});
+
+function handleRowClick(event: MouseEvent) {
+  if ((event.target as HTMLElement).closest('button')) return;
+  emit('openDetail', event, props.entry);
 }
 </script>
 
@@ -36,99 +98,190 @@ function statusBadgeClass(statusCode: number): string {
     :data-log-id="String(entry.id)"
     :data-model="entry.model"
     :data-token-key="entry.token_key"
+    :data-status-code="String(entry.status_code)"
+    class="group cursor-pointer transition-colors"
+    :class="rowClass"
+    @click="handleRowClick"
   >
-    <TableCell class="text-fg-muted font-mono text-xs">
+    <TableCell class="text-fg-muted font-mono text-xs whitespace-nowrap">
       {{ formatUnixMillis(entry.created_at, locale) }}
     </TableCell>
-    <TableCell truncate :title="entry.token_key">
-      {{ entry.token_name }}
+
+    <TableCell v-if="visible.token">
+      <div class="flex min-w-0 flex-col">
+        <div class="flex min-w-0 items-center gap-1">
+          <span class="truncate text-xs font-medium" :title="entry.token_name">
+            {{ entry.token_name }}
+          </span>
+          <button
+            type="button"
+            class="shrink-0 rounded p-0.5 text-[var(--fg-muted)] opacity-0 transition-opacity group-hover:opacity-100 hover:text-[var(--seed-primary)]"
+            data-testid="log-filter-token"
+            :title="t('logs.filterByToken')"
+            @click.stop="emit('filterToken', entry.token_name)"
+          >
+            <UiIcon name="filter" :size="11" />
+          </button>
+        </div>
+        <div
+          class="text-fg-muted truncate font-mono text-[10px] opacity-80"
+          :title="entry.token_key"
+        >
+          {{ maskTokenKey(entry.token_key) }}
+        </div>
+      </div>
     </TableCell>
-    <TableCell data-testid="log-model">{{ entry.model }}</TableCell>
-    <TableCell data-testid="log-channel">{{ entry.channel }}</TableCell>
-    <TableCell>
-      <span class="badge" :class="statusBadgeClass(entry.status_code)" data-testid="log-status">{{
-        entry.status_code
-      }}</span>
+
+    <TableCell v-if="visible.model">
+      <div class="flex min-w-0 flex-col">
+        <div class="flex min-w-0 items-center gap-1" data-testid="log-model-container">
+          <span
+            class="truncate font-mono text-xs font-semibold text-[var(--seed-fg)]"
+            data-testid="log-model"
+          >
+            {{ entry.model }}
+          </span>
+          <button
+            type="button"
+            class="shrink-0 rounded p-0.5 text-[var(--fg-muted)] opacity-0 transition-opacity group-hover:opacity-100 hover:text-[var(--seed-primary)]"
+            data-testid="log-filter-model"
+            :title="t('logs.filterByModel')"
+            @click.stop="emit('filterModel', entry.model)"
+          >
+            <UiIcon name="filter" :size="11" />
+          </button>
+        </div>
+        <div
+          v-if="entry.outbound_model && entry.outbound_model !== entry.model"
+          class="text-fg-muted inline-flex items-center gap-0.5 truncate font-mono text-[10px] opacity-80"
+          :title="`${t('logs.outboundModel')}: ${entry.outbound_model}`"
+          data-testid="log-row-outbound-model"
+        >
+          <UiIcon name="arrow-right" :size="9" />
+          <span>{{ entry.outbound_model }}</span>
+        </div>
+      </div>
     </TableCell>
-    <TableCell class="font-mono text-sm" data-testid="log-latency">
-      {{ entry.latency_ms }} ms
+
+    <TableCell v-if="visible.channel">
+      <div class="inline-flex max-w-full items-center gap-1">
+        <span
+          class="code-chip truncate rounded px-1.5 py-0.5 font-mono text-[11px]"
+          data-testid="log-channel"
+        >
+          {{ entry.channel }}
+        </span>
+        <button
+          type="button"
+          class="shrink-0 rounded p-0.5 text-[var(--fg-muted)] opacity-0 transition-opacity group-hover:opacity-100 hover:text-[var(--seed-primary)]"
+          data-testid="log-filter-channel"
+          :title="t('logs.filterByChannel')"
+          @click.stop="emit('filterChannel', entry.channel)"
+        >
+          <UiIcon name="filter" :size="11" />
+        </button>
+      </div>
     </TableCell>
-    <TableCell class="font-mono text-sm" data-testid="log-cost">
-      <span>{{ formatUsdMicros(entry.cost_usd_micros) }}</span>
-      <span
-        v-if="!entry.settled"
-        class="text-fg-muted ml-1 text-xs"
-        data-testid="log-unsettled"
-      >
-        {{ t('logs.unsettled') }}
-      </span>
+
+    <TableCell v-if="visible.inboundProtocol">
+      <div class="flex min-w-0 flex-col items-start gap-1" data-testid="log-inbound-protocol">
+        <ProtocolBadge :protocol="entry.inbound_protocol" />
+        <div
+          v-if="outbound.status === 'converted'"
+          class="inline-flex items-center gap-0.5"
+          data-testid="log-row-outbound-protocol"
+          :title="`${t('logs.protocolConversion')}: ${entry.inbound_protocol} → ${outbound.protocol}`"
+        >
+          <UiIcon name="arrow-right" :size="9" class="text-fg-muted shrink-0" />
+          <ProtocolBadge :protocol="outbound.protocol" />
+        </div>
+        <div
+          v-else-if="outbound.status === 'unknown'"
+          class="inline-flex items-center gap-0.5"
+          data-testid="log-outbound-protocol-unknown"
+        >
+          <UiIcon name="arrow-right" :size="9" class="text-fg-muted shrink-0" />
+          <span class="badge badge-neutral w-fit text-[10px]">{{
+            t('logs.outboundProtocolUnknown')
+          }}</span>
+        </div>
+      </div>
     </TableCell>
-    <TableCell align="right" class="w-10">
+
+    <TableCell v-if="visible.tokens" class="font-mono text-xs">
+      <div v-if="totalTokens > 0" class="flex flex-col gap-0.5">
+        <span class="text-fg-muted" :title="t('logs.promptTokens')">
+          ↑ {{ formatTokensCount(entry.input_tokens) }}
+        </span>
+        <span class="font-semibold text-[var(--seed-fg)]" :title="t('logs.completionTokens')">
+          ↓ {{ formatTokensCount(entry.output_tokens) }}
+        </span>
+      </div>
+      <span v-else class="text-fg-muted">0</span>
+    </TableCell>
+
+    <TableCell v-if="visible.latency">
+      <LatencyMeter
+        :latency-ms="entry.latency_ms"
+        :output-tokens="entry.output_tokens"
+        latency-test-id="log-latency"
+        speed-test-id="log-speed"
+      />
+    </TableCell>
+
+    <TableCell v-if="visible.cache" class="font-mono text-xs">
+      <div v-if="hasCache" class="flex items-center gap-3">
+        <div class="flex flex-col gap-0.5">
+          <span v-if="entry.cache_read_tokens > 0" class="text-blue-600 dark:text-blue-400">
+            {{ t('logs.cacheReadShort') }} {{ formatTokensCount(entry.cache_read_tokens) }}
+          </span>
+          <span v-if="entry.cache_write_tokens > 0" class="text-purple-600 dark:text-purple-400">
+            {{ t('logs.cacheWriteShort') }} {{ formatTokensCount(entry.cache_write_tokens) }}
+          </span>
+        </div>
+        <span
+          class="badge inline-block w-fit border-blue-500/20 bg-blue-500/10 font-mono text-[10px] text-blue-600 dark:text-blue-400"
+          :title="t('logs.cacheHit')"
+        >
+          ⚡ {{ cacheHitRatio }}%
+        </span>
+      </div>
+      <span v-else class="text-fg-muted">-</span>
+    </TableCell>
+
+    <TableCell v-if="visible.cost" class="font-mono text-xs">
+      <div class="inline-flex flex-col gap-0.5 whitespace-nowrap">
+        <span class="font-medium" data-testid="log-cost">{{
+          formatUsdMicros(entry.cost_usd_micros)
+        }}</span>
+        <span
+          v-if="entry.settled"
+          class="self-center font-medium text-emerald-600 dark:text-emerald-400"
+        >
+          {{ t('logs.settledYes') }}
+        </span>
+        <span
+          v-else
+          class="self-center font-medium text-amber-600 dark:text-amber-400"
+          data-testid="log-unsettled"
+          :title="t('logs.unsettled')"
+        >
+          {{ t('logs.settledNo') }}
+        </span>
+      </div>
+    </TableCell>
+
+    <TableCell align="center">
       <button
         type="button"
         class="btn btn-ghost btn-icon"
         data-testid="log-expand"
-        :aria-expanded="expanded ? 'true' : 'false'"
-        :aria-label="expanded ? t('logs.collapseDetails') : t('logs.expandDetails')"
-        @click="emit('toggleExpand')"
+        :aria-label="t('logs.expandDetails')"
+        :title="t('logs.expandDetails')"
+        @click.stop="emit('openDetail', $event, entry)"
       >
-        <UiIcon :name="expanded ? 'chevron-up' : 'chevron-down'" :size="16" />
+        <UiIcon name="external-link" :size="15" />
       </button>
-    </TableCell>
-  </TableRow>
-  <TableRow v-if="expanded" data-testid="log-detail-row" class="hover:bg-transparent">
-    <TableCell :colspan="detailColSpan" class="align-top whitespace-normal">
-      <dl class="mb-4 grid gap-3 sm:grid-cols-2" data-testid="log-detail-meta">
-        <div>
-          <dt class="text-fg-muted text-xs">{{ t('logs.outboundModel') }}</dt>
-          <dd class="font-mono text-sm" data-testid="log-outbound-model">
-            {{ entry.outbound_model ?? entry.model }}
-          </dd>
-        </div>
-        <div>
-          <dt class="text-fg-muted text-xs">{{ t('logs.channel') }}</dt>
-          <dd class="font-mono text-sm" data-testid="log-detail-channel">
-            {{ entry.channel }}
-          </dd>
-        </div>
-      </dl>
-      <div
-        v-if="!entry.settled"
-        class="mb-4 flex flex-wrap gap-2"
-        data-testid="log-unsettled-actions"
-      >
-        <button
-          type="button"
-          class="btn btn-subtle"
-          data-testid="log-settle"
-          :disabled="closing"
-          :title="t('logs.settleGuide')"
-          @click="emit('settle')"
-        >
-          {{ t('logs.settleCharge') }}
-        </button>
-        <button
-          type="button"
-          class="btn btn-subtle"
-          data-testid="log-waive"
-          :disabled="closing"
-          :title="t('logs.waiveGuide')"
-          @click="emit('waive')"
-        >
-          {{ t('logs.waiveCharge') }}
-        </button>
-      </div>
-      <LogBodyPanel v-if="detail" :entry="detail" />
-      <p
-        v-else-if="detailLoading"
-        class="text-fg-muted text-sm"
-        data-testid="log-body-loading"
-      >
-        {{ t('logs.bodyLoading') }}
-      </p>
-      <p v-else-if="detailError" class="text-danger text-sm" data-testid="log-body-error">
-        {{ detailError }}
-      </p>
     </TableCell>
   </TableRow>
 </template>

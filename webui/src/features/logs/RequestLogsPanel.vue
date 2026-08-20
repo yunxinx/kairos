@@ -3,28 +3,83 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { LogQuery, LogEntry } from '@/api/types';
+import {
+  PROTOCOLS,
+  type LogEntry,
+  type LogQuery,
+  type RequestLogSortBy,
+  type SortDir,
+} from '@/api/types';
 import DateRangePicker from '@/components/ui/DateRangePicker.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
+import UiIcon from '@/components/ui/UiIcon.vue';
+import UiSelect from '@/components/ui/UiSelect.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
+import DataTableColumnHeader from '@/components/ui/data-table/DataTableColumnHeader.vue';
 import DataTablePagination from '@/components/ui/data-table/DataTablePagination.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
+import DataTableViewOptions from '@/components/ui/data-table/DataTableViewOptions.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
-import LogTableRow from '@/features/logs/LogTableRow.vue';
+import LogTableRow, { type RequestLogVisibleColumns } from '@/features/logs/LogTableRow.vue';
+import RequestLogDetailWindow from '@/features/logs/RequestLogDetailWindow.vue';
 import { useLogListControls } from '@/features/logs/useLogListControls';
+import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
+import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
+import { anchorFromEvent } from '@/lib/window-anchor';
+
+type RequestLogWindowPayload = {
+  entry: LogEntry;
+};
+
+type RequestLogColumnId =
+  | 'created'
+  | 'token'
+  | 'model'
+  | 'channel'
+  | 'inboundProtocol'
+  | 'tokens'
+  | 'latency'
+  | 'cache'
+  | 'cost'
+  | 'actions';
+
+const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
+  { id: 'created', locked: true },
+  { id: 'token' },
+  { id: 'model' },
+  { id: 'channel' },
+  { id: 'inboundProtocol' },
+  { id: 'tokens' },
+  { id: 'latency' },
+  { id: 'cache', defaultVisible: false },
+  { id: 'cost' },
+  { id: 'actions', locked: true },
+];
+
+const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
+  'token',
+  'model',
+  'channel',
+  'inboundProtocol',
+  'tokens',
+  'latency',
+  'cache',
+  'cost',
+];
 
 const { t } = useI18n();
 const { error, success } = useToast();
 const queryClient = useQueryClient();
+
 const {
   draftKeyword,
   appliedKeyword,
@@ -40,25 +95,129 @@ const {
   clearBaseFilters,
   pagination,
 } = useLogListControls();
+
+const {
+  windows,
+  topmostId,
+  open: openWindow,
+  close: closeWindow,
+  bringToFront,
+} = useWindowStack<RequestLogWindowPayload>();
+
 const appliedSettled = ref<string[]>([]);
-const expandedIds = ref<Set<number>>(new Set());
+const appliedProtocols = ref<string[]>([]);
+const appliedModel = ref<string | null>(null);
+const appliedChannel = ref<string | null>(null);
+const appliedTokenName = ref<string | null>(null);
 const details = ref<Map<number, LogEntry>>(new Map());
 const detailLoading = ref<Set<number>>(new Set());
 const detailErrors = ref<Map<number, string>>(new Map());
+const autoRefreshSeconds = ref<string>('0');
+
+const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
+  'kairos-logs-columns',
+  REQUEST_LOG_COLUMNS,
+);
+
+const rowVisible = computed((): RequestLogVisibleColumns => ({
+  token: visible.value.token,
+  model: visible.value.model,
+  channel: visible.value.channel,
+  inboundProtocol: visible.value.inboundProtocol,
+  tokens: visible.value.tokens,
+  latency: visible.value.latency,
+  cache: visible.value.cache,
+  cost: visible.value.cost,
+}));
+
+const columnMenuItems = computed(() => menuItems(REQUEST_LOG_HIDEABLE));
+
+const sortBy = ref<RequestLogSortBy>('created');
+const sortDir = ref<SortDir>('desc');
+
+const DEFAULT_SORT_BY: RequestLogSortBy = 'created';
+const DEFAULT_SORT_DIR: SortDir = 'desc';
+
+function isDefaultSort(): boolean {
+  return sortBy.value === DEFAULT_SORT_BY && sortDir.value === DEFAULT_SORT_DIR;
+}
+
+function sortedState(column: RequestLogSortBy): SortDir | false {
+  return sortBy.value === column ? sortDir.value : false;
+}
+
+function sortClearable(column: RequestLogSortBy): boolean {
+  return sortBy.value === column && !isDefaultSort();
+}
+
+function ariaSort(column: RequestLogSortBy): 'ascending' | 'descending' | 'none' {
+  if (sortBy.value !== column) return 'none';
+  return sortDir.value === 'asc' ? 'ascending' : 'descending';
+}
+
+function onSort(column: RequestLogSortBy, dir: SortDir) {
+  sortBy.value = column;
+  sortDir.value = dir;
+  resetResults();
+}
+
+function onClearSort() {
+  sortBy.value = DEFAULT_SORT_BY;
+  sortDir.value = DEFAULT_SORT_DIR;
+  resetResults();
+}
+
+const columnLabels = computed((): Record<RequestLogColumnId, string> => ({
+  created: t('logs.created'),
+  token: t('logs.token'),
+  model: t('logs.model'),
+  channel: t('logs.channel'),
+  inboundProtocol: t('logs.inboundProtocol'),
+  tokens: t('logs.tokens'),
+  latency: t('logs.latencyAndSpeed'),
+  cache: t('logs.cache'),
+  cost: t('logs.cost'),
+  actions: t('common.actions'),
+}));
+
+const activeLogIds = computed(() => new Set(windows.value.map((win) => win.payload.entry.id)));
 
 const settledOptions = computed(() => [
   { value: 'true', label: t('logs.settledYes') },
   { value: 'false', label: t('logs.settledNo') },
 ]);
 
-watch(page, () => {
-  expandedIds.value = new Set();
-  details.value = new Map();
-  detailLoading.value = new Set();
-  detailErrors.value = new Map();
+const protocolOptions = computed(() =>
+  PROTOCOLS.map((value) => ({
+    value,
+    label: t(`protocol.${value}`),
+  })),
+);
+
+const refreshOptions = computed(() => [
+  { value: '0', label: t('logs.autoRefreshOff') },
+  { value: '5', label: t('logs.autoRefreshSeconds', { seconds: 5 }) },
+  { value: '10', label: t('logs.autoRefreshSeconds', { seconds: 10 }) },
+  { value: '30', label: t('logs.autoRefreshSeconds', { seconds: 30 }) },
+]);
+
+const channelsQuery = useQuery({
+  queryKey: ['channels'],
+  queryFn: () => apiClient.listChannels(),
+});
+
+const channelProtocolMap = computed((): Map<string, string> | null => {
+  if (channelsQuery.isPending.value) {
+    return null;
+  }
+  return new Map<string, string>(
+    (channelsQuery.data.value ?? []).map((channel) => [channel.name, channel.protocol]),
+  );
 });
 
 watch(appliedSettled, resetResults);
+watch(appliedProtocols, resetResults);
+watch([appliedModel, appliedChannel, appliedTokenName], resetResults);
 
 function buildQuery(): LogQuery {
   const query: LogQuery = {
@@ -69,6 +228,15 @@ function buildQuery(): LogQuery {
   if (keyword) {
     query.keyword = keyword;
   }
+  if (appliedModel.value) {
+    query.model = appliedModel.value;
+  }
+  if (appliedChannel.value) {
+    query.channel = appliedChannel.value;
+  }
+  if (appliedTokenName.value) {
+    query.token_name = appliedTokenName.value;
+  }
   if (appliedFrom.value !== null) {
     query.from_created_at = appliedFrom.value;
   }
@@ -78,20 +246,52 @@ function buildQuery(): LogQuery {
   if (appliedSettled.value.length === 1) {
     query.settled = appliedSettled.value[0] === 'true';
   }
+  if (appliedProtocols.value.length > 0) {
+    query.inbound_protocol = appliedProtocols.value;
+  }
+  query.sort_by = sortBy.value;
+  query.sort_dir = sortDir.value;
   return query;
 }
 
+const refetchInterval = computed(() => {
+  const s = Number.parseInt(autoRefreshSeconds.value, 10);
+  return s > 0 ? s * 1000 : false;
+});
+
 const logsQuery = useQuery({
-  queryKey: ['logs', page, pageSize, appliedKeyword, appliedFrom, appliedTo, appliedSettled],
+  queryKey: [
+    'logs',
+    page,
+    pageSize,
+    appliedKeyword,
+    appliedFrom,
+    appliedTo,
+    appliedSettled,
+    appliedProtocols,
+    appliedModel,
+    appliedChannel,
+    appliedTokenName,
+    sortBy,
+    sortDir,
+  ],
   queryFn: () => apiClient.queryLogs(buildQuery()),
+  refetchInterval,
 });
 
 const closeMutation = useMutation({
   mutationFn: ({ id, action }: { id: number; action: 'settle' | 'waive' }) =>
     action === 'settle' ? apiClient.settleLog(id) : apiClient.waiveLog(id),
-  onSuccess: async (_entry, vars) => {
+  onSuccess: async (updatedEntry, vars) => {
     success(vars.action === 'settle' ? t('logs.settleSuccess') : t('logs.waiveSuccess'));
-    details.value.delete(vars.id);
+    const nextDetails = new Map(details.value);
+    nextDetails.set(vars.id, updatedEntry);
+    details.value = nextDetails;
+    for (const win of windows.value) {
+      if (win.payload.entry.id === vars.id) {
+        win.payload.entry = { ...win.payload.entry, settled: true };
+      }
+    }
     await queryClient.invalidateQueries({ queryKey: ['logs'] });
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
@@ -113,22 +313,14 @@ const paging = computed(() => pagination(total.value));
 
 function clearFilters() {
   appliedSettled.value = [];
+  appliedProtocols.value = [];
+  appliedModel.value = null;
+  appliedChannel.value = null;
+  appliedTokenName.value = null;
   clearBaseFilters();
-  expandedIds.value = new Set();
-  details.value = new Map();
-  detailLoading.value = new Set();
-  detailErrors.value = new Map();
 }
 
-async function toggleExpand(id: number) {
-  const next = new Set(expandedIds.value);
-  if (next.has(id)) {
-    next.delete(id);
-    expandedIds.value = next;
-    return;
-  }
-  next.add(id);
-  expandedIds.value = next;
+async function loadDetail(id: number) {
   if (details.value.has(id) || detailLoading.value.has(id)) {
     return;
   }
@@ -154,8 +346,36 @@ async function toggleExpand(id: number) {
   }
 }
 
-function isExpanded(id: number): boolean {
-  return expandedIds.value.has(id);
+function openDetailWindow(event: MouseEvent, entry: LogEntry) {
+  const existing = windows.value.find((win) => win.payload.entry.id === entry.id);
+  if (existing) {
+    bringToFront(existing.id);
+  } else {
+    openWindow(anchorFromEvent(event), { entry });
+  }
+  if (!details.value.has(entry.id)) {
+    void loadDetail(entry.id);
+  }
+}
+
+function clearKeyword() {
+  draftKeyword.value = '';
+  appliedKeyword.value = '';
+}
+
+function onFilterModel(model: string) {
+  appliedModel.value = model;
+  clearKeyword();
+}
+
+function onFilterChannel(channel: string) {
+  appliedChannel.value = channel;
+  clearKeyword();
+}
+
+function onFilterToken(tokenName: string) {
+  appliedTokenName.value = tokenName;
+  clearKeyword();
 }
 </script>
 
@@ -185,14 +405,83 @@ function isExpanded(id: number): boolean {
             :options="settledOptions"
             test-id="logs-settled-filter"
           />
+          <FacetedFilter
+            v-model="appliedProtocols"
+            :title="t('logs.protocolFilter')"
+            :options="protocolOptions"
+            test-id="logs-protocol-filter"
+          />
+          <button
+            v-if="appliedModel"
+            type="button"
+            class="filter-btn"
+            data-testid="logs-exact-model"
+            :title="t('logs.clearColumnFilter')"
+            @click="appliedModel = null"
+          >
+            {{ t('logs.model') }}
+            <span class="faceted-filter-sep" aria-hidden="true" />
+            <span class="badge badge-neutral rounded-sm px-1 font-normal">{{ appliedModel }}</span>
+            <UiIcon name="close" :size="12" />
+          </button>
+          <button
+            v-if="appliedChannel"
+            type="button"
+            class="filter-btn"
+            data-testid="logs-exact-channel"
+            :title="t('logs.clearColumnFilter')"
+            @click="appliedChannel = null"
+          >
+            {{ t('logs.channel') }}
+            <span class="faceted-filter-sep" aria-hidden="true" />
+            <span class="badge badge-neutral rounded-sm px-1 font-normal">{{
+              appliedChannel
+            }}</span>
+            <UiIcon name="close" :size="12" />
+          </button>
+          <button
+            v-if="appliedTokenName"
+            type="button"
+            class="filter-btn"
+            data-testid="logs-exact-token"
+            :title="t('logs.clearColumnFilter')"
+            @click="appliedTokenName = null"
+          >
+            {{ t('logs.token') }}
+            <span class="faceted-filter-sep" aria-hidden="true" />
+            <span class="badge badge-neutral rounded-sm px-1 font-normal">{{
+              appliedTokenName
+            }}</span>
+            <UiIcon name="close" :size="12" />
+          </button>
           <p
             v-if="unsettledTotal > 0"
-            class="text-fg-muted text-sm"
+            class="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-600 dark:text-amber-400"
             data-testid="logs-unsettled-total"
           >
             {{ t('logs.unsettledTotal', { count: unsettledTotal }) }}
           </p>
+
           <template #actions>
+            <div class="flex items-center gap-1.5 text-xs text-[var(--fg-muted)]">
+              <UiIcon
+                name="refresh-cw"
+                :size="14"
+                :class="{
+                  'animate-spin text-[var(--seed-primary)]':
+                    autoRefreshSeconds !== '0' && logsQuery.isFetching.value,
+                }"
+              />
+              <div class="w-44 shrink-0">
+                <UiSelect
+                  id="logs-auto-refresh"
+                  v-model="autoRefreshSeconds"
+                  :options="refreshOptions"
+                  :aria-label="t('logs.autoRefresh')"
+                  class="text-xs"
+                />
+              </div>
+            </div>
             <DateRangePicker
               v-model="appliedRange"
               trigger-id="logs-time-range"
@@ -208,47 +497,94 @@ function isExpanded(id: number): boolean {
             >
               {{ t('logs.clearFilters') }}
             </button>
+            <DataTableViewOptions
+              :items="columnMenuItems"
+              :labels="columnLabels"
+              test-id="logs-columns"
+              @toggle="setVisible"
+            />
           </template>
         </DataTableToolbar>
       </template>
+
       <TableHeader>
         <TableRow>
-          <TableHead>{{ t('logs.created') }}</TableHead>
-          <TableHead>{{ t('logs.token') }}</TableHead>
-          <TableHead>{{ t('logs.model') }}</TableHead>
-          <TableHead>{{ t('logs.channel') }}</TableHead>
-          <TableHead>{{ t('logs.status') }}</TableHead>
-          <TableHead>{{ t('logs.latency') }}</TableHead>
-          <TableHead>{{ t('logs.cost') }}</TableHead>
-          <TableHead class="w-10">
-            <span class="sr-only">{{ t('logs.expand') }}</span>
+          <TableHead class="w-40" :aria-sort="ariaSort('created')">
+            <DataTableColumnHeader
+              :label="t('logs.created')"
+              :sorted="sortedState('created')"
+              :clearable="sortClearable('created')"
+              @sort="onSort('created', $event)"
+              @clear="onClearSort"
+            />
           </TableHead>
+          <TableHead v-if="visible.token">{{ t('logs.token') }}</TableHead>
+          <TableHead v-if="visible.model">{{ t('logs.model') }}</TableHead>
+          <TableHead v-if="visible.channel">{{ t('logs.channel') }}</TableHead>
+          <TableHead v-if="visible.inboundProtocol">{{ t('logs.inboundProtocol') }}</TableHead>
+          <TableHead v-if="visible.tokens" class="w-28" :aria-sort="ariaSort('tokens')">
+            <DataTableColumnHeader
+              :label="t('logs.tokens')"
+              :sorted="sortedState('tokens')"
+              :clearable="sortClearable('tokens')"
+              @sort="onSort('tokens', $event)"
+              @clear="onClearSort"
+            />
+          </TableHead>
+          <TableHead v-if="visible.latency" class="w-36" :aria-sort="ariaSort('latency')">
+            <DataTableColumnHeader
+              :label="t('logs.latencyAndSpeed')"
+              :sorted="sortedState('latency')"
+              :clearable="sortClearable('latency')"
+              @sort="onSort('latency', $event)"
+              @clear="onClearSort"
+            />
+          </TableHead>
+          <TableHead v-if="visible.cache" class="w-32" :aria-sort="ariaSort('cache')">
+            <DataTableColumnHeader
+              :label="t('logs.cache')"
+              :sorted="sortedState('cache')"
+              :clearable="sortClearable('cache')"
+              @sort="onSort('cache', $event)"
+              @clear="onClearSort"
+            />
+          </TableHead>
+          <TableHead v-if="visible.cost" class="w-28" :aria-sort="ariaSort('cost')">
+            <DataTableColumnHeader
+              :label="t('logs.cost')"
+              :sorted="sortedState('cost')"
+              :clearable="sortClearable('cost')"
+              @sort="onSort('cost', $event)"
+              @clear="onClearSort"
+            />
+          </TableHead>
+          <TableHead align="center">{{ t('common.actions') }}</TableHead>
         </TableRow>
       </TableHeader>
+
       <TableBody>
-        <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
+        <TableRowsSkeleton v-if="showTableSkeleton" :columns="columnCount" />
         <template v-else>
           <LogTableRow
             v-for="entry in items"
             :key="entry.id"
             :entry="entry"
-            :expanded="isExpanded(entry.id)"
-            :detail="details.get(entry.id) ?? null"
-            :detail-loading="detailLoading.has(entry.id)"
-            :detail-error="detailErrors.get(entry.id) ?? ''"
-            :detail-col-span="8"
-            :closing="closingId === entry.id"
-            @toggle-expand="toggleExpand(entry.id)"
-            @settle="closeMutation.mutate({ id: entry.id, action: 'settle' })"
-            @waive="closeMutation.mutate({ id: entry.id, action: 'waive' })"
+            :visible="rowVisible"
+            :active="activeLogIds.has(entry.id)"
+            :channel-protocol-map="channelProtocolMap"
+            @open-detail="openDetailWindow"
+            @filter-model="onFilterModel"
+            @filter-channel="onFilterChannel"
+            @filter-token="onFilterToken"
           />
           <TableRow v-if="items.length === 0">
-            <TableCell :colspan="8" class="h-24 whitespace-normal">
+            <TableCell :colspan="columnCount" class="h-24 whitespace-normal">
               <EmptyState data-testid="logs-empty" :title="t('common.emptyList')" />
             </TableCell>
           </TableRow>
         </template>
       </TableBody>
+
       <template #pagination>
         <DataTablePagination
           v-model:page="page"
@@ -265,5 +601,29 @@ function isExpanded(id: number): boolean {
         />
       </template>
     </DataTable>
+
+    <template v-for="(win, index) in windows" :key="win.id">
+      <RequestLogDetailWindow
+        :entry="win.payload.entry"
+        :detail="details.get(win.payload.entry.id) ?? null"
+        :detail-loading="detailLoading.has(win.payload.entry.id)"
+        :detail-error="detailErrors.get(win.payload.entry.id) ?? ''"
+        :closing="closingId === win.payload.entry.id"
+        :channel-protocol-map="channelProtocolMap"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @settle="(id) => closeMutation.mutate({ id, action: 'settle' })"
+        @waive="(id) => closeMutation.mutate({ id, action: 'waive' })"
+        @filter-model="onFilterModel"
+        @filter-channel="onFilterChannel"
+        @filter-token="onFilterToken"
+        @retry-detail="loadDetail(win.payload.entry.id)"
+      />
+    </template>
   </div>
 </template>

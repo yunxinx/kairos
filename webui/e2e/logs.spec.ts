@@ -67,9 +67,10 @@ test.describe('request logs page', () => {
     await expect(page.getByTestId('log-row')).toHaveCount(20);
 
     const jsonRow = page.locator('[data-testid="log-row"][data-model="e2e-json-model"]');
-    await expect(jsonRow.getByTestId('log-status')).toHaveText('200');
+    await expect(jsonRow).toHaveAttribute('data-status-code', '200');
     await expect(jsonRow.getByTestId('log-channel')).toHaveText('e2e-page-channel');
-    await expect(jsonRow.getByTestId('log-latency')).toHaveText('42 ms');
+    await expect(jsonRow.getByTestId('log-latency')).toHaveText('42ms');
+    await expect(jsonRow.getByTestId('log-speed')).toHaveText('—');
     await expect(jsonRow.getByTestId('log-cost')).toHaveText(usdLabel(1_500));
 
     await jsonRow.getByTestId('log-expand').click();
@@ -80,17 +81,19 @@ test.describe('request logs page', () => {
 
     await page.getByTestId('log-request-copy').click();
     await expect(page.getByTestId('log-request-copy')).toHaveText(/copied/i);
+    await page.keyboard.press('Escape');
 
     await page.locator('#logs-search').fill('sk-e2e-logs-filter');
     await expect(page.getByTestId('log-row')).toHaveCount(1);
     const filterRow = page.getByTestId('log-row');
-    await expect(filterRow.getByTestId('log-status')).toHaveText('429');
+    await expect(filterRow).toHaveAttribute('data-status-code', '429');
     await expect(filterRow.getByTestId('log-model')).toHaveText('e2e-filter-model');
 
     await filterRow.getByTestId('log-expand').click();
     await expect(page.getByTestId('log-request-body-binary')).toBeVisible();
     await expect(page.getByTestId('log-request-body-binary')).toContainText(/binary/i);
     await expect(page.getByTestId('log-response-body')).toHaveText('plain text body');
+    await page.keyboard.press('Escape');
 
     // 时间范围改经复合选择器：打开弹层 → 快速选择「今天」→ 精调起止 → 确认。
     await page.getByTestId('logs-time-range').click();
@@ -177,12 +180,12 @@ test.describe('request logs page', () => {
     await page.goto('/requests');
     await expect(page.getByTestId('logs-unsettled-total')).toContainText('1');
     await page.getByTestId('logs-settled-filter').click();
-    await page
-      .locator('[data-testid="logs-settled-filter-option"][data-value="false"]')
-      .click();
+    await page.locator('[data-testid="logs-settled-filter-option"][data-value="false"]').click();
     await expect(page.getByTestId('log-row')).toHaveCount(1);
     await expect(page.getByTestId('log-unsettled')).toBeVisible();
-    await expect(page.locator('[data-testid="log-row"][data-model="e2e-unsettled-model"]')).toBeVisible();
+    await expect(
+      page.locator('[data-testid="log-row"][data-model="e2e-unsettled-model"]'),
+    ).toBeVisible();
 
     await page.getByTestId('logs-tab-system').click();
     await expect(page.getByTestId('system-log-row')).toHaveCount(2);
@@ -203,5 +206,178 @@ test.describe('request logs page', () => {
     await expect(page.getByTestId('system-log-row')).toHaveCount(1);
     await expect(page.getByTestId('system-log-target')).toHaveText('billing');
     await expect(page.getByTestId('system-log-message')).toContainText('e2e settlement failed');
+  });
+
+  test('hides request-log columns from the toolbar', async ({ page }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-logs-columns',
+        token_name: 'Columns token',
+        model: 'e2e-columns-model',
+        channel: 'e2e-columns-channel',
+        status_code: 200,
+      },
+    ]);
+
+    await page.addInitScript(() => {
+      localStorage.removeItem('kairos-logs-columns');
+    });
+    await page.goto('/requests');
+    await page.locator('#logs-search').fill('sk-e2e-logs-columns');
+    const row = page.locator('[data-testid="log-row"][data-model="e2e-columns-model"]');
+    await expect(row).toBeVisible();
+    await expect(page.getByRole('columnheader', { name: 'Cache', exact: true })).toHaveCount(0);
+
+    await page.getByTestId('logs-columns').click();
+    await page.locator('[data-testid="logs-columns-option"][data-value="cache"]').click();
+    await expect(page.getByRole('button', { name: 'Cache', exact: true })).toBeVisible();
+    await page.locator('[data-testid="logs-columns-option"][data-value="token"]').click();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: 'Token', exact: true })).toHaveCount(0);
+    await expect(row.getByText('Columns token')).toHaveCount(0);
+  });
+
+  test('hides system-log columns from the toolbar', async ({ page }) => {
+    seedSystemLogs([
+      {
+        level: 'info',
+        target: 'e2e-columns',
+        message: 'e2e column visibility',
+      },
+    ]);
+
+    await page.addInitScript(() => {
+      localStorage.removeItem('kairos-system-logs-columns');
+    });
+    await page.goto('/requests');
+    await page.getByTestId('logs-tab-system').click();
+    await expect(page.getByTestId('system-log-row')).toBeVisible();
+    await expect(page.getByTestId('system-log-level')).toBeVisible();
+
+    await page.getByTestId('system-logs-columns').click();
+    await page.locator('[data-testid="system-logs-columns-option"][data-value="level"]').click();
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('system-log-level')).toHaveCount(0);
+  });
+
+  test('sorts request logs from the column header', async ({ page }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-logs-sort',
+        token_name: 'Sort token',
+        model: 'e2e-sort-expensive',
+        channel: 'e2e-sort-channel',
+        status_code: 200,
+        cost_usd_micros: 5_000,
+      },
+      {
+        created_at: Date.now() - 1_000,
+        token_key: 'sk-e2e-logs-sort',
+        token_name: 'Sort token',
+        model: 'e2e-sort-cheap',
+        channel: 'e2e-sort-channel',
+        status_code: 200,
+        cost_usd_micros: 100,
+      },
+    ]);
+
+    await page.goto('/requests');
+    await page.locator('#logs-search').fill('sk-e2e-logs-sort');
+    await expect(page.getByTestId('log-row')).toHaveCount(2);
+    await expect(page.getByTestId('log-row').first()).toHaveAttribute(
+      'data-model',
+      'e2e-sort-expensive',
+    );
+
+    await page.getByRole('button', { name: 'Cost', exact: true }).click();
+    await page.getByTestId('column-sort-asc').click();
+    await expect(page.getByTestId('log-row').first()).toHaveAttribute(
+      'data-model',
+      'e2e-sort-cheap',
+    );
+    await expect(page.getByTestId('log-row').nth(1)).toHaveAttribute(
+      'data-model',
+      'e2e-sort-expensive',
+    );
+
+    await page.getByTestId('column-clear-sort').click();
+    await expect(page.getByTestId('log-row').first()).toHaveAttribute(
+      'data-model',
+      'e2e-sort-expensive',
+    );
+    await expect(page.getByTestId('column-clear-sort')).toHaveCount(0);
+  });
+
+  test('filters request logs by inbound protocol instead of sorting it', async ({ page }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-logs-protocol',
+        token_name: 'Protocol token',
+        model: 'e2e-protocol-chat',
+        channel: 'e2e-protocol-channel',
+        inbound_protocol: 'openai_chat',
+        status_code: 200,
+      },
+      {
+        created_at: Date.now() - 1_000,
+        token_key: 'sk-e2e-logs-protocol',
+        token_name: 'Protocol token',
+        model: 'e2e-protocol-anthropic',
+        channel: 'e2e-protocol-channel',
+        inbound_protocol: 'anthropic_messages',
+        status_code: 200,
+      },
+    ]);
+
+    await page.goto('/requests');
+    await page.locator('#logs-search').fill('sk-e2e-logs-protocol');
+    await expect(page.getByTestId('log-row')).toHaveCount(2);
+    await expect(page.getByRole('button', { name: 'Inbound Protocol', exact: true })).toHaveCount(
+      0,
+    );
+
+    await page.getByTestId('logs-protocol-filter').click();
+    await page
+      .locator('[data-testid="logs-protocol-filter-option"][data-value="anthropic_messages"]')
+      .click();
+    await expect(page.getByTestId('log-row')).toHaveCount(1);
+    await expect(page.getByTestId('log-row')).toHaveAttribute(
+      'data-model',
+      'e2e-protocol-anthropic',
+    );
+  });
+
+  test('row filter matches the column exactly, not a keyword substring', async ({ page }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-exact-filter',
+        token_name: 'Exact token',
+        model: 'e2e-exact-model',
+        channel: 'e2e-exact-channel',
+        status_code: 200,
+      },
+      {
+        created_at: Date.now() - 1_000,
+        token_key: 'sk-e2e-exact-filter',
+        token_name: 'Exact token',
+        model: 'e2e-exact-model-plus',
+        channel: 'e2e-exact-channel',
+        status_code: 200,
+      },
+    ]);
+
+    await page.goto('/requests');
+    await page.locator('#logs-search').fill('sk-e2e-exact-filter');
+    await expect(page.getByTestId('log-row')).toHaveCount(2);
+
+    const row = page.locator('[data-testid="log-row"][data-model="e2e-exact-model"]');
+    await row.getByTestId('log-filter-model').click();
+    await expect(page.getByTestId('log-row')).toHaveCount(1);
+    await expect(page.getByTestId('log-row')).toHaveAttribute('data-model', 'e2e-exact-model');
+    await expect(page.getByTestId('logs-exact-model')).toContainText('e2e-exact-model');
   });
 });

@@ -25,7 +25,22 @@ export type IconName =
   | 'copy'
   | 'pencil'
   | 'grip-vertical'
-  | 'loader-circle';
+  | 'loader-circle'
+  | 'refresh-cw'
+  | 'play'
+  | 'pause'
+  | 'terminal'
+  | 'code'
+  | 'zap'
+  | 'arrow-right'
+  | 'arrow-up'
+  | 'arrow-down'
+  | 'arrow-left-right'
+  | 'message-square'
+  | 'filter'
+  | 'external-link'
+  | 'sliders-horizontal'
+  | 'chevrons-up-down';
 
 export type IconDef = {
   viewBox?: string;
@@ -209,6 +224,114 @@ export const iconDefs: Record<IconName, IconDef> = {
   /** 加载中。路径来自 Lucide「loader-circle」(ISC)。 */
   'loader-circle': {
     paths: ['M21 12a9 9 0 1 1-6.219-8.56'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  'refresh-cw': {
+    paths: [
+      'M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8',
+      'M21 3v5h-5',
+      'M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16',
+      'M8 16H3v5',
+    ],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  play: {
+    paths: ['M6 3l14 9-14 9V3z'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  pause: {
+    lines: [
+      { x1: 6, y1: 4, x2: 6, y2: 20 },
+      { x1: 18, y1: 4, x2: 18, y2: 20 },
+    ],
+    strokeWidth: 4,
+    strokeLinecap: 'round',
+  },
+  terminal: {
+    paths: ['M4 17l6-6-6-6', 'M12 19h8'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  code: {
+    paths: ['M16 18l6-6-6-6', 'M8 6l-6 6 6 6'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  zap: {
+    paths: ['M13 2L3 14h9l-1 8 10-12h-9l1-8z'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  'arrow-right': {
+    paths: ['M5 12h14', 'M12 5l7 7-7 7'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  'arrow-up': {
+    paths: ['M12 19V5', 'M5 12l7-7 7 7'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  'arrow-down': {
+    paths: ['M12 5v14', 'M19 12l-7 7-7-7'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  'arrow-left-right': {
+    paths: ['M8 3L4 7l4 4', 'M4 7h16', 'M16 21l4-4-4-4', 'M20 17H4'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  'message-square': {
+    paths: ['M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  filter: {
+    paths: ['M22 3H2l8 9.46V19l4 2v-8.54L22 3z'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  'external-link': {
+    paths: ['M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6', 'M15 3h6v6', 'M10 14L21 3'],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+  },
+  /** 工具栏「显示列」。路径来自 Lucide「sliders-horizontal」(ISC)。 */
+  'sliders-horizontal': {
+    lines: [
+      { x1: 21, y1: 4, x2: 14, y2: 4 },
+      { x1: 10, y1: 4, x2: 3, y2: 4 },
+      { x1: 21, y1: 12, x2: 12, y2: 12 },
+      { x1: 8, y1: 12, x2: 3, y2: 12 },
+      { x1: 21, y1: 20, x2: 16, y2: 20 },
+      { x1: 12, y1: 20, x2: 3, y2: 20 },
+      { x1: 14, y1: 2, x2: 14, y2: 6 },
+      { x1: 8, y1: 10, x2: 8, y2: 14 },
+      { x1: 16, y1: 18, x2: 16, y2: 22 },
+    ],
+    strokeWidth: 2,
+    strokeLinecap: 'round',
+  },
+  /** 未排序表头。路径来自 Lucide「chevrons-up-down」(ISC)。 */
+  'chevrons-up-down': {
+    paths: ['m7 15 5 5 5-5', 'm7 9 5-5 5 5'],
     strokeWidth: 2,
     strokeLinecap: 'round',
     strokeLinejoin: 'round',
