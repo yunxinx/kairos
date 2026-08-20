@@ -87,15 +87,24 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const inventory = computed(() => buildInventory(props.channels, props.prices));
 
+function isMember(row: InventoryRow): boolean {
+  return editorMembers.value.some(
+    (member) => member.channel_id === row.channelId && member.model === row.name,
+  );
+}
+
+/** 已加入路由顺序的行从待选列表拿掉，与模型组编辑器一致。 */
+const availableRows = computed(() => inventory.value.filter((row) => !isMember(row)));
+
 const channelOptions = computed(() =>
-  countedFacetOptions(inventory.value.map((row) => row.channelName)),
+  countedFacetOptions(availableRows.value.map((row) => row.channelName)),
 );
 
 /** 按渠道分行：同一名字在不同渠道上各占一行，勾选互不影响。 */
 const pickerRows = computed(() => {
   const q = searchText.value.trim().toLowerCase();
   const channels = new Set(selectedChannels.value);
-  return inventory.value.filter((row) => {
+  return availableRows.value.filter((row) => {
     if (channels.size > 0 && !channels.has(row.channelName)) return false;
     if (!q) return true;
     return row.name.toLowerCase().includes(q) || row.channelName.toLowerCase().includes(q);
@@ -128,21 +137,13 @@ function handleSave() {
   });
 }
 
-function isMember(row: InventoryRow): boolean {
-  return editorMembers.value.some(
-    (member) => member.channel_id === row.channelId && member.model === row.name,
-  );
+function addRow(row: InventoryRow) {
+  if (isMember(row)) return;
+  editorMembers.value = [...editorMembers.value, { channel_id: row.channelId, model: row.name }];
 }
 
-function toggleMember(row: InventoryRow, checked: boolean) {
-  if (checked) {
-    if (isMember(row)) return;
-    editorMembers.value = [...editorMembers.value, { channel_id: row.channelId, model: row.name }];
-    return;
-  }
-  editorMembers.value = editorMembers.value.filter(
-    (member) => !(member.channel_id === row.channelId && member.model === row.name),
-  );
+function onPickCheck(row: InventoryRow, checked: boolean) {
+  if (checked) addRow(row);
 }
 
 function removeMember(member: UnifiedMember) {
@@ -382,12 +383,14 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
                   data-testid="unified-pick"
                   :data-model="row.name"
                   :data-channel="row.channelName"
+                  @click="addRow(row)"
                 >
                   <TableCell>
                     <Checkbox
-                      :model-value="isMember(row)"
+                      :model-value="false"
                       data-testid="unified-pick-check"
-                      @update:model-value="(value) => toggleMember(row, value)"
+                      @click.stop
+                      @update:model-value="(value) => onPickCheck(row, value)"
                     />
                   </TableCell>
                   <TableCell truncate class="font-mono text-sm" :title="row.name">{{
