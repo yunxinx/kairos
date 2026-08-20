@@ -10,13 +10,14 @@ pub mod resources;
 mod system_log;
 
 pub use system_log::{
-    SystemLog, SystemLogList, SystemLogQuery, insert_system_log, query_system_log_page,
-    record_system_error, record_system_warn,
+    SystemLog, SystemLogList, SystemLogQuery, SystemLogSortBy, insert_system_log,
+    query_system_log_page, record_system_error, record_system_warn,
 };
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use sqlx::{
     Row, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
@@ -296,13 +297,50 @@ pub async fn adjust_balance(
         .ok_or(StoreError::MissingToken(token_key.to_string()))
 }
 
+/// 列表排序方向；缺省新→旧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDir {
+    Asc,
+    #[default]
+    Desc,
+}
+
+impl SortDir {
+    /// SQL `ASC` / `DESC` 片段（含前导空格）。
+    pub(crate) fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => " ASC",
+            Self::Desc => " DESC",
+        }
+    }
+}
+
+/// 请求日志可排序列：时间与计量，不含类别/身份列。
+///
+/// 只接受白名单，拼进 `ORDER BY` 的是静态片段，避免把查询参数当标识符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestLogSortBy {
+    #[default]
+    Created,
+    Tokens,
+    Latency,
+    Cache,
+    Cost,
+}
+
 /// 请求日志查询过滤条件与分页。全部过滤维度可选，缺省即不限。
 #[derive(Debug, Clone, Default)]
 pub struct RequestLogQuery {
-    /// 按令牌精确过滤。
+    /// 按令牌 key 精确过滤。
     pub token_key: Option<String>,
+    /// 按令牌展示名精确过滤。列表接口脱敏 `token_key`，行内筛选只能按名匹配。
+    pub token_name: Option<String>,
     /// 按模型精确过滤。
     pub model: Option<String>,
+    /// 按渠道名精确过滤。
+    pub channel: Option<String>,
     /// 综合关键字：对 `token_key`/`token_name`/`model`/`channel` 做 LIKE 子串匹配（OR）。
     pub keyword: Option<String>,
     /// 只返回 `created_at >= from_created_at`。
@@ -311,6 +349,12 @@ pub struct RequestLogQuery {
     pub to_created_at: Option<i64>,
     /// 按是否已写入 `token_balance` 过滤；`None` 表示不限。
     pub settled: Option<bool>,
+    /// 精确匹配的入站协议；空表示不限。
+    pub inbound_protocols: Vec<String>,
+    /// 排序列；缺省时间。
+    pub sort_by: RequestLogSortBy,
+    /// 排序方向；缺省倒序。
+    pub sort_dir: SortDir,
     /// 页码，从 1 起。
     pub page: u64,
     /// 每页条数。
@@ -329,7 +373,7 @@ impl RequestLogQuery {
     }
 }
 
-/// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目（不含 body）。
+/// 按 `filter` 分页查询请求日志（缺省时间倒序），返回本页条目（不含 body）。
 async fn query_request_logs_on(
     conn: &mut SqliteConnection,
     filter: &RequestLogQuery,
@@ -342,7 +386,7 @@ async fn query_request_logs_on(
          settled FROM request_log",
     );
     push_request_log_filters(&mut qb, filter);
-    qb.push(" ORDER BY id DESC");
+    push_request_log_order(&mut qb, filter);
     push_limit_offset(&mut qb, filter.page, filter.page_size);
 
     let rows = qb
@@ -893,9 +937,17 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
         push_where_cond(qb, &mut first, "token_key = ");
         qb.push_bind(token_key);
     }
+    if let Some(token_name) = &filter.token_name {
+        push_where_cond(qb, &mut first, "token_name = ");
+        qb.push_bind(token_name);
+    }
     if let Some(model) = &filter.model {
         push_where_cond(qb, &mut first, "model = ");
         qb.push_bind(model);
+    }
+    if let Some(channel) = &filter.channel {
+        push_where_cond(qb, &mut first, "channel = ");
+        qb.push_bind(channel);
     }
     if let Some(keyword) = filter
         .keyword
@@ -919,6 +971,38 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
         push_where_cond(qb, &mut first, "settled = ");
         qb.push_bind(settled as i64);
     }
+    push_column_in(
+        qb,
+        &mut first,
+        "inbound_protocol",
+        &filter.inbound_protocols,
+    );
+}
+
+/// 把白名单排序列拼进 `ORDER BY`；同向 `id` 保证分页稳定。
+fn push_request_log_order(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &RequestLogQuery) {
+    qb.push(" ORDER BY ");
+    match filter.sort_by {
+        RequestLogSortBy::Created => {
+            qb.push("created_at");
+        }
+        RequestLogSortBy::Tokens => {
+            // 与 Token 列一致：只计 input/output，缓存档有单独列。
+            qb.push("(input_tokens + output_tokens)");
+        }
+        RequestLogSortBy::Latency => {
+            qb.push("latency_ms");
+        }
+        RequestLogSortBy::Cache => {
+            qb.push("(cache_read_tokens + cache_write_tokens)");
+        }
+        RequestLogSortBy::Cost => {
+            qb.push("cost_usd_micros");
+        }
+    }
+    qb.push(filter.sort_dir.sql());
+    qb.push(", id");
+    qb.push(filter.sort_dir.sql());
 }
 
 /// 关键字 → LIKE 子串模式：转义 `\`/`%`/`_`（配合 `ESCAPE '\'`），两端补 `%`。
@@ -1412,7 +1496,7 @@ mod tests {
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                     price,
-                    cost_usd_micros: 12,
+                    cost_usd_micros: i as i64,
                     settled: true,
                     request_id: None,
                     request_body: None,
@@ -1423,7 +1507,7 @@ mod tests {
             .expect("应能写请求日志");
         }
 
-        // 分页：每页 2 条，第一页取最新两条（id 倒序）。
+        // 分页：每页 2 条，第一页取最新两条（时间倒序）。
         let page1 = RequestLogQuery::new(1, 2);
         let rows = query_request_logs(&pool, &page1).await.expect("应能查询");
         assert_eq!(rows.len(), 2);
@@ -1457,6 +1541,39 @@ mod tests {
             2
         );
         assert!(rows.iter().all(|r| r.created_at >= 1002));
+
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.sort_dir = SortDir::Asc;
+        let rows = query_request_logs(&pool, &filter).await.expect("应能正序");
+        assert_eq!(rows[0].created_at, 1000);
+        assert_eq!(rows[3].created_at, 1003);
+
+        filter.sort_by = RequestLogSortBy::Cost;
+        let rows = query_request_logs(&pool, &filter)
+            .await
+            .expect("应能按费用排");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.cost_usd_micros)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+
+        let mut proto = RequestLogQuery::new(1, 10);
+        proto.inbound_protocols = vec!["openai_chat".to_string()];
+        assert_eq!(
+            count_request_logs(&pool, &proto)
+                .await
+                .expect("应能按协议过滤"),
+            4
+        );
+        proto.inbound_protocols = vec!["anthropic_messages".to_string()];
+        assert_eq!(
+            count_request_logs(&pool, &proto)
+                .await
+                .expect("应能按协议过滤"),
+            0
+        );
     }
 
     /// `keyword` 综合搜索：对 token_key/token_name/model/channel 做 LIKE OR 子串匹配，
@@ -1540,6 +1657,146 @@ mod tests {
         assert_eq!(
             count_request_logs(&pool, &filter).await.expect("应能统计"),
             3
+        );
+    }
+
+    /// 行内筛选按列精确匹配：渠道/令牌名不是关键字 OR，子串不误伤。
+    #[tokio::test]
+    async fn request_log_query_filters_exact_channel_and_token_name() {
+        let (_dir, pool) = test_pool().await;
+        let price = PriceSnapshot {
+            input_micros: 0,
+            output_micros: 0,
+            cache_read_micros: 0,
+            cache_write_micros: 0,
+        };
+        let rows = [
+            ("生产", "sk-a", "gpt-4o", "azure"),
+            ("生产备用", "sk-b", "gpt-4o", "azure-east"),
+        ];
+        for (i, (token_name, token_key, model, channel)) in rows.iter().enumerate() {
+            insert_request_log(
+                &pool,
+                &RequestLog {
+                    id: 0,
+                    created_at: 3000 + i as i64,
+                    token_name: (*token_name).to_string(),
+                    token_key: (*token_key).to_string(),
+                    inbound_protocol: "openai_chat".to_string(),
+                    model: (*model).to_string(),
+                    outbound_model: None,
+                    channel: (*channel).to_string(),
+                    status_code: 200,
+                    latency_ms: 10,
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    price,
+                    cost_usd_micros: 0,
+                    settled: true,
+                    request_id: None,
+                    request_body: None,
+                    response_body: None,
+                },
+            )
+            .await
+            .expect("应能写请求日志");
+        }
+
+        let mut by_channel = RequestLogQuery::new(1, 10);
+        by_channel.channel = Some("azure".to_string());
+        let rows = query_request_logs(&pool, &by_channel)
+            .await
+            .expect("应能按渠道精确过滤");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel, "azure");
+
+        let mut by_name = RequestLogQuery::new(1, 10);
+        by_name.token_name = Some("生产".to_string());
+        let rows = query_request_logs(&pool, &by_name)
+            .await
+            .expect("应能按令牌名精确过滤");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].token_name, "生产");
+    }
+
+    /// Token 列排序只计 input+output：缓存量大的行不应排到展示量更小的行前面。
+    #[tokio::test]
+    async fn request_log_tokens_sort_excludes_cache() {
+        let (_dir, pool) = test_pool().await;
+        let price = PriceSnapshot {
+            input_micros: 0,
+            output_micros: 0,
+            cache_read_micros: 0,
+            cache_write_micros: 0,
+        };
+        insert_request_log(
+            &pool,
+            &RequestLog {
+                id: 0,
+                created_at: 1,
+                token_name: "t".to_string(),
+                token_key: "sk-a".to_string(),
+                inbound_protocol: "openai_chat".to_string(),
+                model: "cached".to_string(),
+                outbound_model: None,
+                channel: "c1".to_string(),
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens: 10,
+                output_tokens: 10,
+                cache_read_tokens: 1_000,
+                cache_write_tokens: 0,
+                price,
+                cost_usd_micros: 0,
+                settled: true,
+                request_id: None,
+                request_body: None,
+                response_body: None,
+            },
+        )
+        .await
+        .expect("应能写请求日志");
+        insert_request_log(
+            &pool,
+            &RequestLog {
+                id: 0,
+                created_at: 2,
+                token_name: "t".to_string(),
+                token_key: "sk-a".to_string(),
+                inbound_protocol: "openai_chat".to_string(),
+                model: "heavy".to_string(),
+                outbound_model: None,
+                channel: "c1".to_string(),
+                status_code: 200,
+                latency_ms: 10,
+                input_tokens: 20,
+                output_tokens: 20,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                price,
+                cost_usd_micros: 0,
+                settled: true,
+                request_id: None,
+                request_body: None,
+                response_body: None,
+            },
+        )
+        .await
+        .expect("应能写请求日志");
+
+        let mut filter = RequestLogQuery::new(1, 10);
+        filter.sort_by = RequestLogSortBy::Tokens;
+        filter.sort_dir = SortDir::Desc;
+        let rows = query_request_logs(&pool, &filter)
+            .await
+            .expect("应能按 Token 列排序");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.model.as_str())
+                .collect::<Vec<_>>(),
+            ["heavy", "cached"]
         );
     }
 

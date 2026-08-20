@@ -1050,11 +1050,16 @@ async fn adjust_token_balance(
 #[serde(deny_unknown_fields)]
 struct LogQueryParams {
     token_key: Option<String>,
+    token_name: Option<String>,
     model: Option<String>,
+    channel: Option<String>,
     keyword: Option<String>,
     from_created_at: Option<i64>,
     to_created_at: Option<i64>,
     settled: Option<bool>,
+    inbound_protocol: Option<String>,
+    sort_by: Option<store::RequestLogSortBy>,
+    sort_dir: Option<store::SortDir>,
     page: Option<u64>,
     page_size: Option<u64>,
 }
@@ -1131,7 +1136,7 @@ struct LogPage {
     unsettled_total: u64,
 }
 
-/// 分页查询请求日志（时间倒序），按令牌/模型/综合关键字/时间范围过滤，只读。
+/// 分页查询请求日志（缺省时间倒序），按令牌 key/名、模型、渠道、综合关键字、时间范围过滤，只读。
 ///
 /// `page`/`page_size` 缺省 1/20；`page_size` 上限 200（由存储层夹取），响应的
 /// `page`/`page_size` 反映实际采用值。非法查询参数（如非数字页码）返回结构化 400。
@@ -1145,11 +1150,16 @@ async fn query_logs(
     let mut filter =
         store::RequestLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
     filter.token_key = params.token_key;
+    filter.token_name = params.token_name;
     filter.model = params.model;
+    filter.channel = params.channel;
     filter.keyword = params.keyword.filter(|keyword| !keyword.trim().is_empty());
     filter.from_created_at = params.from_created_at;
     filter.to_created_at = params.to_created_at;
     filter.settled = params.settled;
+    filter.inbound_protocols = parse_comma_list(params.inbound_protocol.as_deref());
+    filter.sort_by = params.sort_by.unwrap_or_default();
+    filter.sort_dir = params.sort_dir.unwrap_or_default();
 
     let (rows, total, unsettled_total) = store::query_request_log_page(&deps.pool, &filter)
         .await
@@ -1240,6 +1250,8 @@ struct SystemLogQueryParams {
     to_created_at: Option<i64>,
     level: Option<String>,
     target: Option<String>,
+    sort_by: Option<store::SystemLogSortBy>,
+    sort_dir: Option<store::SortDir>,
     page: Option<u64>,
     page_size: Option<u64>,
 }
@@ -1263,7 +1275,7 @@ struct SystemLogPage {
     targets: Vec<String>,
 }
 
-/// 分页查询系统日志（时间倒序）。
+/// 分页查询系统日志（缺省时间倒序）。
 async fn query_system_logs(
     State(deps): State<AdminDeps>,
     query: Result<Query<SystemLogQueryParams>, axum::extract::rejection::QueryRejection>,
@@ -1278,6 +1290,8 @@ async fn query_system_logs(
     filter.to_created_at = params.to_created_at;
     filter.levels = parse_comma_list(params.level.as_deref());
     filter.targets = parse_comma_list(params.target.as_deref());
+    filter.sort_by = params.sort_by.unwrap_or_default();
+    filter.sort_dir = params.sort_dir.unwrap_or_default();
     let page = store::query_system_log_page(&deps.pool, &filter)
         .await
         .map_err(AdminError::Store)?;

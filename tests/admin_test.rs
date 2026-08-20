@@ -2002,7 +2002,7 @@ async fn logs_paginate_and_filter() {
             .all(|e| e["model"] == TEST_MODEL)
     );
 
-    // 按令牌过滤：命中全部 3 条（同一令牌）。
+    // 按令牌 key 过滤：命中全部 3 条（同一令牌）。
     let resp = client
         .get(format!("{admin}/logs?token_key={TEST_TOKEN_KEY}"))
         .bearer_auth(TEST_ADMIN_KEY)
@@ -2011,6 +2011,42 @@ async fn logs_paginate_and_filter() {
         .expect("应可过滤日志");
     let page: Value = resp.json().await.expect("日志应可解析");
     assert_eq!(page["total"], 3);
+
+    // 按令牌名精确过滤：子串不命中。
+    let resp = client
+        .get(format!("{admin}/logs?token_name=dev"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可按令牌名过滤");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 3);
+    let resp = client
+        .get(format!("{admin}/logs?token_name=de"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可按令牌名精确过滤");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 0);
+
+    // 按渠道精确过滤：子串不命中。
+    let resp = client
+        .get(format!("{admin}/logs?channel=test-channel"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可按渠道过滤");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 3);
+    let resp = client
+        .get(format!("{admin}/logs?channel=test"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可按渠道精确过滤");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    assert_eq!(page["total"], 0);
 
     // 综合关键字：模型子串命中全部 3 条。
     let resp = client
@@ -2062,6 +2098,39 @@ async fn logs_paginate_and_filter() {
         .expect("应可过滤日志");
     let page: Value = resp.json().await.expect("日志应可解析");
     assert_eq!(page["total"], 3);
+
+    let resp = client
+        .get(format!("{admin}/logs?page_size=10"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可查日志");
+    let page: Value = resp.json().await.expect("日志应可解析");
+    let desc_ids: Vec<i64> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_i64().unwrap())
+        .collect();
+
+    let resp = client
+        .get(format!(
+            "{admin}/logs?sort_by=created&sort_dir=asc&page_size=10"
+        ))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可按时间正序查日志");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let page: Value = resp.json().await.expect("日志应可解析");
+    let mut asc_ids: Vec<i64> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_i64().unwrap())
+        .collect();
+    asc_ids.reverse();
+    assert_eq!(asc_ids, desc_ids, "时间正序应是缺省倒序的逆序");
 }
 
 /// 别名请求：协议响应回显入站短名；管理日志列表=入站、出站字段=上游真名。
@@ -2523,6 +2592,15 @@ async fn new_endpoints_structured_errors() {
     // 日志：未知查询参数 → 400（deny_unknown_fields，拼写错误不静默返回未过滤结果）。
     let resp = client
         .get(format!("{admin}/logs?tokne_key=sk-x"))
+        .bearer_auth(TEST_ADMIN_KEY)
+        .send()
+        .await
+        .expect("应可查日志");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 日志：未知排序列 → 400（只接受白名单）。
+    let resp = client
+        .get(format!("{admin}/logs?sort_by=nope"))
         .bearer_auth(TEST_ADMIN_KEY)
         .send()
         .await

@@ -2,10 +2,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::{
-    StoreError, as_count, clamp_page, like_substring_pattern, push_column_in,
+    SortDir, StoreError, as_count, clamp_page, like_substring_pattern, push_column_in,
     push_created_at_range, push_limit_offset, push_where_cond,
 };
 
@@ -19,6 +20,14 @@ pub struct SystemLog {
     pub message: String,
 }
 
+/// 系统日志可排序列：只有时间有顺序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemLogSortBy {
+    #[default]
+    Created,
+}
+
 /// 系统日志查询：分页 + 可选关键字/时间窗/级别/目标。
 #[derive(Debug, Clone, Default)]
 pub struct SystemLogQuery {
@@ -29,6 +38,10 @@ pub struct SystemLogQuery {
     pub levels: Vec<String>,
     /// 精确匹配的目标；空表示不限。
     pub targets: Vec<String>,
+    /// 排序列；缺省时间。
+    pub sort_by: SystemLogSortBy,
+    /// 排序方向；缺省倒序。
+    pub sort_dir: SortDir,
     pub page: u64,
     pub page_size: u64,
 }
@@ -92,7 +105,7 @@ pub async fn record_system_warn(pool: &SqlitePool, target: &str, message: &str) 
     }
 }
 
-/// 分页查询系统日志（时间倒序）。
+/// 分页查询系统日志（缺省时间倒序）。
 pub async fn query_system_log_page(
     pool: &SqlitePool,
     filter: &SystemLogQuery,
@@ -135,6 +148,18 @@ fn push_system_log_filters(
     }
 }
 
+fn push_system_log_order(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &SystemLogQuery) {
+    qb.push(" ORDER BY ");
+    match filter.sort_by {
+        SystemLogSortBy::Created => {
+            qb.push("created_at");
+        }
+    }
+    qb.push(filter.sort_dir.sql());
+    qb.push(", id");
+    qb.push(filter.sort_dir.sql());
+}
+
 async fn query_system_logs_on(
     conn: &mut SqliteConnection,
     filter: &SystemLogQuery,
@@ -142,7 +167,7 @@ async fn query_system_logs_on(
     let mut qb =
         sqlx::QueryBuilder::new("SELECT id, created_at, level, target, message FROM system_log");
     push_system_log_filters(&mut qb, filter, true);
-    qb.push(" ORDER BY id DESC");
+    push_system_log_order(&mut qb, filter);
     push_limit_offset(&mut qb, filter.page, filter.page_size);
     let rows = qb
         .build()
