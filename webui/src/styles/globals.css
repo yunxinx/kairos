@@ -363,11 +363,8 @@ html[lang='zh-CN'] .font-serif {
 .overview-share-list > li {
   min-height: 0;
 }
-.overview-heatmap-card.overview-panel {
-  overflow: visible;
-}
 .overview-heatmap-card .overview-panel-body {
-  overflow: visible;
+  overflow: hidden;
 }
 .overview-trend-body {
   padding-left: 8px;
@@ -379,7 +376,7 @@ html[lang='zh-CN'] .font-serif {
 .overview-heatmap-body {
   display: flex;
   flex-direction: column;
-  overflow: visible;
+  overflow: hidden;
   padding-top: 12px;
   padding-bottom: 12px;
 }
@@ -387,6 +384,7 @@ html[lang='zh-CN'] .font-serif {
   flex: 1;
   min-height: 0;
   width: 100%;
+  overflow: hidden;
 }
 .overview-heatmap-card {
   min-height: 0;

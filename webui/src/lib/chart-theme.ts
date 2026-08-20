@@ -94,7 +94,7 @@ interface HeatmapTooltipSize {
 
 /**
  * 热力格上方优先，不够再下方，再贴格子左右。最后才相对指针偏移。
- * 避开指针的那条轴不 clamp 回视口，避免把浮窗压到指针上。
+ * 尺寸未知时不把「右侧能放下」当真（0 宽永远能放下），避免先闪到格子右侧。
  */
 function heatmapTooltipPosition(
   point: [number, number],
@@ -111,21 +111,24 @@ function heatmapTooltipPosition(
   const maxY = Math.max(0, viewHeight - tipHeight);
   const clampX = (x: number): number => Math.min(Math.max(x, 0), maxX);
   const clampY = (y: number): number => Math.min(Math.max(y, 0), maxY);
+  const sizeUnknown = tipWidth <= 0 || tipHeight <= 0;
 
   if (rect) {
     const centeredX = clampX(rect.x + rect.width / 2 - tipWidth / 2);
     const above = rect.y - tipHeight - gap;
-    if (above >= 0) return [centeredX, above];
+    if (sizeUnknown || above >= 0) {
+      return [centeredX, sizeUnknown ? Math.max(0, above) : above];
+    }
     const below = rect.y + rect.height + gap;
     if (below + tipHeight <= viewHeight) return [centeredX, below];
 
     const yBesideCell = clampY(rect.y + rect.height / 2 - tipHeight / 2);
     const right = rect.x + rect.width + gap;
-    if (right + tipWidth <= viewWidth) return [right, yBesideCell];
     const left = rect.x - tipWidth - gap;
+    if (right + tipWidth <= viewWidth) return [right, yBesideCell];
     if (left >= 0) return [left, yBesideCell];
     const roomRight = viewWidth - (rect.x + rect.width);
-    return [roomRight >= rect.x ? right : left, yBesideCell];
+    return [clampX(roomRight >= rect.x ? right : left), yBesideCell];
   }
 
   const right = mouseX + gap;
@@ -133,7 +136,7 @@ function heatmapTooltipPosition(
   const x = right + tipWidth <= viewWidth || mouseX < viewWidth / 2 ? right : left;
   const abovePointer = mouseY - tipHeight - gap;
   const y = abovePointer >= 0 ? abovePointer : mouseY + gap;
-  return [x, y];
+  return [clampX(x), clampY(y)];
 }
 
 interface AxisPointerLabelParams {
@@ -243,7 +246,15 @@ export function buildTrendChartOption(input: TrendChartInput): Record<string, un
   return {
     color: colors,
     animationDurationUpdate: 200,
-    grid: { left: 4, right: 4, top: 52, bottom: 12, containLabel: true },
+    // ECharts 6：`containLabel` 需 `use(LegacyGridContainLabel)`，官方等价为 outerBounds。
+    grid: {
+      left: 4,
+      right: 4,
+      top: 52,
+      bottom: 12,
+      outerBoundsMode: 'same',
+      outerBoundsContain: 'axisLabel',
+    },
     legend: {
       top: 0,
       textStyle: axisStyle(),
@@ -367,6 +378,11 @@ export function buildHeatmapChartOption(
       // 默认还包含 click：点底部色条会走 _tryShow，随后 setOption 刷新时 _keepShow 会把浮窗钉住。
       triggerOn: 'mousemove',
       hideDelay: 0,
+      // 默认 0.4s 位移动画会从初始坐标飞向 position 回调结果；右侧格子会先撑开页面。
+      transitionDuration: 0,
+      displayTransition: false,
+      confine: true,
+      appendTo: 'body',
       position: heatmapTooltipPosition,
       className: 'overview-heatmap-tooltip',
       ...tooltipStyle(),
@@ -386,7 +402,6 @@ export function buildHeatmapChartOption(
     },
     grid: {
       ...HEATMAP_CHART_GRID,
-      containLabel: false,
     },
     xAxis: {
       type: 'category',
