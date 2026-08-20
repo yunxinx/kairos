@@ -1,15 +1,12 @@
 <script setup lang="ts">
-// 组员列对齐渠道「模型清单」：双栏 gap-1.5，每个成员一行，+N 跟在下一格。
+// 组员列：双栏最多 3 行（6 格），再多时 +N 占最后一格。
 // 统一模型在列表里只出身份名；成员构成去编辑器看。
 import { computed } from 'vue';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
+import { overflowGridItems } from '@/lib/overflow-grid';
 import type { CallableSourceLine } from '@/lib/unified-sources';
 import ModelSourceLine from '@/features/models/ModelSourceLine.vue';
-
-const GRID_COLUMNS = 2;
-const GRID_ROWS = 7;
-const GRID_SLOTS = GRID_COLUMNS * GRID_ROWS;
 
 const props = withDefaults(
   defineProps<{
@@ -21,15 +18,8 @@ const props = withDefaults(
 
 const { t } = useI18n();
 
-const visible = computed(() => {
-  if (props.lines.length <= GRID_SLOTS) return props.lines;
-  return props.lines.slice(0, GRID_SLOTS - 1);
-});
-const hidden = computed(() => {
-  if (props.lines.length <= GRID_SLOTS) return [];
-  return props.lines.slice(GRID_SLOTS - 1);
-});
-const hiddenCount = computed(() => hidden.value.length);
+const sliced = computed(() => overflowGridItems(props.lines));
+const hiddenCount = computed(() => sliced.value.hidden.length);
 </script>
 
 <template>
@@ -39,7 +29,7 @@ const hiddenCount = computed(() => hidden.value.length);
     data-testid="model-source-lines"
   >
     <ModelSourceLine
-      v-for="line in visible"
+      v-for="line in sliced.visible"
       :key="line.key"
       :line="line"
       :chip-test-id="chipTestId"
@@ -65,7 +55,7 @@ const hiddenCount = computed(() => hidden.value.length);
           >
             <ul class="m-0 grid list-none grid-cols-2 gap-1.5 p-1">
               <ModelSourceLine
-                v-for="line in hidden"
+                v-for="line in sliced.hidden"
                 :key="line.key"
                 :line="line"
                 :chip-test-id="chipTestId"
