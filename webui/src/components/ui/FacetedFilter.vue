@@ -11,8 +11,9 @@ const props = defineProps<{
   title: string;
   options: FacetedFilterOption[];
   testId?: string;
+  /** 叠加到浮层上的类名，例如加宽以放下较长选项文案。 */
+  menuClass?: string;
 }>();
-
 const selected = defineModel<string[]>({ required: true });
 const { t } = useI18n();
 const query = ref('');
@@ -74,7 +75,11 @@ function clear() {
       </template>
     </PopoverTrigger>
     <PopoverPortal>
-      <PopoverContent align="start" :side-offset="4" class="faceted-filter-menu">
+      <PopoverContent
+        align="start"
+        :side-offset="4"
+        :class="['faceted-filter-menu', menuClass]"
+      >
         <div class="faceted-filter-search">
           <UiIcon name="search" :size="14" class="text-fg-subtle shrink-0" />
           <input

@@ -410,6 +410,7 @@ function onFilterToken(tokenName: string) {
             :title="t('logs.protocolFilter')"
             :options="protocolOptions"
             test-id="logs-protocol-filter"
+            menu-class="faceted-filter-menu-wide"
           />
           <button
             v-if="appliedModel"

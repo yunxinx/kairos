@@ -641,6 +641,9 @@ html[lang='zh-CN'] .font-serif {
   padding: 0;
   outline: none;
 }
+.faceted-filter-menu-wide {
+  width: 15rem;
+}
 .faceted-filter-search {
   display: flex;
   align-items: center;
