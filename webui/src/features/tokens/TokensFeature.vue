@@ -349,7 +349,7 @@ function openBulkDelete() {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="9" />
+          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="9" />
           <template v-else>
             <TableRow
               v-for="token in filteredTokens"

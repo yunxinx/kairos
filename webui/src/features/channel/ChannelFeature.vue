@@ -326,7 +326,7 @@ function openProbe(channel: ChannelView) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="8" />
+          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="8" />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"

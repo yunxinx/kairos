@@ -274,7 +274,7 @@ function openBulkDelete() {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="5" />
+          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="5" />
           <template v-else>
             <TableRow
               v-for="model in filtered"
@@ -291,7 +291,7 @@ function openBulkDelete() {
               <TableCell class="font-mono font-medium">
                 <CopyableName :text="model.id" test-id="unified-model-name" />
               </TableCell>
-              <TableCell>
+              <TableCell class="whitespace-normal">
                 <UnifiedJumpOrder :members="model.models" :channels="channels" />
               </TableCell>
               <TableCell>

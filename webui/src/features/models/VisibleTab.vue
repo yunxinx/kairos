@@ -136,7 +136,11 @@ function refetchAll() {
       @retry="refetchAll"
     />
     <div v-else class="flex flex-col">
-      <DataTable :busy="showTableSkeleton">
+      <DataTable
+        class="[&_[data-slot=table]]:table-fixed"
+        data-testid="visible-table"
+        :busy="showTableSkeleton"
+      >
         <template #toolbar>
           <DataTableToolbar>
             <SearchInput
@@ -155,6 +159,12 @@ function refetchAll() {
             />
           </DataTableToolbar>
         </template>
+        <!-- 自动布局会把宽度让给双栏路由网格；固定后模型列吃到约三分之一，余量给请求路由。 -->
+        <colgroup>
+          <col class="w-[32%]" />
+          <col />
+          <col class="w-[30%]" />
+        </colgroup>
         <TableHeader>
           <TableRow>
             <TableHead>
@@ -193,10 +203,10 @@ function refetchAll() {
                 :data-model="row.id"
                 :data-group="section.groupName"
               >
-                <TableCell class="font-mono font-medium">
+                <TableCell class="min-w-0 font-mono font-medium">
                   <CopyableName :text="row.id" test-id="visible-model-name" />
                 </TableCell>
-                <TableCell>
+                <TableCell class="min-w-0 whitespace-normal">
                   <div v-if="row.unified" data-testid="visible-unified-order">
                     <UnifiedJumpOrder :members="row.unified.models" :channels="channels" />
                   </div>
@@ -209,6 +219,7 @@ function refetchAll() {
                   <ChannelSourceMark v-else kind="unlisted" />
                 </TableCell>
                 <TableCell
+                  class="min-w-0 whitespace-normal"
                   :data-testid="
                     row.unified && row.unified.hiddenMembers.length > 0
                       ? 'visible-hidden-members'

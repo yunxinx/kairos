@@ -358,7 +358,11 @@ function loadErrorMessage(): string {
     />
 
     <div v-else class="flex flex-col">
-      <DataTable :busy="showTableSkeleton">
+      <DataTable
+        class="[&_[data-slot=table]]:table-fixed"
+        data-testid="inventory-table"
+        :busy="showTableSkeleton"
+      >
         <template #toolbar>
           <DataTableToolbar>
             <SearchInput
@@ -383,6 +387,17 @@ function loadErrorMessage(): string {
             />
           </DataTableToolbar>
         </template>
+        <!-- 复选框/价格/操作定宽；模型和别名不设宽，均分剩余，避免价格列吞掉身份列。 -->
+        <colgroup>
+          <col class="w-10" />
+          <col />
+          <col />
+          <col class="w-28" />
+          <col class="w-28" />
+          <col class="w-28" />
+          <col class="w-28" />
+          <col class="w-24" />
+        </colgroup>
         <TableHeader>
           <TableRow>
             <TableHead class="w-10">
@@ -401,11 +416,11 @@ function loadErrorMessage(): string {
             <TableHead>{{ t('pricing.outputUsd') }}</TableHead>
             <TableHead>{{ t('pricing.cacheReadUsd') }}</TableHead>
             <TableHead>{{ t('pricing.cacheWriteUsd') }}</TableHead>
-            <TableHead align="center">{{ t('common.actions') }}</TableHead>
+            <TableHead align="center" class="w-24">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="tableColumnCount" />
+          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="tableColumnCount" />
           <template v-else>
             <template v-for="section in sections" :key="section.channelName">
               <TableRow
@@ -433,8 +448,8 @@ function loadErrorMessage(): string {
                   test-id="inventory-select"
                   @toggle="selection.toggle(inventoryRowKey(row))"
                 />
-                <TableCell class="font-medium">
-                  <span class="inline-flex items-center gap-2">
+                <TableCell class="min-w-0 font-medium">
+                  <span class="inline-flex min-w-0 items-center gap-2">
                     <CopyableName :text="row.name" test-id="inventory-model-name" />
                     <span
                       v-if="row.price === null"
@@ -445,7 +460,7 @@ function loadErrorMessage(): string {
                     </span>
                   </span>
                 </TableCell>
-                <TableCell data-testid="inventory-alias">
+                <TableCell class="min-w-0" data-testid="inventory-alias">
                   <OverflowChips :items="row.aliasChipItems" chip-test-id="inventory-alias-chip" />
                 </TableCell>
                 <TableCell class="font-mono" data-testid="price-input">

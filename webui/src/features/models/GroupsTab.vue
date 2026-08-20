@@ -242,6 +242,13 @@ function openBulkDelete() {
             </template>
           </DataTableToolbar>
         </template>
+        <!-- table-fixed 下百分比列若加满，剩余宽度会摊到复选框列；成员列不设宽以吃掉余量。 -->
+        <colgroup>
+          <col class="w-10" />
+          <col class="w-[28%]" />
+          <col />
+          <col class="w-24" />
+        </colgroup>
         <TableHeader>
           <TableRow>
             <TableHead class="w-10">
@@ -255,12 +262,12 @@ function openBulkDelete() {
               </div>
             </TableHead>
             <TableHead class="w-[28%]">{{ t('models.groupName') }}</TableHead>
-            <TableHead class="w-[58%]">{{ t('models.groupMembers') }}</TableHead>
+            <TableHead class="min-w-0">{{ t('models.groupMembers') }}</TableHead>
             <TableHead align="center" class="w-24">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="4" />
+          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="4" />
           <template v-else>
             <TableRow
               v-for="group in filtered"
