@@ -412,15 +412,51 @@ async fn logout(State(deps): State<AdminDeps>, request: Request) -> Result<Statu
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 当前用户：身份 + 可用组 + 钱包。
+///
+/// 刻意不带用量统计：`/me` 在每次进入受保护路由时都会被拉一次（`ensureMe`、
+/// `loadTokenRows`），而用量是对整张 `request_log` 的全历史聚合、没有时间窗。
+/// 统计留给 `GET /users/{id}`——那是运营按需打开的详情页。
+#[derive(Debug, Serialize)]
+struct MeView {
+    id: i64,
+    email: String,
+    display_name: String,
+    role: ManagementRole,
+    enabled: bool,
+    avatar: Option<String>,
+    rate_limit_rpm: Option<u64>,
+    assigned_groups: Vec<String>,
+    balance_usd_micros: i64,
+    settled_usd_micros: i64,
+}
+
 async fn get_me(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
-) -> Result<Json<UserAdminView>, AdminError> {
+) -> Result<Json<MeView>, AdminError> {
     let user = users::get_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", identity.user_id())))?;
-    user_admin_view(&deps.pool, user, None).await.map(Json)
+    let assigned_groups = users::list_assigned_groups(&deps.pool, user.id)
+        .await
+        .map_err(AdminError::Store)?;
+    let (balance_usd_micros, settled_usd_micros) = store::get_user_wallet(&deps.pool, user.id)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(MeView {
+        id: user.id,
+        email: user.email,
+        display_name: user.display_name,
+        role: user.role,
+        enabled: user.enabled,
+        avatar: user.avatar,
+        rate_limit_rpm: user.rate_limit_rpm,
+        assigned_groups,
+        balance_usd_micros,
+        settled_usd_micros,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -798,7 +834,8 @@ struct UserAdminView {
     display_name: String,
     role: ManagementRole,
     enabled: bool,
-    avatar: Option<String>,
+    // 不带 avatar：运营列表与详情都不渲染头像，而它可能是 MB 级 base64 data URL，
+    // 逐个用户带上等于给 /users 平白挂几 MB。自己的头像走 /me。
     rate_limit_rpm: Option<u64>,
     assigned_groups: Vec<String>,
     balance_usd_micros: i64,
@@ -832,7 +869,6 @@ async fn user_admin_view(
         display_name: record.display_name,
         role: record.role,
         enabled: record.enabled,
-        avatar: record.avatar,
         rate_limit_rpm: record.rate_limit_rpm,
         assigned_groups: groups,
         balance_usd_micros,
@@ -844,6 +880,10 @@ async fn user_admin_view(
     })
 }
 
+/// 列出管理用户。
+///
+/// 三个维度（可用组、钱包、用量）都按批取回：逐个用户查会变成 2N+2 次查询，而
+/// 未命中 stats 的用户还会各自触发一次全历史聚合。
 async fn list_management_users(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
@@ -857,11 +897,41 @@ async fn list_management_users(
     let stats_map = users::list_users_stats(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
-    let mut views = Vec::with_capacity(records.len());
-    for record in records {
-        let stats = stats_map.get(&record.id).cloned();
-        views.push(user_admin_view(&deps.pool, record, stats).await?);
+    let wallets = store::list_user_wallets(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
+    let mut groups_by_user: HashMap<i64, Vec<String>> = HashMap::new();
+    for (user_id, group) in users::list_all_assigned_groups(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?
+    {
+        groups_by_user.entry(user_id).or_default().push(group);
     }
+    let views = records
+        .into_iter()
+        .map(|record| {
+            let stats = stats_map.get(&record.id).cloned().unwrap_or_default();
+            let (balance_usd_micros, settled_usd_micros) =
+                wallets.get(&record.id).copied().unwrap_or((0, 0));
+            let mut assigned_groups = groups_by_user.remove(&record.id).unwrap_or_default();
+            assigned_groups.sort();
+            UserAdminView {
+                id: record.id,
+                email: record.email,
+                display_name: record.display_name,
+                role: record.role,
+                enabled: record.enabled,
+                rate_limit_rpm: record.rate_limit_rpm,
+                assigned_groups,
+                balance_usd_micros,
+                settled_usd_micros,
+                request_count: stats.request_count,
+                input_tokens: stats.input_tokens,
+                output_tokens: stats.output_tokens,
+                last_used_at: stats.last_used_at,
+            }
+        })
+        .collect();
     Ok(Json(views))
 }
 
@@ -941,11 +1011,9 @@ async fn list_user_tokens(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    let mut records = store::resources::list_token_records(&deps.pool)
+    let records = store::resources::list_token_records_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
-    records.retain(|record| record.token.user_id == id);
-    records.sort_by_key(|record| record.id);
     let settled = store::list_token_settled(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -1100,11 +1168,9 @@ async fn list_tokens(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<TokenView>>, AdminError> {
-    let mut records = store::resources::list_token_records(&deps.pool)
+    let records = store::resources::list_token_records_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
-    records.retain(|record| record.token.user_id == identity.user_id());
-    records.sort_by_key(|record| record.id);
     let settled = store::list_token_settled(&deps.pool)
         .await
         .map_err(AdminError::Store)?;

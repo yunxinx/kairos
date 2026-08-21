@@ -183,17 +183,18 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         .into_iter()
         .map(|model| (model.id.clone(), model))
         .collect();
-    let user_rows = users::list_users(pool).await?;
+    // 只取请求路径要用的字段：头像不进快照（见 list_users_for_snapshot）。
+    let user_rows = users::list_users_for_snapshot(pool).await?;
     let assigned_rows = users::list_all_assigned_groups(pool).await?;
     let mut users: HashMap<i64, RuntimeUser> = HashMap::new();
-    for record in user_rows {
+    for (id, role, enabled, rate_limit_rpm) in user_rows {
         users.insert(
-            record.id,
+            id,
             RuntimeUser {
-                role: record.role,
-                enabled: record.enabled,
+                role,
+                enabled,
                 assigned_groups: HashSet::new(),
-                rate_limit_rpm: record.rate_limit_rpm,
+                rate_limit_rpm,
             },
         );
     }

@@ -52,18 +52,10 @@ test.describe('token resource page', () => {
     await page.keyboard.press('Escape');
     await expect(row).toBeVisible();
 
-    // 快捷档位累计成差额：算式预览 `+5 = ...`，保存后才落库。
+    // 编辑器只管令牌定义：钱包记在所属用户上（ADR-0008），充值在用户管理页。
     await row.getByTestId('token-edit').click();
     await expect(page.getByTestId('token-editor-rpm')).toHaveValue('60');
-    await page.getByTestId('token-quick-add-5').click();
-    await expect(page.getByTestId('token-balance-delta')).toHaveText('+5');
-
-    // 取消只清空快捷差额：算式消失。
-    await page.getByTestId('token-quick-cancel').click();
-    await expect(page.getByTestId('token-balance-delta')).toHaveCount(0);
-
-    await page.getByTestId('token-quick-add-5').click();
-    await expect(page.getByTestId('token-balance-result')).toBeVisible();
+    await expect(page.getByTestId('token-quick-add-5')).toHaveCount(0);
 
     // 修改名称与 RPM
     await page.locator('[id^="token-editor-name"]').fill('Alpha renamed');
@@ -103,19 +95,19 @@ test.describe('token resource page', () => {
     expect(secondKey).not.toBe(firstKey);
   });
 
-  test('rejects a negative target balance without saving', async ({ page }) => {
+  test('shows the owning user wallet once, not per token row', async ({ page }) => {
     await page.goto('/tokens');
-    await page.getByTestId('create-token').click();
-    await page.locator('[id^="token-editor-name"]').fill('Negative');
-    await page.getByTestId('token-save').click();
-    const row = page.locator('[data-testid="token-row"]', { hasText: 'Negative' });
-    await expect(row).toBeVisible();
+    for (const name of ['WalletA', 'WalletB']) {
+      await page.getByTestId('create-token').click();
+      await page.locator('[id^="token-editor-name"]').fill(name);
+      await page.getByTestId('token-save').click();
+      await expect(page.locator('[data-testid="token-row"]', { hasText: name })).toBeVisible();
+    }
 
-    // 目标余额不允许为负：保存被校验拦截，窗口保持打开。
-    await row.getByTestId('token-edit').click();
-    await page.getByTestId('token-editor-amount').fill('-1');
-    await page.getByTestId('token-save').click();
-    await expect(page.locator('[data-form-field="amount"] .form-field-hint')).toBeVisible();
+    // 钱包是用户级的、多把令牌共用，只在工具栏显示一次；逐行重复同一个数字会让
+    // 运营以为每把令牌各有一笔余额。
+    await expect(page.getByTestId('tokens-wallet-balance')).toHaveCount(1);
+    await expect(page.getByTestId('token-balance')).toHaveCount(0);
   });
 
   test('bulk selects tokens and deletes them from the floating bulk bar', async ({ page }) => {

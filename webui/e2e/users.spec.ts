@@ -7,7 +7,7 @@ import { seedUser } from './helpers/users';
 test.describe.configure({ mode: 'serial' });
 
 test.describe('users page', () => {
-  test('lists /admin/users and supports create, edit, recharge, groups, disable, and delete', async ({
+  test('lists /users and supports create, edit, recharge, groups, disable, and archive', async ({
     page,
   }) => {
     await seedModelGroup(page, { name: 'e2e-user-group', models: [] });

@@ -247,8 +247,8 @@ export interface MeView extends UserView {
   last_used_at?: number | null;
 }
 
-/** 用户管理列表/详情。 */
-export interface UserAdminView extends MeView {
+/** 用户管理列表/详情。不含 avatar：运营视图不渲染头像，自己的走 `/me`。 */
+export interface UserAdminView extends Omit<MeView, 'avatar'> {
   request_count: number;
   input_tokens: number;
   output_tokens: number;

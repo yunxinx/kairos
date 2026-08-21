@@ -14,6 +14,7 @@ import OverflowChips from '@/components/ui/OverflowChips.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import { downscaleAvatar, isAcceptedAvatarType } from '@/lib/avatar';
 import { formatUsdMicros } from '@/lib/format';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import { useNavAvatarPreference } from '@/lib/preferences';
@@ -89,24 +90,24 @@ function triggerAvatarUpload() {
   fileInputRef.value?.click();
 }
 
-function handleAvatarFileChange(e: Event) {
+async function handleAvatarFileChange(e: Event) {
   const target = e.target as HTMLInputElement;
   const file = target.files?.[0];
+  target.value = '';
   if (!file) return;
-  if (!file.type.startsWith('image/')) {
+  if (!isAcceptedAvatarType(file.type)) {
     error(t('account.invalidImage'));
     return;
   }
-  const reader = new FileReader();
-  reader.onload = (event) => {
-    const result = event.target?.result as string;
-    avatarData.value = result;
-    profileMutation.mutate({
-      avatar: result,
-    });
-  };
-  reader.readAsDataURL(file);
-  target.value = '';
+  try {
+    // 先在浏览器侧降采样：原图直传会把 MB 级 base64 写进库，也会被后端的
+    // data URL 长度上限拒掉。
+    const resized = await downscaleAvatar(file);
+    avatarData.value = resized;
+    profileMutation.mutate({ avatar: resized });
+  } catch {
+    error(t('account.invalidImage'));
+  }
 }
 
 function handleRemoveAvatar() {
@@ -178,7 +179,7 @@ function handleChangePassword() {
         <input
           ref="fileInputRef"
           type="file"
-          accept="image/*"
+          accept="image/png,image/jpeg,image/webp,image/gif"
           aria-label="Upload avatar"
           class="hidden"
           data-testid="account-avatar-input"

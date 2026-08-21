@@ -178,14 +178,15 @@ async fn update_me_email_and_password_with_current() {
     .await;
     assert_eq!(changed.status(), StatusCode::OK);
 
+    // 位图 data URL 可以存。SVG 不在允许名单：它能内联脚本与外链资源，一旦哪天
+    // 被 v-html/object 渲染就成了 XSS，头像不值得冒这个险。
+    const AVATAR_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
     let avatar_update = bearer_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
         "/me",
-        json!({
-            "avatar": "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
-        }),
+        json!({ "avatar": AVATAR_PNG }),
     )
     .await;
     assert_eq!(avatar_update.status(), StatusCode::OK);
@@ -194,7 +195,35 @@ async fn update_me_email_and_password_with_current() {
         .json()
         .await
         .expect("json");
-    assert_eq!(me["avatar"], "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=");
+    assert_eq!(me["avatar"], AVATAR_PNG);
+
+    let svg_rejected = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        "/me",
+        json!({ "avatar": "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=" }),
+    )
+    .await;
+    assert_eq!(
+        svg_rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "SVG 头像应被拒绝"
+    );
+
+    let oversized = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        "/me",
+        json!({ "avatar": format!("data:image/png;base64,{}", "A".repeat(300 * 1024)) }),
+    )
+    .await;
+    assert_eq!(
+        oversized.status(),
+        StatusCode::BAD_REQUEST,
+        "超限头像应被拒绝，而不是撑大 users 表"
+    );
 
     let old_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))

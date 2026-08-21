@@ -188,7 +188,13 @@ test.describe('request logs page', () => {
     ).toBeVisible();
 
     await page.getByTestId('logs-tab-system').click();
-    await expect(page.getByTestId('system-log-row')).toHaveCount(2);
+    // 不断言总数：审计日志（登录成功等 info 行）也落在这张表里，条数随用例增长。
+    await expect(
+      page.getByTestId('system-log-row').filter({ hasText: 'e2e settlement failed' }),
+    ).toBeVisible();
+    await expect(
+      page.getByTestId('system-log-row').filter({ hasText: 'e2e catalog warning' }),
+    ).toBeVisible();
     await page.getByTestId('system-logs-level-filter').click();
     await page
       .locator('[data-testid="system-logs-level-filter-option"][data-value="warn"]')

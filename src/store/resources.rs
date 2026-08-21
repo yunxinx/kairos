@@ -683,6 +683,26 @@ pub async fn list_token_records(pool: &SqlitePool) -> Result<Vec<TokenRecord>, S
     rows.iter().map(map_token_record).collect()
 }
 
+/// 按归属用户读出令牌记录（按 id 排序，保证确定性）。
+///
+/// 下推成 `WHERE user_id = ?` 而非全表读回内存再过滤：`idx_tokens_user_id` 就是
+/// 为这条路径建的。
+pub async fn list_token_records_for_user(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Vec<TokenRecord>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
+         FROM tokens WHERE user_id = ? ORDER BY id",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    rows.iter().map(map_token_record).collect()
+}
+
 /// 按库生成的 `id` 读出一条令牌记录；不存在返回 `None`。
 pub async fn get_token_record(
     pool: &SqlitePool,

@@ -414,6 +414,35 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError
     rows.iter().map(map_user_row).collect()
 }
 
+/// 快照专用的用户投影：只取请求路径要用的字段。
+///
+/// 不走 [`list_users`]：那个 SELECT 带 `avatar`（可能是 MB 级 base64 data URL），
+/// 而 `reload_and_swap` 在每次管理面写操作后都会重跑一遍全量快照加载——改一次渠道
+/// 价格就把所有用户的头像读出来再丢掉。
+pub async fn list_users_for_snapshot(
+    pool: &SqlitePool,
+) -> Result<Vec<(i64, ManagementRole, bool, Option<u64>)>, StoreError> {
+    let rows =
+        sqlx::query("SELECT id, role, enabled, rate_limit_rpm FROM users WHERE deleted_at IS NULL")
+            .fetch_all(pool)
+            .await
+            .map_err(StoreError::Query)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let role: String = row.try_get("role").map_err(StoreError::Query)?;
+        let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
+        let rate_limit_rpm: Option<i64> =
+            row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
+        out.push((
+            row.try_get("id").map_err(StoreError::Query)?,
+            ManagementRole::parse(&role)?,
+            enabled != 0,
+            rate_limit_rpm.and_then(|n| u64::try_from(n).ok()),
+        ));
+    }
+    Ok(out)
+}
+
 /// 读出全部用户可用模型组（未排序）。
 pub async fn list_all_assigned_groups(pool: &SqlitePool) -> Result<Vec<(i64, String)>, StoreError> {
     let rows = sqlx::query(
@@ -731,6 +760,9 @@ pub async fn set_avatar(
     user_id: i64,
     avatar: Option<&str>,
 ) -> Result<(), StoreError> {
+    if let Some(avatar) = avatar {
+        validate_avatar(avatar)?;
+    }
     let result = sqlx::query("UPDATE users SET avatar = ? WHERE id = ?")
         .bind(avatar)
         .bind(user_id)
@@ -739,6 +771,40 @@ pub async fn set_avatar(
         .map_err(StoreError::Query)?;
     if result.rows_affected() == 0 {
         return Err(StoreError::UserNotFound(user_id));
+    }
+    Ok(())
+}
+
+/// 头像 data URL 的长度上限（字符）。
+///
+/// 256×256 的 PNG/WebP 经 base64 后通常在 100KB 以内；留到 256KB 有富余，同时
+/// 挡住「原图直传」——那既会撑大 users 表，也会让每次读用户都拖着几 MB。
+const AVATAR_MAX_LEN: usize = 256 * 1024;
+
+/// 校验头像取值：只收固定几种图片的 data URL，并限长。
+///
+/// 后端必须自己校验：前端的 `accept="image/*"` 与 `file.type` 都来自浏览器，
+/// 直接调接口可以绕开。
+fn validate_avatar(avatar: &str) -> Result<(), StoreError> {
+    const ALLOWED_PREFIXES: [&str; 4] = [
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/webp;base64,",
+        "data:image/gif;base64,",
+    ];
+    if !ALLOWED_PREFIXES
+        .iter()
+        .any(|prefix| avatar.starts_with(prefix))
+    {
+        return Err(StoreError::InvalidResource(
+            "头像须为 png/jpeg/webp/gif 的 data URL".to_string(),
+        ));
+    }
+    if avatar.len() > AVATAR_MAX_LEN {
+        return Err(StoreError::InvalidResource(format!(
+            "头像过大（上限 {} KB），请压缩后再上传",
+            AVATAR_MAX_LEN / 1024
+        )));
     }
     Ok(())
 }

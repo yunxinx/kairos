@@ -343,6 +343,27 @@ pub async fn get_user_wallet(pool: &SqlitePool, user_id: i64) -> Result<(i64, i6
     .ok_or(StoreError::MissingWallet(user_id))
 }
 
+/// 全部用户钱包，供管理列表一次取回。
+pub async fn list_user_wallets(pool: &SqlitePool) -> Result<HashMap<i64, (i64, i64)>, StoreError> {
+    let rows =
+        sqlx::query("SELECT user_id, balance_usd_micros, settled_usd_micros FROM user_balance")
+            .fetch_all(pool)
+            .await
+            .map_err(StoreError::Query)?;
+    let mut wallets = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
+        let balance: i64 = row
+            .try_get("balance_usd_micros")
+            .map_err(StoreError::Query)?;
+        let settled: i64 = row
+            .try_get("settled_usd_micros")
+            .map_err(StoreError::Query)?;
+        wallets.insert(user_id, (balance, settled));
+    }
+    Ok(wallets)
+}
+
 /// 相对调整用户钱包：充值传正数、扣减传负数。返回 `(剩余, 用户累计结算)`。
 pub async fn adjust_user_balance(
     conn: &mut SqliteConnection,
