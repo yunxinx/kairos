@@ -227,7 +227,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &admin_token,
         reqwest::Method::POST,
-        &format!("/tokens/{seeded_id}/balance"),
+        "/users/1/balance",
         json!({ "delta_usd_micros": 1_000_000 }),
     )
     .await;
@@ -432,4 +432,64 @@ async fn last_root_cannot_be_archived() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let body: Value = resp.json().await.expect("应可解析");
     assert_eq!(body["error"]["code"], "last_root_protected");
+}
+
+/// `PUT /users/{id}` 的 `rate_limit_rpm` 三态：缺省不改、`null` 清空、数值设值。
+///
+/// 界面清空输入框时发的是 `null`；曾因 serde 的 `Option<Option<T>>` 语义被当成
+/// 「字段缺省」而静默忽略——保存成功，刷新后旧值原样回来。
+#[tokio::test]
+async fn user_rate_limit_rpm_can_be_cleared_with_null() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    let (user_id, _) = create_role(&gw, "rpm@example.com", "user").await;
+
+    let set = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "rate_limit_rpm": 42 }),
+    )
+    .await;
+    assert_eq!(set.status(), StatusCode::OK);
+    assert_eq!(
+        set.json::<Value>().await.expect("应可解析")["rate_limit_rpm"],
+        42
+    );
+
+    // 字段缺省：不改。
+    let untouched = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "display_name": "改个名" }),
+    )
+    .await;
+    assert_eq!(untouched.status(), StatusCode::OK);
+    assert_eq!(
+        untouched.json::<Value>().await.expect("应可解析")["rate_limit_rpm"],
+        42,
+        "字段缺省不应改动 RPM"
+    );
+
+    // 显式 null：清空。
+    let cleared = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "rate_limit_rpm": null }),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::OK);
+    assert!(
+        cleared.json::<Value>().await.expect("应可解析")["rate_limit_rpm"].is_null(),
+        "null 应清空 RPM"
+    );
+    let reread = get_req(&gw, &gw.session, &format!("/users/{user_id}")).await;
+    assert!(
+        reread.json::<Value>().await.expect("应可解析")["rate_limit_rpm"].is_null(),
+        "回读也应为空，而不是旧值复活"
+    );
 }

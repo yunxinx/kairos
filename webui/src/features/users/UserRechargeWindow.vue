@@ -31,31 +31,41 @@ const { fieldError, fieldInputHandlers, validate } = useFormValidation();
 const uid = useId();
 const amountInputId = `user-recharge-amount-${uid}`;
 
-// 余额编辑计算器语义：输入框是基数（可直接改为目标余额），
-// 快捷档位累计成右侧差额，`=` 后预览结果，保存时一并生效。
-const displayedBalance = ref(props.user.balance_usd_micros);
-const editorAmount = ref(formatUsdAmount(props.user.balance_usd_micros));
+// 纯差额语义：输入框写的是「调整多少」，不是「调整成多少」。
+//
+// 接口本身是相对量（delta）。此前界面把输入框当成目标余额、保存时算
+// `目标 - 打开窗口那刻的余额`——网关在持续扣费，期间的消耗会让实际结果偏离运营
+// 输入的目标（丢更新）；而透支用户的预填值是负数，又会被「不小于 0」的校验挡住，
+// 最需要充值的场景反而走不通。
+const currentBalance = computed(() => props.user.balance_usd_micros);
+
+/** 手输差额（美元字符串，可为负）。 */
+const editorAmount = ref('');
+/** 快捷档位累计的差额（micro-USD）。 */
 const quickDelta = ref(0);
 
-const dirty = computed(
-  () => editorAmount.value !== formatUsdAmount(displayedBalance.value) || quickDelta.value !== 0,
-);
-watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
-
-/** 输入框基数（micro-USD）；非法输入返回 null。 */
-const baseMicros = computed(() => parseUsdToMicros(editorAmount.value));
-
-/** 计算器结果：基数叠加快捷差额，不低于 0；基数非法时为 null。 */
-const draftResult = computed(() => {
-  if (baseMicros.value === null) return null;
-  return Math.max(0, baseMicros.value + quickDelta.value);
+/** 手输部分的差额（micro-USD）；空串视为 0，非法输入为 null。 */
+const typedDelta = computed(() => {
+  const raw = editorAmount.value.trim();
+  if (raw === '') return 0;
+  return parseUsdToMicros(raw);
 });
 
-/** 保存时需要应用到余额的差额（micro-USD）；无变化或输入非法时为 0。 */
-function balanceDelta(): number {
-  if (draftResult.value === null) return 0;
-  return draftResult.value - displayedBalance.value;
-}
+/** 本次要应用的总差额；输入非法时为 null。 */
+const totalDelta = computed(() => {
+  const typed = typedDelta.value;
+  if (typed === null) return null;
+  return typed + quickDelta.value;
+});
+
+/** 预计调整后的余额；允许为负（后端本就允许透支）。 */
+const projectedBalance = computed(() => {
+  if (totalDelta.value === null) return null;
+  return currentBalance.value + totalDelta.value;
+});
+
+const dirty = computed(() => totalDelta.value !== null && totalDelta.value !== 0);
+watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const saveMutation = useMutation({
   mutationFn: (delta: number) =>
@@ -71,16 +81,14 @@ const saveMutation = useMutation({
 });
 
 function handleSave() {
+  // 差额可正可负，不设下限；只拒绝解析不出来的输入。
   if (
-    !validate(
-      [{ name: 'amount', value: editorAmount.value, rules: [{ kind: 'required' }, { kind: 'usd', min: 0 }] }],
-      t,
-    )
+    !validate([{ name: 'amount', value: editorAmount.value, rules: [{ kind: 'usd' }] }], t)
   ) {
     return;
   }
-  const delta = balanceDelta();
-  if (delta === 0) {
+  const delta = totalDelta.value;
+  if (delta === null || delta === 0) {
     emit('close');
     return;
   }
@@ -131,6 +139,12 @@ function applyQuick(deltaUsd: number) {
             </button>
           </div>
         </div>
+        <p class="text-fg-muted mt-1 text-center text-xs" data-testid="user-current-balance">
+          {{ t('users.currentBalance') }}
+          <span class="text-fg font-mono font-semibold">{{
+            formatUsdAmount(currentBalance)
+          }}</span>
+        </p>
         <div class="mt-2 flex items-end justify-center gap-3">
           <div class="w-1/3" data-form-field="amount">
             <div class="form-field-control">
@@ -157,22 +171,23 @@ function applyQuick(deltaUsd: number) {
           </div>
           <!-- 算式容器与输入框同高（2.25rem）并底对齐，数字恰好落在输入框中线上。 -->
           <div
-            v-if="quickDelta !== 0 && draftResult !== null"
+            v-if="totalDelta !== null && totalDelta !== 0 && projectedBalance !== null"
             class="flex h-9 items-center gap-3"
             aria-live="polite"
           >
             <p
               class="font-mono text-lg font-semibold"
-              :class="quickDelta > 0 ? 'text-success' : 'text-danger'"
+              :class="totalDelta > 0 ? 'text-success' : 'text-danger'"
               data-testid="user-balance-delta"
             >
-              {{ quickDelta > 0 ? '+' : '-' }}{{ formatUsdAmount(Math.abs(quickDelta)) }}
+              {{ totalDelta > 0 ? '+' : '-' }}{{ formatUsdAmount(Math.abs(totalDelta)) }}
             </p>
-            <p class="text-fg-muted font-mono text-lg" aria-hidden="true">=</p>
+            <p class="text-fg-muted font-mono text-lg" aria-hidden="true">→</p>
             <p class="font-mono text-lg font-semibold" data-testid="user-balance-result">
-              {{ formatUsdAmount(draftResult) }}
+              {{ formatUsdAmount(projectedBalance) }}
             </p>
             <button
+              v-if="quickDelta !== 0"
               type="button"
               class="btn btn-sm"
               data-testid="user-quick-cancel"

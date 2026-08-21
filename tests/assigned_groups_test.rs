@@ -155,7 +155,7 @@ async fn assigned_groups_gate_create_rebind_and_requests() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/tokens/{token_row_id}/balance"),
+        &format!("/users/{user_id}/balance"),
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;

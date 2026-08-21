@@ -215,13 +215,6 @@ export interface BalanceAdjustment {
   delta_usd_micros: number;
 }
 
-/** 余额视图。 */
-export interface BalanceView {
-  token_id: number;
-  balance_usd_micros: number;
-  settled_usd_micros: number;
-}
-
 /** 管理角色：上级含下级权限。 */
 export type ManagementRole = 'user' | 'admin' | 'root';
 

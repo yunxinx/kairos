@@ -37,6 +37,7 @@ import {
   maskTokenKey,
   relativeTimeParts,
 } from '@/lib/format';
+import { useCurrentUser } from '@/lib/session';
 import { groupDisplayName } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -55,6 +56,7 @@ const COPY_FEEDBACK_MS = 2_000;
 
 const { t, locale } = useI18n();
 const { error } = useToast();
+const me = useCurrentUser();
 const queryClient = useQueryClient();
 
 const searchText = ref('');
@@ -161,22 +163,37 @@ async function copyKey(key: string) {
   }
 }
 
-function quotaRatio(token: TokenRow): number {
-  const total = token.settled_usd_micros + token.balance_usd_micros;
-  if (total <= 0) return 0;
-  return Math.min(1, Math.max(0, token.balance_usd_micros / total));
+/**
+ * 该令牌累计结算占其累计上限的比例；未设上限返回 null（不画进度条）。
+ *
+ * 不用「余额」作分母：余额是所属用户的共享钱包（ADR-0008），拿它跟单个令牌的
+ * settled 相比会让同一钱包下的每把令牌各显示一个无意义的百分比。
+ */
+/** 所属用户钱包剩余；未 hydrate 时为 null。 */
+const walletBalance = computed(() => me.value?.balance_usd_micros ?? null);
+
+function quotaRatio(token: TokenRow): number | null {
+  const limit = token.limit_usd_micros;
+  if (limit === null || limit <= 0) return null;
+  return Math.min(1, Math.max(0, token.settled_usd_micros / limit));
 }
 
+/** 用量越接近上限越危险（与「剩余越少越危险」方向相反）。 */
 function quotaColorClass(ratio: number): string {
-  if (ratio <= REMAINING_DANGER_RATIO) return 'bg-[var(--danger)]';
-  if (ratio <= REMAINING_WARN_RATIO) return 'bg-[var(--warn)]';
+  if (ratio >= 1 - REMAINING_DANGER_RATIO) return 'bg-[var(--danger)]';
+  if (ratio >= 1 - REMAINING_WARN_RATIO) return 'bg-[var(--warn)]';
   return 'bg-[var(--success)]';
 }
 
 function quotaLabel(token: TokenRow): string {
   const settled = formatUsdMicros(token.settled_usd_micros);
-  const balance = formatUsdMicros(token.balance_usd_micros);
-  return t('tokens.quotaUsage', { settled, balance });
+  if (token.limit_usd_micros === null) {
+    return t('tokens.quotaUnlimitedUsage', { settled });
+  }
+  return t('tokens.quotaUsage', {
+    settled,
+    limit: formatUsdMicros(token.limit_usd_micros),
+  });
 }
 
 function formatRelative(millis: number): string {
@@ -313,6 +330,16 @@ function openBulkDelete() {
               test-id="tokens-status-filter"
             />
             <template #actions>
+              <!-- 钱包是用户级的，同一用户所有令牌共用；只在此处显示一次。 -->
+              <span
+                v-if="walletBalance !== null"
+                class="text-fg-muted font-mono text-xs"
+                data-testid="tokens-wallet-balance"
+                :title="t('tokens.walletGuide')"
+              >
+                {{ t('tokens.wallet') }}
+                <span class="text-fg font-semibold">{{ formatUsdFixed2(walletBalance) }}</span>
+              </span>
               <button
                 type="button"
                 class="btn btn-primary"
@@ -405,18 +432,20 @@ function openBulkDelete() {
                     <span data-testid="token-settled">{{
                       formatUsdFixed2(token.settled_usd_micros)
                     }}</span>
-                    <span data-testid="token-balance">{{
-                      formatUsdFixed2(token.balance_usd_micros)
-                    }}</span>
+                    <span v-if="token.limit_usd_micros !== null" data-testid="token-limit">
+                      / {{ formatUsdFixed2(token.limit_usd_micros) }}
+                    </span>
+                    <span v-else class="text-fg-subtle">{{ t('common.unlimited') }}</span>
                   </div>
                   <div
+                    v-if="quotaRatio(token) !== null"
                     class="bg-surface-alt h-1.5 w-full overflow-hidden rounded-full"
                     data-testid="token-quota-track"
                   >
                     <div
                       class="h-full rounded-full transition-[width]"
-                      :class="quotaColorClass(quotaRatio(token))"
-                      :style="{ width: `${quotaRatio(token) * 100}%` }"
+                      :class="quotaColorClass(quotaRatio(token) ?? 0)"
+                      :style="{ width: `${(quotaRatio(token) ?? 0) * 100}%` }"
                     />
                   </div>
                 </div>

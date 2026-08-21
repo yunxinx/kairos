@@ -250,11 +250,10 @@ async fn hide_drops_collected_members_but_keeps_them_callable() {
     .await;
     let token: Value = created_token.json().await.expect("令牌应可解析");
     let pack_key = token["token_key"].as_str().expect("应有 key").to_string();
-    let pack_id = token["id"].as_i64().expect("应有 id");
     let topped = admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/tokens/{pack_id}/balance"),
+        "/users/1/balance",
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;

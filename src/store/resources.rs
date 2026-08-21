@@ -926,19 +926,6 @@ pub async fn rebind_channels_to_default(
     Ok(())
 }
 
-/// 判断令牌定义是否存在。
-///
-/// 供余额调整等「先校验存在再写余额」的原语在事务内使用，与后续写持同一写锁，
-/// 避免并发删除令牌后仍写出一条孤儿余额行、被后续重建令牌复活。
-pub async fn token_exists(conn: &mut SqliteConnection, id: i64) -> Result<bool, StoreError> {
-    let row = sqlx::query("SELECT 1 FROM tokens WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    Ok(row.is_some())
-}
-
 /// 读出全部价格（每渠道每模型一行）。
 pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
     let rows = sqlx::query(
@@ -1422,41 +1409,6 @@ mod tests {
                 .expect("应能查询")
                 .is_none(),
             "不存在的 key 返回 None"
-        );
-    }
-
-    /// 令牌定义存在性判断：存在返回 true，不存在返回 false。
-    #[tokio::test]
-    async fn token_exists_truthiness() {
-        let (_dir, pool) = test_pool().await;
-        let mut conn = pool.acquire().await.expect("应能获取连接");
-        assert!(
-            !token_exists(&mut conn, 1).await.expect("应能查询"),
-            "未播种的令牌不存在"
-        );
-        upsert_token(
-            &mut conn,
-            &Token {
-                token_key: "sk-a".to_string(),
-                name: "dev".to_string(),
-                limit_usd_micros: None,
-                enabled: true,
-                rate_limit_rpm: None,
-                model_group: DEFAULT_MODEL_GROUP.to_string(),
-                user_id: ROOT_USER_ID,
-            },
-            1,
-        )
-        .await
-        .expect("应能写令牌");
-        let id = get_token_record_by_key(&pool, "sk-a")
-            .await
-            .expect("应能读记录")
-            .expect("记录应存在")
-            .id;
-        assert!(
-            token_exists(&mut conn, id).await.expect("应能查询"),
-            "播种后的令牌应存在"
         );
     }
 

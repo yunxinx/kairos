@@ -330,32 +330,6 @@ pub async fn settle_charge(
         .ok_or(StoreError::MissingToken(token_key.to_string()))
 }
 
-/// 相对调整所属用户钱包：充值传正数、扣减传负数，原子完成。返回调整后视图。
-///
-/// 与 `settle_charge` 不同，本原语只动用户剩余、不动累计结算额，供运营调账使用。
-pub async fn adjust_balance(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-    delta_usd_micros: i64,
-) -> Result<TokenBalance, StoreError> {
-    let updated = sqlx::query(
-        "UPDATE user_balance SET balance_usd_micros = balance_usd_micros + ? \
-         WHERE user_id = (SELECT user_id FROM tokens WHERE token_key = ?)",
-    )
-    .bind(delta_usd_micros)
-    .bind(token_key)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::MissingToken(token_key.to_string()));
-    }
-
-    get_token_balance(conn, token_key)
-        .await?
-        .ok_or(StoreError::MissingToken(token_key.to_string()))
-}
-
 /// 读用户钱包。插入用户时同步建行；缺失视为数据损坏。
 pub async fn get_user_wallet(pool: &SqlitePool, user_id: i64) -> Result<(i64, i64), StoreError> {
     sqlx::query_as(
@@ -1373,9 +1347,9 @@ mod tests {
         assert_eq!(b.settled_usd_micros, 0);
     }
 
-    /// 余额相对调整：充值/扣减同一原语，原子生效。
+    /// 钱包相对调整：充值/扣减同一原语，只动剩余、不动累计结算额。
     #[tokio::test]
-    async fn adjust_balance_recharges_and_deducts() {
+    async fn adjust_user_balance_recharges_and_deducts() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
         seed_token(&mut conn, "sk-a").await;
@@ -1383,18 +1357,25 @@ mod tests {
             .await
             .expect("应能初始化余额");
 
-        let after_recharge = adjust_balance(&mut conn, "sk-a", 5_000_000)
+        let (balance, settled) = adjust_user_balance(&mut conn, resources::ROOT_USER_ID, 5_000_000)
             .await
             .expect("应能充值");
-        assert_eq!(after_recharge.balance_usd_micros, 15_000_000);
-        // 充值/扣减不动累计结算额。
-        assert_eq!(after_recharge.settled_usd_micros, 0);
+        assert_eq!(balance, 15_000_000);
+        assert_eq!(settled, 0, "调账不动累计结算额");
 
-        let after_deduct = adjust_balance(&mut conn, "sk-a", -3_000_000)
+        let (balance, settled) =
+            adjust_user_balance(&mut conn, resources::ROOT_USER_ID, -3_000_000)
+                .await
+                .expect("应能扣减");
+        assert_eq!(balance, 12_000_000);
+        assert_eq!(settled, 0);
+
+        // 令牌视图读到的剩余就是所属用户的钱包。
+        let view = get_token_balance(&mut conn, "sk-a")
             .await
-            .expect("应能扣减");
-        assert_eq!(after_deduct.balance_usd_micros, 12_000_000);
-        assert_eq!(after_deduct.settled_usd_micros, 0);
+            .expect("应能读")
+            .expect("应有视图");
+        assert_eq!(view.balance_usd_micros, 12_000_000);
     }
 
     /// 连接选项治理 SQLite 坏默认值：WAL 日志模式、NORMAL 同步、外键强制、

@@ -136,7 +136,6 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
     let signed_in = Router::new()
         .route("/tokens", get(list_tokens).post(create_token))
         .route("/tokens/{id}", put(update_token).delete(delete_token))
-        .route("/tokens/{id}/balance", post(adjust_token_balance))
         .route("/logs", get(query_logs))
         .route("/logs/{id}", get(get_log))
         .route("/stats", get(get_stats))
@@ -497,8 +496,23 @@ struct UserUpdate {
     password: Option<String>,
     display_name: Option<String>,
     avatar: Option<String>,
-    #[serde(default)]
+    /// 三态：字段缺省 = 不改，`null` = 清空（跟随全局兜底），数值 = 设为该值。
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     rate_limit_rpm: Option<Option<u64>>,
+}
+
+/// 把 `null` 与「字段缺省」区分开，供 `Option<Option<T>>` 表达三态。
+///
+/// serde 对 `Option<T>` 的 `null` 走 `visit_none()`，直接落成外层 `None`，于是
+/// `null` 与缺省不可区分——界面上清空输入框会保存成功但值不变（静默失败）。
+/// 这里让外层由 `#[serde(default)]` 负责「缺省」，本函数只解内层，`null` 得以
+/// 落成 `Some(None)`。
+fn deserialize_double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 async fn update_user(
@@ -1671,64 +1685,14 @@ fn catalog_err(err: catalog::CatalogError) -> AdminError {
 // --- 令牌余额调整 ---
 
 /// 余额调整请求体：`delta_usd_micros` 为相对量（正数充值、负数扣减）。
+///
+/// 钱包记在用户上（ADR-0008），只经 `POST /users/{id}/balance` 调整。此前另有一个
+/// 按令牌寻址的 `/tokens/{key}/balance`：名为「令牌余额」实则改所属用户的钱包，
+/// 强化了 ADR-0008 要消除的「令牌自带钱包」心智模型，已删除。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BalanceAdjustment {
     delta_usd_micros: i64,
-}
-
-/// 余额视图 wire 契约：调整后余额与累计结算额。
-#[derive(Debug, Serialize)]
-struct BalanceView {
-    token_id: i64,
-    balance_usd_micros: i64,
-    settled_usd_micros: i64,
-}
-
-/// 相对调整令牌所属用户的钱包（充值/扣减），库内原子完成，返回调整后视图。
-///
-/// 不动令牌定义（修改令牌属性不重置钱包）；剩余存在 `user_balance`，不参与
-/// 快照替换。令牌不存在返回 404；结算行缺失先在事务内建零额行再调整。
-async fn adjust_token_balance(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(raw_id): Path<String>,
-    body: Result<Json<BalanceAdjustment>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<BalanceView>, AdminError> {
-    if !identity.role().at_least(ManagementRole::Admin) {
-        return Err(AdminError::Forbidden);
-    }
-    let id = parse_token_id(&raw_id)?;
-    let adjustment = body.map_err(AdminError::bad_body)?;
-    let existing = read_token_record(&deps, id).await?;
-    let owner = users::get_user(&deps.pool, existing.token.user_id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", existing.token.user_id)))?;
-    reject_user_management(&identity, &owner, None)?;
-    let token_key = existing.token.token_key.clone();
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    // 存在性校验在事务内针对 tokens 表完成（与后续写持同一写锁），避免并发删除后
-    // 仍写出一条孤儿余额行、被重建令牌复活。
-    if !crate::store::resources::token_exists(&mut tx, id)
-        .await
-        .map_err(AdminError::Store)?
-    {
-        return Err(AdminError::NotFound(format!("令牌 {id} 不存在")));
-    }
-    // 确保余额行存在（新建令牌已建零额行，此处防御已删余额行的边界），再原子调整。
-    crate::store::ensure_token_balance(&mut tx, &token_key, 0.0, super::logging::unix_millis())
-        .await
-        .map_err(AdminError::Store)?;
-    let balance = crate::store::adjust_balance(&mut tx, &token_key, adjustment.delta_usd_micros)
-        .await
-        .map_err(AdminError::Store)?;
-    tx.commit().await.map_err(db_err)?;
-    Ok(Json(BalanceView {
-        token_id: id,
-        balance_usd_micros: balance.balance_usd_micros,
-        settled_usd_micros: balance.settled_usd_micros,
-    }))
 }
 
 // --- 请求日志查询 ---
@@ -3062,5 +3026,28 @@ impl IntoResponse for AdminError {
             Json(json!({ "error": { "code": code, "message": message } })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `rate_limit_rpm` 三态：字段缺省不改、`null` 清空、数值设值。
+    ///
+    /// 钉住的是 serde 的一个坑：`Option<Option<T>>` 直接用 `#[serde(default)]` 时，
+    /// `null` 会落成外层 `None`（等同缺省），界面上清空 RPM 会静默失败。
+    #[test]
+    fn user_update_rate_limit_rpm_distinguishes_absent_from_null() {
+        let absent: UserUpdate = serde_json::from_value(json!({})).expect("空体应可解析");
+        assert_eq!(absent.rate_limit_rpm, None, "字段缺省表示不改");
+
+        let cleared: UserUpdate =
+            serde_json::from_value(json!({ "rate_limit_rpm": null })).expect("null 应可解析");
+        assert_eq!(cleared.rate_limit_rpm, Some(None), "null 表示清空");
+
+        let set: UserUpdate =
+            serde_json::from_value(json!({ "rate_limit_rpm": 60 })).expect("数值应可解析");
+        assert_eq!(set.rate_limit_rpm, Some(Some(60)), "数值表示设值");
     }
 }

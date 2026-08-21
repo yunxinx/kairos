@@ -3,7 +3,6 @@ import { ApiClientError, type ApiErrorBody } from '@/api/types';
 import type {
   AssignedGroupsView,
   BalanceAdjustment,
-  BalanceView,
   Channel,
   ChannelProbeResult,
   ChannelView,
@@ -161,13 +160,6 @@ export const apiClient = {
 
   deleteToken(id: number): Promise<TokenView> {
     return apiFetch(`/tokens/${id}`, { method: 'DELETE' });
-  },
-
-  adjustTokenBalance(id: number, body: BalanceAdjustment): Promise<BalanceView> {
-    return apiFetch(`/tokens/${id}/balance`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
   },
 
   listChannels(): Promise<ChannelView[]> {

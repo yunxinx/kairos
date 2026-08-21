@@ -279,7 +279,7 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     // 新建令牌在请求路径即时可用：充值（余额调整属 04 票，测试内用相对量原语
     // 绕过）后请求成功。新建令牌已有零额余额行，故可被 `adjust_balance` 充值。
     let mut conn = gw.pool.acquire().await.expect("应能获取连接");
-    store::adjust_balance(&mut conn, &new_key, 5_000_000)
+    store::adjust_user_balance(&mut conn, 1, 5_000_000)
         .await
         .expect("应能为新令牌充值");
     drop(conn);
@@ -355,7 +355,7 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
 
     // 充值后成功请求一次：列表中的最后使用时间被刷新。
     let mut conn = gw.pool.acquire().await.expect("应能获取连接");
-    store::adjust_balance(&mut conn, &life_key, 5_000_000)
+    store::adjust_user_balance(&mut conn, 1, 5_000_000)
         .await
         .expect("应能充值");
     drop(conn);
@@ -1417,12 +1417,8 @@ async fn runtime_resources_survive_process_restart() {
         .as_str()
         .expect("应返回生成的 key")
         .to_string();
-    let restart_id = common::token_id(&gw.pool, &restart_key).await;
     let resp = reqwest::Client::new()
-        .post(format!(
-            "{}/tokens/{restart_id}/balance",
-            gw.admin_base_url()
-        ))
+        .post(format!("{}/users/1/balance", gw.admin_base_url()))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
@@ -1562,9 +1558,8 @@ async fn empty_db_bootstraps_via_admin_api() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
-    let boot_id = common::token_id(&gw.pool, &boot_key).await;
     let resp = reqwest::Client::new()
-        .post(format!("{}/tokens/{boot_id}/balance", gw.admin_base_url()))
+        .post(format!("{}/users/1/balance", gw.admin_base_url()))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
@@ -1603,7 +1598,7 @@ async fn deleting_token_clears_balance_row() {
         .expect("应返回生成的 key")
         .to_string();
     let mut conn = gw.pool.acquire().await.expect("应能获取连接");
-    store::adjust_balance(&mut conn, &cycle_key, 5_000_000)
+    store::adjust_user_balance(&mut conn, 1, 5_000_000)
         .await
         .expect("应能充值");
     drop(conn);
@@ -1888,20 +1883,20 @@ async fn balance_adjustment_reflected_in_admission() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
     let client = reqwest::Client::new();
     let admin = gw.admin_base_url();
-    let seeded_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
 
     // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
     let resp = client
-        .post(format!("{admin}/tokens/{seeded_id}/balance"))
+        .post(format!("{admin}/users/1/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": -5_000_000 }))
         .send()
         .await
         .expect("应可调整余额");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let balance: Value = resp.json().await.expect("余额应可解析");
-    assert_eq!(balance["balance_usd_micros"], 0);
-    assert_eq!(balance["token_id"], seeded_id);
+    // 钱包端点回的是用户视图（ADR-0008：钱包在用户上，令牌不持有钱包）。
+    let wallet: Value = resp.json().await.expect("钱包应可解析");
+    assert_eq!(wallet["balance_usd_micros"], 0);
+    assert_eq!(wallet["id"], 1, "调整的是 root 的钱包");
 
     // 零余额：计费准入拒绝。
     let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
@@ -1913,7 +1908,7 @@ async fn balance_adjustment_reflected_in_admission() {
 
     // 充值后恢复可用。
     let resp = client
-        .post(format!("{admin}/tokens/{seeded_id}/balance"))
+        .post(format!("{admin}/users/1/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
@@ -1933,7 +1928,7 @@ async fn token_attr_update_does_not_reset_balance() {
 
     // 充值 1 USD（初始 5 USD → 6 USD）。
     let resp = client
-        .post(format!("{admin}/tokens/{seeded_id}/balance"))
+        .post(format!("{admin}/users/1/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 1_000_000 }))
         .send()
@@ -1952,7 +1947,7 @@ async fn token_attr_update_does_not_reset_balance() {
 
     // 余额不变：以 delta 0 读回应仍为 6_000_000。
     let resp = client
-        .post(format!("{admin}/tokens/{seeded_id}/balance"))
+        .post(format!("{admin}/users/1/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 0 }))
         .send()
@@ -2585,7 +2580,7 @@ async fn new_endpoints_structured_errors() {
 
     // 余额：不存在的令牌 → 404。
     let resp = client
-        .post(format!("{admin}/tokens/nope/balance"))
+        .post(format!("{admin}/users/999999/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 100 }))
         .send()

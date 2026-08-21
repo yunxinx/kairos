@@ -422,11 +422,10 @@ async fn delete_group_nulls_token_group_without_rebind() {
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
     let key = token["token_key"].as_str().expect("应有 key").to_string();
-    let key_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/tokens/{key_id}/balance"),
+        "/users/1/balance",
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;
@@ -496,11 +495,10 @@ async fn out_of_group_model_is_not_found_not_503() {
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
     let coding_key = token["token_key"].as_str().expect("应有 key");
-    let coding_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/tokens/{coding_id}/balance"),
+        "/users/1/balance",
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;
@@ -905,11 +903,10 @@ async fn pinned_group_source_routes_only_that_channel() {
     .await;
     let token: Value = token_resp.json().await.expect("令牌应可解析");
     let coding_key = token["token_key"].as_str().expect("应有 key");
-    let coding_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/tokens/{coding_id}/balance"),
+        "/users/1/balance",
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;
