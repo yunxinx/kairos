@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Row, SqliteConnection, SqlitePool,
+    AssertSqlSafe, Row, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 use thiserror::Error;
@@ -108,6 +108,11 @@ pub struct RequestLog {
     pub created_at: i64,
     pub token_name: String,
     pub token_key: String,
+    /// 归属管理用户，写入时定格。
+    ///
+    /// 冗余存储而非 JOIN `tokens`：令牌删除后归属仍在，日志过滤与用量统计不缩水。
+    /// `0` 为存量行或归属未知，不匹配任何真实用户。
+    pub user_id: i64,
     pub inbound_protocol: String,
     /// 入站模型名（下游请求的 `model`，别名或统一模型 ID 原样保留）。
     pub model: String,
@@ -152,16 +157,17 @@ pub async fn insert_request_log_on(
 ) -> Result<i64, StoreError> {
     let result = sqlx::query(
         "INSERT INTO request_log \
-         (created_at, token_name, token_key, inbound_protocol, model, outbound_model, channel, \
-          status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         (created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
+          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
           cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
           cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
           settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.created_at)
     .bind(&log.token_name)
     .bind(&log.token_key)
+    .bind(log.user_id)
     .bind(&log.inbound_protocol)
     .bind(&log.model)
     .bind(&log.outbound_model)
@@ -452,6 +458,10 @@ pub enum RequestLogSortBy {
 /// 请求日志查询过滤条件与分页。全部过滤维度可选，缺省即不限。
 #[derive(Debug, Clone, Default)]
 pub struct RequestLogQuery {
+    /// 按归属管理用户精确过滤。
+    ///
+    /// 普通用户查询时由管理面强制注入自己的 id；`None` 表示不限（admin/root 看全量）。
+    pub user_id: Option<i64>,
     /// 按令牌 key 精确过滤。
     pub token_key: Option<String>,
     /// 按令牌展示名精确过滤。列表接口脱敏 `token_key`，行内筛选只能按名匹配。
@@ -498,7 +508,7 @@ async fn query_request_logs_on(
     filter: &RequestLogQuery,
 ) -> Result<Vec<RequestLog>, StoreError> {
     let mut qb = sqlx::QueryBuilder::new(
-        "SELECT id, created_at, token_name, token_key, inbound_protocol, model, outbound_model, \
+        "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
@@ -524,7 +534,7 @@ async fn query_request_logs_on(
 /// 按主键读一条请求日志（含 body）；不存在返回 `None`。
 pub async fn get_request_log(pool: &SqlitePool, id: i64) -> Result<Option<RequestLog>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, created_at, token_name, token_key, inbound_protocol, model, outbound_model, \
+        "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
@@ -699,8 +709,10 @@ pub struct StatsSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd_micros: i64,
+    /// 令牌数：全局视图为全部令牌，归属视图只数该用户自己的。
     pub token_count: u64,
-    pub channel_count: u64,
+    /// 出站渠道数。归属视图为 `None`：渠道是运营视角的数字，普通用户不该看到。
+    pub channel_count: Option<u64>,
 }
 
 /// 趋势桶：`days=1` 为 UTC 小时（24 点），否则为日历日；无流量的桶补零。
@@ -735,7 +747,13 @@ pub struct LifetimeStats {
 }
 
 /// 聚合 `days` 天（已夹取）内的 stats。费用只计 HTTP 2xx（与计费「仅成功结算」一致）。
-pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreError> {
+///
+/// `user_id` 为 `Some` 时只统计该用户名下的流量（普通用户视图），并省略渠道数。
+pub async fn query_stats(
+    pool: &SqlitePool,
+    days: u64,
+    user_id: Option<i64>,
+) -> Result<Stats, StoreError> {
     let days = clamp_stats_days(Some(days));
     let now_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -745,22 +763,41 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
     let start_day = today.saturating_sub(days as i64 - 1);
     let from_created_at = start_day.saturating_mul(MS_PER_DAY);
 
-    let summary_row = sqlx::query(
+    let summary_sql = format!(
         "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS success_count, \
          COALESCE(SUM(input_tokens), 0) AS input_tokens, \
          COALESCE(SUM(output_tokens), 0) AS output_tokens, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros \
-         FROM request_log WHERE created_at >= ?",
-    )
-    .bind(from_created_at)
-    .fetch_one(pool)
-    .await
-    .map_err(StoreError::Query)?;
+         FROM request_log WHERE created_at >= ?{}",
+        user_scope_clause(user_id)
+    );
+    let mut summary_query = sqlx::query(AssertSqlSafe(summary_sql)).bind(from_created_at);
+    if let Some(user_id) = user_id {
+        summary_query = summary_query.bind(user_id);
+    }
+    let summary_row = summary_query
+        .fetch_one(pool)
+        .await
+        .map_err(StoreError::Query)?;
 
-    let token_count = count_rows(pool, "SELECT COUNT(*) AS cnt FROM tokens").await?;
-    let channel_count = count_rows(pool, "SELECT COUNT(*) AS cnt FROM channels").await?;
+    let token_count = match user_id {
+        Some(user_id) => {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await
+                .map_err(StoreError::Query)?;
+            as_count(count)
+        }
+        None => count_rows(pool, "SELECT COUNT(*) AS cnt FROM tokens").await?,
+    };
+    // 渠道数只在全局视图给出：普通用户看不到渠道，也不需要知道有多少条。
+    let channel_count = match user_id {
+        Some(_) => None,
+        None => Some(count_rows(pool, "SELECT COUNT(*) AS cnt FROM channels").await?),
+    };
 
     let summary = StatsSummary {
         request_count: as_count(
@@ -791,12 +828,13 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
     };
 
     let daily = if days == 1 {
-        query_hourly_buckets(pool, from_created_at).await?
+        query_hourly_buckets(pool, from_created_at, user_id).await?
     } else {
-        query_daily_buckets(pool, from_created_at, days).await?
+        query_daily_buckets(pool, from_created_at, days, user_id).await?
     };
-    let by_model = query_cost_share(pool, from_created_at, CostDimension::Model).await?;
-    let by_channel = query_cost_share(pool, from_created_at, CostDimension::Channel).await?;
+    let by_model = query_cost_share(pool, from_created_at, CostDimension::Model, user_id).await?;
+    let by_channel =
+        query_cost_share(pool, from_created_at, CostDimension::Channel, user_id).await?;
 
     Ok(Stats {
         summary,
@@ -807,18 +845,26 @@ pub async fn query_stats(pool: &SqlitePool, days: u64) -> Result<Stats, StoreErr
 }
 
 /// 全量累计：请求数、成功结算费用、四分量 token 合计。
-pub async fn query_lifetime_stats(pool: &SqlitePool) -> Result<LifetimeStats, StoreError> {
-    let row = sqlx::query(
+///
+/// `user_id` 为 `Some` 时只累计该用户名下的流量。
+pub async fn query_lifetime_stats(
+    pool: &SqlitePool,
+    user_id: Option<i64>,
+) -> Result<LifetimeStats, StoreError> {
+    let sql = format!(
         "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
          COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
            AS total_tokens \
-         FROM request_log",
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(StoreError::Query)?;
+         FROM request_log{}",
+        lifetime_user_scope_clause(user_id)
+    );
+    let mut query = sqlx::query(AssertSqlSafe(sql));
+    if let Some(user_id) = user_id {
+        query = query.bind(user_id);
+    }
+    let row = query.fetch_one(pool).await.map_err(StoreError::Query)?;
 
     Ok(LifetimeStats {
         request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
@@ -842,8 +888,9 @@ fn trend_bucket(row: &sqlx::sqlite::SqliteRow) -> Result<DailyBucket, StoreError
 async fn query_hourly_buckets(
     pool: &SqlitePool,
     from_created_at: i64,
+    user_id: Option<i64>,
 ) -> Result<Vec<DailyBucket>, StoreError> {
-    let rows = sqlx::query(
+    let sql = format!(
         "WITH RECURSIVE calendar(ts, n) AS ( \
             SELECT datetime(? / 1000, 'unixepoch') AS ts, 1 AS n \
             UNION ALL \
@@ -862,17 +909,20 @@ async fn query_hourly_buckets(
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
                         THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
-            FROM request_log WHERE created_at >= ? \
+            FROM request_log WHERE created_at >= ?{} \
             GROUP BY hour \
          ) agg ON agg.hour = strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) \
          ORDER BY calendar.ts",
-    )
-    .bind(from_created_at)
-    .bind(HOURS_PER_DAY)
-    .bind(from_created_at)
-    .fetch_all(pool)
-    .await
-    .map_err(StoreError::Query)?;
+        user_scope_clause(user_id)
+    );
+    let mut query = sqlx::query(AssertSqlSafe(sql))
+        .bind(from_created_at)
+        .bind(HOURS_PER_DAY)
+        .bind(from_created_at);
+    if let Some(user_id) = user_id {
+        query = query.bind(user_id);
+    }
+    let rows = query.fetch_all(pool).await.map_err(StoreError::Query)?;
 
     rows.iter().map(trend_bucket).collect()
 }
@@ -882,8 +932,9 @@ async fn query_daily_buckets(
     pool: &SqlitePool,
     from_created_at: i64,
     days: u64,
+    user_id: Option<i64>,
 ) -> Result<Vec<DailyBucket>, StoreError> {
-    let rows = sqlx::query(
+    let sql = format!(
         "WITH RECURSIVE calendar(day, n) AS ( \
             SELECT date(? / 1000, 'unixepoch') AS day, 1 AS n \
             UNION ALL \
@@ -902,17 +953,20 @@ async fn query_daily_buckets(
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
                         THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
-            FROM request_log WHERE created_at >= ? \
+            FROM request_log WHERE created_at >= ?{} \
             GROUP BY day \
          ) agg ON agg.day = calendar.day \
          ORDER BY calendar.day",
-    )
-    .bind(from_created_at)
-    .bind(days as i64)
-    .bind(from_created_at)
-    .fetch_all(pool)
-    .await
-    .map_err(StoreError::Query)?;
+        user_scope_clause(user_id)
+    );
+    let mut query = sqlx::query(AssertSqlSafe(sql))
+        .bind(from_created_at)
+        .bind(days as i64)
+        .bind(from_created_at);
+    if let Some(user_id) = user_id {
+        query = query.bind(user_id);
+    }
+    let rows = query.fetch_all(pool).await.map_err(StoreError::Query)?;
 
     rows.iter().map(trend_bucket).collect()
 }
@@ -928,30 +982,26 @@ async fn query_cost_share(
     pool: &SqlitePool,
     from_created_at: i64,
     dimension: CostDimension,
+    user_id: Option<i64>,
 ) -> Result<Vec<CostShare>, StoreError> {
-    let sql = match dimension {
-        CostDimension::Model => {
-            "SELECT model AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-               AS cost_usd_micros \
-             FROM request_log WHERE created_at >= ? \
-             GROUP BY model \
-             ORDER BY cost_usd_micros DESC, name ASC"
-        }
-        CostDimension::Channel => {
-            "SELECT channel AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-             COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-               AS cost_usd_micros \
-             FROM request_log WHERE created_at >= ? \
-             GROUP BY channel \
-             ORDER BY cost_usd_micros DESC, name ASC"
-        }
+    let column = match dimension {
+        CostDimension::Model => "model",
+        CostDimension::Channel => "channel",
     };
-    let rows = sqlx::query(sql)
-        .bind(from_created_at)
-        .fetch_all(pool)
-        .await
-        .map_err(StoreError::Query)?;
+    let sql = format!(
+        "SELECT {column} AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
+           AS cost_usd_micros \
+         FROM request_log WHERE created_at >= ?{} \
+         GROUP BY {column} \
+         ORDER BY cost_usd_micros DESC, name ASC",
+        user_scope_clause(user_id)
+    );
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(from_created_at);
+    if let Some(user_id) = user_id {
+        query = query.bind(user_id);
+    }
+    let rows = query.fetch_all(pool).await.map_err(StoreError::Query)?;
 
     let mut shares = Vec::with_capacity(rows.len());
     for row in rows {
@@ -977,6 +1027,27 @@ async fn count_rows(pool: &SqlitePool, sql: &'static str) -> Result<u64, StoreEr
 /// SQLite 聚合整数转计数；负值视为 0。
 pub(crate) fn as_count(value: i64) -> u64 {
     value.max(0) as u64
+}
+
+/// 归属过滤片段，拼在已有 `WHERE` 之后；`Some` 时调用方须紧接着 bind 该 id。
+///
+/// 用拼接而非 `(? IS NULL OR user_id = ?)`：后者会让 SQLite 放弃
+/// `idx_request_log_user_id`，而归属视图正是最常走的那条路径。
+fn user_scope_clause(user_id: Option<i64>) -> &'static str {
+    if user_id.is_some() {
+        " AND user_id = ?"
+    } else {
+        ""
+    }
+}
+
+/// 同 [`user_scope_clause`]，但用于本身没有 `WHERE` 的查询。
+fn lifetime_user_scope_clause(user_id: Option<i64>) -> &'static str {
+    if user_id.is_some() {
+        " WHERE user_id = ?"
+    } else {
+        ""
+    }
 }
 
 /// 页码从 1 起，每页条数夹到 `[1, 200]`。请求日志与系统日志共用。
@@ -1052,6 +1123,10 @@ pub(crate) fn push_limit_offset(
 /// 把 `filter` 中非空条件以 AND 拼入 WHERE 子句。
 fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &RequestLogQuery) {
     let mut first = true;
+    if let Some(user_id) = filter.user_id {
+        push_where_cond(qb, &mut first, "user_id = ");
+        qb.push_bind(user_id);
+    }
     if let Some(token_key) = &filter.token_key {
         push_where_cond(qb, &mut first, "token_key = ");
         qb.push_bind(token_key);
@@ -1162,6 +1237,7 @@ fn map_request_log_row(
         created_at: row.try_get("created_at").map_err(StoreError::Query)?,
         token_name: row.try_get("token_name").map_err(StoreError::Query)?,
         token_key: row.try_get("token_key").map_err(StoreError::Query)?,
+        user_id: row.try_get("user_id").map_err(StoreError::Query)?,
         inbound_protocol: row.try_get("inbound_protocol").map_err(StoreError::Query)?,
         model: row.try_get("model").map_err(StoreError::Query)?,
         outbound_model: row.try_get("outbound_model").map_err(StoreError::Query)?,
@@ -1721,6 +1797,7 @@ mod tests {
                     created_at: 1000 + i as i64,
                     token_name: format!("t{i}"),
                     token_key: "sk-a".to_string(),
+                    user_id: resources::ROOT_USER_ID,
                     inbound_protocol: "openai_chat".to_string(),
                     model: model.to_string(),
                     outbound_model: None,
@@ -1836,6 +1913,7 @@ mod tests {
                     created_at: 2000 + i as i64,
                     token_name: (*token_name).to_string(),
                     token_key: (*token_key).to_string(),
+                    user_id: resources::ROOT_USER_ID,
                     inbound_protocol: "openai_chat".to_string(),
                     model: (*model).to_string(),
                     outbound_model: None,
@@ -1918,6 +1996,7 @@ mod tests {
                     created_at: 3000 + i as i64,
                     token_name: (*token_name).to_string(),
                     token_key: (*token_key).to_string(),
+                    user_id: resources::ROOT_USER_ID,
                     inbound_protocol: "openai_chat".to_string(),
                     model: (*model).to_string(),
                     outbound_model: None,
@@ -1974,6 +2053,7 @@ mod tests {
                 created_at: 1,
                 token_name: "t".to_string(),
                 token_key: "sk-a".to_string(),
+                user_id: resources::ROOT_USER_ID,
                 inbound_protocol: "openai_chat".to_string(),
                 model: "cached".to_string(),
                 outbound_model: None,
@@ -2001,6 +2081,7 @@ mod tests {
                 created_at: 2,
                 token_name: "t".to_string(),
                 token_key: "sk-a".to_string(),
+                user_id: resources::ROOT_USER_ID,
                 inbound_protocol: "openai_chat".to_string(),
                 model: "heavy".to_string(),
                 outbound_model: None,
@@ -2054,6 +2135,7 @@ mod tests {
                 created_at: 1000,
                 token_name: "t".to_string(),
                 token_key: "sk-a".to_string(),
+                user_id: resources::ROOT_USER_ID,
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
@@ -2116,6 +2198,7 @@ mod tests {
                 created_at: 2,
                 token_name: "t".to_string(),
                 token_key: "sk-a".to_string(),
+                user_id: resources::ROOT_USER_ID,
                 inbound_protocol: "openai_chat".to_string(),
                 model: "fast".to_string(),
                 outbound_model: Some("gpt-4o-mini".to_string()),
@@ -2174,6 +2257,7 @@ mod tests {
                 created_at: 1,
                 token_name: "t".to_string(),
                 token_key: "sk-a".to_string(),
+                user_id: resources::ROOT_USER_ID,
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
@@ -2201,6 +2285,7 @@ mod tests {
                 created_at: 2,
                 token_name: "t".to_string(),
                 token_key: "sk-a".to_string(),
+                user_id: resources::ROOT_USER_ID,
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
@@ -2222,7 +2307,7 @@ mod tests {
         .await
         .expect("应能写已结算日志");
 
-        let lifetime = query_lifetime_stats(&pool).await.expect("应能聚合");
+        let lifetime = query_lifetime_stats(&pool, None).await.expect("应能聚合");
         assert_eq!(lifetime.cost_usd_micros, 100, "未结算费用不应计入");
     }
 
@@ -2232,6 +2317,7 @@ mod tests {
             created_at,
             token_name: "t".to_string(),
             token_key: "sk-a".to_string(),
+            user_id: resources::ROOT_USER_ID,
             inbound_protocol: "openai_chat".to_string(),
             model: "m".to_string(),
             outbound_model: None,
@@ -2270,7 +2356,7 @@ mod tests {
             .await
             .expect("应能写无 id 存量行");
 
-        let lifetime = query_lifetime_stats(&pool).await.expect("应能聚合");
+        let lifetime = query_lifetime_stats(&pool, None).await.expect("应能聚合");
         assert_eq!(
             lifetime.request_count, 2,
             "共享 request_id 的两跳计 1，加上一条存量"

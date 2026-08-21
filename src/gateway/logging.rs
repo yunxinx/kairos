@@ -92,6 +92,7 @@ pub(super) async fn log_request(
         created_at: now,
         token_name: token.name.clone(),
         token_key: token.token_key.clone(),
+        user_id: token.user_id,
         inbound_protocol: protocol_name(inbound_protocol).to_string(),
         model: model.to_string(),
         outbound_model: outbound_model.map(str::to_string),

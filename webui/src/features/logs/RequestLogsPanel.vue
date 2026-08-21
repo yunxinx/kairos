@@ -5,6 +5,7 @@ import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import {
   PROTOCOLS,
+  roleAtLeast,
   type LogEntry,
   type LogQuery,
   type RequestLogSortBy,
@@ -34,6 +35,7 @@ import { useLogListControls } from '@/features/logs/useLogListControls';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
+import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent } from '@/lib/window-anchor';
 
 type RequestLogWindowPayload = {
@@ -78,6 +80,13 @@ const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
 
 const { t } = useI18n();
 const { error, success } = useToast();
+const me = useCurrentUser();
+
+/** 补扣/豁免是计费操作，后端要求 admin+；普通用户不渲染入口。 */
+const canSettleLogs = computed(() => {
+  const role = me.value?.role;
+  return role !== undefined && roleAtLeast(role, 'admin');
+});
 const queryClient = useQueryClient();
 
 const {
@@ -610,6 +619,7 @@ function onFilterToken(tokenName: string) {
         :detail-loading="detailLoading.has(win.payload.entry.id)"
         :detail-error="detailErrors.get(win.payload.entry.id) ?? ''"
         :closing="closingId === win.payload.entry.id"
+        :can-settle="canSettleLogs"
         :channel-protocol-map="channelProtocolMap"
         :anchor="win.anchor"
         :stack-order="win.z"

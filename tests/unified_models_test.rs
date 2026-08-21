@@ -424,7 +424,7 @@ async fn ordered_failover_tries_one_member_at_a_time() {
     assert!(rows[0].1.is_some(), "新日志应有 request_id");
     assert_eq!(rows[0].1, rows[1].1, "同一下游请求的 hop 共用 request_id");
 
-    let lifetime = kairos::store::query_lifetime_stats(&gw.pool)
+    let lifetime = kairos::store::query_lifetime_stats(&gw.pool, None)
         .await
         .expect("应能聚合");
     assert_eq!(

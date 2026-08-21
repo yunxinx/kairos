@@ -41,11 +41,14 @@ const tokenTotal = computed(() => {
                 formatCount(summary.token_count, locale)
               }}</span>
               {{ t('overview.tokenCount') }}
-              <span aria-hidden="true"> · </span>
-              <span data-testid="overview-channel-count">{{
-                formatCount(summary.channel_count, locale)
-              }}</span>
-              {{ t('overview.channelCount') }}
+              <!-- 渠道数只在运营视图返回：普通用户看不到渠道，这一段整体省略。 -->
+              <template v-if="summary.channel_count !== undefined">
+                <span aria-hidden="true"> · </span>
+                <span data-testid="overview-channel-count">{{
+                  formatCount(summary.channel_count, locale)
+                }}</span>
+                {{ t('overview.channelCount') }}
+              </template>
             </div>
             <SkeletonBlock v-else height="h-3" width="w-32" />
           </div>

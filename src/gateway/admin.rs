@@ -126,7 +126,13 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
             "/users/{id}/model-groups",
             get(get_user_model_groups).put(replace_user_model_groups),
         )
+        .route("/logs/{id}/settle", post(settle_log))
+        .route("/logs/{id}/waive", post(waive_log))
+        .route("/system-logs", get(query_system_logs))
         .route_layer(middleware::from_fn(require_admin));
+    // 此层等于「所有登录用户可见」。在这里新增端点前必须先回答：它是否要按归属
+    // 收窄？需要收窄的（日志、统计）由处理器用 `owner_scope` 注入 user_id；
+    // 与归属无关的运营端点应放进 `admin_plus` / `root_only`，而不是留在这里。
     let signed_in = Router::new()
         .route("/tokens", get(list_tokens).post(create_token))
         .route(
@@ -136,9 +142,6 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
         .route("/tokens/{token_key}/balance", post(adjust_token_balance))
         .route("/logs", get(query_logs))
         .route("/logs/{id}", get(get_log))
-        .route("/logs/{id}/settle", post(settle_log))
-        .route("/logs/{id}/waive", post(waive_log))
-        .route("/system-logs", get(query_system_logs))
         .route("/stats", get(get_stats))
         .route("/stats/lifetime", get(get_lifetime_stats))
         .route("/me", get(get_me).put(update_me))
@@ -181,6 +184,18 @@ impl ManagementIdentity {
 
     fn user_id(&self) -> i64 {
         self.user.id
+    }
+
+    /// 只读聚合与日志查询的归属范围：普通用户钉自己，admin/root 不限。
+    ///
+    /// ADR-0009 给 `user` 的可见面只有「自己的令牌、余额与用量」；日志与统计
+    /// 都必须过这道收窄，否则登录即可读到全站流量与他人对话 body。
+    fn owner_scope(&self) -> Option<i64> {
+        if self.role().at_least(ManagementRole::Admin) {
+            None
+        } else {
+            Some(self.user_id())
+        }
     }
 }
 
@@ -1801,6 +1816,7 @@ struct LogPage {
 /// `page`/`page_size` 反映实际采用值。非法查询参数（如非数字页码）返回结构化 400。
 async fn query_logs(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<LogQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<LogPage>, AdminError> {
     let params = query
@@ -1808,6 +1824,8 @@ async fn query_logs(
         .0;
     let mut filter =
         store::RequestLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
+    // 归属范围由会话身份决定，不接受查询参数覆盖：普通用户改不了自己的可见面。
+    filter.user_id = identity.owner_scope();
     filter.token_key = params.token_key;
     filter.token_name = params.token_name;
     filter.model = params.model;
@@ -1832,15 +1850,24 @@ async fn query_logs(
     }))
 }
 
-/// 按 id 读取一条请求日志（含 body）。不存在或 id 非法返回 404。
+/// 按 id 读取一条请求日志（含 body）。不存在、id 非法或不属于本人一律 404。
+///
+/// 越权按「不存在」而非 403 应答：403 会确认该 id 存在，让普通用户能靠遍历 id
+/// 摸出全站的流量规模。
 async fn get_log(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(raw): Path<String>,
 ) -> Result<Json<LogEntry>, AdminError> {
     let id = parse_log_id(&raw)?;
     let log = store::get_request_log(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
+        .filter(|log| {
+            identity
+                .owner_scope()
+                .is_none_or(|owner| owner == log.user_id)
+        })
         .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
     Ok(Json(LogEntry::from_store_log(log)))
 }
@@ -1854,26 +1881,48 @@ fn parse_log_id(raw: &str) -> Result<i64, AdminError> {
 /// 对未结算日志补扣：按行上费用写入余额（允许透支），再标为已结算。
 async fn settle_log(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(raw): Path<String>,
 ) -> Result<Json<LogEntry>, AdminError> {
-    close_unsettled_log(&deps, &raw, true).await
+    close_unsettled_log(&deps, &identity, &raw, true).await
 }
 
 /// 豁免未结算日志：只翻 `settled`，不改余额。
 async fn waive_log(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(raw): Path<String>,
 ) -> Result<Json<LogEntry>, AdminError> {
-    close_unsettled_log(&deps, &raw, false).await
+    close_unsettled_log(&deps, &identity, &raw, false).await
 }
 
 /// 未结算闭环：`charge` 为 true 时补扣，否则豁免。
+///
+/// 路由层已要求 admin+；这里再按日志归属用户过一次 [`reject_user_management`]，
+/// 使 admin 只能处理普通用户的行，不能动 root/其他 admin 的账。
 async fn close_unsettled_log(
     deps: &AdminDeps,
+    identity: &ManagementIdentity,
     raw: &str,
     charge: bool,
 ) -> Result<Json<LogEntry>, AdminError> {
     let id = parse_log_id(raw)?;
+    let log = store::get_request_log(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
+    // 存量行的 user_id 为 0（迁移前无归属），此时无从判定越权，只允许 root 处理。
+    if log.user_id == 0 {
+        if identity.role() != ManagementRole::Root {
+            return Err(AdminError::Forbidden);
+        }
+    } else {
+        let owner = users::get_user(&deps.pool, log.user_id)
+            .await
+            .map_err(AdminError::Store)?
+            .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", log.user_id)))?;
+        reject_user_management(identity, &owner, None)?;
+    }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     let outcome = if charge {
         store::settle_unsettled_log(&mut tx, id).await
@@ -1990,8 +2039,11 @@ struct StatsSummaryView {
     input_tokens: u64,
     output_tokens: u64,
     cost_usd_micros: i64,
+    /// 令牌数：全局视图为全部，归属视图只数本人的。
     token_count: u64,
-    channel_count: u64,
+    /// 出站渠道数；归属视图整键省略（渠道属运营视角，普通用户不可见）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_count: Option<u64>,
 }
 
 /// 逐日序列点 wire 契约。
@@ -2032,13 +2084,14 @@ struct StatsView {
 /// 只读聚合：时间窗内请求量/token/费用与分布。非法 `days`（非数字）返回 400。
 async fn get_stats(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<StatsQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<StatsView>, AdminError> {
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
     let days = store::clamp_stats_days(params.days);
-    let stats = store::query_stats(&deps.pool, days)
+    let stats = store::query_stats(&deps.pool, days, identity.owner_scope())
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(StatsView {
@@ -2099,8 +2152,9 @@ struct LifetimeStatsView {
 /// 只读全量累计：请求数 / 成功结算费用 / 四分量 token 合计。
 async fn get_lifetime_stats(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<LifetimeStatsView>, AdminError> {
-    let stats = store::query_lifetime_stats(&deps.pool)
+    let stats = store::query_lifetime_stats(&deps.pool, identity.owner_scope())
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(LifetimeStatsView {

@@ -410,7 +410,8 @@ export interface StatsSummary {
   output_tokens: number;
   cost_usd_micros: number;
   token_count: number;
-  channel_count: number;
+  /** 出站渠道数；普通用户视图后端整键省略（渠道属运营视角）。 */
+  channel_count?: number;
 }
 
 /** `/stats` 趋势点。`date` 在 `days=1` 时为 UTC 小时 `YYYY-MM-DDTHH:00:00Z`，否则为日历日 `YYYY-MM-DD`。 */

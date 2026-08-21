@@ -872,39 +872,53 @@ pub struct UserStatsRecord {
 }
 
 /// 批量查出所有用户的聚合统计（按 user_id 汇总）。
+///
+/// 用量按 `request_log.user_id` 聚合而非 JOIN `tokens`：令牌删除后历史用量仍归属该
+/// 用户。`last_used_at` 仍取自现存令牌——它是「当前凭证的活跃度」，删掉的令牌不该
+/// 继续把用户显示为活跃。
 pub async fn list_users_stats(
     pool: &SqlitePool,
 ) -> Result<std::collections::HashMap<i64, UserStatsRecord>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT t.user_id, \
-                COUNT(DISTINCT COALESCE(l.request_id, CAST(l.id AS TEXT))) AS request_count, \
-                COALESCE(SUM(l.input_tokens), 0) AS input_tokens, \
-                COALESCE(SUM(l.output_tokens), 0) AS output_tokens, \
-                MAX(t.last_used_at) AS last_used_at \
-         FROM tokens t \
-         LEFT JOIN request_log l ON l.token_key = t.token_key \
-         GROUP BY t.user_id",
+    let usage_rows = sqlx::query(
+        "SELECT user_id, \
+                COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
+                COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                COALESCE(SUM(output_tokens), 0) AS output_tokens \
+         FROM request_log \
+         GROUP BY user_id",
     )
     .fetch_all(pool)
     .await
     .map_err(StoreError::Query)?;
 
-    let mut map = std::collections::HashMap::with_capacity(rows.len());
-    for row in rows {
+    let mut map: std::collections::HashMap<i64, UserStatsRecord> =
+        std::collections::HashMap::with_capacity(usage_rows.len());
+    for row in usage_rows {
         let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
         let request_count: i64 = row.try_get("request_count").map_err(StoreError::Query)?;
         let input_tokens: i64 = row.try_get("input_tokens").map_err(StoreError::Query)?;
         let output_tokens: i64 = row.try_get("output_tokens").map_err(StoreError::Query)?;
-        let last_used_at: Option<i64> = row.try_get("last_used_at").map_err(StoreError::Query)?;
         map.insert(
             user_id,
             UserStatsRecord {
                 request_count: request_count.max(0) as u64,
                 input_tokens: input_tokens.max(0) as u64,
                 output_tokens: output_tokens.max(0) as u64,
-                last_used_at,
+                last_used_at: None,
             },
         );
+    }
+
+    let last_used_rows = sqlx::query(
+        "SELECT user_id, MAX(last_used_at) AS last_used_at FROM tokens GROUP BY user_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    for row in last_used_rows {
+        let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
+        let last_used_at: Option<i64> = row.try_get("last_used_at").map_err(StoreError::Query)?;
+        map.entry(user_id).or_default().last_used_at = last_used_at;
     }
     Ok(map)
 }
@@ -914,27 +928,27 @@ pub async fn get_user_stats(
     pool: &SqlitePool,
     user_id: i64,
 ) -> Result<UserStatsRecord, StoreError> {
-    let row = sqlx::query(
-        "SELECT COUNT(DISTINCT COALESCE(l.request_id, CAST(l.id AS TEXT))) AS request_count, \
-                COALESCE(SUM(l.input_tokens), 0) AS input_tokens, \
-                COALESCE(SUM(l.output_tokens), 0) AS output_tokens, \
-                MAX(t.last_used_at) AS last_used_at \
-         FROM tokens t \
-         LEFT JOIN request_log l ON l.token_key = t.token_key \
-         WHERE t.user_id = ?",
+    let usage = sqlx::query(
+        "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
+                COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                COALESCE(SUM(output_tokens), 0) AS output_tokens \
+         FROM request_log WHERE user_id = ?",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await
     .map_err(StoreError::Query)?;
+    let request_count: i64 = usage.try_get("request_count").map_err(StoreError::Query)?;
+    let input_tokens: i64 = usage.try_get("input_tokens").map_err(StoreError::Query)?;
+    let output_tokens: i64 = usage.try_get("output_tokens").map_err(StoreError::Query)?;
 
-    let Some(row) = row else {
-        return Ok(UserStatsRecord::default());
-    };
-    let request_count: i64 = row.try_get("request_count").map_err(StoreError::Query)?;
-    let input_tokens: i64 = row.try_get("input_tokens").map_err(StoreError::Query)?;
-    let output_tokens: i64 = row.try_get("output_tokens").map_err(StoreError::Query)?;
-    let last_used_at: Option<i64> = row.try_get("last_used_at").map_err(StoreError::Query)?;
+    let last_used_at: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(last_used_at) FROM tokens WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .map_err(StoreError::Query)?;
+
     Ok(UserStatsRecord {
         request_count: request_count.max(0) as u64,
         input_tokens: input_tokens.max(0) as u64,

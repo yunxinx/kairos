@@ -25,6 +25,8 @@ const props = withDefaults(
     detailLoading?: boolean;
     detailError?: string;
     closing?: boolean;
+    /** 是否显示补扣/豁免入口。后端要求 admin+，普通用户点了只会拿到 403。 */
+    canSettle?: boolean;
     channelProtocolMap?: Map<string, string> | null;
     anchor?: FloatingWindowAnchor | null;
     stackOrder?: number;
@@ -37,6 +39,7 @@ const props = withDefaults(
     detailLoading: false,
     detailError: '',
     closing: false,
+    canSettle: false,
     channelProtocolMap: null,
     anchor: null,
     stackOrder: 0,
@@ -341,7 +344,7 @@ const calculationSteps = computed(() => {
           </div>
 
           <div
-            v-if="!entry.settled"
+            v-if="!entry.settled && canSettle"
             class="mt-3 flex flex-wrap items-center gap-2 border-t border-[var(--seed-border)] pt-2.5"
             data-testid="log-unsettled-actions"
           >
