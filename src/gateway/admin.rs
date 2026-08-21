@@ -135,11 +135,8 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
     // 与归属无关的运营端点应放进 `admin_plus` / `root_only`，而不是留在这里。
     let signed_in = Router::new()
         .route("/tokens", get(list_tokens).post(create_token))
-        .route(
-            "/tokens/{token_key}",
-            put(update_token).delete(delete_token),
-        )
-        .route("/tokens/{token_key}/balance", post(adjust_token_balance))
+        .route("/tokens/{id}", put(update_token).delete(delete_token))
+        .route("/tokens/{id}/balance", post(adjust_token_balance))
         .route("/logs", get(query_logs))
         .route("/logs/{id}", get(get_log))
         .route("/stats", get(get_stats))
@@ -756,7 +753,7 @@ async fn list_user_tokens(
         .await
         .map_err(AdminError::Store)?;
     records.retain(|record| record.token.user_id == id);
-    records.sort_by(|a, b| a.token.token_key.cmp(&b.token.token_key));
+    records.sort_by_key(|record| record.id);
     let settled = store::list_token_settled(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -765,7 +762,8 @@ async fn list_user_tokens(
             .into_iter()
             .map(|record| {
                 let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
-                TokenView::from_record(record, amount)
+                // 他人令牌的 key 脱敏：运营按 id 操作，不需要明文。
+                TokenView::from_record_masked(record, amount)
             })
             .collect(),
     ))
@@ -845,6 +843,8 @@ fn map_user_store_err(err: StoreError) -> AdminError {
 /// 令牌读响应 wire 契约：定义字段 + 生命周期元数据 + 该令牌累计结算（写契约仍是 `Token`）。
 #[derive(Debug, Serialize)]
 struct TokenView {
+    /// 库生成的稳定身份；管理面以此定位令牌。
+    id: i64,
     token_key: String,
     name: String,
     limit_usd_micros: Option<i64>,
@@ -857,9 +857,10 @@ struct TokenView {
 }
 
 impl TokenView {
-    /// 从存储层记录构造 wire 视图。
+    /// 从存储层记录构造 wire 视图。key 明文，仅供令牌所有者读取。
     fn from_record(record: store::resources::TokenRecord, settled_usd_micros: i64) -> Self {
         Self {
+            id: record.id,
             token_key: record.token.token_key,
             name: record.token.name,
             limit_usd_micros: record.token.limit_usd_micros,
@@ -870,6 +871,17 @@ impl TokenView {
             last_used_at: record.last_used_at,
             settled_usd_micros,
         }
+    }
+
+    /// 同上，但 key 脱敏，供运营查看他人令牌。
+    ///
+    /// ADR-0009 给 admin 的权限是「可禁用普通用户的令牌」——禁用只需要标识，
+    /// 不需要明文。返回明文等于让 admin 能拿别人的 key 发下游请求、花别人的余额。
+    fn from_record_masked(record: store::resources::TokenRecord, settled_usd_micros: i64) -> Self {
+        let masked = mask_token_key(&record.token.token_key);
+        let mut view = Self::from_record(record, settled_usd_micros);
+        view.token_key = masked;
+        view
     }
 }
 
@@ -883,7 +895,7 @@ async fn token_view(
     Ok(TokenView::from_record(record, settled))
 }
 
-/// 列出当前用户的令牌（按 `token_key` 排序，保证确定性）。
+/// 列出当前用户的令牌（按库生成 id 排序，保证确定性）。
 ///
 /// 直接读库而非快照：`last_used_at` 随请求路径刷新、不进快照，列表需要库内最新值。
 /// 他人令牌经 `GET /users/{id}/tokens`。
@@ -895,7 +907,7 @@ async fn list_tokens(
         .await
         .map_err(AdminError::Store)?;
     records.retain(|record| record.token.user_id == identity.user_id());
-    records.sort_by(|a, b| a.token.token_key.cmp(&b.token.token_key));
+    records.sort_by_key(|record| record.id);
     let settled = store::list_token_settled(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -974,7 +986,7 @@ async fn create_token(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    let created = read_token_record(&deps, &token.token_key).await?;
+    let created = read_token_record_by_key(&deps, &token.token_key).await?;
     Ok((
         StatusCode::CREATED,
         Json(token_view(&deps.pool, created).await?),
@@ -988,14 +1000,16 @@ async fn create_token(
 async fn update_token(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
-    Path(token_key): Path<String>,
+    Path(raw_id): Path<String>,
     body: Result<Json<Token>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TokenView>, AdminError> {
+    let id = parse_token_id(&raw_id)?;
     let mut token = body.map_err(AdminError::bad_body)?.0;
-    token.token_key = token_key;
+    let existing = read_token_record(&deps, id).await?;
+    // key 由库内记录权威给出：请求体里的 `token_key`（含脱敏形态）一律忽略，
+    // 免得运营把界面上看到的掩码当真值写回来、把密钥改坏。
+    token.token_key = existing.token.token_key.clone();
     token.model_group = token.model_group.trim().to_string();
-    reject_token_key_shape(&token)?;
-    let existing = read_token_record(&deps, &token.token_key).await?;
     reject_token_mutation(&deps, &identity, &existing, Some(&token)).await?;
     if existing.token.user_id == identity.user_id() {
         validate_token(&token)?;
@@ -1008,7 +1022,7 @@ async fn update_token(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    let updated = read_token_record(&deps, &token.token_key).await?;
+    let updated = read_token_record(&deps, id).await?;
     Ok(Json(token_view(&deps.pool, updated).await?))
 }
 
@@ -1020,15 +1034,16 @@ async fn update_token(
 async fn delete_token(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
-    Path(token_key): Path<String>,
+    Path(raw_id): Path<String>,
 ) -> Result<Json<TokenView>, AdminError> {
-    let deleted = read_token_record(&deps, &token_key).await?;
+    let id = parse_token_id(&raw_id)?;
+    let deleted = read_token_record(&deps, id).await?;
     reject_token_mutation(&deps, &identity, &deleted, None).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    crate::store::delete_token_balance(&mut tx, &token_key)
+    crate::store::delete_token_balance(&mut tx, &deleted.token.token_key)
         .await
         .map_err(AdminError::Store)?;
-    crate::store::resources::delete_token(&mut tx, &token_key)
+    crate::store::resources::delete_token(&mut tx, id)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
@@ -1665,7 +1680,7 @@ struct BalanceAdjustment {
 /// 余额视图 wire 契约：调整后余额与累计结算额。
 #[derive(Debug, Serialize)]
 struct BalanceView {
-    token_key: String,
+    token_id: i64,
     balance_usd_micros: i64,
     settled_usd_micros: i64,
 }
@@ -1677,27 +1692,29 @@ struct BalanceView {
 async fn adjust_token_balance(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
-    Path(token_key): Path<String>,
+    Path(raw_id): Path<String>,
     body: Result<Json<BalanceAdjustment>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<BalanceView>, AdminError> {
     if !identity.role().at_least(ManagementRole::Admin) {
         return Err(AdminError::Forbidden);
     }
+    let id = parse_token_id(&raw_id)?;
     let adjustment = body.map_err(AdminError::bad_body)?;
-    let existing = read_token_record(&deps, &token_key).await?;
+    let existing = read_token_record(&deps, id).await?;
     let owner = users::get_user(&deps.pool, existing.token.user_id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", existing.token.user_id)))?;
     reject_user_management(&identity, &owner, None)?;
+    let token_key = existing.token.token_key.clone();
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     // 存在性校验在事务内针对 tokens 表完成（与后续写持同一写锁），避免并发删除后
     // 仍写出一条孤儿余额行、被重建令牌复活。
-    if !crate::store::resources::token_exists(&mut tx, &token_key)
+    if !crate::store::resources::token_exists(&mut tx, id)
         .await
         .map_err(AdminError::Store)?
     {
-        return Err(AdminError::NotFound(format!("令牌 {token_key} 不存在")));
+        return Err(AdminError::NotFound(format!("令牌 {id} 不存在")));
     }
     // 确保余额行存在（新建令牌已建零额行，此处防御已删余额行的边界），再原子调整。
     crate::store::ensure_token_balance(&mut tx, &token_key, 0.0, super::logging::unix_millis())
@@ -1708,7 +1725,7 @@ async fn adjust_token_balance(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     Ok(Json(BalanceView {
-        token_key,
+        token_id: id,
         balance_usd_micros: balance.balance_usd_micros,
         settled_usd_micros: balance.settled_usd_micros,
     }))
@@ -2471,15 +2488,32 @@ async fn reload_and_swap(deps: &AdminDeps) -> Result<(), AdminError> {
     Ok(())
 }
 
-/// 从库读回一条令牌记录；不存在返回 `NotFound`。
+/// 按库生成的 id 读回一条令牌记录；不存在返回 `NotFound`。
 async fn read_token_record(
+    deps: &AdminDeps,
+    id: i64,
+) -> Result<store::resources::TokenRecord, AdminError> {
+    store::resources::get_token_record(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))
+}
+
+/// 新建后按 key 回读：`create_token` 自己生成 key，尚不知道库发的 id。
+async fn read_token_record_by_key(
     deps: &AdminDeps,
     token_key: &str,
 ) -> Result<store::resources::TokenRecord, AdminError> {
-    store::resources::get_token_record(&deps.pool, token_key)
+    store::resources::get_token_record_by_key(&deps.pool, token_key)
         .await
         .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("令牌 {token_key} 不存在")))
+        .ok_or_else(|| AdminError::NotFound("令牌不存在".to_string()))
+}
+
+/// 解析路径中的令牌 id；非整数不标识任何令牌，按不存在处理（404）。
+fn parse_token_id(raw: &str) -> Result<i64, AdminError> {
+    raw.parse::<i64>()
+        .map_err(|_| AdminError::NotFound(format!("令牌 {raw} 不存在")))
 }
 
 /// 从当前快照按 id 读回一条渠道记录；不存在返回 `NotFound`。

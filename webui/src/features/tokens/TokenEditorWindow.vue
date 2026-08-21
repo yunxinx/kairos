@@ -135,14 +135,16 @@ const dirty = computed(
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
-/** 保存载荷：新建不带 key（系统生成），更新携带原 key。 */
-type SavePayload = { kind: 'create'; body: TokenCreate } | { kind: 'update'; body: Token };
+/** 保存载荷：新建由系统发 key，更新按库生成 id 定位。 */
+type SavePayload =
+  | { kind: 'create'; body: TokenCreate }
+  | { kind: 'update'; id: number; body: Token };
 
 const saveMutation = useMutation({
   mutationFn: (payload: SavePayload) =>
     payload.kind === 'create'
       ? apiClient.createToken(payload.body)
-      : apiClient.updateToken(payload.body.token_key, payload.body),
+      : apiClient.updateToken(payload.id, payload.body),
   onSuccess: async () => {
     // 余额变更随保存一同生效：定义保存成功后，有差额才调用余额接口。
     const delta = props.initial === null || !canAdjustBalance.value ? 0 : balanceDelta();
@@ -160,7 +162,7 @@ const saveMutation = useMutation({
 
 const balanceMutation = useMutation({
   mutationFn: (delta: number) =>
-    apiClient.adjustTokenBalance(props.initial?.token_key ?? '', { delta_usd_micros: delta }),
+    apiClient.adjustTokenBalance(props.initial?.id ?? 0, { delta_usd_micros: delta }),
   onSuccess: async () => {
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
@@ -218,6 +220,7 @@ function handleSave() {
   } else {
     saveMutation.mutate({
       kind: 'update',
+      id: props.initial.id,
       body: {
         token_key: initialKey,
         name,

@@ -39,8 +39,10 @@ export interface Token {
 /** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */
 export type TokenCreate = Omit<Token, 'token_key'>;
 
-/** 令牌读响应：写契约字段 + 生命周期元数据 + 该令牌累计结算。 */
+/** 令牌读响应：库生成身份 + 写契约字段 + 生命周期元数据 + 该令牌累计结算。 */
 export interface TokenView extends Token {
+  /** 库生成的稳定身份；管理面按它定位令牌。 */
+  id: number;
   /** 创建时刻（unix 毫秒）。 */
   created_at: number;
   /** 最后使用时刻（unix 毫秒）；null 表示从未使用。 */
@@ -215,7 +217,7 @@ export interface BalanceAdjustment {
 
 /** 余额视图。 */
 export interface BalanceView {
-  token_key: string;
+  token_id: number;
   balance_usd_micros: number;
   settled_usd_micros: number;
 }

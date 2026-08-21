@@ -150,11 +150,12 @@ async fn assigned_groups_gate_create_rebind_and_requests() {
     assert_eq!(token_resp.status(), StatusCode::CREATED);
     let token: Value = token_resp.json().await.expect("令牌应可解析");
     let key = token["token_key"].as_str().expect("应有 key").to_string();
+    let token_row_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/tokens/{key}/balance"),
+        &format!("/tokens/{token_row_id}/balance"),
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;
@@ -205,7 +206,7 @@ async fn assigned_groups_gate_create_rebind_and_requests() {
         &gw,
         &session,
         reqwest::Method::PUT,
-        &format!("/tokens/{key}"),
+        &format!("/tokens/{token_row_id}"),
         json!({
             "token_key": key,
             "name": "coder",

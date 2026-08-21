@@ -108,31 +108,31 @@ const filteredTokens = computed(() => {
 });
 
 // 行选择：全选只作用于当前可见行；被筛掉的已选行保留选择但不计入全选。
-const selection = useRowSelection<string>();
+const selection = useRowSelection<number>();
 
 const allVisibleSelected = computed({
   get: () =>
     filteredTokens.value.length > 0 &&
-    filteredTokens.value.every((token) => selection.isSelected(token.token_key)),
+    filteredTokens.value.every((token) => selection.isSelected(token.id)),
   set: (value) =>
     selection.setMany(
-      filteredTokens.value.map((token) => token.token_key),
+      filteredTokens.value.map((token) => token.id),
       value,
     ),
 });
 
 const someVisibleSelected = computed(() =>
-  filteredTokens.value.some((token) => selection.isSelected(token.token_key)),
+  filteredTokens.value.some((token) => selection.isSelected(token.id)),
 );
 
 // 删除或刷新后列表键变化，剔除幽灵选择。
-watch(tokens, (rows) => selection.prune(rows.map((row) => row.token_key)));
+watch(tokens, (rows) => selection.prune(rows.map((row) => row.id)));
 
-const bulkDelete = useBulkDelete<string>({
+const bulkDelete = useBulkDelete<number>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['tokens'],
-  deleteOne: (tokenKey) => apiClient.deleteToken(tokenKey),
+  deleteOne: (id) => apiClient.deleteToken(id),
 });
 
 // 相对时间随时间推移刷新：定时推进 now，避免「3 秒前」长期停留。
@@ -208,32 +208,32 @@ function formatCreated(millis: number): string {
 const deleteErrors = ref<Record<number, string>>({});
 
 const deleteMutation = useMutation({
-  mutationFn: (tokenKey: string) => apiClient.deleteToken(tokenKey),
-  onSuccess: async (_data, tokenKey) => {
+  mutationFn: (id: number) => apiClient.deleteToken(id),
+  onSuccess: async (_data, id) => {
     const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.token.token_key === tokenKey,
+      (item) => item.payload.kind === 'delete' && item.payload.token.id === id,
     );
     if (entry) closeWindow(entry.id);
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
-  onError: (err, tokenKey) => {
+  onError: (err, id) => {
     const message = extractApiError(err).message;
     error(message);
     const entry = windows.value.find(
-      (item) => item.payload.kind === 'delete' && item.payload.token.token_key === tokenKey,
+      (item) => item.payload.kind === 'delete' && item.payload.token.id === id,
     );
     if (entry) deleteErrors.value[entry.id] = message;
   },
 });
 
-const deletingKey = computed(() =>
+const deletingId = computed(() =>
   deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
 );
 
 // 启用/禁用：整体替换写（PUT 携带完整定义），成功后重取列表。
 const toggleMutation = useMutation({
   mutationFn: (token: TokenRow) =>
-    apiClient.updateToken(token.token_key, tokenWriteBody({ ...token, enabled: !token.enabled })),
+    apiClient.updateToken(token.id, tokenWriteBody({ ...token, enabled: !token.enabled })),
   onSuccess: async () => {
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
@@ -253,7 +253,7 @@ function openCreate(event: Event) {
 function openEdit(token: TokenRow) {
   const existing = windows.value.find(
     (entry) =>
-      entry.payload.kind === 'editor' && entry.payload.token?.token_key === token.token_key,
+      entry.payload.kind === 'editor' && entry.payload.token?.id === token.id,
   );
   if (existing) {
     bringToFront(existing.id);
@@ -264,7 +264,7 @@ function openEdit(token: TokenRow) {
 
 function openDelete(token: TokenRow) {
   const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'delete' && entry.payload.token.token_key === token.token_key,
+    (entry) => entry.payload.kind === 'delete' && entry.payload.token.id === token.id,
   );
   if (existing) {
     bringToFront(existing.id);
@@ -355,12 +355,12 @@ function openBulkDelete() {
               :key="token.token_key"
               data-testid="token-row"
               :data-token-key="token.token_key"
-              :data-state="selection.isSelected(token.token_key) ? 'selected' : undefined"
+              :data-state="selection.isSelected(token.id) ? 'selected' : undefined"
             >
               <SelectCell
-                :checked="selection.isSelected(token.token_key)"
+                :checked="selection.isSelected(token.id)"
                 test-id="token-select"
-                @toggle="selection.toggle(token.token_key)"
+                @toggle="selection.toggle(token.id)"
               />
               <TableCell class="font-medium">{{ token.name }}</TableCell>
               <TableCell class="font-mono text-sm" data-testid="token-model-group">
@@ -530,12 +530,12 @@ function openBulkDelete() {
         :attention="win.attention"
         :topmost="win.id === topmostId"
         :error="deleteErrors[win.id] ?? ''"
-        :busy="deletingKey === win.payload.token.token_key"
+        :busy="deletingId === win.payload.token.id"
         confirm-test-id="token-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
-        @confirm="deleteMutation.mutate(win.payload.token.token_key)"
+        @confirm="deleteMutation.mutate(win.payload.token.id)"
       />
       <ConfirmWindow
         v-else

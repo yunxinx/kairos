@@ -152,31 +152,21 @@ export const apiClient = {
     return apiFetch('/tokens', { method: 'POST', body: JSON.stringify(body) });
   },
 
-  updateToken(tokenKey: string, body: Token): Promise<TokenView> {
-    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}`, {
+  updateToken(id: number, body: Token): Promise<TokenView> {
+    return apiFetch(`/tokens/${id}`, {
       method: 'PUT',
       body: JSON.stringify(body),
     });
   },
 
-  deleteToken(tokenKey: string): Promise<TokenView> {
-    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}`, { method: 'DELETE' });
+  deleteToken(id: number): Promise<TokenView> {
+    return apiFetch(`/tokens/${id}`, { method: 'DELETE' });
   },
 
-  adjustTokenBalance(tokenKey: string, body: BalanceAdjustment): Promise<BalanceView> {
-    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}/balance`, {
+  adjustTokenBalance(id: number, body: BalanceAdjustment): Promise<BalanceView> {
+    return apiFetch(`/tokens/${id}/balance`, {
       method: 'POST',
       body: JSON.stringify(body),
-    });
-  },
-
-  /**
-   * 读令牌余额：管理 API 无独立 GET，相对调整 `delta = 0` 返回当前余额且不改账。
-   */
-  readTokenBalance(tokenKey: string): Promise<BalanceView> {
-    return apiFetch(`/tokens/${encodeURIComponent(tokenKey)}/balance`, {
-      method: 'POST',
-      body: JSON.stringify({ delta_usd_micros: 0 }),
     });
   },
 

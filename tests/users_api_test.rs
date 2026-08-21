@@ -113,6 +113,7 @@ async fn users_list_and_recharge_are_admin_plus() {
 #[tokio::test]
 async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let seeded_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
     let (user_id, user_token) = create_role(&gw, "user@example.com", "user").await;
     let (_admin_id, admin_token) = create_role(&gw, "admin@example.com", "admin").await;
 
@@ -127,6 +128,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     assert_eq!(created.status(), StatusCode::CREATED);
     let mine: Value = created.json().await.expect("令牌应可解析");
     let mine_key = mine["token_key"].as_str().expect("应有 key").to_string();
+    let mine_id = mine["id"].as_i64().expect("应有 id");
 
     let user_list: Value = get_req(&gw, &user_token, "/tokens")
         .await
@@ -151,10 +153,12 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     )
     .await;
     assert_eq!(admin_creates.status(), StatusCode::CREATED);
-    let admin_token_key = admin_creates.json::<Value>().await.expect("应可解析")["token_key"]
+    let admin_created: Value = admin_creates.json().await.expect("应可解析");
+    let admin_token_key = admin_created["token_key"]
         .as_str()
         .expect("应有 key")
         .to_string();
+    let admin_token_id = admin_created["id"].as_i64().expect("应有 id");
     let owner: (i64,) = sqlx::query_as("SELECT user_id FROM tokens WHERE token_key = ?")
         .bind(&admin_token_key)
         .fetch_one(&gw.pool)
@@ -166,7 +170,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &admin_token,
         reqwest::Method::PUT,
-        &format!("/tokens/{mine_key}"),
+        &format!("/tokens/{mine_id}"),
         json!({
             "token_key": mine_key,
             "name": "mine",
@@ -183,7 +187,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &admin_token,
         reqwest::Method::PUT,
-        &format!("/tokens/{mine_key}"),
+        &format!("/tokens/{mine_id}"),
         json!({
             "token_key": mine_key,
             "name": "hijacked",
@@ -197,7 +201,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     assert_eq!(rename.status(), StatusCode::FORBIDDEN);
 
     let delete_others = reqwest::Client::new()
-        .delete(admin_url(&gw, &format!("/tokens/{mine_key}")))
+        .delete(admin_url(&gw, &format!("/tokens/{mine_id}")))
         .bearer_auth(&admin_token)
         .send()
         .await
@@ -208,7 +212,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &admin_token,
         reqwest::Method::PUT,
-        &format!("/tokens/{admin_token_key}"),
+        &format!("/tokens/{admin_token_id}"),
         json!({
             "token_key": admin_token_key,
             "name": "admin-renamed",
@@ -223,7 +227,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &admin_token,
         reqwest::Method::POST,
-        &format!("/tokens/{TEST_TOKEN_KEY}/balance"),
+        &format!("/tokens/{seeded_id}/balance"),
         json!({ "delta_usd_micros": 1_000_000 }),
     )
     .await;
@@ -261,7 +265,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &user_token,
         reqwest::Method::PUT,
-        &format!("/tokens/{TEST_TOKEN_KEY}"),
+        &format!("/tokens/{seeded_id}"),
         json!({
             "token_key": TEST_TOKEN_KEY,
             "name": "hijack",
@@ -275,11 +279,15 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     let others = get_req(&gw, &gw.session, &format!("/users/{user_id}/tokens")).await;
     assert_eq!(others.status(), StatusCode::OK);
     let listed: Value = others.json().await.expect("应可解析");
-    assert!(
-        listed
-            .as_array()
-            .expect("应为数组")
-            .iter()
-            .any(|t| t["token_key"] == mine_key && t["enabled"] == false)
-    );
+    let row = listed
+        .as_array()
+        .expect("应为数组")
+        .iter()
+        .find(|t| t["id"] == mine_id)
+        .expect("应能按 id 找到该令牌");
+    assert_eq!(row["enabled"], false, "admin 应已禁用该令牌");
+    // 他人令牌的 key 只给脱敏形态：运营按 id 操作，拿不到明文去花别人的余额。
+    let shown = row["token_key"].as_str().expect("应有 key 字段");
+    assert_ne!(shown, mine_key, "不应回显明文 key");
+    assert!(shown.contains("******"), "应为脱敏形态，实际 {shown}");
 }

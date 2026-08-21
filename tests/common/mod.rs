@@ -510,12 +510,29 @@ pub const TEST_ROOT_EMAIL: &str = "root@localhost";
 /// 测试用内置 root 登录密码（播种进库后经 `/login` 换会话）。
 pub const TEST_ROOT_PASSWORD: &str = "sk-admin-test";
 
+/// 按 key 查出令牌的库生成 id。
+///
+/// 管理 API 按 id 寻址（明文 key 只对所有者返回），而多数测试手上只有播种时的 key。
+pub async fn token_id(pool: &sqlx::SqlitePool, token_key: &str) -> i64 {
+    sqlx::query_scalar("SELECT id FROM tokens WHERE token_key = ?")
+        .bind(token_key)
+        .fetch_one(pool)
+        .await
+        .expect("令牌应存在")
+}
+
 /// 一个已启动的网关 + mock 上游 + SQLite 组件的完整测试环境。
 pub struct TestGateway {
     pub addr: SocketAddr,
     pub upstream: MockUpstream,
     pub pool: sqlx::SqlitePool,
-    pub db_path: tempfile::TempPath,
+    /// 库文件路径；落在 `db_dir` 内。
+    pub db_path: std::path::PathBuf,
+    /// 临时目录，`Drop` 时连 WAL/SHM 边车文件一起清掉。
+    ///
+    /// 不用 `NamedTempFile`：它只认自己创建的那一个文件，WAL 模式下 SQLite 另建
+    /// `<path>-wal` / `<path>-shm`，测试结束后会永久留在 /tmp（一天的回归就能攒出 GB 级）。
+    pub db_dir: tempfile::TempDir,
     /// 独立管理监听地址；未启用管理面时为 `None`。
     pub admin_addr: Option<SocketAddr>,
     /// 管理面 root 会话（`ksess_…`）。未启用管理面时为空串。
@@ -547,8 +564,8 @@ impl TestGateway {
     async fn start_with_opts(make_seed: impl Fn(&str) -> Seed, with_admin: bool) -> Self {
         let upstream = MockUpstream::start().await;
 
-        let db = tempfile::NamedTempFile::new().expect("应能创建临时库文件");
-        let db_path = db.into_temp_path();
+        let db_dir = tempfile::tempdir().expect("应能创建临时库目录");
+        let db_path = db_dir.path().join("kairos-test.db");
         let pool = store::open(&db_path)
             .await
             .expect("SQLite 建库与迁移应成功");
@@ -613,6 +630,7 @@ impl TestGateway {
             upstream,
             pool,
             db_path,
+            db_dir,
             admin_addr,
             session,
         }
@@ -632,8 +650,8 @@ impl TestGateway {
         }
         let bases: Vec<String> = upstreams.iter().map(|u| u.base_url()).collect();
 
-        let db = tempfile::NamedTempFile::new().expect("应能创建临时库文件");
-        let db_path = db.into_temp_path();
+        let db_dir = tempfile::tempdir().expect("应能创建临时库目录");
+        let db_path = db_dir.path().join("kairos-test.db");
         let pool = store::open(&db_path)
             .await
             .expect("SQLite 建库与迁移应成功");
@@ -664,6 +682,7 @@ impl TestGateway {
             upstream: upstreams[0].clone(),
             pool,
             db_path,
+            db_dir,
             admin_addr: None,
             session: String::new(),
         };

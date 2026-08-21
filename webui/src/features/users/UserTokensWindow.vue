@@ -12,9 +12,8 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
-import UiIcon from '@/components/ui/UiIcon.vue';
 import { useToast } from '@/composables/useToast';
-import { formatUsdFixed2, formatUsdMicros, maskTokenKey } from '@/lib/format';
+import { formatUsdFixed2, formatUsdMicros } from '@/lib/format';
 import { groupDisplayName, tokenGroupUsable } from '@/lib/visible-models';
 
 const props = defineProps<{
@@ -28,20 +27,6 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
-
-const copiedKey = ref<string | null>(null);
-
-async function copyKey(key: string) {
-  try {
-    await navigator.clipboard.writeText(key);
-    copiedKey.value = key;
-    setTimeout(() => {
-      if (copiedKey.value === key) copiedKey.value = null;
-    }, 1500);
-  } catch {
-    // 忽略剪贴板写入失败
-  }
-}
 
 const tokensQuery = useQuery({
   queryKey: ['users', props.user.id, 'tokens'],
@@ -73,14 +58,11 @@ function quotaLabel(token: TokenView): string {
   });
 }
 
-const togglingKey = ref<string | null>(null);
+const togglingId = ref<number | null>(null);
 const toggleMutation = useMutation({
   mutationFn: async (token: TokenView) => {
-    togglingKey.value = token.token_key;
-    await apiClient.updateToken(
-      token.token_key,
-      tokenWriteBody({ ...token, enabled: !token.enabled }),
-    );
+    togglingId.value = token.id;
+    await apiClient.updateToken(token.id, tokenWriteBody({ ...token, enabled: !token.enabled }));
   },
   onSuccess: async () => {
     await queryClient.invalidateQueries({ queryKey: ['users', props.user.id, 'tokens'] });
@@ -90,7 +72,7 @@ const toggleMutation = useMutation({
     error(extractApiError(err).message);
   },
   onSettled: () => {
-    togglingKey.value = null;
+    togglingId.value = null;
   },
 });
 </script>
@@ -124,31 +106,16 @@ const toggleMutation = useMutation({
           <TableBody>
             <TableRow
               v-for="token in tokens"
-              :key="token.token_key"
+              :key="token.id"
               data-testid="user-token-row"
-              :data-token-key="token.token_key"
+              :data-token-id="token.id"
             >
               <TableCell class="max-w-32 font-medium">
                 <span class="block truncate" :title="token.name">{{ token.name }}</span>
               </TableCell>
+              <!-- 接口只返回脱敏 key：运营按 id 操作，不需要（也拿不到）明文。 -->
               <TableCell>
-                <div class="flex items-center gap-1.5 font-mono text-xs">
-                  <span class="text-fg-muted">{{ maskTokenKey(token.token_key) }}</span>
-                  <button
-                    type="button"
-                    class="btn btn-ghost btn-icon size-5 text-xs"
-                    data-testid="token-copy-key"
-                    :aria-label="copiedKey === token.token_key ? t('common.copied') : t('common.copy')"
-                    :title="copiedKey === token.token_key ? t('common.copied') : t('common.copy')"
-                    @click="copyKey(token.token_key)"
-                  >
-                    <UiIcon
-                      :name="copiedKey === token.token_key ? 'check' : 'copy'"
-                      :size="12"
-                      :class="copiedKey === token.token_key ? 'text-success' : undefined"
-                    />
-                  </button>
-                </div>
+                <span class="text-fg-muted font-mono text-xs">{{ token.token_key }}</span>
               </TableCell>
               <TableCell class="font-mono text-xs" data-testid="user-token-model-group">
                 <span class="inline-flex items-center gap-1">
@@ -191,7 +158,7 @@ const toggleMutation = useMutation({
                   class="badge cursor-pointer text-[10px]"
                   :class="token.enabled ? 'badge-success' : 'badge-danger'"
                   data-testid="user-token-toggle-enabled"
-                  :disabled="togglingKey === token.token_key"
+                  :disabled="togglingId === token.id"
                   :aria-label="token.enabled ? t('tokens.disable') : t('tokens.enable')"
                   :title="token.enabled ? t('tokens.disable') : t('tokens.enable')"
                   @click="toggleMutation.mutate(token)"

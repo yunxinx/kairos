@@ -63,16 +63,16 @@ test.describe('users page', () => {
       data: { name: 'owned', limit_usd_micros: null, enabled: true },
     });
     expect(own.ok()).toBeTruthy();
-    const owned = (await own.json()) as { token_key: string };
+    // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态。
+    const owned = (await own.json()) as { id: number; token_key: string };
 
     await page.goto('/admin/users');
     const tokenOwner = page.locator(`[data-testid="user-row"][data-user-id="${created.id}"]`);
     await tokenOwner.getByTestId('user-edit').click();
     await page.getByTestId('user-tab-tokens').click();
-    const tokenRow = page.locator(
-      `[data-testid="user-token-row"][data-token-key="${owned.token_key}"]`,
-    );
+    const tokenRow = page.locator(`[data-testid="user-token-row"][data-token-id="${owned.id}"]`);
     await expect(tokenRow).toBeVisible();
+    await expect(tokenRow).not.toContainText(owned.token_key);
     await tokenRow.getByTestId('user-token-toggle-enabled').click();
     await expect(tokenRow).toContainText(/disabled/i);
 
@@ -156,16 +156,22 @@ test.describe('users page', () => {
     await page.getByTestId('user-groups-save').click();
 
     await page.getByTestId('users-group-filter').click();
-    await page.locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]').click();
+    await page
+      .locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]')
+      .click();
     await page.keyboard.press('Escape');
     // 只有 Low RPM 用户匹配该组，Root 用户（不受组限制）不应混入特定组筛选
     await expect(page.locator('[data-testid="user-row"]')).toHaveCount(1);
     await expect(page.locator('[data-testid="user-row"]')).toContainText('Low RPM User');
-    await expect(page.locator('[data-testid="user-row"]', { hasText: 'root@localhost' })).toHaveCount(0);
+    await expect(
+      page.locator('[data-testid="user-row"]', { hasText: 'root@localhost' }),
+    ).toHaveCount(0);
 
     // 清除模型组筛选
     await page.getByTestId('users-group-filter').click();
-    await page.locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]').click();
+    await page
+      .locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]')
+      .click();
     await page.keyboard.press('Escape');
 
     // 查看 Root 用户
@@ -177,4 +183,3 @@ test.describe('users page', () => {
     await page.keyboard.press('Escape');
   });
 });
-

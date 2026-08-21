@@ -333,6 +333,8 @@ pub fn visible_model_ids<'a>(
 /// 生命周期字段由存储层维护，不属于可写契约，故不派生 serde。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenRecord {
+    /// 库生成的稳定身份；管理 API 以此定位令牌，明文 `token_key` 只对所有者返回。
+    pub id: i64,
     pub token: Token,
     /// 创建时刻（unix 毫秒）；迁移前的存量令牌为 0。
     pub created_at: i64,
@@ -671,7 +673,7 @@ pub async fn list_tokens(pool: &SqlitePool) -> Result<Vec<Token>, StoreError> {
 /// 读出全部令牌记录（含创建/最后使用时间等生命周期元数据）。
 pub async fn list_token_records(pool: &SqlitePool) -> Result<Vec<TokenRecord>, StoreError> {
     let rows = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
+        "SELECT id, token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
          FROM tokens",
     )
     .fetch_all(pool)
@@ -681,13 +683,32 @@ pub async fn list_token_records(pool: &SqlitePool) -> Result<Vec<TokenRecord>, S
     rows.iter().map(map_token_record).collect()
 }
 
-/// 按 `token_key` 读出一条令牌记录；不存在返回 `None`。
+/// 按库生成的 `id` 读出一条令牌记录；不存在返回 `None`。
 pub async fn get_token_record(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<Option<TokenRecord>, StoreError> {
+    let row = sqlx::query(
+        "SELECT id, token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
+         FROM tokens WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    row.as_ref().map(map_token_record).transpose()
+}
+
+/// 按 `token_key` 读出一条令牌记录；不存在返回 `None`。
+///
+/// 只用于新建后回读：`create_token` 自己生成 key，尚不知道库发的 id。
+pub async fn get_token_record_by_key(
     pool: &SqlitePool,
     token_key: &str,
 ) -> Result<Option<TokenRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
+        "SELECT id, token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
          FROM tokens WHERE token_key = ?",
     )
     .bind(token_key)
@@ -704,6 +725,7 @@ fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreE
     let rate_limit_rpm: Option<i64> = row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
     let model_group: Option<String> = row.try_get("model_group").map_err(StoreError::Query)?;
     Ok(TokenRecord {
+        id: row.try_get("id").map_err(StoreError::Query)?,
         token: Token {
             token_key: row.try_get("token_key").map_err(StoreError::Query)?,
             name: row.try_get("name").map_err(StoreError::Query)?,
@@ -775,9 +797,9 @@ pub async fn touch_token_used(
 }
 
 /// 按 `token_key` 删除令牌；不存在视为成功（幂等）。
-pub async fn delete_token(conn: &mut SqliteConnection, token_key: &str) -> Result<(), StoreError> {
-    sqlx::query("DELETE FROM tokens WHERE token_key = ?")
-        .bind(token_key)
+pub async fn delete_token(conn: &mut SqliteConnection, id: i64) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM tokens WHERE id = ?")
+        .bind(id)
         .execute(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
@@ -908,12 +930,9 @@ pub async fn rebind_channels_to_default(
 ///
 /// 供余额调整等「先校验存在再写余额」的原语在事务内使用，与后续写持同一写锁，
 /// 避免并发删除令牌后仍写出一条孤儿余额行、被后续重建令牌复活。
-pub async fn token_exists(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-) -> Result<bool, StoreError> {
-    let row = sqlx::query("SELECT 1 FROM tokens WHERE token_key = ?")
-        .bind(token_key)
+pub async fn token_exists(conn: &mut SqliteConnection, id: i64) -> Result<bool, StoreError> {
+    let row = sqlx::query("SELECT 1 FROM tokens WHERE id = ?")
+        .bind(id)
         .fetch_optional(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
@@ -1361,10 +1380,11 @@ mod tests {
             .await
             .expect("应能写令牌");
 
-        let record = get_token_record(&pool, "sk-a")
+        let record = get_token_record_by_key(&pool, "sk-a")
             .await
             .expect("应能读记录")
             .expect("记录应存在");
+        let id = record.id;
         assert_eq!(record.created_at, 1_000);
         assert_eq!(record.last_used_at, None, "未使用时为空");
 
@@ -1379,7 +1399,8 @@ mod tests {
             .await
             .expect("应能刷新最后使用时间");
 
-        let record = get_token_record(&pool, "sk-a")
+        // 按库生成 id 回读：与管理面的寻址方式一致。
+        let record = get_token_record(&pool, id)
             .await
             .expect("应能读记录")
             .expect("记录应存在");
@@ -1389,11 +1410,18 @@ mod tests {
         assert_eq!(record.last_used_at, Some(2_000));
 
         assert!(
-            get_token_record(&pool, "sk-none")
+            get_token_record(&pool, id + 1_000)
                 .await
                 .expect("应能查询")
                 .is_none(),
-            "不存在的令牌返回 None"
+            "不存在的 id 返回 None"
+        );
+        assert!(
+            get_token_record_by_key(&pool, "sk-none")
+                .await
+                .expect("应能查询")
+                .is_none(),
+            "不存在的 key 返回 None"
         );
     }
 
@@ -1403,7 +1431,7 @@ mod tests {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
         assert!(
-            !token_exists(&mut conn, "sk-a").await.expect("应能查询"),
+            !token_exists(&mut conn, 1).await.expect("应能查询"),
             "未播种的令牌不存在"
         );
         upsert_token(
@@ -1421,8 +1449,13 @@ mod tests {
         )
         .await
         .expect("应能写令牌");
+        let id = get_token_record_by_key(&pool, "sk-a")
+            .await
+            .expect("应能读记录")
+            .expect("记录应存在")
+            .id;
         assert!(
-            token_exists(&mut conn, "sk-a").await.expect("应能查询"),
+            token_exists(&mut conn, id).await.expect("应能查询"),
             "播种后的令牌应存在"
         );
     }

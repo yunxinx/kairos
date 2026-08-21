@@ -349,11 +349,13 @@ async fn token_binds_exactly_one_group() {
     let token: Value = coded.json().await.expect("令牌应可解析");
     assert_eq!(token["model_group"], "coding");
     let coding_key = token["token_key"].as_str().expect("应有 key").to_string();
+    let coding_id = token["id"].as_i64().expect("应有 id");
+    let default_id = common::token_id(&gw.pool, default_key).await;
 
     let rebound = admin_json(
         &gw,
         reqwest::Method::PUT,
-        &format!("/tokens/{default_key}"),
+        &format!("/tokens/{default_id}"),
         json!({
             "token_key": default_key,
             "name": "anon",
@@ -370,7 +372,7 @@ async fn token_binds_exactly_one_group() {
     let missing = admin_json(
         &gw,
         reqwest::Method::PUT,
-        &format!("/tokens/{coding_key}"),
+        &format!("/tokens/{coding_id}"),
         json!({
             "token_key": coding_key,
             "name": "coder",
@@ -420,10 +422,11 @@ async fn delete_group_nulls_token_group_without_rebind() {
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
     let key = token["token_key"].as_str().expect("应有 key").to_string();
+    let key_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/tokens/{key}/balance"),
+        &format!("/tokens/{key_id}/balance"),
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;
@@ -493,10 +496,11 @@ async fn out_of_group_model_is_not_found_not_503() {
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
     let coding_key = token["token_key"].as_str().expect("应有 key");
+    let coding_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/tokens/{coding_key}/balance"),
+        &format!("/tokens/{coding_id}/balance"),
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;
@@ -901,10 +905,11 @@ async fn pinned_group_source_routes_only_that_channel() {
     .await;
     let token: Value = token_resp.json().await.expect("令牌应可解析");
     let coding_key = token["token_key"].as_str().expect("应有 key");
+    let coding_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/tokens/{coding_key}/balance"),
+        &format!("/tokens/{coding_id}/balance"),
         json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;

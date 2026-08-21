@@ -293,8 +293,9 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     );
 
     // 删除后立即失效：请求路径认证失败（401），列表也移除。
+    let new_id = common::token_id(&gw.pool, &new_key).await;
     let resp = reqwest::Client::new()
-        .delete(format!("{}/tokens/{new_key}", gw.admin_base_url()))
+        .delete(format!("{}/tokens/{new_id}", gw.admin_base_url()))
         .bearer_auth(&gw.session)
         .send()
         .await
@@ -380,9 +381,10 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
     );
 
     // 禁用后立即在认证处拒绝（401）。
+    let life_id = common::token_id(&gw.pool, &life_key).await;
     let resp = admin_put(
         &gw,
-        &format!("/tokens/{life_key}"),
+        &format!("/tokens/{life_id}"),
         json!({ "token_key": life_key, "name": "life", "limit_usd_micros": null, "enabled": false }),
     )
     .await;
@@ -399,7 +401,7 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
     // 重新启用后立即可用。
     let resp = admin_put(
         &gw,
-        &format!("/tokens/{life_key}"),
+        &format!("/tokens/{life_id}"),
         json!({ "token_key": life_key, "name": "life", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
@@ -412,13 +414,16 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
     );
 }
 
-/// PUT 不存在的令牌返回 404，不隐式创建；非法字符 key 返回 400。
+/// PUT 不存在的令牌返回 404，不隐式创建；非整数 id 同样按不存在处理。
+///
+/// 令牌按库生成 id 寻址，body 里的 `token_key` 一律被忽略（界面上看到的是掩码，
+/// 写回来不能改坏密钥），所以「非法字符 key → 400」这条路径已不可达。
 #[tokio::test]
-async fn update_missing_token_is_404_and_invalid_key_charset_is_400() {
+async fn update_missing_token_is_404_and_non_numeric_id_is_404() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let resp = admin_put(
         &gw,
-        "/tokens/does-not-exist",
+        "/tokens/999999",
         json!({
             "token_key": "does-not-exist",
             "name": "x",
@@ -440,9 +445,9 @@ async fn update_missing_token_is_404_and_invalid_key_charset_is_400() {
         }),
     )
     .await;
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
     let body: Value = resp.json().await.expect("应返回结构化错误");
-    assert_eq!(body["error"]["code"], "invalid_body");
+    assert_eq!(body["error"]["code"], "not_found");
 }
 
 /// 渠道与价格写后即时生效：渠道可路由、价格增减即时反映在计费准入。
@@ -1412,9 +1417,10 @@ async fn runtime_resources_survive_process_restart() {
         .as_str()
         .expect("应返回生成的 key")
         .to_string();
+    let restart_id = common::token_id(&gw.pool, &restart_key).await;
     let resp = reqwest::Client::new()
         .post(format!(
-            "{}/tokens/{restart_key}/balance",
+            "{}/tokens/{restart_id}/balance",
             gw.admin_base_url()
         ))
         .bearer_auth(&gw.session)
@@ -1556,8 +1562,9 @@ async fn empty_db_bootstraps_via_admin_api() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
+    let boot_id = common::token_id(&gw.pool, &boot_key).await;
     let resp = reqwest::Client::new()
-        .post(format!("{}/tokens/{boot_key}/balance", gw.admin_base_url()))
+        .post(format!("{}/tokens/{boot_id}/balance", gw.admin_base_url()))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
@@ -1606,8 +1613,9 @@ async fn deleting_token_clears_balance_row() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     // 删除后余额行一并清理：库内不再残留该 key 的余额记录。
+    let cycle_id = common::token_id(&gw.pool, &cycle_key).await;
     let resp = client
-        .delete(format!("{}/tokens/{cycle_key}", gw.admin_base_url()))
+        .delete(format!("{}/tokens/{cycle_id}", gw.admin_base_url()))
         .bearer_auth(&gw.session)
         .send()
         .await
@@ -1880,10 +1888,11 @@ async fn balance_adjustment_reflected_in_admission() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
     let client = reqwest::Client::new();
     let admin = gw.admin_base_url();
+    let seeded_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
 
     // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
     let resp = client
-        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .post(format!("{admin}/tokens/{seeded_id}/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": -5_000_000 }))
         .send()
@@ -1892,7 +1901,7 @@ async fn balance_adjustment_reflected_in_admission() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let balance: Value = resp.json().await.expect("余额应可解析");
     assert_eq!(balance["balance_usd_micros"], 0);
-    assert_eq!(balance["token_key"], TEST_TOKEN_KEY);
+    assert_eq!(balance["token_id"], seeded_id);
 
     // 零余额：计费准入拒绝。
     let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
@@ -1904,7 +1913,7 @@ async fn balance_adjustment_reflected_in_admission() {
 
     // 充值后恢复可用。
     let resp = client
-        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .post(format!("{admin}/tokens/{seeded_id}/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
@@ -1920,10 +1929,11 @@ async fn token_attr_update_does_not_reset_balance() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let client = reqwest::Client::new();
     let admin = gw.admin_base_url();
+    let seeded_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
 
     // 充值 1 USD（初始 5 USD → 6 USD）。
     let resp = client
-        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .post(format!("{admin}/tokens/{seeded_id}/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 1_000_000 }))
         .send()
@@ -1934,7 +1944,7 @@ async fn token_attr_update_does_not_reset_balance() {
     // 修改令牌其他属性（name）。
     let resp = admin_put(
         &gw,
-        &format!("/tokens/{TEST_TOKEN_KEY}"),
+        &format!("/tokens/{seeded_id}"),
         json!({ "token_key": TEST_TOKEN_KEY, "name": "renamed", "limit_usd_micros": null, "enabled": true }),
     )
     .await;
@@ -1942,7 +1952,7 @@ async fn token_attr_update_does_not_reset_balance() {
 
     // 余额不变：以 delta 0 读回应仍为 6_000_000。
     let resp = client
-        .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
+        .post(format!("{admin}/tokens/{seeded_id}/balance"))
         .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 0 }))
         .send()
@@ -2439,6 +2449,7 @@ async fn token_rate_limit_uses_global_fallback_and_token_override() {
         seed
     })
     .await;
+    let seeded_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(completion_body()));
     gw.upstream
@@ -2457,7 +2468,7 @@ async fn token_rate_limit_uses_global_fallback_and_token_override() {
 
     let resp = admin_put(
         &gw,
-        &format!("/tokens/{TEST_TOKEN_KEY}"),
+        &format!("/tokens/{seeded_id}"),
         json!({
             "token_key": TEST_TOKEN_KEY,
             "name": "dev",
