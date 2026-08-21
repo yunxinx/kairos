@@ -17,15 +17,19 @@
     "models": "Models",
     "settings": "Settings",
     "logs": "Logs",
+    "users": "Users",
+    "account": "Account",
     "logout": "Sign out"
   },
   "auth": {
     "loginTitle": "Kairos",
-    "adminKey": "Admin key",
-    "adminKeyPlaceholder": "sk-...",
+    "email": "Email",
+    "emailPlaceholder": "you{'@'}example.com",
+    "password": "Password",
+    "passwordPlaceholder": "Password",
     "login": "Sign in",
     "loggingIn": "Signing in...",
-    "invalidKey": "Invalid admin key."
+    "invalidCredentials": "Invalid email or password."
   },
   "overview": {
     "title": "Overview",
@@ -146,12 +150,56 @@
     "quickCancel": "Clear",
     "modelGroup": "Model group",
     "modelGroupGuide": "The token can only see and call names in this group. Unspecified tokens use Ungrouped.",
+    "groupUnusable": "Unusable",
+    "groupUnusableHint": "This group is no longer assigned. Rebind before the token can call models.",
     "disable": "Disable",
     "enable": "Enable",
     "deleteTitle": "Delete token",
     "deleteMessage": "Delete token \"{name}\"? This cannot be undone.",
     "bulkDeleteTitle": "Delete tokens",
     "bulkDeleteMessage": "Delete {count} selected tokens? This cannot be undone."
+  },
+  "users": {
+    "create": "Create user",
+    "search": "Search by email or name",
+    "editorCreate": "New user",
+    "email": "Email",
+    "displayName": "Name",
+    "password": "Password",
+    "passwordGuide": "At least 8 characters.",
+    "role": "Role",
+    "roleUser": "User",
+    "roleAdmin": "Admin",
+    "roleRoot": "Root",
+    "status": "Status",
+    "statusEnabled": "Enabled",
+    "statusDisabled": "Disabled",
+    "balance": "Balance",
+    "groups": "Groups",
+    "recharge": "Recharge",
+    "rechargeTitle": "Recharge {name}",
+    "rechargeAmount": "Amount (USD)",
+    "rechargeGuide": "Positive adds credit; negative deducts. Up to six decimal places.",
+    "currentBalance": "Current balance: {amount}",
+    "assignGroups": "Assign groups",
+    "groupsTitle": "Groups for {name}",
+    "viewTokens": "Tokens",
+    "tokensTitle": "Tokens for {name}",
+    "tokensEmpty": "This user has no tokens yet.",
+    "manageTitle": "{name}",
+    "manageTabs": "User management"
+  },
+  "account": {
+    "email": "Email",
+    "emailGuide": "This is the address you use to sign in.",
+    "displayName": "Name",
+    "currentPassword": "Current password",
+    "currentPasswordGuide": "Required only when setting a new password.",
+    "newPassword": "New password",
+    "confirmPassword": "Confirm new password",
+    "passwordMismatch": "The new passwords do not match.",
+    "saveSuccess": "Account saved.",
+    "missingProfile": "Could not load your profile."
   },
   "time": {
     "secondsAgo": "{seconds} seconds ago",
@@ -369,7 +417,7 @@
     "groupEmpty": "No custom groups yet. Tokens without a group use Ungrouped.",
     "groupDefaultHint": "Names not listed in another group stay available to Ungrouped.",
     "groupDeleteTitle": "Delete group",
-    "groupDeleteMessage": "Delete group \"{name}\"? This cannot be undone.",
+    "groupDeleteMessage": "Delete group \"{name}\"? Bound tokens keep the name but become unusable until rebound. This cannot be undone.",
     "groupForceDeleteTitle": "Group still has tokens",
     "groupForceDeleteMessage": "Group \"{name}\" still has tokens bound. Force delete will move those tokens back to Ungrouped.",
     "groupBulkDeleteTitle": "Delete groups",
@@ -542,7 +590,8 @@
   },
   "fieldGuides": {
     "auth": {
-      "adminKey": "Enter the static admin key from the config file. It is stored only in this browser."
+      "email": "Use the email address of your management account.",
+      "password": "At least 8 characters. The session is stored only in this browser."
     }
   },
   "validation": {

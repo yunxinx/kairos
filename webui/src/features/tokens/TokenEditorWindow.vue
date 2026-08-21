@@ -5,7 +5,7 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { Token, TokenCreate } from '@/api/types';
+import { roleAtLeast, type Token, type TokenCreate } from '@/api/types';
 import type { TokenRow } from '@/api/token-rows';
 import FieldInfoHint from '@/components/ui/FieldInfoHint.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
@@ -16,7 +16,13 @@ import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import { formatUsdAmount, parseUsdToMicros } from '@/lib/format';
-import { DEFAULT_MODEL_GROUP, groupSelectOptions } from '@/lib/visible-models';
+import { useCurrentUser } from '@/lib/session';
+import {
+  DEFAULT_MODEL_GROUP,
+  assignedGroupOptions,
+  groupSelectOptions,
+  tokenGroupUsable,
+} from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -56,10 +62,18 @@ const amountInputId = `token-editor-amount-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
+const me = useCurrentUser();
+
+const canListAllGroups = computed(() => {
+  const role = me.value?.role;
+  return role !== undefined && roleAtLeast(role, 'admin');
+});
+const canAdjustBalance = computed(() => me.value?.role === 'root');
 
 const groupsQuery = useQuery({
   queryKey: ['model-groups'],
   queryFn: () => apiClient.listModelGroups(),
+  enabled: canListAllGroups,
 });
 
 const initialKey = props.initial ? props.initial.token_key : '';
@@ -73,7 +87,15 @@ const initialRpm =
     ? String(props.initial.rate_limit_rpm)
     : '';
 const initialEnabled = props.initial ? props.initial.enabled : true;
-const initialGroup = props.initial ? props.initial.model_group : DEFAULT_MODEL_GROUP;
+const initialGroup = (() => {
+  if (props.initial) return props.initial.model_group;
+  const user = me.value;
+  if (user?.role === 'user') {
+    if (user.assigned_groups.includes(DEFAULT_MODEL_GROUP)) return DEFAULT_MODEL_GROUP;
+    return user.assigned_groups[0] ?? '';
+  }
+  return DEFAULT_MODEL_GROUP;
+})();
 
 const editorName = ref(initialName);
 const editorLimit = ref(initialLimit);
@@ -81,9 +103,24 @@ const editorRpm = ref(initialRpm);
 const editorEnabled = ref(initialEnabled);
 const editorGroup = ref(initialGroup);
 
-const groupOptions = computed(() =>
-  groupSelectOptions(groupsQuery.data.value ?? [], editorGroup.value, t('models.ungrouped')),
-);
+const groupOptions = computed(() => {
+  const user = me.value;
+  if (user?.role === 'user') {
+    return assignedGroupOptions(
+      user.assigned_groups,
+      editorGroup.value,
+      t('models.ungrouped'),
+      props.initial !== null,
+    );
+  }
+  return groupSelectOptions(groupsQuery.data.value ?? [], editorGroup.value, t('models.ungrouped'));
+});
+
+const groupUnusable = computed(() => {
+  const user = me.value;
+  if (!user) return false;
+  return !tokenGroupUsable(editorGroup.value, user.role, user.assigned_groups);
+});
 
 // 余额编辑：仅编辑已有令牌时可用。计算器语义——输入框是基数（可直接改为目标余额），
 // 快捷档位累计成右侧差额，`=` 后预览结果，保存时一并生效。
@@ -98,8 +135,8 @@ const dirty = computed(
     editorRpm.value !== initialRpm ||
     editorEnabled.value !== initialEnabled ||
     editorGroup.value !== initialGroup ||
-    editorAmount.value !== formatUsdAmount(displayedBalance.value) ||
-    quickDelta.value !== 0,
+    (canAdjustBalance.value &&
+      (editorAmount.value !== formatUsdAmount(displayedBalance.value) || quickDelta.value !== 0)),
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -113,7 +150,7 @@ const saveMutation = useMutation({
       : apiClient.updateToken(payload.body.token_key, payload.body),
   onSuccess: async () => {
     // 余额变更随保存一同生效：定义保存成功后，有差额才调用余额接口。
-    const delta = props.initial === null ? 0 : balanceDelta();
+    const delta = props.initial === null || !canAdjustBalance.value ? 0 : balanceDelta();
     if (delta !== 0) {
       balanceMutation.mutate(delta);
       return;
@@ -161,7 +198,7 @@ function handleSave() {
     { name: 'limit', value: editorLimit.value, rules: [{ kind: 'usd', min: 0 }] },
     { name: 'rateLimitRpm', value: editorRpm.value, rules: [{ kind: 'uint', min: 0 }] },
   ];
-  if (props.initial !== null) {
+  if (props.initial !== null && canAdjustBalance.value) {
     specs.push({
       name: 'amount',
       value: editorAmount.value,
@@ -249,6 +286,13 @@ function applyQuick(deltaUsd: number) {
             :options="groupOptions"
             data-testid="token-editor-group"
           />
+          <p
+            v-if="groupUnusable"
+            class="text-danger mt-1 text-xs"
+            data-testid="token-group-unusable-hint"
+          >
+            {{ t('tokens.groupUnusableHint') }}
+          </p>
         </FormField>
         <FormField
           field-name="limit"
@@ -306,7 +350,10 @@ function applyQuick(deltaUsd: number) {
           />
         </FormField>
 
-        <fieldset v-if="initial !== null" class="border-seed rounded-md border p-3">
+        <fieldset
+          v-if="initial !== null && canAdjustBalance"
+          class="border-seed rounded-md border p-3"
+        >
           <legend class="text-fg-muted flex items-center gap-1.5 px-1 text-xs font-medium">
             {{ t('tokens.balanceSection') }}
             <FieldInfoHint>

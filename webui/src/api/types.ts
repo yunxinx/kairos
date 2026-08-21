@@ -39,12 +39,26 @@ export interface Token {
 /** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */
 export type TokenCreate = Omit<Token, 'token_key'>;
 
-/** 令牌读响应：写契约字段 + 生命周期元数据。 */
+/** 令牌读响应：写契约字段 + 生命周期元数据 + 该令牌累计结算。 */
 export interface TokenView extends Token {
   /** 创建时刻（unix 毫秒）。 */
   created_at: number;
   /** 最后使用时刻（unix 毫秒）；null 表示从未使用。 */
   last_used_at: number | null;
+  /** 该令牌累计已结算（micro-USD），对照 `limit_usd_micros`。 */
+  settled_usd_micros: number;
+}
+
+/** PUT 令牌：剥离只读字段。 */
+export function tokenWriteBody(view: Token): Token {
+  return {
+    token_key: view.token_key,
+    name: view.name,
+    limit_usd_micros: view.limit_usd_micros,
+    rate_limit_rpm: view.rate_limit_rpm,
+    enabled: view.enabled,
+    model_group: view.model_group,
+  };
 }
 
 /** 渠道：出站接入单元（写契约，不含库生成身份）。 */
@@ -204,6 +218,72 @@ export interface BalanceView {
   token_key: string;
   balance_usd_micros: number;
   settled_usd_micros: number;
+}
+
+/** 管理角色：上级含下级权限。 */
+export type ManagementRole = 'user' | 'admin' | 'root';
+
+const ROLE_RANK: Record<ManagementRole, number> = { user: 0, admin: 1, root: 2 };
+
+/** 是否不低于 `min`（root > admin > user）。 */
+export function roleAtLeast(role: ManagementRole, min: ManagementRole): boolean {
+  return ROLE_RANK[role] >= ROLE_RANK[min];
+}
+
+/** 登录与 `/me` 的身份字段。 */
+export interface UserView {
+  id: number;
+  email: string;
+  display_name: string;
+  role: ManagementRole;
+  enabled: boolean;
+}
+
+/** 当前用户：身份 + 可用组 + 钱包。 */
+export interface MeView extends UserView {
+  assigned_groups: string[];
+  balance_usd_micros: number;
+  settled_usd_micros: number;
+}
+
+/** 用户管理列表/详情（与 `MeView` 同形）。 */
+export type UserAdminView = MeView;
+
+export interface LoginRequest {
+  email: string;
+  password: string;
+}
+
+export interface LoginView {
+  token: string;
+  expires_at: number;
+  user: UserView;
+}
+
+export interface UserCreate {
+  email: string;
+  display_name: string;
+  password: string;
+  role: ManagementRole;
+}
+
+/** 当前用户改自己的资料。改密码时必须带 `current_password`。 */
+export interface MeUpdate {
+  email?: string;
+  display_name?: string;
+  password?: string;
+  current_password?: string;
+}
+
+export interface UserUpdate {
+  role?: ManagementRole;
+  enabled?: boolean;
+  password?: string;
+  display_name?: string;
+}
+
+export interface AssignedGroupsView {
+  groups: string[];
 }
 
 /** 请求日志条目；完整 body 为 base64。 */

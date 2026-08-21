@@ -3,8 +3,8 @@ import { requireAuth } from '@/lib/router-guards';
 
 /** 旧「价格」路径改到模型页。 */
 export const Route = createFileRoute('/pricing')({
-  beforeLoad: () => {
-    requireAuth();
+  beforeLoad: async () => {
+    await requireAuth();
     throw redirect({ to: '/models' });
   },
 });

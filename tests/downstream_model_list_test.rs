@@ -6,10 +6,10 @@
 
 mod common;
 
-use common::{TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use serde_json::{Value, json};
 
-/// 带 `TEST_ADMIN_KEY` 认证的 JSON 请求。
+/// 带 `&gw.session` 认证的 JSON 请求。
 async fn admin_json(
     gw: &TestGateway,
     method: reqwest::Method,
@@ -18,7 +18,7 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&body)
         .send()
         .await
@@ -28,7 +28,7 @@ async fn admin_json(
 async fn first_channel_id(gw: &TestGateway) -> i64 {
     let channels: Value = reqwest::Client::new()
         .get(format!("{}/channels", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("渠道列表应可达")

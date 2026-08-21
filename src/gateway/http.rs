@@ -199,12 +199,16 @@ async fn list_models(
         )
         .await;
     }
-    let ids = store::resources::visible_model_ids(
-        &snapshot.model_groups,
-        &snapshot.unified_models,
-        snapshot.channels.iter().map(|record| &record.channel),
-        &token.model_group,
-    );
+    let ids = if snapshot.token_group_assigned(token) {
+        store::resources::visible_model_ids(
+            &snapshot.model_groups,
+            &snapshot.unified_models,
+            snapshot.channels.iter().map(|record| &record.channel),
+            &token.model_group,
+        )
+    } else {
+        Vec::new()
+    };
     let body = protocol::encode_model_list(&ids, inbound_protocol);
     Json(body).into_response()
 }
@@ -507,8 +511,14 @@ async fn handle_request(
         }
     };
 
-    // 3. 模型组允许名单：组外名字按「不存在」拒绝，不提分组、不用 503。
-    if !store::resources::group_allows(&snapshot.model_groups, &token.model_group, &request.model) {
+    // 3. 模型组允许名单：组外、空组、已撤组一律按「不存在」拒绝，不提分组、不用 503。
+    if !snapshot.token_group_assigned(token)
+        || !store::resources::group_allows(
+            &snapshot.model_groups,
+            &token.model_group,
+            &request.model,
+        )
+    {
         let message = format!("模型 {} 不存在", request.model);
         return error_response(
             StatusCode::NOT_FOUND,
@@ -545,7 +555,7 @@ async fn handle_request(
         }
     };
 
-    // 5. 计费准入：令牌余额与累计上限须通过（单价按实际跳在出站时选用）。
+    // 5. 计费准入：用户钱包与令牌累计上限须通过（单价按实际跳在出站时选用）。
     let mut conn = match deps.pool.acquire().await {
         Ok(conn) => conn,
         Err(err) => {
@@ -563,8 +573,8 @@ async fn handle_request(
             .await;
         }
     };
-    // 余额独立存 token_balance 表：建行发生在创建令牌时，准入只读、不写。
-    // 行缺失视为 0（与「首次出现按 0」一致），由后续 402 挡住，不在热路径 INSERT。
+    // 剩余在用户钱包：建行发生在创建用户/令牌时，准入只读、不写。
+    // 令牌或钱包缺失视为 0，由后续 402 挡住，不在热路径 INSERT。
     let balance = match store::get_token_balance(&mut conn, &token.token_key).await {
         Ok(Some(balance)) => balance,
         Ok(None) => store::TokenBalance {
@@ -588,8 +598,7 @@ async fn handle_request(
     };
     if balance.balance_usd_micros <= 0 {
         let message = format!(
-            "令牌 {} 余额不足（当前 {:.2} USD）",
-            token.name,
+            "用户余额不足（当前 {:.2} USD）",
             balance.balance_usd_micros as f64 / 1_000_000.0
         );
         return error_response(
@@ -631,8 +640,7 @@ async fn handle_request(
         let estimate = estimate_admission_cost_micros(&hops, &snapshot, max_tokens);
         if estimate > balance.balance_usd_micros {
             let message = format!(
-                "令牌 {} 预估费用超过余额（预估 {:.2} USD，当前 {:.2} USD）",
-                token.name,
+                "用户余额不足以覆盖预估费用（预估 {:.2} USD，当前 {:.2} USD）",
                 estimate as f64 / 1_000_000.0,
                 balance.balance_usd_micros as f64 / 1_000_000.0
             );
@@ -2017,6 +2025,13 @@ fn authenticate<'a>(
         .ok_or_else(|| anyhow::anyhow!("无效的认证令牌"))?;
     if !token.enabled {
         return Err(anyhow::anyhow!("认证令牌已被禁用"));
+    }
+    if snapshot
+        .users
+        .get(&token.user_id)
+        .is_none_or(|user| !user.enabled)
+    {
+        return Err(anyhow::anyhow!("所属用户已禁用"));
     }
     Ok(token)
 }

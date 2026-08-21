@@ -5,14 +5,14 @@
 
 mod common;
 
-use common::{TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use serde_json::{Value, json};
 
-/// 带 `TEST_ADMIN_KEY` 认证的 GET。
+/// 带 `&gw.session` 认证的 GET。
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("管理请求应可达")
@@ -27,7 +27,7 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&body)
         .send()
         .await
@@ -38,7 +38,7 @@ async fn admin_json(
 async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("管理请求应可达")
@@ -136,18 +136,6 @@ async fn default_group_always_exists_and_cannot_be_deleted() {
     assert!(
         !msg.to_lowercase().contains("force"),
         "普通删除文案不必提 force"
-    );
-
-    let forced = admin_send(
-        &gw,
-        reqwest::Method::DELETE,
-        "/model-groups/default?force=true",
-    )
-    .await;
-    assert_eq!(
-        forced.status(),
-        reqwest::StatusCode::CONFLICT,
-        "强制也不能删 default"
     );
 
     let list: Value = admin_get(&gw, "/model-groups")
@@ -412,15 +400,15 @@ async fn token_binds_exactly_one_group() {
     assert_eq!(coder["model_group"], "coding", "失败的改绑不应落库");
 }
 
-/// 删除仍有令牌的组被拒；强制删除把那些令牌改回 `default`。
+/// 删除有令牌绑定的组：令牌组置空失效，不改绑 `default`；无需 force。
 #[tokio::test]
-async fn delete_group_with_tokens_is_blocked_until_forced() {
-    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+async fn delete_group_nulls_token_group_without_rebind() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
     admin_json(
         &gw,
         reqwest::Method::POST,
         "/model-groups",
-        json!({ "name": "coding", "models": [] }),
+        json!({ "name": "coding", "models": [source_entry(first_channel_id(&gw).await, TEST_MODEL)] }),
     )
     .await;
     let created = admin_json(
@@ -432,30 +420,16 @@ async fn delete_group_with_tokens_is_blocked_until_forced() {
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
     let key = token["token_key"].as_str().expect("应有 key").to_string();
-
-    let blocked = admin_send(&gw, reqwest::Method::DELETE, "/model-groups/coding").await;
-    assert_eq!(blocked.status(), reqwest::StatusCode::CONFLICT);
-    let body: Value = blocked.json().await.expect("错误体应可解析");
-    let msg = body["error"]["message"].as_str().expect("应有消息");
-    assert!(
-        msg.contains("令牌") || msg.contains("绑定"),
-        "应说明仍有令牌，实际 {msg}"
-    );
-
-    let list: Value = admin_get(&gw, "/model-groups")
-        .await
-        .json()
-        .await
-        .expect("组列表应可解析");
-    group_named(&list, "coding");
-
-    let forced = admin_send(
+    admin_json(
         &gw,
-        reqwest::Method::DELETE,
-        "/model-groups/coding?force=true",
+        reqwest::Method::POST,
+        &format!("/tokens/{key}/balance"),
+        json!({ "delta_usd_micros": 5_000_000 }),
     )
     .await;
-    assert_eq!(forced.status(), reqwest::StatusCode::OK);
+
+    let deleted = admin_send(&gw, reqwest::Method::DELETE, "/model-groups/coding").await;
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
 
     let list: Value = admin_get(&gw, "/model-groups")
         .await
@@ -475,13 +449,23 @@ async fn delete_group_with_tokens_is_blocked_until_forced() {
         .json()
         .await
         .expect("令牌列表应可解析");
-    let rebound = tokens
+    let cleared = tokens
         .as_array()
         .unwrap()
         .iter()
         .find(|t| t["token_key"] == key)
         .expect("令牌应仍在");
-    assert_eq!(rebound["model_group"], "default");
+    assert_eq!(cleared["model_group"], "");
+
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let denied = chat_request(&gw, &key, TEST_MODEL).await;
+    assert_ne!(
+        denied.status(),
+        reqwest::StatusCode::OK,
+        "组被删后令牌应立刻失效"
+    );
+    assert!(gw.upstream.received().is_empty(), "失效令牌不应出站");
 }
 
 /// 组外调用：404「不存在该模型」，不提分组，不是 503；组内仍可调。

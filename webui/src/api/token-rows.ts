@@ -1,25 +1,20 @@
 import { apiClient } from '@/api/client';
-import type { BalanceView, TokenView } from '@/api/types';
+import type { TokenView } from '@/api/types';
+import { setMe } from '@/lib/session';
+import { tokenGroupUsable } from '@/lib/visible-models';
 
 export type TokenRow = TokenView & {
   balance_usd_micros: number;
-  settled_usd_micros: number;
+  group_usable: boolean;
 };
 
-/** 列表页与导航预取共用：先列令牌，再串行读余额（避免并发写锁）。 */
+/** 列表页与导航预取共用：令牌列表 + 当前用户钱包（多令牌共用额度）。 */
 export async function loadTokenRows(): Promise<TokenRow[]> {
-  const listed = await apiClient.listTokens();
-  const balances: BalanceView[] = [];
-  for (const token of listed) {
-    balances.push(await apiClient.readTokenBalance(token.token_key));
-  }
-  const byKey = new Map(balances.map((item) => [item.token_key, item]));
-  return listed.map((token) => {
-    const balance = byKey.get(token.token_key);
-    return {
-      ...token,
-      balance_usd_micros: balance?.balance_usd_micros ?? 0,
-      settled_usd_micros: balance?.settled_usd_micros ?? 0,
-    };
-  });
+  const [listed, me] = await Promise.all([apiClient.listTokens(), apiClient.getMe()]);
+  setMe(me);
+  return listed.map((token) => ({
+    ...token,
+    balance_usd_micros: me.balance_usd_micros,
+    group_usable: tokenGroupUsable(token.model_group, me.role, me.assigned_groups),
+  }));
 }

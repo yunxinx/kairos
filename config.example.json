@@ -1,6 +1,5 @@
 {
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "database": { "path": "./kairos.db" },
-  "admin_key": "sk-admin-secret",
   "admin_listen": { "host": "127.0.0.1", "port": 8788 }
 }

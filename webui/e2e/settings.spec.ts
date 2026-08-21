@@ -1,5 +1,7 @@
 import { authedTest as test, expect } from './fixtures';
-import { E2E_ADMIN_KEY, E2E_PROTOCOL_PORT } from './helpers/gateway';
+import { E2E_PROTOCOL_PORT } from './helpers/gateway';
+import { e2eRootHeaders } from './helpers/session';
+import { seedToken } from './helpers/models';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -15,8 +17,10 @@ test.describe('settings page', () => {
     await page.getByTestId('settings-save').click();
     await expect(page.getByTestId('toast')).toContainText(/saved|已保存/);
 
+    const token = await seedToken(page, { name: 'e2e-settings-body-limit' });
     const oversized = 'x'.repeat(20_000);
     const resp = await request.post(`http://127.0.0.1:${E2E_PROTOCOL_PORT}/v1/chat/completions`, {
+      headers: { Authorization: `Bearer ${token.token_key}` },
       data: {
         model: 'gpt-4o',
         messages: [{ role: 'user', content: oversized }],
@@ -48,7 +52,7 @@ test.describe('settings page', () => {
     await expect(page.getByTestId('toast')).toContainText(/saved|已保存/);
 
     const resp = await request.get('/settings', {
-      headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+      headers: await e2eRootHeaders(page.request),
     });
     expect(resp.ok()).toBeTruthy();
     expect((await resp.json()).full_body).toBe(true);
@@ -56,12 +60,9 @@ test.describe('settings page', () => {
     await page.reload();
     await expect(page.getByTestId('settings-full-body')).toBeChecked();
     await expect(page.getByTestId('settings-log-body-max-bytes')).toBeVisible();
-    await page
-      .locator('[data-form-field="fullBody"]')
-      .getByRole('button', { name: /format and requirements|格式与填写说明/ })
-      .click();
-    await expect(page.locator('#settings-full-body-guide')).toContainText(
-      /plaintext in sqlite|明文写入 sqlite/i,
-    );
+    await page.locator('[data-form-field="fullBody"] .field-info-hint-trigger').click();
+    await expect(
+      page.getByRole('dialog', { name: /format and requirements|格式与填写说明/i }),
+    ).toContainText(/plaintext in sqlite|明文写入 sqlite/i);
   });
 });

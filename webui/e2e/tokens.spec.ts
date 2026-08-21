@@ -1,5 +1,5 @@
 import { authedTest as test, expect } from './fixtures';
-import { E2E_ADMIN_KEY } from './helpers/gateway';
+import { e2eRootHeaders } from './helpers/session';
 import { clickRowAction } from './helpers/table';
 
 test.describe.configure({ mode: 'serial' });
@@ -13,7 +13,7 @@ async function readBalanceMicros(
   tokenKey: string,
 ): Promise<number | null> {
   const resp = await page.request.post(`/tokens/${tokenKey}/balance`, {
-    headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+    headers: await e2eRootHeaders(page.request),
     data: { delta_usd_micros: 0 },
   });
   if (!resp.ok()) return null;

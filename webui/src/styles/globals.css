@@ -1370,7 +1370,7 @@ html[lang='zh-CN'] .font-serif {
   border: 1px solid color-mix(in srgb, var(--seed-border) 65%, transparent);
   border-radius: 8px;
   box-shadow: none;
-  transform-origin: top left;
+  transform-origin: bottom left;
 }
 .field-info-hint-content[data-state='open'] {
   animation: field-info-hint-in 140ms ease-out;
@@ -1381,7 +1381,7 @@ html[lang='zh-CN'] .font-serif {
 @keyframes field-info-hint-in {
   from {
     opacity: 0;
-    transform: translateY(-2px) scale(0.98);
+    transform: translateY(2px) scale(0.98);
   }
   to {
     opacity: 1;
@@ -1395,7 +1395,7 @@ html[lang='zh-CN'] .font-serif {
   }
   to {
     opacity: 0;
-    transform: translateY(-2px) scale(0.98);
+    transform: translateY(2px) scale(0.98);
   }
 }
 .field-info-hint-body {

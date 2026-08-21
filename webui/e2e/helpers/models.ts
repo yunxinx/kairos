@@ -1,5 +1,5 @@
 import { expect, type Page } from '@playwright/test';
-import { E2E_ADMIN_KEY } from './gateway';
+import { e2eRootHeaders } from './session';
 import {
   channelWriteBody,
   type Channel,
@@ -9,13 +9,12 @@ import {
   type UnifiedModel,
 } from '../../src/api/types';
 
-const headers = { Authorization: `Bearer ${E2E_ADMIN_KEY}` };
-
 /** 经管理 API 写入一条渠道，供模型页 e2e 绕过渠道编辑器。 */
 export async function seedChannel(
   page: Page,
   body: Partial<Channel> & Pick<Channel, 'name' | 'models'>,
 ): Promise<{ id: number }> {
+  const headers = await e2eRootHeaders(page.request);
   const resp = await page.request.post('/channels', {
     headers,
     data: {
@@ -38,19 +37,28 @@ export async function seedChannel(
 
 /** 经管理 API 写入一条价格。 */
 export async function seedPrice(page: Page, body: Price): Promise<void> {
-  const resp = await page.request.post('/prices', { headers, data: body });
+  const resp = await page.request.post('/prices', {
+    headers: await e2eRootHeaders(page.request),
+    data: body,
+  });
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }
 
 /** 经管理 API 写入一个统一模型。 */
 export async function seedUnifiedModel(page: Page, body: UnifiedModel): Promise<void> {
-  const resp = await page.request.post('/unified-models', { headers, data: body });
+  const resp = await page.request.post('/unified-models', {
+    headers: await e2eRootHeaders(page.request),
+    data: body,
+  });
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }
 
 /** 经管理 API 写入一个模型组。 */
 export async function seedModelGroup(page: Page, body: ModelGroup): Promise<void> {
-  const resp = await page.request.post('/model-groups', { headers, data: body });
+  const resp = await page.request.post('/model-groups', {
+    headers: await e2eRootHeaders(page.request),
+    data: body,
+  });
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }
 
@@ -60,7 +68,7 @@ export async function seedToken(
   body: Partial<{ name: string; model_group: string }> & { name: string },
 ): Promise<{ token_key: string }> {
   const resp = await page.request.post('/tokens', {
-    headers,
+    headers: await e2eRootHeaders(page.request),
     data: {
       limit_usd_micros: null,
       enabled: true,
@@ -85,7 +93,10 @@ export async function seedCatalog(
     cache_write_micros: number | null;
   }>,
 ): Promise<void> {
-  const resp = await page.request.put('/catalog', { headers, data: { models } });
+  const resp = await page.request.put('/catalog', {
+    headers: await e2eRootHeaders(page.request),
+    data: { models },
+  });
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }
 
@@ -95,6 +106,7 @@ export async function updateChannel(
   id: number,
   patch: Partial<Channel>,
 ): Promise<void> {
+  const headers = await e2eRootHeaders(page.request);
   const listed = await page.request.get('/channels', { headers });
   expect(listed.ok(), await listed.text()).toBeTruthy();
   const channels = (await listed.json()) as ChannelView[];
@@ -111,6 +123,8 @@ export async function updateChannel(
 
 /** 删除渠道。 */
 export async function deleteChannel(page: Page, id: number): Promise<void> {
-  const resp = await page.request.delete(`/channels/${id}`, { headers });
+  const resp = await page.request.delete(`/channels/${id}`, {
+    headers: await e2eRootHeaders(page.request),
+  });
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }

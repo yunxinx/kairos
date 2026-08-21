@@ -1,9 +1,11 @@
-//! 管理 API：独立管理监听 + 静态 admin key 认证 + 资源 CRUD + 嵌入式 Web UI。
+//! 管理 API：独立管理监听 + 管理会话认证 + 资源 CRUD + 嵌入式 Web UI。
 //!
 //! 管理面与协议面物理隔离：配置文件中可选的管理监听地址（`admin_listen`）配置了
-//! 才启动，未配置即管理面整体关闭，协议监听不注册任何管理路由。所有资源 API
-//! 以静态 `admin_key`（Bearer）认证；`webui/dist` 静态资源与 SPA 回退挂在 fallback
-//! 上、免认证。产物缺失时管理面退化为纯 API。
+//! 才启动，未配置即管理面整体关闭，协议监听不注册任何管理路由。资源 API **只**
+//! 接受登录签发的会话（`ksess_…` Bearer）。配置里的 `admin_password` 是 root 的
+//! Web UI 登录口令种子，哈希后进库；把它原样放进 `Authorization` 不会通过认证。
+//! `webui/dist` 静态资源与 SPA 回退挂在 fallback 上、免认证。产物缺失时管理面
+//! 退化为纯 API。
 //!
 //! 资源 CRUD（令牌/渠道/价格/模型组/统一模型）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
@@ -16,7 +18,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
@@ -36,9 +38,10 @@ use crate::{
     store::StoreError,
     store::catalog::{CatalogMeta, CatalogModel, CatalogView},
     store::resources::{
-        Channel, ChannelRecord, GroupModel, ModelGroup, Price, Settings, Token, UnifiedMember,
-        UnifiedModel, channel_lists_callable,
+        Channel, ChannelRecord, GroupModel, ModelGroup, Price, Settings, Token, TokenRecord,
+        UnifiedMember, UnifiedModel, channel_lists_callable,
     },
+    store::users::{self, ManagementRole, NewUser, UserRecord},
 };
 
 use super::http::{OutboundAuth, extract_bearer};
@@ -51,47 +54,46 @@ struct AdminDeps {
     pool: SqlitePool,
     snapshot: crate::runtime::SnapshotHandle,
     client: reqwest::Client,
+    throttle: AuthThrottle,
 }
 
-/// 管理认证中间件状态：静态 admin key + 认证失败限流 + 快照（读限流阈值）。
+/// 管理认证中间件状态：认证失败限流 + 会话查库。
+///
+/// 故意不持有配置里的 `admin_password`：持有它会诱使中间件做常数时间比较，
+/// 把登录口令重新变成机器 API 密钥。
 #[derive(Clone)]
 struct AdminAuth {
-    admin_key: String,
     throttle: AuthThrottle,
     snapshot: crate::runtime::SnapshotHandle,
+    pool: SqlitePool,
 }
 
-/// 组装管理面路由：资源 CRUD 挂在 admin key 认证中间件之后；静态 UI 为 fallback。
+/// 组装管理面路由：资源 CRUD 挂在认证中间件之后；`/login` 与静态 UI 免认证。
 ///
 /// 路由以领域词直出（`/tokens`、`/channels`、`/prices`），集合端点 GET 列出、
 /// POST 新建；单资源端点 PUT 整体替换、DELETE 删除。UI 静态资源与未匹配的 GET
 /// 深链不经认证中间件。
-pub fn router(
-    pool: SqlitePool,
-    snapshot: crate::runtime::SnapshotHandle,
-    admin_key: String,
-) -> Router {
+pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Router {
     // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
     // builder 事先记下错误时失败；本路径未设置会失败的选项。
     let client = reqwest::Client::builder()
         .build()
         .expect("未配置会失败的 ClientBuilder 选项，rustls 客户端应能构建");
+    let throttle = AuthThrottle::new();
     let deps = AdminDeps {
-        pool,
+        pool: pool.clone(),
         snapshot: snapshot.clone(),
         client,
+        throttle: throttle.clone(),
     };
-    Router::new()
-        .route("/tokens", get(list_tokens).post(create_token))
-        .route(
-            "/tokens/{token_key}",
-            put(update_token).delete(delete_token),
-        )
-        .route("/tokens/{token_key}/balance", post(adjust_token_balance))
+    let root_only = Router::new()
         .route("/channels", get(list_channels).post(create_channel))
         .route("/channels/models", post(list_upstream_models))
         .route("/channels/{id}", put(update_channel).delete(delete_channel))
         .route("/channels/{id}/test", post(test_channel))
+        .route("/settings", get(get_settings).put(update_settings))
+        .route_layer(middleware::from_fn(require_root));
+    let admin_plus = Router::new()
         .route("/prices", get(list_prices).post(create_price))
         .route(
             "/prices/{channel_id}/{model}",
@@ -113,10 +115,25 @@ pub fn router(
             "/unified-models/{id}",
             put(update_unified_model).delete(delete_unified_model),
         )
-        .route("/settings", get(get_settings).put(update_settings))
         .route("/catalog", get(get_catalog).put(put_catalog))
         .route("/catalog/meta", get(get_catalog_meta))
         .route("/catalog/sync", post(sync_catalog))
+        .route("/users", get(list_management_users))
+        .route("/users/{id}", get(get_management_user))
+        .route("/users/{id}/balance", post(recharge_user))
+        .route("/users/{id}/tokens", get(list_user_tokens))
+        .route(
+            "/users/{id}/model-groups",
+            get(get_user_model_groups).put(replace_user_model_groups),
+        )
+        .route_layer(middleware::from_fn(require_admin));
+    let signed_in = Router::new()
+        .route("/tokens", get(list_tokens).post(create_token))
+        .route(
+            "/tokens/{token_key}",
+            put(update_token).delete(delete_token),
+        )
+        .route("/tokens/{token_key}/balance", post(adjust_token_balance))
         .route("/logs", get(query_logs))
         .route("/logs/{id}", get(get_log))
         .route("/logs/{id}/settle", post(settle_log))
@@ -124,27 +141,57 @@ pub fn router(
         .route("/system-logs", get(query_system_logs))
         .route("/stats", get(get_stats))
         .route("/stats/lifetime", get(get_lifetime_stats))
+        .route("/me", get(get_me).put(update_me))
+        .route("/logout", post(logout))
+        .route("/users", post(create_user))
+        .route("/users/{id}", put(update_user).delete(delete_user));
+    let protected = Router::new()
+        .merge(root_only)
+        .merge(admin_plus)
+        .merge(signed_in)
         .route_layer(middleware::from_fn_with_state(
             AdminAuth {
-                admin_key,
-                throttle: AuthThrottle::new(),
+                throttle,
                 snapshot,
+                pool,
             },
             admin_auth,
-        ))
+        ));
+    Router::new()
+        .merge(protected)
+        // POST 是登录 API；GET/HEAD 走 SPA（仅 POST 时 axum 对 GET 返回 405，登录页刷新/深链打不开）。
+        .route("/login", post(login).get(super::webui::serve))
         // fallback 不走 route_layer：静态资源与 SPA 回退免认证；API 路由仍受中间件保护。
         .fallback(super::webui::serve)
         .with_state(deps)
 }
 
-/// admin key 认证中间件：请求需带 `Authorization: Bearer <admin_key>`，否则 401。
+/// 已认证主体：一条未吊销的管理会话对应用户。
 ///
-/// 管理面与协议面监听隔离，本中间件只作用于管理路由；认证失败返回结构化错误。
-/// 同一 IP 在窗口内认证失败过多则 429，比较密钥用常数时间避免侧信道。
+/// Bearer 必须是 `POST /login` 签发的 `ksess_…`，与用户登录口令不是同一种东西。
+#[derive(Clone)]
+struct ManagementIdentity {
+    user: UserRecord,
+}
+
+impl ManagementIdentity {
+    fn role(&self) -> ManagementRole {
+        self.user.role
+    }
+
+    fn user_id(&self) -> i64 {
+        self.user.id
+    }
+}
+
+/// 管理认证：Bearer 仅为未吊销的会话。失败 401，窗口内过多则 429。
+///
+/// 只走 `user_for_session`（查 `ksess_…` 哈希）。不把配置密码、库内 Argon2 哈希
+/// 或任何静态密钥拿来和 Bearer 比较——否则登录口令会退化成机器 API 密钥。
 async fn admin_auth(
     State(auth): State<AdminAuth>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let ip = addr.ip();
@@ -167,33 +214,557 @@ async fn admin_auth(
         .and_then(|value| value.to_str().ok())
         .and_then(extract_bearer)
         .unwrap_or("");
-    if constant_time_eq(provided.as_bytes(), auth.admin_key.as_bytes()) {
-        next.run(request).await
-    } else {
-        auth.throttle.record_failure(ip, max_failures, window);
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(
-                json!({ "error": { "code": "unauthorized", "message": "无效或缺失的 admin key" } }),
-            ),
-        )
-            .into_response()
+    let now = super::logging::unix_millis();
+    match users::user_for_session(&auth.pool, provided, now).await {
+        Ok(Some(user)) => {
+            request.extensions_mut().insert(ManagementIdentity { user });
+            next.run(request).await
+        }
+        Ok(None) => {
+            auth.throttle.record_failure(ip, max_failures, window);
+            unauthorized_response()
+        }
+        Err(err) => AdminError::Store(err).into_response(),
     }
 }
 
-/// 常数时间比较：长度不同时仍扫描较短一侧，避免按首个差异字节提前返回。
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = (left.len() != right.len()) as u8;
-    let n = left.len().min(right.len());
-    for i in 0..n {
-        diff |= left[i] ^ right[i];
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": { "code": "unauthorized", "message": "无效或缺失的管理凭证" } })),
+    )
+        .into_response()
+}
+
+fn forbidden_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": { "code": "forbidden", "message": "权限不足" } })),
+    )
+        .into_response()
+}
+
+async fn require_root(request: Request, next: Next) -> Response {
+    require_min_role(request, next, ManagementRole::Root).await
+}
+
+async fn require_admin(request: Request, next: Next) -> Response {
+    require_min_role(request, next, ManagementRole::Admin).await
+}
+
+async fn require_min_role(request: Request, next: Next, min: ManagementRole) -> Response {
+    let Some(identity) = request.extensions().get::<ManagementIdentity>() else {
+        return unauthorized_response();
+    };
+    if identity.role().at_least(min) {
+        next.run(request).await
+    } else {
+        forbidden_response()
     }
-    diff == 0
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginBody {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UserView {
+    id: i64,
+    email: String,
+    display_name: String,
+    role: ManagementRole,
+    enabled: bool,
+}
+
+impl UserView {
+    fn from_record(record: UserRecord) -> Self {
+        Self {
+            id: record.id,
+            email: record.email,
+            display_name: record.display_name,
+            role: record.role,
+            enabled: record.enabled,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LoginView {
+    token: String,
+    expires_at: i64,
+    user: UserView,
+}
+
+/// 邮箱密码换会话。成功后的 Bearer 是会话令牌，不是登录口令本身。
+async fn login(
+    State(deps): State<AdminDeps>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    body: Result<Json<LoginBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<LoginView>, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    let max_failures = snapshot.auth_throttle_max_failures;
+    let window = snapshot.auth_throttle_window();
+    drop(snapshot);
+    let ip = addr.ip();
+    if deps.throttle.is_blocked(ip, max_failures, window) {
+        return Err(AdminError::RateLimited);
+    }
+    let body = body.map_err(AdminError::bad_body)?.0;
+    let Some(user) = users::authenticate_password(&deps.pool, &body.email, &body.password)
+        .await
+        .map_err(AdminError::Store)?
+    else {
+        deps.throttle.record_failure(ip, max_failures, window);
+        return Err(AdminError::Unauthorized);
+    };
+    let now = super::logging::unix_millis();
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let (token, expires_at) = users::issue_session(&mut tx, user.id, now)
+        .await
+        .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(Json(LoginView {
+        token,
+        expires_at,
+        user: UserView::from_record(user),
+    }))
+}
+
+/// 吊销当前会话；非 `ksess_` 前缀视为无操作，仍 204。
+async fn logout(State(deps): State<AdminDeps>, request: Request) -> Result<StatusCode, AdminError> {
+    let provided = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer)
+        .unwrap_or("");
+    users::revoke_session(&deps.pool, provided)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_me(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<Json<UserAdminView>, AdminError> {
+    user_admin_view(&deps.pool, identity.user).await.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeUpdate {
+    email: Option<String>,
+    password: Option<String>,
+    /// 改密码时必填；只改邮箱/展示名不必带。防止有人拿已窃会话静默换口令。
+    current_password: Option<String>,
+    display_name: Option<String>,
+}
+
+/// 当前用户改自己的邮箱、展示名或密码。
+async fn update_me(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<MeUpdate>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<UserView>, AdminError> {
+    let update = body.map_err(AdminError::bad_body)?.0;
+    let user_id = identity.user_id();
+    if update.password.is_some() {
+        let Some(current) = update.current_password.as_deref() else {
+            return Err(AdminError::InvalidBody(
+                "修改密码需要提供当前密码".to_string(),
+            ));
+        };
+        let matches = users::password_matches(&deps.pool, user_id, current)
+            .await
+            .map_err(AdminError::Store)?;
+        if !matches {
+            return Err(AdminError::InvalidBody("当前密码不正确".to_string()));
+        }
+    }
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    if let Some(email) = update.email {
+        users::set_email(&mut tx, user_id, &email)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    if let Some(password) = update.password {
+        users::set_password(&mut tx, user_id, &password)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    if let Some(display_name) = update.display_name {
+        let name = display_name.trim();
+        if name.is_empty() {
+            return Err(AdminError::InvalidBody("display_name 不能为空".to_string()));
+        }
+        sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
+            .bind(name)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    let user = users::get_user(&deps.pool, user_id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {user_id} 不存在")))?;
+    Ok(Json(UserView::from_record(user)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserCreate {
+    email: String,
+    display_name: String,
+    password: String,
+    role: ManagementRole,
+}
+
+async fn create_user(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<UserCreate>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<UserView>), AdminError> {
+    let create = body.map_err(AdminError::bad_body)?.0;
+    match (identity.role(), create.role) {
+        (ManagementRole::Root, _) => {}
+        (ManagementRole::Admin, ManagementRole::User) => {}
+        _ => return Err(AdminError::Forbidden),
+    }
+    let now = super::logging::unix_millis();
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let user = users::insert_user(
+        &mut tx,
+        NewUser {
+            email: &create.email,
+            display_name: &create.display_name,
+            password: &create.password,
+            role: create.role,
+        },
+        now,
+    )
+    .await
+    .map_err(map_user_store_err)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok((StatusCode::CREATED, Json(UserView::from_record(user))))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserUpdate {
+    role: Option<ManagementRole>,
+    enabled: Option<bool>,
+    password: Option<String>,
+    display_name: Option<String>,
+}
+
+async fn update_user(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(id): Path<i64>,
+    body: Result<Json<UserUpdate>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<UserView>, AdminError> {
+    let update = body.map_err(AdminError::bad_body)?.0;
+    let target = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    reject_user_management(&identity, &target, update.role)?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    if let Some(role) = update.role {
+        users::set_user_role(&mut tx, id, role)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    if let Some(enabled) = update.enabled {
+        users::set_user_enabled(&mut tx, id, enabled)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    if let Some(password) = update.password {
+        users::set_password(&mut tx, id, &password)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    if let Some(display_name) = update.display_name {
+        let name = display_name.trim();
+        if name.is_empty() {
+            return Err(AdminError::InvalidBody("display_name 不能为空".to_string()));
+        }
+        sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
+            .bind(name)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    let user = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    Ok(Json(UserView::from_record(user)))
+}
+
+async fn delete_user(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AdminError> {
+    let target = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    reject_user_management(&identity, &target, None)?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    users::delete_user(&mut tx, id)
+        .await
+        .map_err(map_user_store_err)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignedGroupsBody {
+    groups: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AssignedGroupsView {
+    groups: Vec<String>,
+}
+
+async fn get_user_model_groups(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(id): Path<i64>,
+) -> Result<Json<AssignedGroupsView>, AdminError> {
+    let target = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    reject_user_management(&identity, &target, None)?;
+    let groups = users::list_assigned_groups(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(AssignedGroupsView { groups }))
+}
+
+async fn replace_user_model_groups(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(id): Path<i64>,
+    body: Result<Json<AssignedGroupsBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<AssignedGroupsView>, AdminError> {
+    let body = body.map_err(AdminError::bad_body)?.0;
+    let target = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    reject_user_management(&identity, &target, None)?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let groups = users::replace_assigned_groups(&mut tx, id, &body.groups)
+        .await
+        .map_err(map_user_store_err)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(AssignedGroupsView { groups }))
+}
+
+#[derive(Debug, Serialize)]
+struct UserAdminView {
+    id: i64,
+    email: String,
+    display_name: String,
+    role: ManagementRole,
+    enabled: bool,
+    assigned_groups: Vec<String>,
+    balance_usd_micros: i64,
+    settled_usd_micros: i64,
+}
+
+async fn user_admin_view(
+    pool: &SqlitePool,
+    record: UserRecord,
+) -> Result<UserAdminView, AdminError> {
+    let groups = users::list_assigned_groups(pool, record.id)
+        .await
+        .map_err(AdminError::Store)?;
+    let (balance_usd_micros, settled_usd_micros) = store::get_user_wallet(pool, record.id)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(UserAdminView {
+        id: record.id,
+        email: record.email,
+        display_name: record.display_name,
+        role: record.role,
+        enabled: record.enabled,
+        assigned_groups: groups,
+        balance_usd_micros,
+        settled_usd_micros,
+    })
+}
+
+async fn list_management_users(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<Json<Vec<UserAdminView>>, AdminError> {
+    let mut records = users::list_users(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
+    if identity.role() == ManagementRole::Admin {
+        records.retain(|record| record.role == ManagementRole::User);
+    }
+    let mut views = Vec::with_capacity(records.len());
+    for record in records {
+        views.push(user_admin_view(&deps.pool, record).await?);
+    }
+    Ok(Json(views))
+}
+
+async fn get_management_user(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(id): Path<i64>,
+) -> Result<Json<UserAdminView>, AdminError> {
+    let target = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    reject_user_management(&identity, &target, None)?;
+    user_admin_view(&deps.pool, target).await.map(Json)
+}
+
+async fn recharge_user(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(id): Path<i64>,
+    body: Result<Json<BalanceAdjustment>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<UserAdminView>, AdminError> {
+    let delta = body.map_err(AdminError::bad_body)?.0.delta_usd_micros;
+    let target = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    reject_user_management(&identity, &target, None)?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    store::adjust_user_balance(&mut tx, id, delta)
+        .await
+        .map_err(map_user_store_err)?;
+    tx.commit().await.map_err(db_err)?;
+    user_admin_view(&deps.pool, target).await.map(Json)
+}
+
+async fn list_user_tokens(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<TokenView>>, AdminError> {
+    let target = users::get_user(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    reject_user_management(&identity, &target, None)?;
+    let mut records = store::resources::list_token_records(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
+    records.retain(|record| record.token.user_id == id);
+    records.sort_by(|a, b| a.token.token_key.cmp(&b.token.token_key));
+    let settled = store::list_token_settled(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(
+        records
+            .into_iter()
+            .map(|record| {
+                let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
+                TokenView::from_record(record, amount)
+            })
+            .collect(),
+    ))
+}
+
+/// 自己的令牌可整体替换或删除。admin/root 对他人令牌仅当所有者为普通用户且只改 `enabled`。
+async fn reject_token_mutation(
+    deps: &AdminDeps,
+    identity: &ManagementIdentity,
+    existing: &TokenRecord,
+    next: Option<&Token>,
+) -> Result<(), AdminError> {
+    if existing.token.user_id == identity.user_id() {
+        return Ok(());
+    }
+    if !identity.role().at_least(ManagementRole::Admin) {
+        return Err(AdminError::Forbidden);
+    }
+    let owner = users::get_user(&deps.pool, existing.token.user_id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", existing.token.user_id)))?;
+    if owner.role != ManagementRole::User {
+        return Err(AdminError::Forbidden);
+    }
+    let Some(next) = next else {
+        return Err(AdminError::Forbidden);
+    };
+    if !disable_only_token_change(&existing.token, next) {
+        return Err(AdminError::Forbidden);
+    }
+    Ok(())
+}
+
+/// 除 `enabled` 外，定义字段必须与现有令牌一致（跨用户禁用不得改名/改绑/改限额）。
+fn disable_only_token_change(existing: &Token, next: &Token) -> bool {
+    next.token_key == existing.token_key
+        && next.name == existing.name
+        && next.limit_usd_micros == existing.limit_usd_micros
+        && next.rate_limit_rpm == existing.rate_limit_rpm
+        && next.model_group == existing.model_group
+}
+
+/// admin 不能管理 admin/root；user 不能管理任何人；改角色到更高档需 root。
+fn reject_user_management(
+    actor: &ManagementIdentity,
+    target: &UserRecord,
+    new_role: Option<ManagementRole>,
+) -> Result<(), AdminError> {
+    match actor.role() {
+        ManagementRole::User => return Err(AdminError::Forbidden),
+        ManagementRole::Admin => {
+            if target.role != ManagementRole::User {
+                return Err(AdminError::Forbidden);
+            }
+            if new_role.is_some_and(|role| role != ManagementRole::User) {
+                return Err(AdminError::Forbidden);
+            }
+        }
+        ManagementRole::Root => {}
+    }
+    Ok(())
+}
+
+fn map_user_store_err(err: StoreError) -> AdminError {
+    match err {
+        StoreError::LastRootProtected => AdminError::LastRootProtected,
+        StoreError::EmailTaken => AdminError::Conflict("邮箱已被使用".to_string()),
+        StoreError::UserNotFound(id) => AdminError::NotFound(format!("用户 {id} 不存在")),
+        StoreError::InvalidResource(message) => AdminError::InvalidBody(message),
+        other => AdminError::Store(other),
+    }
 }
 
 // --- 令牌 ---
 
-/// 令牌读响应 wire 契约：定义字段 + 生命周期元数据（写契约仍是 `Token`）。
+/// 令牌读响应 wire 契约：定义字段 + 生命周期元数据 + 该令牌累计结算（写契约仍是 `Token`）。
 #[derive(Debug, Serialize)]
 struct TokenView {
     token_key: String,
@@ -204,11 +775,12 @@ struct TokenView {
     model_group: String,
     created_at: i64,
     last_used_at: Option<i64>,
+    settled_usd_micros: i64,
 }
 
 impl TokenView {
     /// 从存储层记录构造 wire 视图。
-    fn from_record(record: store::resources::TokenRecord) -> Self {
+    fn from_record(record: store::resources::TokenRecord, settled_usd_micros: i64) -> Self {
         Self {
             token_key: record.token.token_key,
             name: record.token.name,
@@ -218,20 +790,45 @@ impl TokenView {
             model_group: record.token.model_group,
             created_at: record.created_at,
             last_used_at: record.last_used_at,
+            settled_usd_micros,
         }
     }
 }
 
-/// 列出全部令牌（按 `token_key` 排序，保证确定性）。
+async fn token_view(
+    pool: &SqlitePool,
+    record: store::resources::TokenRecord,
+) -> Result<TokenView, AdminError> {
+    let settled = store::get_token_settled(pool, &record.token.token_key)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(TokenView::from_record(record, settled))
+}
+
+/// 列出当前用户的令牌（按 `token_key` 排序，保证确定性）。
 ///
 /// 直接读库而非快照：`last_used_at` 随请求路径刷新、不进快照，列表需要库内最新值。
-async fn list_tokens(State(deps): State<AdminDeps>) -> Result<Json<Vec<TokenView>>, AdminError> {
+/// 他人令牌经 `GET /users/{id}/tokens`。
+async fn list_tokens(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<Json<Vec<TokenView>>, AdminError> {
     let mut records = store::resources::list_token_records(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
+    records.retain(|record| record.token.user_id == identity.user_id());
     records.sort_by(|a, b| a.token.token_key.cmp(&b.token.token_key));
+    let settled = store::list_token_settled(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
     Ok(Json(
-        records.into_iter().map(TokenView::from_record).collect(),
+        records
+            .into_iter()
+            .map(|record| {
+                let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
+                TokenView::from_record(record, amount)
+            })
+            .collect(),
     ))
 }
 
@@ -263,6 +860,7 @@ fn generate_token_key() -> String {
 /// 新建令牌：key 由系统生成（快照内查重，碰撞实际不可能发生），写库 + 换快照 + 返回新令牌。
 async fn create_token(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<TokenCreate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<TokenView>), AdminError> {
     let create = body.map_err(AdminError::bad_body)?.0;
@@ -281,24 +879,28 @@ async fn create_token(
         rate_limit_rpm: create.rate_limit_rpm,
         enabled: create.enabled,
         model_group: create.model_group.trim().to_string(),
+        user_id: identity.user_id(),
     };
     validate_token(&token)?;
     reject_unknown_group(&deps, &token.model_group).await?;
+    reject_unassigned_group(&deps, &identity, &token.model_group).await?;
     let now = super::logging::unix_millis();
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_token(&mut tx, &token, now)
         .await
         .map_err(AdminError::Store)?;
-    // 令牌定义与余额分离存储：新建时同步建零额余额行，使令牌可被后续充值
-    // （`adjust_balance` 的 UPDATE 只改已有行，缺行会报 MissingToken），否则
-    // 新令牌永远无法被运营充值使用。
+    // 令牌定义与累计结算行分离：新建时同步建零额结算行，并把后续充值记入所属用户钱包
+    // （`adjust_balance` 的 UPDATE 按令牌找用户，缺结算行仍可读钱包）。
     crate::store::ensure_token_balance(&mut tx, &token.token_key, 0.0, now)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_token_record(&deps, &token.token_key).await?;
-    Ok((StatusCode::CREATED, Json(TokenView::from_record(created))))
+    Ok((
+        StatusCode::CREATED,
+        Json(token_view(&deps.pool, created).await?),
+    ))
 }
 
 /// 整体替换令牌（按路径 `token_key`，路径权威）：写库 + 换快照 + 返回新令牌。
@@ -307,15 +909,21 @@ async fn create_token(
 /// 分支不触碰创建时间与最后使用时间，属性编辑不重置生命周期元数据。
 async fn update_token(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(token_key): Path<String>,
     body: Result<Json<Token>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TokenView>, AdminError> {
-    let mut token = body.map_err(AdminError::bad_body)?;
+    let mut token = body.map_err(AdminError::bad_body)?.0;
     token.token_key = token_key;
     token.model_group = token.model_group.trim().to_string();
-    validate_token(&token)?;
-    reject_unknown_group(&deps, &token.model_group).await?;
-    read_token_record(&deps, &token.token_key).await?;
+    reject_token_key_shape(&token)?;
+    let existing = read_token_record(&deps, &token.token_key).await?;
+    reject_token_mutation(&deps, &identity, &existing, Some(&token)).await?;
+    if existing.token.user_id == identity.user_id() {
+        validate_token(&token)?;
+        reject_unknown_group(&deps, &token.model_group).await?;
+        reject_unassigned_group(&deps, &identity, &token.model_group).await?;
+    }
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_token(&mut tx, &token, super::logging::unix_millis())
         .await
@@ -323,7 +931,7 @@ async fn update_token(
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_token_record(&deps, &token.token_key).await?;
-    Ok(Json(TokenView::from_record(updated)))
+    Ok(Json(token_view(&deps.pool, updated).await?))
 }
 
 /// 删除令牌：不存在则 404，否则删除并返回被删令牌。
@@ -333,9 +941,11 @@ async fn update_token(
 /// 让同 key 重建的令牌复活旧余额。
 async fn delete_token(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(token_key): Path<String>,
 ) -> Result<Json<TokenView>, AdminError> {
     let deleted = read_token_record(&deps, &token_key).await?;
+    reject_token_mutation(&deps, &identity, &deleted, None).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::delete_token_balance(&mut tx, &token_key)
         .await
@@ -345,7 +955,7 @@ async fn delete_token(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    Ok(Json(TokenView::from_record(deleted)))
+    Ok(Json(token_view(&deps.pool, deleted).await?))
 }
 
 // --- 渠道 ---
@@ -664,40 +1274,16 @@ async fn update_model_group(
     Ok(Json(updated))
 }
 
-/// 删除查询：`force=true` 时把仍绑定的令牌改回 `default` 再删组。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelGroupDeleteQuery {
-    #[serde(default)]
-    force: bool,
-}
-
-/// 删除模型组：内置 `default` 拒绝；仍有令牌且未强制则 409；强制则令牌回 `default`。
+/// 删除模型组：内置 `default` 拒绝；令牌组由外键置空失效，渠道默认组改回 `default`。
 async fn delete_model_group(
     State(deps): State<AdminDeps>,
     Path(name): Path<String>,
-    query: Result<Query<ModelGroupDeleteQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<ModelGroup>, AdminError> {
-    let force = query
-        .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
-        .0
-        .force;
     if name == crate::store::resources::DEFAULT_MODEL_GROUP {
         return Err(AdminError::Conflict("内置组 default 不能删除".to_string()));
     }
     let deleted = read_model_group(&deps, &name).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    let bound = crate::store::resources::count_tokens_in_group(&mut tx, &name)
-        .await
-        .map_err(AdminError::Store)?;
-    if bound > 0 && !force {
-        return Err(AdminError::Conflict(format!("模型组 {name} 仍有令牌绑定")));
-    }
-    if bound > 0 {
-        crate::store::resources::rebind_tokens_to_default(&mut tx, &name)
-            .await
-            .map_err(AdminError::Store)?;
-    }
     crate::store::resources::rebind_channels_to_default(&mut tx, &name)
         .await
         .map_err(AdminError::Store)?;
@@ -1006,16 +1592,26 @@ struct BalanceView {
     settled_usd_micros: i64,
 }
 
-/// 相对调整令牌余额（充值/扣减），库内原子完成，返回调整后余额。
+/// 相对调整令牌所属用户的钱包（充值/扣减），库内原子完成，返回调整后视图。
 ///
-/// 不动令牌定义（修改令牌属性不重置余额）；余额独立存 `token_balance` 表，不参与
-/// 快照替换。令牌不存在返回 404；余额行缺失先在事务内建零额行再调整。
+/// 不动令牌定义（修改令牌属性不重置钱包）；剩余存在 `user_balance`，不参与
+/// 快照替换。令牌不存在返回 404；结算行缺失先在事务内建零额行再调整。
 async fn adjust_token_balance(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(token_key): Path<String>,
     body: Result<Json<BalanceAdjustment>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<BalanceView>, AdminError> {
+    if !identity.role().at_least(ManagementRole::Admin) {
+        return Err(AdminError::Forbidden);
+    }
     let adjustment = body.map_err(AdminError::bad_body)?;
+    let existing = read_token_record(&deps, &token_key).await?;
+    let owner = users::get_user(&deps.pool, existing.token.user_id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", existing.token.user_id)))?;
+    reject_user_management(&identity, &owner, None)?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     // 存在性校验在事务内针对 tokens 表完成（与后续写持同一写锁），避免并发删除后
     // 仍写出一条孤儿余额行、被重建令牌复活。
@@ -1855,6 +2451,26 @@ async fn reject_unknown_group(deps: &AdminDeps, group: &str) -> Result<(), Admin
     }
 }
 
+/// 普通用户只能绑到自己可用名单里的组；root/admin 只需组存在。
+async fn reject_unassigned_group(
+    deps: &AdminDeps,
+    identity: &ManagementIdentity,
+    group: &str,
+) -> Result<(), AdminError> {
+    if identity.role().at_least(ManagementRole::Admin) {
+        return Ok(());
+    }
+    let snapshot = deps.snapshot.read().await;
+    let Some(user) = snapshot.users.get(&identity.user_id()) else {
+        return Err(AdminError::Forbidden);
+    };
+    if user.assigned_groups.contains(group) {
+        Ok(())
+    } else {
+        Err(AdminError::InvalidBody("模型组不在可用名单中".to_string()))
+    }
+}
+
 /// 渠道默认组：空白视为不自动入组。
 fn normalize_channel_group(channel: &mut Channel) {
     channel.model_group = channel.model_group.trim().to_string();
@@ -1888,14 +2504,7 @@ async fn enroll_channel_models(
 
 /// 校验令牌字段：键/名非空、key 仅 ASCII 字母数字与 `._-`、累计上限非负。
 fn validate_token(token: &Token) -> Result<(), AdminError> {
-    if token.token_key.trim().is_empty() {
-        return Err(AdminError::InvalidBody("token_key 不能为空".to_string()));
-    }
-    if !token_key_charset_ok(&token.token_key) {
-        return Err(AdminError::InvalidBody(
-            "token_key 仅允许 ASCII 字母、数字与 ._-".to_string(),
-        ));
-    }
+    reject_token_key_shape(token)?;
     if token.name.trim().is_empty() {
         return Err(AdminError::InvalidBody("name 不能为空".to_string()));
     }
@@ -1915,6 +2524,19 @@ fn validate_token(token: &Token) -> Result<(), AdminError> {
     }
     if token.model_group.trim().is_empty() {
         return Err(AdminError::InvalidBody("model_group 不能为空".to_string()));
+    }
+    Ok(())
+}
+
+/// 路径/body 中的 key 须在查库前校验，以免非法字符被 404 盖住。
+fn reject_token_key_shape(token: &Token) -> Result<(), AdminError> {
+    if token.token_key.trim().is_empty() {
+        return Err(AdminError::InvalidBody("token_key 不能为空".to_string()));
+    }
+    if !token_key_charset_ok(&token.token_key) {
+        return Err(AdminError::InvalidBody(
+            "token_key 仅允许 ASCII 字母、数字与 ._-".to_string(),
+        ));
     }
     Ok(())
 }
@@ -2230,10 +2852,18 @@ fn validate_price(price: &Price) -> Result<(), AdminError> {
 enum AdminError {
     /// 请求体非法（400）：JSON 解析失败或字段校验失败。
     InvalidBody(String),
+    /// 未认证（401）。
+    Unauthorized,
+    /// 已认证但角色不够（403）。
+    Forbidden,
+    /// 认证尝试过于频繁（429）。
+    RateLimited,
     /// 资源不存在（404）。
     NotFound(String),
     /// 资源冲突（409）：同名已存在、渠道内别名占用已登记主模型，或启用渠道间别名指向不同真名。
     Conflict(String),
+    /// 最后一个 root 不能删除或降级（409）。
+    LastRootProtected,
     /// 上游访问失败（502）：模型列表请求不可达、非 2xx 或响应形态非法。
     Upstream(String),
     /// 存储层错误（500）。
@@ -2251,8 +2881,24 @@ impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
             AdminError::InvalidBody(msg) => (StatusCode::BAD_REQUEST, "invalid_body", msg),
+            AdminError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "无效或缺失的管理凭证".to_string(),
+            ),
+            AdminError::Forbidden => (StatusCode::FORBIDDEN, "forbidden", "权限不足".to_string()),
+            AdminError::RateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "认证尝试过于频繁，请稍后再试".to_string(),
+            ),
             AdminError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg),
             AdminError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg),
+            AdminError::LastRootProtected => (
+                StatusCode::CONFLICT,
+                "last_root_protected",
+                "不能删除或降级最后一个 root".to_string(),
+            ),
             AdminError::Upstream(msg) => (StatusCode::BAD_GATEWAY, "upstream_error", msg),
             AdminError::Store(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

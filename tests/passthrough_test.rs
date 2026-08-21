@@ -176,9 +176,12 @@ async fn stream_passthrough_forwards_and_bills_usage() {
     // usage：input 1000 / output 100 / cache_read 200 / cache_write 50。
     // 费用 = 1000*2.5 + 100*10 + 200*1.25 + 50*10 = 2500+1000+250+500 = 4250。
     let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT balance_usd_micros, settled_usd_micros, input_tokens, output_tokens, cost_usd_micros \
-         FROM token_balance JOIN request_log ON token_balance.token_key = request_log.token_key \
-         WHERE token_balance.token_key = ?",
+        "SELECT ub.balance_usd_micros, tb.settled_usd_micros, input_tokens, output_tokens, cost_usd_micros \
+         FROM tokens t \
+         JOIN user_balance ub ON ub.user_id = t.user_id \
+         JOIN token_balance tb ON tb.token_key = t.token_key \
+         JOIN request_log ON request_log.token_key = t.token_key \
+         WHERE t.token_key = ?",
     )
     .bind(TEST_TOKEN_KEY)
     .fetch_one(&gw.pool)

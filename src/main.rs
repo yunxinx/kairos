@@ -21,6 +21,33 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&cli.config)?;
 
     let pool = store::open(&cfg.database.path).await?;
+    // 必须在加载快照之前播种：管理面登录读库，不读快照；先播种才能用邮箱密码换会话。
+    // 凭证以库为准：仅当 password_hash 仍为 NULL 时才读配置或生成。已设密则忽略配置，
+    // 也不把生成值写回 config.json——配置常进版本库，写回去等于把秘密提交出去。
+    match store::users::seed_builtin_root(
+        &pool,
+        cfg.admin_email.as_deref(),
+        cfg.admin_password.as_deref(),
+    )
+    .await?
+    {
+        store::users::RootSeedOutcome::AlreadyProvisioned => {
+            tracing::info!("内置 root 已有登录密码，忽略配置中的 admin_email / admin_password");
+        }
+        store::users::RootSeedOutcome::Provisioned {
+            email,
+            generated_password,
+        } => {
+            // 邮箱每次播种都打印：运营需要知道用哪个账号登录。口令只在本进程生成时打印，
+            // 配置提供的口令不回显，避免把写在文件里的秘密再打到 stdout/日志采集。
+            println!("kairos 内置 root 登录邮箱: {email}");
+            if let Some(password) = generated_password {
+                println!(
+                    "kairos 已生成内置 root 登录密码（仅本次启动打印，不会写回配置文件）: {password}"
+                );
+            }
+        }
+    }
     // 启动时从库加载全部运行时资源进内存快照；请求路径读快照，管理 API 写库后
     // 原子替换，使新资源即时生效。
     let snapshot = runtime::load_snapshot(&pool).await?;
@@ -30,8 +57,7 @@ async fn main() -> anyhow::Result<()> {
     // 可选的管理面：配置了 `admin_listen` 才启动独立管理监听；未配置即管理面
     // 整体关闭，协议监听不注册任何管理路由。管理面与协议面物理隔离。
     if let Some(admin_listen) = &cfg.admin_listen {
-        let admin_app =
-            gateway::admin_router(pool.clone(), snapshot.clone(), cfg.admin_key.clone());
+        let admin_app = gateway::admin_router(pool.clone(), snapshot.clone());
         let admin_addr = format!("{}:{}", admin_listen.host, admin_listen.port);
         let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
         if gateway::webui_available() {

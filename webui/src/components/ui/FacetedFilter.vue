@@ -75,11 +75,7 @@ function clear() {
       </template>
     </PopoverTrigger>
     <PopoverPortal>
-      <PopoverContent
-        align="start"
-        :side-offset="4"
-        :class="['faceted-filter-menu', menuClass]"
-      >
+      <PopoverContent align="start" :side-offset="4" :class="['faceted-filter-menu', menuClass]">
         <div class="faceted-filter-search">
           <UiIcon name="search" :size="14" class="text-fg-subtle shrink-0" />
           <input

@@ -3,24 +3,32 @@ import { ref } from 'vue';
 import { useNavigate } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { setAdminKey } from '@/lib/session';
+import { setAdminKey, setMe } from '@/lib/session';
 import MarketingSiteHeader from '@/app/shell/MarketingSiteHeader.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
+import FormTextInput from '@/components/ui/FormTextInput.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 
 const { t } = useI18n();
 const navigate = useNavigate();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
 
-const adminKey = ref('');
+// 登录卡对齐旧视觉：字段本身不挂 :guide。说明若需要，走标签行上的 FieldInfoHint 气泡，
+// 不把提示文案铺在输入框下面，以免把登录卡撑成设置表单。
+
+const email = ref('');
+const password = ref('');
 const loading = ref(false);
 const errorMsg = ref('');
 
 async function handleSubmit() {
   errorMsg.value = '';
   const isValid = validate(
-    [{ name: 'adminKey', value: adminKey.value, rules: [{ kind: 'required' }] }],
+    [
+      { name: 'email', value: email.value, rules: [{ kind: 'required' }] },
+      { name: 'password', value: password.value, rules: [{ kind: 'required' }] },
+    ],
     t,
   );
   if (!isValid) {
@@ -29,12 +37,17 @@ async function handleSubmit() {
 
   loading.value = true;
   try {
-    await apiClient.listTokens(adminKey.value.trim());
-    setAdminKey(adminKey.value.trim());
+    const loggedIn = await apiClient.login({
+      email: email.value.trim(),
+      password: password.value,
+    });
+    setAdminKey(loggedIn.token);
+    setMe(await apiClient.getMe());
     await navigate({ to: '/overview' });
   } catch (err) {
     const extracted = extractApiError(err);
-    errorMsg.value = extracted.code === 'unauthorized' ? t('auth.invalidKey') : extracted.message;
+    errorMsg.value =
+      extracted.code === 'unauthorized' ? t('auth.invalidCredentials') : extracted.message;
     loading.value = false;
   }
 }
@@ -53,21 +66,39 @@ async function handleSubmit() {
           <form novalidate @submit.prevent="handleSubmit">
             <div class="space-y-4">
               <FormField
-                field-name="adminKey"
-                :label="t('auth.adminKey')"
-                input-id="login-admin-key"
-                :error="fieldError('adminKey')"
-                :guide="t('fieldGuides.auth.adminKey')"
+                field-name="email"
+                :label="t('auth.email')"
+                input-id="login-email"
+                :error="fieldError('email')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    id="login-email"
+                    v-model="email"
+                    type="email"
+                    autocomplete="username"
+                    :placeholder="t('auth.emailPlaceholder')"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('email')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="password"
+                :label="t('auth.password')"
+                input-id="login-password"
+                :error="fieldError('password')"
               >
                 <template #default="{ hintId, invalid }">
                   <FormPasswordInput
-                    id="login-admin-key"
-                    v-model="adminKey"
-                    autocomplete="off"
-                    :placeholder="t('auth.adminKeyPlaceholder')"
+                    id="login-password"
+                    v-model="password"
+                    autocomplete="current-password"
+                    :placeholder="t('auth.passwordPlaceholder')"
                     :invalid="invalid"
                     :hint-id="hintId"
-                    v-on="fieldInputHandlers('adminKey')"
+                    v-on="fieldInputHandlers('password')"
                   />
                 </template>
               </FormField>

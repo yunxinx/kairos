@@ -17,6 +17,7 @@ export type IconName =
   | 'moon'
   | 'globe'
   | 'log-out'
+  | 'user'
   | 'circle-alert'
   | 'lock'
   | 'lock-open'
@@ -147,6 +148,11 @@ export const iconDefs: Record<IconName, IconDef> = {
   },
   'log-out': {
     paths: ['M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4', 'M16 17l5-5-5-5', 'M21 12H9'],
+  },
+  /** 账户入口。路径来自 Lucide「user」(ISC)。 */
+  user: {
+    circles: [{ cx: 12, cy: 7, r: 4 }],
+    paths: ['M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2'],
   },
   'circle-alert': {
     circles: [{ cx: 12, cy: 12, r: 10 }],

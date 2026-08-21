@@ -420,7 +420,11 @@ function loadErrorMessage(): string {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="tableColumnCount" />
+          <TableRowsSkeleton
+            v-if="showTableSkeleton"
+            has-select-column
+            :columns="tableColumnCount"
+          />
           <template v-else>
             <template v-for="section in sections" :key="section.channelName">
               <TableRow

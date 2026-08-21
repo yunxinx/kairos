@@ -11,7 +11,7 @@ export const test = base.extend({
   },
 });
 
-/** 已持有 admin key 的页面，供资源页 e2e 跳过登录表单。 */
+/** 已持有管理会话（`ksess_…`）的页面，供资源页 e2e 跳过登录表单。 */
 export const authedTest = base.extend({
   page: async ({ page }, use) => {
     await seedAdminSession(page);

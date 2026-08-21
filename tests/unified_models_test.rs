@@ -6,18 +6,17 @@
 mod common;
 
 use common::{
-    SEED_PRICE_ATTACH_LISTING_CHANNELS, TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway,
-    UpstreamBehavior,
+    SEED_PRICE_ATTACH_LISTING_CHANNELS, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior,
 };
 use kairos::config;
 use kairos::store::resources::{Channel, Price, UnifiedMember, UnifiedModel};
 use serde_json::{Value, json};
 
-/// 带 `TEST_ADMIN_KEY` 认证的 GET。
+/// 带 `&gw.session` 认证的 GET。
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("管理请求应可达")
@@ -32,7 +31,7 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&body)
         .send()
         .await
@@ -43,7 +42,7 @@ async fn admin_json(
 async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("管理请求应可达")
@@ -83,13 +82,15 @@ fn completion_body(model: &str, prompt: u64, completion: u64) -> Value {
 }
 
 async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
-    let row: (i64,) =
-        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(key)
-            .fetch_one(&gw.pool)
-            .await
-            .expect("令牌余额应存在");
-    row.0
+    sqlx::query_scalar(
+        "SELECT ub.balance_usd_micros \
+         FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id \
+         WHERE t.token_key = ?",
+    )
+    .bind(key)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("用户余额应存在")
 }
 
 fn member(channel_id: i64, model: &str) -> UnifiedMember {

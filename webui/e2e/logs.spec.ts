@@ -252,8 +252,9 @@ test.describe('request logs page', () => {
     });
     await page.goto('/requests');
     await page.getByTestId('logs-tab-system').click();
-    await expect(page.getByTestId('system-log-row')).toBeVisible();
-    await expect(page.getByTestId('system-log-level')).toBeVisible();
+    const row = page.getByTestId('system-log-row').filter({ hasText: 'e2e column visibility' });
+    await expect(row).toBeVisible();
+    await expect(row.getByTestId('system-log-level')).toBeVisible();
 
     await page.getByTestId('system-logs-columns').click();
     await page.locator('[data-testid="system-logs-columns-option"][data-value="level"]').click();
@@ -335,9 +336,9 @@ test.describe('request logs page', () => {
     await page.goto('/requests');
     await page.locator('#logs-search').fill('sk-e2e-logs-protocol');
     await expect(page.getByTestId('log-row')).toHaveCount(2);
-    await expect(page.getByRole('button', { name: 'Inbound Protocol', exact: true })).toHaveCount(
-      0,
-    );
+    await expect(
+      page.getByRole('columnheader', { name: 'Inbound Protocol', exact: true }),
+    ).toHaveCount(0);
 
     await page.getByTestId('logs-protocol-filter').click();
     await page

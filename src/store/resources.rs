@@ -16,9 +16,17 @@ use crate::store::StoreError;
 /// 内置模型组名：未指定分组的令牌与未放入其他组的可调用名落在此组。
 pub const DEFAULT_MODEL_GROUP: &str = "default";
 
+/// 内置 root 用户 id：迁移播种，亦为未标明所有者的令牌缺省归属。
+pub const ROOT_USER_ID: i64 = 1;
+
 /// serde 缺省：令牌未写 `model_group` 时绑到内置 `default`。
 pub fn default_model_group() -> String {
     DEFAULT_MODEL_GROUP.to_string()
+}
+
+/// serde 缺省：令牌未写 `user_id` 时归内置 root。
+fn default_token_user_id() -> i64 {
+    ROOT_USER_ID
 }
 
 /// 渠道：指向一个上游端点的出站接入单元。
@@ -56,7 +64,7 @@ pub struct ChannelRecord {
     pub channel: Channel,
 }
 
-/// 令牌：认证与计费的最小单位；余额独立存 `token_balance` 表。
+/// 令牌：下游调用凭证。钱包在所属用户上；本行只保留定义与累计结算上限。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Token {
@@ -69,9 +77,12 @@ pub struct Token {
     pub rate_limit_rpm: Option<u64>,
     /// 是否启用：禁用的令牌在网关认证阶段被拒绝。
     pub enabled: bool,
-    /// 绑定的模型组名；缺省为 [`DEFAULT_MODEL_GROUP`]。
+    /// 绑定的模型组名；缺省为 [`DEFAULT_MODEL_GROUP`]。空字符串表示库中 NULL（已失效）。
     #[serde(default = "default_model_group")]
     pub model_group: String,
+    /// 所属管理用户。缺省 [`ROOT_USER_ID`]。
+    #[serde(default = "default_token_user_id")]
+    pub user_id: i64,
 }
 
 /// 模型组：令牌的可调用名允许名单（渠道模型、别名 key、统一模型 ID）。
@@ -660,7 +671,7 @@ pub async fn list_tokens(pool: &SqlitePool) -> Result<Vec<Token>, StoreError> {
 /// 读出全部令牌记录（含创建/最后使用时间等生命周期元数据）。
 pub async fn list_token_records(pool: &SqlitePool) -> Result<Vec<TokenRecord>, StoreError> {
     let rows = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group \
+        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
          FROM tokens",
     )
     .fetch_all(pool)
@@ -676,7 +687,7 @@ pub async fn get_token_record(
     token_key: &str,
 ) -> Result<Option<TokenRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group \
+        "SELECT token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
          FROM tokens WHERE token_key = ?",
     )
     .bind(token_key)
@@ -691,6 +702,7 @@ pub async fn get_token_record(
 fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreError> {
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
     let rate_limit_rpm: Option<i64> = row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
+    let model_group: Option<String> = row.try_get("model_group").map_err(StoreError::Query)?;
     Ok(TokenRecord {
         token: Token {
             token_key: row.try_get("token_key").map_err(StoreError::Query)?,
@@ -698,7 +710,8 @@ fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreE
             limit_usd_micros: row.try_get("limit_usd_micros").map_err(StoreError::Query)?,
             rate_limit_rpm: rate_limit_rpm.and_then(|n| u64::try_from(n).ok()),
             enabled: enabled != 0,
-            model_group: row.try_get("model_group").map_err(StoreError::Query)?,
+            model_group: model_group.unwrap_or_default(),
+            user_id: row.try_get("user_id").map_err(StoreError::Query)?,
         },
         created_at: row.try_get("created_at").map_err(StoreError::Query)?,
         last_used_at: row.try_get("last_used_at").map_err(StoreError::Query)?,
@@ -707,16 +720,16 @@ fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreE
 
 /// 新增或整体替换一个令牌（按 `token_key`），同一事务内幂等。
 ///
-/// `created_at` 仅在首次插入时落库；冲突覆盖不改创建时间，也不改 `last_used_at`
-/// （编辑属性不算使用）。
+/// `created_at` 仅在首次插入时落库；冲突覆盖不改创建时间、`last_used_at`
+/// （编辑属性不算使用）与 `user_id`（归属只在插入时确定）。
 pub async fn upsert_token(
     conn: &mut SqliteConnection,
     token: &Token,
     created_at: i64,
 ) -> Result<(), StoreError> {
     sqlx::query(
-        "INSERT INTO tokens (token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, model_group) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO tokens (token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, model_group, user_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(token_key) DO UPDATE SET \
            name = excluded.name, limit_usd_micros = excluded.limit_usd_micros, \
            rate_limit_rpm = excluded.rate_limit_rpm, \
@@ -728,11 +741,17 @@ pub async fn upsert_token(
     .bind(bind_rate_limit_rpm(token.rate_limit_rpm))
     .bind(token.enabled)
     .bind(created_at)
-    .bind(&token.model_group)
+    .bind(bind_token_model_group(&token.model_group))
+    .bind(token.user_id)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
     Ok(())
+}
+
+/// 空组落库为 NULL（失效）；非空写组名。
+fn bind_token_model_group(group: &str) -> Option<&str> {
+    if group.is_empty() { None } else { Some(group) }
 }
 
 /// 令牌 RPM 落库为可空整数；超出 `i64` 的值截到 `i64::MAX`（管理面校验会先拦住）。
@@ -806,7 +825,7 @@ pub async fn upsert_model_group(
 
 /// 按 `name` 删除模型组；不存在视为成功（幂等）。
 ///
-/// 调用方须先处理令牌绑定：内置 `default` 与仍有令牌的组不应走到这里。
+/// 令牌 `model_group` 外键 `ON DELETE SET NULL`；调用方须先把渠道默认组改回 `default`。
 pub async fn delete_model_group(conn: &mut SqliteConnection, name: &str) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM model_groups WHERE name = ?")
         .bind(name)
@@ -814,19 +833,6 @@ pub async fn delete_model_group(conn: &mut SqliteConnection, name: &str) -> Resu
         .await
         .map_err(StoreError::Query)?;
     Ok(())
-}
-
-/// 统计绑定到指定模型组的令牌数。
-pub async fn count_tokens_in_group(
-    conn: &mut SqliteConnection,
-    group: &str,
-) -> Result<u64, StoreError> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE model_group = ?")
-        .bind(group)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    Ok(count.max(0) as u64)
 }
 
 /// 读出全部统一模型。
@@ -878,20 +884,6 @@ pub async fn upsert_unified_model(
 pub async fn delete_unified_model(conn: &mut SqliteConnection, id: &str) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM unified_models WHERE id = ?")
         .bind(id)
-        .execute(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    Ok(())
-}
-
-/// 把绑定到 `from_group` 的令牌改回内置 `default`。
-pub async fn rebind_tokens_to_default(
-    conn: &mut SqliteConnection,
-    from_group: &str,
-) -> Result<(), StoreError> {
-    sqlx::query("UPDATE tokens SET model_group = ? WHERE model_group = ?")
-        .bind(DEFAULT_MODEL_GROUP)
-        .bind(from_group)
         .execute(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
@@ -1341,6 +1333,7 @@ mod tests {
             enabled: true,
             rate_limit_rpm: None,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
+            user_id: ROOT_USER_ID,
         };
         upsert_token(&mut conn, &token, 1_700_000_000_000)
             .await
@@ -1362,6 +1355,7 @@ mod tests {
             enabled: true,
             rate_limit_rpm: None,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
+            user_id: ROOT_USER_ID,
         };
         upsert_token(&mut conn, &token, 1_000)
             .await
@@ -1421,6 +1415,7 @@ mod tests {
                 enabled: true,
                 rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
+                user_id: ROOT_USER_ID,
             },
             1,
         )
@@ -1432,7 +1427,7 @@ mod tests {
         );
     }
 
-    /// 令牌属性更新不触碰余额：余额存 token_balance 表，令牌表只存定义。
+    /// 令牌属性更新不触碰钱包：剩余在用户钱包，令牌表只存定义。
     #[tokio::test]
     async fn token_attr_update_keeps_balance_separate() {
         let (_dir, pool) = test_pool().await;
@@ -1447,6 +1442,7 @@ mod tests {
                 enabled: true,
                 rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
+                user_id: ROOT_USER_ID,
             },
             1,
         )
@@ -1467,6 +1463,7 @@ mod tests {
                 enabled: true,
                 rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
+                user_id: ROOT_USER_ID,
             },
             2,
         )
@@ -1516,9 +1513,9 @@ mod tests {
         assert_eq!(groups[0].name, DEFAULT_MODEL_GROUP);
     }
 
-    /// 令牌改绑后计数变化；改回 default 后原组计数为 0。
+    /// 删除模型组：令牌 `model_group` 置空，不改绑 default。
     #[tokio::test]
-    async fn rebind_tokens_to_default_clears_group_membership() {
+    async fn deleting_group_nulls_token_model_group() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
         upsert_model_group(
@@ -1539,28 +1536,17 @@ mod tests {
                 enabled: true,
                 rate_limit_rpm: None,
                 model_group: "coding".to_string(),
+                user_id: ROOT_USER_ID,
             },
             1,
         )
         .await
         .expect("应能写令牌");
-        assert_eq!(
-            count_tokens_in_group(&mut conn, "coding")
-                .await
-                .expect("应能计数"),
-            1
-        );
-        rebind_tokens_to_default(&mut conn, "coding")
+        delete_model_group(&mut conn, "coding")
             .await
-            .expect("应能改绑");
-        assert_eq!(
-            count_tokens_in_group(&mut conn, "coding")
-                .await
-                .expect("应能计数"),
-            0
-        );
+            .expect("应能删组");
         let tokens = list_tokens(&pool).await.expect("应能读令牌");
-        assert_eq!(tokens[0].model_group, DEFAULT_MODEL_GROUP);
+        assert_eq!(tokens[0].model_group, "");
     }
 
     /// default 含未放入其他组的名字；只出现在自定义组的名字对 default 不允许。

@@ -57,7 +57,7 @@ const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
   { id: 'token' },
   { id: 'model' },
   { id: 'channel' },
-  { id: 'inboundProtocol' },
+  { id: 'inboundProtocol', defaultVisible: false },
   { id: 'tokens' },
   { id: 'latency' },
   { id: 'cache', defaultVisible: false },

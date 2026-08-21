@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as SplatRouteImport } from './routes/$'
+import { Route as AccountRouteImport } from './routes/account'
 import { Route as ChannelRouteImport } from './routes/channel'
 import { Route as ConfigRouteImport } from './routes/config'
 import { Route as LoginRouteImport } from './routes/login'
@@ -19,6 +20,7 @@ import { Route as OverviewRouteImport } from './routes/overview'
 import { Route as PricingRouteImport } from './routes/pricing'
 import { Route as RequestsRouteImport } from './routes/requests'
 import { Route as TokenRouteImport } from './routes/token'
+import { Route as AdminUsersRouteImport } from './routes/admin.users'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -28,6 +30,11 @@ const IndexRoute = IndexRouteImport.update({
 const SplatRoute = SplatRouteImport.update({
   id: '/$',
   path: '/$',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const AccountRoute = AccountRouteImport.update({
+  id: '/account',
+  path: '/account',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ChannelRoute = ChannelRouteImport.update({
@@ -70,10 +77,16 @@ const TokenRoute = TokenRouteImport.update({
   path: '/token',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AdminUsersRoute = AdminUsersRouteImport.update({
+  id: '/admin/users',
+  path: '/admin/users',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/account': typeof AccountRoute
   '/channel': typeof ChannelRoute
   '/config': typeof ConfigRoute
   '/login': typeof LoginRoute
@@ -82,10 +95,12 @@ export interface FileRoutesByFullPath {
   '/pricing': typeof PricingRoute
   '/requests': typeof RequestsRoute
   '/token': typeof TokenRoute
+  '/admin/users': typeof AdminUsersRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/account': typeof AccountRoute
   '/channel': typeof ChannelRoute
   '/config': typeof ConfigRoute
   '/login': typeof LoginRoute
@@ -94,11 +109,13 @@ export interface FileRoutesByTo {
   '/pricing': typeof PricingRoute
   '/requests': typeof RequestsRoute
   '/token': typeof TokenRoute
+  '/admin/users': typeof AdminUsersRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
+  '/account': typeof AccountRoute
   '/channel': typeof ChannelRoute
   '/config': typeof ConfigRoute
   '/login': typeof LoginRoute
@@ -107,12 +124,14 @@ export interface FileRoutesById {
   '/pricing': typeof PricingRoute
   '/requests': typeof RequestsRoute
   '/token': typeof TokenRoute
+  '/admin/users': typeof AdminUsersRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
     | '/$'
+    | '/account'
     | '/channel'
     | '/config'
     | '/login'
@@ -121,10 +140,12 @@ export interface FileRouteTypes {
     | '/pricing'
     | '/requests'
     | '/token'
+    | '/admin/users'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/$'
+    | '/account'
     | '/channel'
     | '/config'
     | '/login'
@@ -133,10 +154,12 @@ export interface FileRouteTypes {
     | '/pricing'
     | '/requests'
     | '/token'
+    | '/admin/users'
   id:
     | '__root__'
     | '/'
     | '/$'
+    | '/account'
     | '/channel'
     | '/config'
     | '/login'
@@ -145,11 +168,13 @@ export interface FileRouteTypes {
     | '/pricing'
     | '/requests'
     | '/token'
+    | '/admin/users'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   SplatRoute: typeof SplatRoute
+  AccountRoute: typeof AccountRoute
   ChannelRoute: typeof ChannelRoute
   ConfigRoute: typeof ConfigRoute
   LoginRoute: typeof LoginRoute
@@ -158,6 +183,7 @@ export interface RootRouteChildren {
   PricingRoute: typeof PricingRoute
   RequestsRoute: typeof RequestsRoute
   TokenRoute: typeof TokenRoute
+  AdminUsersRoute: typeof AdminUsersRoute
 }
 
 declare module '@tanstack/vue-router' {
@@ -174,6 +200,13 @@ declare module '@tanstack/vue-router' {
       path: '/$'
       fullPath: '/$'
       preLoaderRoute: typeof SplatRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/account': {
+      id: '/account'
+      path: '/account'
+      fullPath: '/account'
+      preLoaderRoute: typeof AccountRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/channel': {
@@ -232,12 +265,20 @@ declare module '@tanstack/vue-router' {
       preLoaderRoute: typeof TokenRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/admin/users': {
+      id: '/admin/users'
+      path: '/admin/users'
+      fullPath: '/admin/users'
+      preLoaderRoute: typeof AdminUsersRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   SplatRoute: SplatRoute,
+  AccountRoute: AccountRoute,
   ChannelRoute: ChannelRoute,
   ConfigRoute: ConfigRoute,
   LoginRoute: LoginRoute,
@@ -246,6 +287,7 @@ const rootRouteChildren: RootRouteChildren = {
   PricingRoute: PricingRoute,
   RequestsRoute: RequestsRoute,
   TokenRoute: TokenRoute,
+  AdminUsersRoute: AdminUsersRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

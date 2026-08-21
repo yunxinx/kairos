@@ -1,5 +1,6 @@
 import { authedTest as test, expect } from './fixtures';
-import { E2E_ADMIN_KEY, E2E_PROTOCOL_PORT } from './helpers/gateway';
+import { E2E_PROTOCOL_PORT } from './helpers/gateway';
+import { e2eRootHeaders } from './helpers/session';
 import { seedChannel } from './helpers/models';
 import { clickRowAction } from './helpers/table';
 import { startProbeUpstream } from './helpers/upstream';
@@ -10,7 +11,7 @@ async function savedChannelModels(
   name: string,
 ): Promise<string[] | undefined> {
   const resp = await page.request.get('/channels', {
-    headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+    headers: await e2eRootHeaders(page.request),
   });
   const channels = (await resp.json()) as Array<{ name: string; models: string[] }>;
   return channels.find((item) => item.name === name)?.models;
@@ -367,7 +368,7 @@ test.describe('channel manual model add', () => {
     const manualId = 'manual-only-id';
     try {
       const tokenResp = await page.request.post('/tokens', {
-        headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+        headers: await e2eRootHeaders(page.request),
         data: { name: 'manual-add-token', limit_usd_micros: null, enabled: true },
       });
       expect(tokenResp.ok()).toBeTruthy();

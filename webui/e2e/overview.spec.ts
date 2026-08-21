@@ -1,6 +1,6 @@
 import type { APIRequestContext, Page } from '@playwright/test';
 import { authedTest as test, expect } from './fixtures';
-import { E2E_ADMIN_KEY } from './helpers/gateway';
+import { e2eRootHeaders } from './helpers/session';
 import { MS_PER_DAY, seedRequestLogs, utcDayStart } from './helpers/seed-logs';
 import { usdLabel } from './helpers/usd';
 import type { LifetimeStats, StatsView } from '../src/api/types';
@@ -11,7 +11,7 @@ test.describe.configure({ mode: 'serial' });
 
 async function fetchStats(request: APIRequestContext, days: number): Promise<StatsView> {
   const resp = await request.get(`/stats?days=${days}`, {
-    headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+    headers: await e2eRootHeaders(request),
   });
   expect(resp.ok()).toBeTruthy();
   return (await resp.json()) as StatsView;
@@ -19,7 +19,7 @@ async function fetchStats(request: APIRequestContext, days: number): Promise<Sta
 
 async function fetchLifetimeStats(request: APIRequestContext): Promise<LifetimeStats> {
   const resp = await request.get('/stats/lifetime', {
-    headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+    headers: await e2eRootHeaders(request),
   });
   expect(resp.ok()).toBeTruthy();
   return (await resp.json()) as LifetimeStats;

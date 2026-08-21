@@ -6,7 +6,7 @@
 //! 抓取一个 `Arc` 引用，不受后续原子替换影响。管理 API 写库成功后原子替换快照
 //! （见 `SnapshotHandle`），是唯一动态入口。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use crate::store::resources::{
     SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS,
     SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
+use crate::store::users::{self, ManagementRole};
 
 pub use crate::store::resources::{
     DEFAULT_AUTH_THROTTLE_MAX_FAILURES, DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
@@ -46,6 +47,8 @@ pub struct RuntimeSnapshot {
     pub model_groups: HashMap<String, resources::ModelGroup>,
     /// 统一模型，按可调用名索引（有序 failover）。
     pub unified_models: HashMap<String, resources::UnifiedModel>,
+    /// 管理用户：启停、角色与可用模型组（入站令牌准入）。
+    pub users: HashMap<i64, RuntimeUser>,
     /// 是否落完整请求/响应 body（来自 `full_body` 开关）。
     pub full_body: bool,
     /// 入站请求体大小上限（字节，来自 `max_request_bytes` 开关）。
@@ -72,10 +75,40 @@ pub struct RuntimeSnapshot {
     pub rate_limit_rpm: u64,
 }
 
+/// 快照里的管理用户：请求路径只读启停、角色与可用组。
+#[derive(Debug, Clone)]
+pub struct RuntimeUser {
+    pub role: ManagementRole,
+    pub enabled: bool,
+    pub assigned_groups: HashSet<String>,
+}
+
 impl RuntimeSnapshot {
     /// 按渠道稳定 id + 可调用名取单价。
     pub fn price_for_channel(&self, channel_id: i64, model: &str) -> Option<&resources::Price> {
         self.prices.get(&channel_id)?.get(model)
+    }
+
+    /// 令牌组是否仍可调用：组非空、用户启用、组存在；普通用户还须在可用名单里。
+    ///
+    /// root/admin 的令牌只要组还在即可。空组（删组后置空）一律不可调用。
+    pub fn token_group_assigned(&self, token: &resources::Token) -> bool {
+        if token.model_group.is_empty() {
+            return false;
+        }
+        let Some(user) = self.users.get(&token.user_id) else {
+            return false;
+        };
+        if !user.enabled {
+            return false;
+        }
+        if !self.model_groups.contains_key(&token.model_group) {
+            return false;
+        }
+        if user.role.at_least(ManagementRole::Admin) {
+            return true;
+        }
+        user.assigned_groups.contains(&token.model_group)
     }
 
     /// 认证失败计数窗口；库内为 0 时按 1 秒处理，避免 `Duration::from_secs(0)` 让窗口立刻过期。
@@ -149,6 +182,24 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         .into_iter()
         .map(|model| (model.id.clone(), model))
         .collect();
+    let user_rows = users::list_users(pool).await?;
+    let assigned_rows = users::list_all_assigned_groups(pool).await?;
+    let mut users: HashMap<i64, RuntimeUser> = HashMap::new();
+    for record in user_rows {
+        users.insert(
+            record.id,
+            RuntimeUser {
+                role: record.role,
+                enabled: record.enabled,
+                assigned_groups: HashSet::new(),
+            },
+        );
+    }
+    for (user_id, group) in assigned_rows {
+        if let Some(user) = users.get_mut(&user_id) {
+            user.assigned_groups.insert(group);
+        }
+    }
 
     Ok(RuntimeSnapshot {
         channels,
@@ -156,6 +207,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         prices,
         model_groups,
         unified_models,
+        users,
         full_body: load_full_body(&settings),
         max_request_bytes: load_max_request_bytes(&settings),
         max_response_bytes: load_u64(
@@ -267,6 +319,15 @@ mod tests {
         assert!(snap.prices.is_empty());
         assert_eq!(snap.model_groups.len(), 1, "空库应有内置 default 组");
         assert!(snap.unified_models.is_empty());
+        let root = snap
+            .users
+            .get(&resources::ROOT_USER_ID)
+            .expect("空库应有内置 root");
+        assert!(root.enabled);
+        assert!(
+            root.assigned_groups
+                .contains(resources::DEFAULT_MODEL_GROUP)
+        );
         assert!(
             snap.model_groups
                 .contains_key(resources::DEFAULT_MODEL_GROUP)
@@ -337,6 +398,7 @@ mod tests {
                 enabled: true,
                 rate_limit_rpm: None,
                 model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
+                user_id: resources::ROOT_USER_ID,
             },
             1,
         )

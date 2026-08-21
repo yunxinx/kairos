@@ -1,6 +1,7 @@
 import { invalidateAdminKey, getAdminKey } from '@/lib/session';
 import { ApiClientError, type ApiErrorBody } from '@/api/types';
 import type {
+  AssignedGroupsView,
   BalanceAdjustment,
   BalanceView,
   Channel,
@@ -11,6 +12,10 @@ import type {
   LogEntry,
   SystemLogQuery,
   SystemLogPage,
+  LoginRequest,
+  LoginView,
+  MeUpdate,
+  MeView,
   ModelGroup,
   Price,
   CatalogModel,
@@ -26,6 +31,10 @@ import type {
   UnifiedModel,
   UpstreamModelsDraft,
   UpstreamModelsView,
+  UserAdminView,
+  UserCreate,
+  UserUpdate,
+  UserView,
 } from '@/api/types';
 
 function buildQuery(params: object): string {
@@ -49,7 +58,8 @@ function buildQuery(params: object): string {
 }
 
 /**
- * 调用管理 API。路径无 `/api` 前缀；认证为 `Authorization: Bearer <admin key>`。
+ * 调用管理 API。路径无 `/api` 前缀；认证为 `Authorization: Bearer <会话令牌>`。
+ * 会话来自 `POST /login`，不是配置里的登录密码。
  *
  * `keyOverride` 用于登录试探：失败时不清除已持有的凭据。
  */
@@ -79,6 +89,61 @@ async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: strin
 }
 
 export const apiClient = {
+  login(body: LoginRequest): Promise<LoginView> {
+    return apiFetch('/login', { method: 'POST', body: JSON.stringify(body) }, '');
+  },
+
+  logout(): Promise<void> {
+    return apiFetch('/logout', { method: 'POST' });
+  },
+
+  getMe(): Promise<MeView> {
+    return apiFetch('/me');
+  },
+
+  updateMe(body: MeUpdate): Promise<UserView> {
+    return apiFetch('/me', { method: 'PUT', body: JSON.stringify(body) });
+  },
+
+  listUsers(): Promise<UserAdminView[]> {
+    return apiFetch('/users');
+  },
+
+  getUser(id: number): Promise<UserAdminView> {
+    return apiFetch(`/users/${id}`);
+  },
+
+  createUser(body: UserCreate): Promise<UserView> {
+    return apiFetch('/users', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  updateUser(id: number, body: UserUpdate): Promise<UserView> {
+    return apiFetch(`/users/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+  },
+
+  deleteUser(id: number): Promise<void> {
+    return apiFetch(`/users/${id}`, { method: 'DELETE' });
+  },
+
+  rechargeUser(id: number, body: BalanceAdjustment): Promise<UserAdminView> {
+    return apiFetch(`/users/${id}/balance`, { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  getUserModelGroups(id: number): Promise<AssignedGroupsView> {
+    return apiFetch(`/users/${id}/model-groups`);
+  },
+
+  replaceUserModelGroups(id: number, groups: string[]): Promise<AssignedGroupsView> {
+    return apiFetch(`/users/${id}/model-groups`, {
+      method: 'PUT',
+      body: JSON.stringify({ groups }),
+    });
+  },
+
+  listUserTokens(id: number): Promise<TokenView[]> {
+    return apiFetch(`/users/${id}/tokens`);
+  },
+
   listTokens(keyOverride?: string): Promise<TokenView[]> {
     return apiFetch('/tokens', { method: 'GET' }, keyOverride);
   },
@@ -180,9 +245,8 @@ export const apiClient = {
     });
   },
 
-  deleteModelGroup(name: string, force = false): Promise<ModelGroup> {
-    const query = force ? '?force=true' : '';
-    return apiFetch(`/model-groups/${encodeURIComponent(name)}${query}`, { method: 'DELETE' });
+  deleteModelGroup(name: string): Promise<ModelGroup> {
+    return apiFetch(`/model-groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
   },
 
   listUnifiedModels(): Promise<UnifiedModel[]> {

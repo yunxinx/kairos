@@ -1,4 +1,10 @@
-import type { ChannelView, ModelGroup, UnifiedMember, UnifiedModel } from '@/api/types';
+import type {
+  ChannelView,
+  ManagementRole,
+  ModelGroup,
+  UnifiedMember,
+  UnifiedModel,
+} from '@/api/types';
 import { groupModelName } from '@/lib/group-models';
 
 export const DEFAULT_MODEL_GROUP = 'default';
@@ -23,6 +29,42 @@ export function groupSelectOptions(
   ];
   if (current && !options.some((item) => item.value === current)) {
     options.push({ value: current, label: current });
+  }
+  return options;
+}
+
+/**
+ * 令牌当前绑定的组是否仍能调用。
+ * 空组始终失效；普通用户还要求组仍在可用名单里。admin/root 只要组名非空（组存在性由保存接口校验）。
+ */
+export function tokenGroupUsable(
+  modelGroup: string,
+  role: ManagementRole,
+  assignedGroups: readonly string[],
+): boolean {
+  if (modelGroup === '') return false;
+  if (role === 'user') return assignedGroups.includes(modelGroup);
+  return true;
+}
+
+/** 普通用户：只列出被分配的组名。编辑已绑且已撤的组时，把当前值附在末尾以便提示失效。 */
+export function assignedGroupOptions(
+  groups: string[],
+  current: string,
+  ungroupedLabel: string,
+  keepCurrentIfMissing = true,
+): { value: string; label: string }[] {
+  const options = [...groups]
+    .sort((left, right) => left.localeCompare(right))
+    .map((name) => ({
+      value: name,
+      label: name === DEFAULT_MODEL_GROUP ? ungroupedLabel : name,
+    }));
+  if (keepCurrentIfMissing && current && !options.some((item) => item.value === current)) {
+    options.push({
+      value: current,
+      label: current === DEFAULT_MODEL_GROUP ? ungroupedLabel : current,
+    });
   }
   return options;
 }

@@ -35,7 +35,6 @@ import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor'
 type GroupWindowPayload =
   | { kind: 'editor'; group: ModelGroup | null }
   | { kind: 'delete'; group: ModelGroup }
-  | { kind: 'force-delete'; group: ModelGroup }
   | BulkDeletePayload;
 
 const { t } = useI18n();
@@ -126,49 +125,29 @@ const bulkDelete = useBulkDelete<string>({
 });
 
 const deleteMutation = useMutation({
-  mutationFn: ({ name, force }: { name: string; force: boolean }) =>
-    apiClient.deleteModelGroup(name, force),
-  onSuccess: async (_data, { name }) => {
+  mutationFn: (name: string) => apiClient.deleteModelGroup(name),
+  onSuccess: async (_data, name) => {
     const entry = windows.value.find((item) => {
       const payload = item.payload;
-      return (
-        (payload.kind === 'delete' || payload.kind === 'force-delete') &&
-        payload.group.name === name
-      );
+      return payload.kind === 'delete' && payload.group.name === name;
     });
     if (entry) closeWindow(entry.id);
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
     await queryClient.invalidateQueries({ queryKey: ['channels'] });
   },
-  onError: (err, { name }) => {
-    const { message, code } = extractApiError(err);
-    const deleteEntry = windows.value.find((item) => item.payload.kind === 'delete');
-    const payload = deleteEntry?.payload;
-    if (
-      deleteEntry &&
-      payload?.kind === 'delete' &&
-      payload.group.name === name &&
-      code === 'conflict'
-    ) {
-      closeWindow(deleteEntry.id);
-      openWindow(null, { kind: 'force-delete', group: payload.group });
-      return;
-    }
-    const entry = windows.value.find((item) => {
-      const itemPayload = item.payload;
-      return (
-        (itemPayload.kind === 'delete' || itemPayload.kind === 'force-delete') &&
-        itemPayload.group.name === name
-      );
-    });
+  onError: (err, name) => {
+    const message = extractApiError(err).message;
+    const entry = windows.value.find(
+      (item) => item.payload.kind === 'delete' && item.payload.group.name === name,
+    );
     if (entry) deleteErrors.value[entry.id] = message;
     error(message);
   },
 });
 
 const deletingName = computed(() =>
-  deleteMutation.isPending.value ? (deleteMutation.variables.value?.name ?? null) : null,
+  deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
 );
 
 function openCreate(event: Event) {
@@ -189,9 +168,7 @@ function openEdit(group: ModelGroup) {
 function openDelete(group: ModelGroup) {
   if (group.name === DEFAULT_MODEL_GROUP) return;
   const existing = windows.value.find(
-    (entry) =>
-      (entry.payload.kind === 'delete' || entry.payload.kind === 'force-delete') &&
-      entry.payload.group.name === group.name,
+    (entry) => entry.payload.kind === 'delete' && entry.payload.group.name === group.name,
   );
   if (existing) {
     bringToFront(existing.id);
@@ -375,25 +352,7 @@ function openBulkDelete() {
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"
-        @confirm="deleteMutation.mutate({ name: win.payload.group.name, force: false })"
-      />
-      <ConfirmWindow
-        v-else-if="win.payload.kind === 'force-delete'"
-        :title="t('models.groupForceDeleteTitle')"
-        :message="t('models.groupForceDeleteMessage', { name: win.payload.group.name })"
-        :anchor="win.anchor"
-        :stack-order="win.z"
-        :cascade="index"
-        :attention="win.attention"
-        :topmost="win.id === topmostId"
-        :error="deleteErrors[win.id] ?? ''"
-        :busy="deletingName === win.payload.group.name"
-        confirm-test-id="group-force-delete-confirm"
-        :confirm-label="t('common.forceDelete')"
-        @close="closeWindow(win.id)"
-        @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
-        @confirm="deleteMutation.mutate({ name: win.payload.group.name, force: true })"
+        @confirm="deleteMutation.mutate(win.payload.group.name)"
       />
       <ConfirmWindow
         v-else

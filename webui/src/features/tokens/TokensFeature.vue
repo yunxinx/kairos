@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
+import { tokenWriteBody } from '@/api/types';
 import { loadTokenRows, type TokenRow } from '@/api/token-rows';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
@@ -228,14 +229,7 @@ const deletingKey = computed(() =>
 // 启用/禁用：整体替换写（PUT 携带完整定义），成功后重取列表。
 const toggleMutation = useMutation({
   mutationFn: (token: TokenRow) =>
-    apiClient.updateToken(token.token_key, {
-      token_key: token.token_key,
-      name: token.name,
-      limit_usd_micros: token.limit_usd_micros,
-      rate_limit_rpm: token.rate_limit_rpm,
-      enabled: !token.enabled,
-      model_group: token.model_group,
-    }),
+    apiClient.updateToken(token.token_key, tokenWriteBody({ ...token, enabled: !token.enabled })),
   onSuccess: async () => {
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
@@ -365,7 +359,17 @@ function openBulkDelete() {
               />
               <TableCell class="font-medium">{{ token.name }}</TableCell>
               <TableCell class="font-mono text-sm" data-testid="token-model-group">
-                {{ groupDisplayName(token.model_group, t('models.ungrouped')) }}
+                <span class="inline-flex items-center gap-1">
+                  {{ groupDisplayName(token.model_group, t('models.ungrouped')) }}
+                  <span
+                    v-if="!token.group_usable"
+                    class="badge badge-danger"
+                    data-testid="token-group-unusable"
+                    :title="t('tokens.groupUnusableHint')"
+                  >
+                    {{ t('tokens.groupUnusable') }}
+                  </span>
+                </span>
               </TableCell>
               <TableCell>
                 <span class="inline-flex items-center gap-1">

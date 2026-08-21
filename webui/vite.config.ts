@@ -19,6 +19,9 @@ const adminApiPrefixes = [
   '/logs',
   '/system-logs',
   '/stats',
+  '/logout',
+  '/me',
+  '/users',
 ];
 
 export default defineConfig({
@@ -42,8 +45,20 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     strictPort: true,
-    proxy: Object.fromEntries(
-      adminApiPrefixes.map((prefix) => [prefix, { target: adminTarget, changeOrigin: true }]),
-    ),
+    proxy: {
+      ...Object.fromEntries(
+        adminApiPrefixes.map((prefix) => [prefix, { target: adminTarget, changeOrigin: true }]),
+      ),
+      '/login': {
+        target: adminTarget,
+        changeOrigin: true,
+        // POST 登录走管理 API；GET 留给 Vite，避免文档导航打到网关 dist。
+        bypass(req) {
+          if (req.method !== 'POST') {
+            return req.url ?? '/index.html';
+          }
+        },
+      },
+    },
   },
 });

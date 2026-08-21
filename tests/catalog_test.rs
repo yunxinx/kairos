@@ -5,13 +5,13 @@
 
 mod common;
 
-use common::{TEST_ADMIN_KEY, TestGateway};
+use common::TestGateway;
 use serde_json::{Value, json};
 
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("管理请求应可达")
@@ -25,7 +25,7 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&body)
         .send()
         .await

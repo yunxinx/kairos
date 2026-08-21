@@ -68,6 +68,12 @@ export function prefetchAdminRoute(to: string): void {
           apiClient.queryLogs({ page: LOGS_INITIAL_PAGE, page_size: LOGS_INITIAL_PAGE_SIZE }),
       });
       return;
+    case '/admin/users':
+      void queryClient.prefetchQuery({
+        queryKey: ['users'],
+        queryFn: () => apiClient.listUsers(),
+      });
+      return;
     default:
   }
 }

@@ -31,11 +31,12 @@ const open = ref(false);
       </button>
     </PopoverTrigger>
     <PopoverPortal>
+      <!-- 钉在标签行上方：说明是点开的气泡，不能落到输入框下面把表单撑开。 -->
       <PopoverContent
         :id="resolvedContentId"
         class="field-info-hint-content"
         :side-offset="6"
-        side="bottom"
+        side="top"
         align="start"
       >
         <div class="field-info-hint-body">

@@ -5,9 +5,10 @@ import { useI18n } from 'vue-i18n';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import { toggleLocale } from '@/app/providers/i18n';
 import { getStoredTheme, resolveDark, toggleTheme } from '@/lib/theme';
-import { NAV_TABS } from '@/lib/nav';
+import { navTabsFor } from '@/lib/nav';
 import { prefetchAdminRoute } from '@/lib/prefetch-admin';
-import { clearAdminKey, hasAdminKey } from '@/lib/session';
+import { clearAdminKey, useCurrentUser } from '@/lib/session';
+import { apiClient } from '@/api/client';
 import { useResolvedDarkTheme } from '@/composables/useResolvedDarkTheme';
 
 const { t } = useI18n();
@@ -17,7 +18,8 @@ const peek = ref(false);
 const isDark = useResolvedDarkTheme();
 const fabNavEl = ref<HTMLElement | null>(null);
 
-const tabs = computed(() => (hasAdminKey() ? NAV_TABS : []));
+const me = useCurrentUser();
+const tabs = computed(() => navTabsFor(me.value?.role));
 
 /** 与桌面 NavBar 左→右顺序对应，移动端面板内为下→上（概览贴近 FAB）。 */
 const tabsBottomUp = computed(() => [...tabs.value].reverse());
@@ -59,6 +61,11 @@ watch(menuOpen, (open) => {
 
 async function handleLogout() {
   closeMenu();
+  try {
+    await apiClient.logout();
+  } catch {
+    // 会话可能已失效；本地清凭据即可。
+  }
   clearAdminKey();
   await navigate({ to: '/login' });
 }
@@ -117,11 +124,22 @@ onUnmounted(() => scrollRoot.removeEventListener('scroll', handleScroll));
             >
               <UiIcon :name="isDark ? 'sun' : 'moon'" class="fab-utility-icon" :size="16" />
             </button>
+            <Link
+              to="/account"
+              class="fab-utility-btn"
+              :title="t('nav.account')"
+              data-testid="nav-account-mobile"
+              @click="closeMenu"
+            >
+              <UiIcon name="user" class="fab-utility-icon" :size="16" />
+              <span class="sr-only">{{ t('nav.account') }}</span>
+            </Link>
             <button
               type="button"
               class="fab-utility-btn"
               :aria-label="t('nav.logout')"
               :title="t('nav.logout')"
+              data-testid="nav-logout"
               @click="handleLogout"
             >
               <UiIcon name="log-out" class="fab-utility-icon" :size="16" />

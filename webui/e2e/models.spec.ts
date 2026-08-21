@@ -1,6 +1,6 @@
 import { authedTest as test, expect } from './fixtures';
 import type { Locator, Page } from '@playwright/test';
-import { E2E_ADMIN_KEY } from './helpers/gateway';
+import { e2eRootHeaders } from './helpers/session';
 import {
   seedCatalog,
   seedChannel,
@@ -184,7 +184,7 @@ test.describe('models page', () => {
     await expect(canonical.getByTestId('price-cache-write')).toHaveText('—');
 
     const listed = await page.request.get('/prices', {
-      headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+      headers: await e2eRootHeaders(page.request),
     });
     const prices = (await listed.json()) as Array<{
       model: string;
@@ -628,7 +628,7 @@ test.describe('models page', () => {
     await expect(rowB.getByTestId('price-output')).toHaveText('5');
 
     const listed = await page.request.get('/prices', {
-      headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+      headers: await e2eRootHeaders(page.request),
     });
     const prices = (await listed.json()) as Array<{
       channel_id: number;
@@ -759,7 +759,7 @@ test.describe('models page', () => {
     ).toHaveCount(0);
   });
 
-  test('deleting a group with bound tokens asks to force; force rebinds tokens to default', async ({
+  test('deleting a group with bound tokens nulls the token group without rebind', async ({
     page,
   }) => {
     const forceChannel = await seedChannel(page, {
@@ -784,14 +784,12 @@ test.describe('models page', () => {
     const groupRow = page.locator('[data-testid="group-row"][data-group-name="e2e-force-group"]');
     await clickRowAction(groupRow, page, 'group-delete');
     await page.getByRole('dialog').getByTestId('group-delete-confirm').click();
-    await expect(page.getByTestId('group-force-delete-confirm')).toBeVisible();
-    await page.getByTestId('group-force-delete-confirm').click();
     await expect(groupRow).toHaveCount(0);
 
     const listed = await page.request.get('/tokens', {
-      headers: { Authorization: `Bearer ${E2E_ADMIN_KEY}` },
+      headers: await e2eRootHeaders(page.request),
     });
     const tokens = (await listed.json()) as Array<{ token_key: string; model_group: string }>;
-    expect(tokens.find((item) => item.token_key === token.token_key)?.model_group).toBe('default');
+    expect(tokens.find((item) => item.token_key === token.token_key)?.model_group).toBe('');
   });
 });

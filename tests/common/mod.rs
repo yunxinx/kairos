@@ -5,7 +5,8 @@
 //!
 //! v2 起运行时资源（渠道/令牌/价格/开关）移入 SQLite，夹具从「构造 Config 注入
 //! 资源」改为「DB 播种资源 + 极简静态配置」：`Seed` 持有资源清单，`start_with`
-//! 播种进库后加载快照启动网关。静态配置仅含监听/数据库路径/admin key。
+//! 播种进库后加载快照启动网关。静态配置仅含监听/数据库路径；管理面认证是登录
+//! 会话，不再使用静态 admin key。
 //!
 //! 该模块被多个测试二进制独立编译，各二进制只用到夹具的一个子集，
 //! 故整体允许 `dead_code`。
@@ -452,6 +453,7 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
                 enabled: true,
                 rate_limit_rpm: token.rate_limit_rpm,
                 model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
+                user_id: resources::ROOT_USER_ID,
             },
             unix_millis(),
         )
@@ -503,8 +505,10 @@ pub fn unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// 测试用管理 API 静态密钥（Bearer 认证）。
-pub const TEST_ADMIN_KEY: &str = "sk-admin-test";
+/// 测试用内置 root 登录邮箱（播种进库，不是 Bearer）。
+pub const TEST_ROOT_EMAIL: &str = "root@localhost";
+/// 测试用内置 root 登录密码（播种进库后经 `/login` 换会话）。
+pub const TEST_ROOT_PASSWORD: &str = "sk-admin-test";
 
 /// 一个已启动的网关 + mock 上游 + SQLite 组件的完整测试环境。
 pub struct TestGateway {
@@ -514,6 +518,8 @@ pub struct TestGateway {
     pub db_path: tempfile::TempPath,
     /// 独立管理监听地址；未启用管理面时为 `None`。
     pub admin_addr: Option<SocketAddr>,
+    /// 管理面 root 会话（`ksess_…`）。未启用管理面时为空串。
+    pub session: String,
 }
 
 impl TestGateway {
@@ -531,8 +537,8 @@ impl TestGateway {
         Self::start_with_opts(make_seed, false).await
     }
 
-    /// 带独立管理监听启动：协议面与 `start_with` 相同，另起一个以
-    /// `TEST_ADMIN_KEY` 认证的管理监听，`admin_addr` 记录其地址。
+    /// 带独立管理监听启动：协议面与 `start_with` 相同，另起管理监听。
+    /// 内置 root 用 `TEST_ROOT_EMAIL` / `TEST_ROOT_PASSWORD` 播种后登录，`session` 为会话 Bearer。
     pub async fn start_with_admin(make_seed: impl Fn(&str) -> Seed) -> Self {
         Self::start_with_opts(make_seed, true).await
     }
@@ -557,9 +563,17 @@ impl TestGateway {
 
         // 管理面与协议面共用同一快照句柄：管理写库后换快照，协议请求路径读到
         // 新资源，端到端断言「写后即时生效」。
-        let admin_addr = if with_admin {
-            let admin_app =
-                gateway::admin_router(pool.clone(), snapshot.clone(), TEST_ADMIN_KEY.to_string());
+        let (admin_addr, session) = if with_admin {
+            // 测试不走 config.json：直接调用与进程启动相同的播种入口，再 `/login` 换会话。
+            // `session` 才是管理 API Bearer；`TEST_ROOT_PASSWORD` 只用于登录，不能当 Authorization。
+            kairos::store::users::seed_builtin_root(
+                &pool,
+                Some(TEST_ROOT_EMAIL),
+                Some(TEST_ROOT_PASSWORD),
+            )
+            .await
+            .expect("测试 root 应能播种登录凭证");
+            let admin_app = gateway::admin_router(pool.clone(), snapshot.clone());
             let admin_listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("管理监听应能绑定随机端口");
@@ -574,9 +588,10 @@ impl TestGateway {
                 .await
                 .expect("管理面服务应运行");
             });
-            Some(admin_addr)
+            let session = login_root_session(&format!("http://{admin_addr}")).await;
+            (Some(admin_addr), session)
         } else {
-            None
+            (None, String::new())
         };
 
         let app = gateway::router(pool.clone(), snapshot).await;
@@ -599,6 +614,7 @@ impl TestGateway {
             pool,
             db_path,
             admin_addr,
+            session,
         }
     }
 
@@ -649,6 +665,7 @@ impl TestGateway {
             pool,
             db_path,
             admin_addr: None,
+            session: String::new(),
         };
         (gw, upstreams)
     }
@@ -693,4 +710,28 @@ impl TestGateway {
         });
         format!("http://{addr}")
     }
+}
+
+/// 用测试 root 邮箱密码换会话。管理面必须已经完成播种。
+async fn login_root_session(admin_base: &str) -> String {
+    let resp = reqwest::Client::new()
+        .post(format!("{admin_base}/login"))
+        .json(&serde_json::json!({
+            "email": TEST_ROOT_EMAIL,
+            "password": TEST_ROOT_PASSWORD
+        }))
+        .send()
+        .await
+        .expect("测试 root 登录应可达");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("登录响应应可解析");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "测试 root 应能登录: {body}"
+    );
+    body["token"]
+        .as_str()
+        .expect("登录应返回会话令牌")
+        .to_string()
 }

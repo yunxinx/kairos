@@ -21,8 +21,7 @@ async fn config_driven_listen_and_fallback() {
         f,
         r#"{{
             "listen": {{ "host": "127.0.0.1", "port": {port} }},
-            "database": {{ "path": "./kairos.db" }},
-            "admin_key": "sk-admin"
+            "database": {{ "path": "./kairos.db" }}
         }}"#
     )
     .expect("应能写入配置");
@@ -86,7 +85,8 @@ fn example_config_file_is_valid() {
     let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.json"));
     let cfg = config::Config::load(path).expect("示例配置应可解析");
     assert_eq!(cfg.listen.port, 8787);
-    assert_eq!(cfg.admin_key, "sk-admin-secret");
+    assert!(cfg.admin_email.is_none());
+    assert!(cfg.admin_password.is_none());
     let admin = cfg.admin_listen.expect("示例配置应含管理监听");
     assert_eq!(admin.port, 8788);
     assert_eq!(

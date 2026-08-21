@@ -25,28 +25,26 @@ fn ok_response(usage: Value) -> Value {
     })
 }
 
-/// 读取令牌当前余额（micro-USD）。
+/// 读取令牌所属用户的钱包剩余（micro-USD）。
 async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
-    let row: (i64, i64) = sqlx::query_as(
-        "SELECT balance_usd_micros, settled_usd_micros FROM token_balance WHERE token_key = ?",
+    sqlx::query_scalar(
+        "SELECT ub.balance_usd_micros \
+         FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id \
+         WHERE t.token_key = ?",
     )
     .bind(key)
     .fetch_one(&gw.pool)
     .await
-    .expect("令牌余额应存在");
-    row.0
+    .expect("用户余额应存在")
 }
 
 /// 读取令牌累计结算（micro-USD）。
 async fn settled_micros(gw: &TestGateway, key: &str) -> i64 {
-    let row: (i64, i64) = sqlx::query_as(
-        "SELECT balance_usd_micros, settled_usd_micros FROM token_balance WHERE token_key = ?",
-    )
-    .bind(key)
-    .fetch_one(&gw.pool)
-    .await
-    .expect("令牌余额应存在");
-    row.1
+    sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
+        .bind(key)
+        .fetch_one(&gw.pool)
+        .await
+        .expect("令牌累计结算应存在")
 }
 
 /// 发起一次 Chat Completions 请求，返回响应。
@@ -404,6 +402,122 @@ async fn huge_max_tokens_is_rejected_before_upstream() {
         balance_micros(&gw, TEST_TOKEN_KEY).await,
         5_000_000,
         "被门槛挡住时不应扣费"
+    );
+}
+
+/// 同一用户两把令牌共用钱包；各令牌 `settled` 分开计。
+#[tokio::test]
+async fn sibling_tokens_share_user_wallet() {
+    const SIBLING_KEY: &str = "sk-test-token-b";
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.tokens.push(common::SeedToken {
+            token_key: SIBLING_KEY.to_string(),
+            name: "dev-b".to_string(),
+            limit_usd: None,
+            balance_usd: 0.0,
+            rate_limit_rpm: None,
+        });
+        seed
+    })
+    .await;
+    let usage = json!({
+        "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
+        "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
+    });
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(usage.clone())));
+    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000 - 4250);
+    assert_eq!(balance_micros(&gw, SIBLING_KEY).await, 5_000_000 - 4250);
+    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 4250);
+    assert_eq!(settled_micros(&gw, SIBLING_KEY).await, 0);
+
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(usage)));
+    let resp = send_completion(&gw.base_url(), TEST_MODEL, SIBLING_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000 - 8500);
+    assert_eq!(balance_micros(&gw, SIBLING_KEY).await, 5_000_000 - 8500);
+    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 4250);
+    assert_eq!(settled_micros(&gw, SIBLING_KEY).await, 4250);
+}
+
+/// 一把令牌在途透支后，同用户另一把令牌的新请求也被挡住。
+#[tokio::test]
+async fn overdraft_on_one_token_blocks_sibling() {
+    const SIBLING_KEY: &str = "sk-test-token-b";
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].balance_usd = 0.000001;
+        seed.tokens.push(common::SeedToken {
+            token_key: SIBLING_KEY.to_string(),
+            name: "dev-b".to_string(),
+            limit_usd: None,
+            balance_usd: 0.0,
+            rate_limit_rpm: None,
+        });
+        seed
+    })
+    .await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(json!({
+            "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
+            "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
+        }))));
+    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(balance_micros(&gw, SIBLING_KEY).await, 1 - 4250);
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL, SIBLING_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(
+        gw.upstream.received().len(),
+        1,
+        "第二把令牌被挡住时不应再出站"
+    );
+}
+
+/// 令牌 `limit_usd_micros` 按该令牌 settled，不与同用户另一把令牌共享。
+#[tokio::test]
+async fn token_limit_is_per_token_not_shared_wallet() {
+    const SIBLING_KEY: &str = "sk-test-token-b";
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].limit_usd = Some(0.01);
+        seed.tokens.push(common::SeedToken {
+            token_key: SIBLING_KEY.to_string(),
+            name: "dev-b".to_string(),
+            limit_usd: None,
+            balance_usd: 0.0,
+            rate_limit_rpm: None,
+        });
+        seed
+    })
+    .await;
+    let usage = json!({
+        "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
+        "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
+    });
+    for _ in 0..3 {
+        gw.upstream
+            .set_behavior(UpstreamBehavior::Json(ok_response(usage.clone())));
+        let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    }
+    let blocked = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(blocked.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(usage)));
+    let sibling = send_completion(&gw.base_url(), TEST_MODEL, SIBLING_KEY).await;
+    assert_eq!(sibling.status(), reqwest::StatusCode::OK);
+    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 12_750);
+    assert_eq!(settled_micros(&gw, SIBLING_KEY).await, 4250);
+    assert_eq!(
+        balance_micros(&gw, SIBLING_KEY).await,
+        5_000_000 - 12_750 - 4250
     );
 }
 

@@ -20,7 +20,7 @@ test.describe('locale and theme', () => {
       isDark ? 'dark' : 'light',
     );
     await page.reload();
-    await expect(page.locator('#login-admin-key')).toBeVisible();
+    await expect(page.locator('#login-email')).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.classList.contains('dark'))).toBe(
       isDark,
     );

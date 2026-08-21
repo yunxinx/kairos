@@ -1,4 +1,4 @@
-//! 管理 API 端到端黑盒测试：独立管理监听 + 静态 admin key 认证 + 资源 CRUD。
+//! 管理 API 端到端黑盒测试：独立管理监听 + 登录会话认证 + 资源 CRUD。
 //!
 //! 主接缝：测试内启动网关 + mock 上游 + 独立管理监听，断言外部可观察行为
 //! （管理写库后的即时生效、认证拒绝、结构化错误、SQLite 持久化状态）。
@@ -6,16 +6,16 @@
 mod common;
 
 use base64::Engine as _;
-use common::{TEST_ADMIN_KEY, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use futures_util::StreamExt;
 use kairos::store;
 use serde_json::{Value, json};
 
-/// 带 `TEST_ADMIN_KEY` 认证的 GET 请求。
+/// 带管理会话认证的 GET 请求。
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("管理请求应可达")
@@ -55,7 +55,7 @@ fn channel_body(name: &str, base_url: String, models: Value) -> Value {
     })
 }
 
-/// 带 `TEST_ADMIN_KEY` 认证、携带 JSON body 的请求。
+/// 带管理会话认证、携带 JSON body 的请求。
 async fn admin_json(
     gw: &TestGateway,
     method: reqwest::Method,
@@ -64,7 +64,7 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&body)
         .send()
         .await
@@ -117,11 +117,11 @@ async fn fetch_bodies(pool: &sqlx::SqlitePool) -> (Option<Vec<u8>>, Option<Vec<u
         .expect("应有请求日志")
 }
 
-/// 以 `TEST_ADMIN_KEY` 认证、携带 JSON body 的 PUT 请求。
+/// 以管理会话认证、携带 JSON body 的 PUT 请求。
 async fn admin_put(gw: &TestGateway, path: &str, body: Value) -> reqwest::Response {
     reqwest::Client::new()
         .put(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&body)
         .send()
         .await
@@ -229,7 +229,7 @@ async fn admin_accepts_lowercase_bearer_scheme() {
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}/tokens", gw.admin_base_url()))
-        .header("Authorization", format!("bearer {TEST_ADMIN_KEY}"))
+        .header("Authorization", format!("bearer {}", gw.session))
         .send()
         .await
         .expect("应可请求管理面");
@@ -295,7 +295,7 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     // 删除后立即失效：请求路径认证失败（401），列表也移除。
     let resp = reqwest::Client::new()
         .delete(format!("{}/tokens/{new_key}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可删除令牌");
@@ -544,7 +544,7 @@ async fn channel_and_price_immediate_effect() {
             "{}/prices/{mini_id}/gpt-4o-mini",
             gw.admin_base_url()
         ))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可删除价格");
@@ -559,7 +559,7 @@ async fn channel_and_price_immediate_effect() {
     // 删除渠道：模型失去路由，请求 503（无渠道）。
     let resp = client
         .delete(format!("{}/channels/{mini_id}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可删除渠道");
@@ -850,7 +850,7 @@ async fn deleting_channel_cascades_its_prices() {
 
     let resp = reqwest::Client::new()
         .delete(format!("{}/channels/{channel_id}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可删除渠道");
@@ -875,7 +875,7 @@ async fn unpriced_sibling_is_skipped_not_503() {
             "{}/prices/{seed_id}/{TEST_MODEL}",
             gw.admin_base_url()
         ))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可删除播种价格");
@@ -1122,7 +1122,7 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     // 畸形 JSON body → 400 结构化错误。
     let resp = client
         .post(format!("{admin}/tokens"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .header("content-type", "application/json")
         .body("{ not json")
         .send()
@@ -1200,7 +1200,7 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     // 删除不存在的资源 → 404。
     let resp = client
         .delete(format!("{admin}/tokens/does-not-exist"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可请求管理面");
@@ -1231,7 +1231,7 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     for path in PROTOCOL_FORBIDDEN_ADMIN_GETS {
         let resp = client
             .get(format!("{}{path}", gw.base_url()))
-            .bearer_auth(TEST_ADMIN_KEY)
+            .bearer_auth(&gw.session)
             .send()
             .await
             .expect("协议监听应可请求");
@@ -1243,7 +1243,7 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     }
     let resp = client
         .post(format!("{}/channels/1/test", gw.base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("协议监听应可请求");
@@ -1256,7 +1256,7 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     // 管理监听无协议端点。
     let resp = client
         .post(format!("{}/v1/chat/completions", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({
             "model": TEST_MODEL,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -1283,12 +1283,12 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
         "下游令牌不应能认证管理面"
     );
 
-    // admin key 不能当下游令牌。
-    let resp = chat_request(&gw, TEST_ADMIN_KEY, TEST_MODEL).await;
+    // 管理会话不能当下游令牌。
+    let resp = chat_request(&gw, &gw.session, TEST_MODEL).await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "admin key 不应能作为下游令牌"
+        "管理会话不应能作为下游令牌"
     );
 }
 
@@ -1417,7 +1417,7 @@ async fn runtime_resources_survive_process_restart() {
             "{}/tokens/{restart_key}/balance",
             gw.admin_base_url()
         ))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
         .await
@@ -1558,7 +1558,7 @@ async fn empty_db_bootstraps_via_admin_api() {
 
     let resp = reqwest::Client::new()
         .post(format!("{}/tokens/{boot_key}/balance", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
         .await
@@ -1608,7 +1608,7 @@ async fn deleting_token_clears_balance_row() {
     // 删除后余额行一并清理：库内不再残留该 key 的余额记录。
     let resp = client
         .delete(format!("{}/tokens/{cycle_key}", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可删除令牌");
@@ -1633,7 +1633,7 @@ async fn settings_write_takes_effect_immediately() {
     // 缺省设置：full_body 关闭、body 上限为正。
     let resp = client
         .get(format!("{admin}/settings"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可读设置");
@@ -1836,7 +1836,7 @@ async fn settings_toggle_full_body_enables_body_logging() {
     // 列表不带 body；详情按 id 以 base64 返回。
     let resp = client
         .get(format!("{admin}/logs?page_size=1"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可查日志");
@@ -1846,7 +1846,7 @@ async fn settings_toggle_full_body_enables_body_logging() {
     let id = entry["id"].as_i64().expect("应有日志 id");
     let resp = client
         .get(format!("{admin}/logs/{id}"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可查日志详情");
@@ -1884,7 +1884,7 @@ async fn balance_adjustment_reflected_in_admission() {
     // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
     let resp = client
         .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": -5_000_000 }))
         .send()
         .await
@@ -1905,7 +1905,7 @@ async fn balance_adjustment_reflected_in_admission() {
     // 充值后恢复可用。
     let resp = client
         .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 5_000_000 }))
         .send()
         .await
@@ -1924,7 +1924,7 @@ async fn token_attr_update_does_not_reset_balance() {
     // 充值 1 USD（初始 5 USD → 6 USD）。
     let resp = client
         .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 1_000_000 }))
         .send()
         .await
@@ -1943,7 +1943,7 @@ async fn token_attr_update_does_not_reset_balance() {
     // 余额不变：以 delta 0 读回应仍为 6_000_000。
     let resp = client
         .post(format!("{admin}/tokens/{TEST_TOKEN_KEY}/balance"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 0 }))
         .send()
         .await
@@ -1970,7 +1970,7 @@ async fn logs_paginate_and_filter() {
     // 全量：total 反映日志总数，默认每页 20 条。
     let resp = client
         .get(format!("{admin}/logs"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可查日志");
@@ -1988,7 +1988,7 @@ async fn logs_paginate_and_filter() {
     // 按模型过滤：命中全部 3 条。
     let resp = client
         .get(format!("{admin}/logs?model={TEST_MODEL}"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可过滤日志");
@@ -2005,7 +2005,7 @@ async fn logs_paginate_and_filter() {
     // 按令牌 key 过滤：命中全部 3 条（同一令牌）。
     let resp = client
         .get(format!("{admin}/logs?token_key={TEST_TOKEN_KEY}"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可过滤日志");
@@ -2015,7 +2015,7 @@ async fn logs_paginate_and_filter() {
     // 按令牌名精确过滤：子串不命中。
     let resp = client
         .get(format!("{admin}/logs?token_name=dev"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可按令牌名过滤");
@@ -2023,7 +2023,7 @@ async fn logs_paginate_and_filter() {
     assert_eq!(page["total"], 3);
     let resp = client
         .get(format!("{admin}/logs?token_name=de"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可按令牌名精确过滤");
@@ -2033,7 +2033,7 @@ async fn logs_paginate_and_filter() {
     // 按渠道精确过滤：子串不命中。
     let resp = client
         .get(format!("{admin}/logs?channel=test-channel"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可按渠道过滤");
@@ -2041,7 +2041,7 @@ async fn logs_paginate_and_filter() {
     assert_eq!(page["total"], 3);
     let resp = client
         .get(format!("{admin}/logs?channel=test"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可按渠道精确过滤");
@@ -2051,7 +2051,7 @@ async fn logs_paginate_and_filter() {
     // 综合关键字：模型子串命中全部 3 条。
     let resp = client
         .get(format!("{admin}/logs?keyword={TEST_MODEL}"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可过滤日志");
@@ -2061,7 +2061,7 @@ async fn logs_paginate_and_filter() {
     // 综合关键字：无命中时 total 为 0。
     let resp = client
         .get(format!("{admin}/logs?keyword=no-such-keyword"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可过滤日志");
@@ -2071,7 +2071,7 @@ async fn logs_paginate_and_filter() {
     // 分页：page_size=2 → 第一页 2 条、第二页 1 条。
     let resp = client
         .get(format!("{admin}/logs?page=1&page_size=2"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可分页");
@@ -2082,7 +2082,7 @@ async fn logs_paginate_and_filter() {
 
     let resp = client
         .get(format!("{admin}/logs?page=2&page_size=2"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可分页");
@@ -2092,7 +2092,7 @@ async fn logs_paginate_and_filter() {
     // 分页 + 时间过滤：from_created_at 远在过去 → 仍命中全部。
     let resp = client
         .get(format!("{admin}/logs?from_created_at=1&page_size=2"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可过滤日志");
@@ -2101,7 +2101,7 @@ async fn logs_paginate_and_filter() {
 
     let resp = client
         .get(format!("{admin}/logs?page_size=10"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可查日志");
@@ -2117,7 +2117,7 @@ async fn logs_paginate_and_filter() {
         .get(format!(
             "{admin}/logs?sort_by=created&sort_dir=asc&page_size=10"
         ))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可按时间正序查日志");
@@ -2376,7 +2376,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
         .expect("应能写待豁免日志");
 
     let before: (i64,) =
-        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+        sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
             .bind(TEST_TOKEN_KEY)
             .fetch_one(&gw.pool)
             .await
@@ -2385,7 +2385,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
 
     let resp = reqwest::Client::new()
         .post(format!("{}/logs/{settle_id}/settle", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应能补扣");
@@ -2393,7 +2393,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
     let settled: Value = resp.json().await.expect("补扣响应应可解析");
     assert_eq!(settled["settled"], true);
     let after_settle: (i64,) =
-        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+        sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
             .bind(TEST_TOKEN_KEY)
             .fetch_one(&gw.pool)
             .await
@@ -2402,7 +2402,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
 
     let again = reqwest::Client::new()
         .post(format!("{}/logs/{settle_id}/settle", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应能再请求");
@@ -2410,7 +2410,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
 
     let resp = reqwest::Client::new()
         .post(format!("{}/logs/{waive_id}/waive", gw.admin_base_url()))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应能豁免");
@@ -2418,7 +2418,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
     let waived: Value = resp.json().await.expect("豁免响应应可解析");
     assert_eq!(waived["settled"], true);
     let after_waive: (i64,) =
-        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+        sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
             .bind(TEST_TOKEN_KEY)
             .fetch_one(&gw.pool)
             .await
@@ -2571,7 +2571,7 @@ async fn new_endpoints_structured_errors() {
     // 余额：不存在的令牌 → 404。
     let resp = client
         .post(format!("{admin}/tokens/nope/balance"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "delta_usd_micros": 100 }))
         .send()
         .await
@@ -2581,7 +2581,7 @@ async fn new_endpoints_structured_errors() {
     // 日志：非法查询参数 → 400 结构化错误。
     let resp = client
         .get(format!("{admin}/logs?page=abc"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可查日志");
@@ -2592,7 +2592,7 @@ async fn new_endpoints_structured_errors() {
     // 日志：未知查询参数 → 400（deny_unknown_fields，拼写错误不静默返回未过滤结果）。
     let resp = client
         .get(format!("{admin}/logs?tokne_key=sk-x"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可查日志");
@@ -2601,7 +2601,7 @@ async fn new_endpoints_structured_errors() {
     // 日志：未知排序列 → 400（只接受白名单）。
     let resp = client
         .get(format!("{admin}/logs?sort_by=nope"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可查日志");
@@ -2829,7 +2829,7 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
     // 非数字 → 400 结构化错误。
     let resp = client
         .get(format!("{admin}/stats?days=abc"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可请求 stats");
@@ -2840,7 +2840,7 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
     // 未知查询参数 → 400。
     let resp = client
         .get(format!("{admin}/stats?dayz=7"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("应可请求 stats");
@@ -2902,7 +2902,7 @@ async fn channel_probe_success_skips_billing_and_logging() {
         .set_behavior(UpstreamBehavior::Json(completion_body()));
 
     let balance_before: (i64,) =
-        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+        sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
             .bind(TEST_TOKEN_KEY)
             .fetch_one(&gw.pool)
             .await
@@ -2918,7 +2918,7 @@ async fn channel_probe_success_skips_billing_and_logging() {
             "{}/channels/{channel_id}/test",
             gw.admin_base_url()
         ))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -2951,7 +2951,7 @@ async fn channel_probe_success_skips_billing_and_logging() {
     );
 
     let balance_after: (i64,) =
-        sqlx::query_as("SELECT balance_usd_micros FROM token_balance WHERE token_key = ?")
+        sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
             .bind(TEST_TOKEN_KEY)
             .fetch_one(&gw.pool)
             .await
@@ -2981,7 +2981,7 @@ async fn channel_probe_upstream_error_is_reachable_with_status() {
             "{}/channels/{channel_id}/test",
             gw.admin_base_url()
         ))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -3029,7 +3029,7 @@ async fn channel_probe_timeout_is_unreachable() {
             "{}/channels/{timeout_id}/test",
             gw.admin_base_url()
         ))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -3252,7 +3252,7 @@ async fn stats_and_probe_auth_and_unknown_channel() {
 
     let resp = client
         .post(format!("{admin}/channels/999999/test"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -3310,6 +3310,23 @@ async fn admin_spa_deep_link_serves_html_without_auth() {
     assert!(is_html(&resp), "深链回退应为 text/html");
 }
 
+/// `POST /login` 占用同路径时，GET 仍须回退 SPA，不能 405。
+#[tokio::test]
+async fn admin_get_login_serves_html_without_auth() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/login", gw.admin_base_url()))
+        .send()
+        .await
+        .expect("管理监听应可达");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "GET /login 应返回登录页，不能 405"
+    );
+    assert!(is_html(&resp), "GET /login 应为 text/html");
+}
+
 /// 静态资源免认证；资源 API 未带 key 仍 401。
 #[tokio::test]
 async fn admin_static_is_public_api_still_requires_key() {
@@ -3359,7 +3376,7 @@ async fn admin_root_never_5xx_and_api_still_works() {
 
     let tokens = client
         .get(format!("{admin}/tokens"))
-        .bearer_auth(TEST_ADMIN_KEY)
+        .bearer_auth(&gw.session)
         .send()
         .await
         .expect("管理 API 应可达");
