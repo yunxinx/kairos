@@ -576,7 +576,7 @@ async fn delete_user(
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    users::delete_user(&mut tx, id)
+    users::delete_user(&mut tx, id, super::logging::unix_millis())
         .await
         .map_err(map_user_store_err)?;
     tx.commit().await.map_err(db_err)?;

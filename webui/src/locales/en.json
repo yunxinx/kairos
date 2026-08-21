@@ -214,11 +214,11 @@
     "manageTabs": "User management",
     "updateSuccess": "User updated",
     "rechargeSuccess": "Recharge successful",
-    "delete": "Delete",
-    "deleteTitle": "Delete user",
-    "deleteMessage": "Delete user \"{name}\"? Owned tokens will also be deleted.",
-    "bulkDeleteTitle": "Delete users",
-    "bulkDeleteMessage": "Delete {count} selected users? Owned tokens will also be deleted."
+    "delete": "Archive",
+    "deleteTitle": "Archive user",
+    "deleteMessage": "Archive user \"{name}\"? The account is disabled and its tokens stop working immediately. Usage history is kept and the email can be registered again.",
+    "bulkDeleteTitle": "Archive users",
+    "bulkDeleteMessage": "Archive the {count} selected users? Their accounts are disabled and their tokens stop working immediately. Usage history is kept."
   },
   "account": {
     "profile": "Profile",

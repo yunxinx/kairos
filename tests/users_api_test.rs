@@ -291,3 +291,145 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     assert_ne!(shown, mine_key, "不应回显明文 key");
     assert!(shown.contains("******"), "应为脱敏形态，实际 {shown}");
 }
+
+/// 软删除：账号停用归档、令牌立即失效、消费记录保留、原邮箱可重新注册。
+///
+/// 曾经是硬删除：`tokens.user_id` 是无级联外键，删有令牌的用户直接撞 FOREIGN KEY
+/// 返 500，而正常使用下用户都有令牌，所以「删除用户」对活跃用户必然失败。
+#[tokio::test]
+async fn deleting_user_archives_and_keeps_usage_history() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let (user_id, user_token) = create_role(&gw, "archive-me@example.com", "user").await;
+
+    let created = json_req(
+        &gw,
+        &user_token,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({ "name": "doomed", "limit_usd_micros": null, "enabled": true }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let owned: Value = created.json().await.expect("令牌应可解析");
+    let owned_key = owned["token_key"].as_str().expect("应有 key").to_string();
+
+    // 手写一条归属该用户的请求日志，模拟已产生的消费。
+    sqlx::query(
+        "INSERT INTO request_log \
+         (created_at, token_name, token_key, user_id, inbound_protocol, model, channel, \
+          status_code, latency_ms, cost_usd_micros, settled) \
+         VALUES (1, 'doomed', ?, ?, 'openai_chat', 'gpt-4o', 'c', 200, 5, 1234, 1)",
+    )
+    .bind(&owned_key)
+    .bind(user_id)
+    .execute(&gw.pool)
+    .await
+    .expect("应能写日志");
+
+    let deleted = reqwest::Client::new()
+        .delete(admin_url(&gw, &format!("/users/{user_id}")))
+        .bearer_auth(&gw.session)
+        .send()
+        .await
+        .expect("归档应可达");
+    assert_eq!(
+        deleted.status(),
+        StatusCode::NO_CONTENT,
+        "有令牌的用户也应能归档（硬删除会撞外键返 500）"
+    );
+
+    // 列表里消失，但库内行仍在。
+    let listed: Value = get_req(&gw, &gw.session, "/users")
+        .await
+        .json()
+        .await
+        .expect("列表应可解析");
+    assert!(
+        !listed
+            .as_array()
+            .expect("应为数组")
+            .iter()
+            .any(|u| u["id"] == user_id),
+        "归档用户不应出现在列表"
+    );
+    let archived: (Option<i64>, String, i64) =
+        sqlx::query_as("SELECT deleted_at, email, enabled FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("行应仍在");
+    assert!(archived.0.is_some(), "应打上归档时刻");
+    assert_eq!(archived.2, 0, "应同时停用");
+    assert_eq!(
+        archived.1,
+        format!("deleted.{user_id}.archive-me@example.com"),
+        "邮箱应改写以释放原地址"
+    );
+
+    // 消费记录保留。
+    let kept: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM request_log WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计");
+    assert_eq!(kept.0, 1, "历史消费记录必须保留");
+
+    // 令牌行仍在（供日志归属），但入站请求立即失效。
+    let token_rows: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tokens WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计");
+    assert_eq!(token_rows.0, 1, "令牌行保留，token_key → user_id 关联不丢");
+    let denied = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(&owned_key)
+        .json(&json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .expect("下游请求应可达");
+    assert_eq!(
+        denied.status(),
+        StatusCode::UNAUTHORIZED,
+        "归档用户的令牌应立即失效"
+    );
+
+    // 会话立即失效。
+    let stale = get_req(&gw, &user_token, "/me").await;
+    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED, "会话应被吊销");
+
+    // 原邮箱可重新注册。
+    let recreated = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "archive-me@example.com",
+            "display_name": "再来一个",
+            "password": "password1",
+            "role": "user"
+        }),
+    )
+    .await;
+    assert_eq!(
+        recreated.status(),
+        StatusCode::CREATED,
+        "归档后原邮箱应可重新注册"
+    );
+}
+
+/// 最后一个启用 root 不能归档。
+#[tokio::test]
+async fn last_root_cannot_be_archived() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let resp = reqwest::Client::new()
+        .delete(admin_url(&gw, "/users/1"))
+        .bearer_auth(&gw.session)
+        .send()
+        .await
+        .expect("请求应可达");
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = resp.json().await.expect("应可解析");
+    assert_eq!(body["error"]["code"], "last_root_protected");
+}

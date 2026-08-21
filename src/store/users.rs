@@ -163,7 +163,7 @@ mod tests {
             .await
             .expect_err("应拒绝");
         assert!(matches!(err, StoreError::LastRootProtected));
-        let err = delete_user(&mut conn, ROOT_USER_ID)
+        let err = delete_user(&mut conn, ROOT_USER_ID, 1)
             .await
             .expect_err("应拒绝删除");
         assert!(matches!(err, StoreError::LastRootProtected));
@@ -229,7 +229,7 @@ pub async fn seed_builtin_root(
     // 有行时内层 Option 才是 `password_hash` 列（NULL → None，已哈希 → Some）。
     // 无行视为迁移损坏：这里不 INSERT 第二份 root，否则会绕过「最后一个启用 root」保护。
     let password_hash: Option<Option<String>> =
-        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ?")
+        sqlx::query_scalar("SELECT password_hash FROM users WHERE id = ? AND deleted_at IS NULL")
             .bind(ROOT_USER_ID)
             .fetch_optional(pool)
             .await
@@ -301,7 +301,7 @@ pub fn normalize_email(email: &str) -> String {
 /// 按 id 读用户；不存在返回 `None`。
 pub async fn get_user(pool: &SqlitePool, id: i64) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ?",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -317,7 +317,7 @@ pub async fn get_user_by_email(
 ) -> Result<Option<UserRecord>, StoreError> {
     let email = normalize_email(email);
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ?",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ? AND deleted_at IS NULL",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -406,7 +406,7 @@ pub async fn insert_user(
 /// 列出全部管理用户（不含密码）。
 pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE deleted_at IS NULL",
     )
     .fetch_all(pool)
     .await
@@ -416,10 +416,14 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError
 
 /// 读出全部用户可用模型组（未排序）。
 pub async fn list_all_assigned_groups(pool: &SqlitePool) -> Result<Vec<(i64, String)>, StoreError> {
-    let rows = sqlx::query("SELECT user_id, group_name FROM user_model_groups")
-        .fetch_all(pool)
-        .await
-        .map_err(StoreError::Query)?;
+    let rows = sqlx::query(
+        "SELECT g.user_id, g.group_name FROM user_model_groups g \
+         JOIN users u ON u.id = g.user_id \
+         WHERE u.deleted_at IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         out.push((
@@ -497,7 +501,7 @@ async fn get_user_by_email_on_conn(
     email: &str,
 ) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ?",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ? AND deleted_at IS NULL",
     )
     .bind(email)
     .fetch_optional(&mut *conn)
@@ -540,7 +544,7 @@ pub async fn password_matches(
     user_id: i64,
     password: &str,
 ) -> Result<bool, StoreError> {
-    let row = sqlx::query("SELECT password_hash FROM users WHERE id = ?")
+    let row = sqlx::query("SELECT password_hash FROM users WHERE id = ? AND deleted_at IS NULL")
         .bind(user_id)
         .fetch_optional(pool)
         .await
@@ -616,15 +620,39 @@ pub async fn set_user_enabled(
     Ok(())
 }
 
-/// 删除用户。最后一个启用 root 拒绝。
-pub async fn delete_user(conn: &mut SqliteConnection, user_id: i64) -> Result<(), StoreError> {
+/// 软删除用户：停用 + 归档 + 释放邮箱 + 吊销会话。最后一个启用 root 拒绝。
+///
+/// 不做硬删除：`request_log` 按 `user_id` 记归属，删掉用户行会让历史消费记录变成
+/// 孤儿；`tokens.user_id` 又是无级联外键，硬删会直接撞 FOREIGN KEY 约束。
+///
+/// 令牌行不动：`authenticate` 与 `token_group_assigned` 都查快照里的用户，归档用户
+/// 不进快照，其令牌随即失效，而 `token_key → user_id` 关联保留，日志归属不丢。
+///
+/// 邮箱改写为 `deleted.{id}.{原邮箱}`，把原地址放回可注册状态（列级 UNIQUE 无法
+/// 改成 partial index，见 migration 0027）。已归档则幂等返回。
+pub async fn delete_user(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    now: i64,
+) -> Result<(), StoreError> {
     let Some(current) = get_user_on_conn(conn, user_id).await? else {
         return Ok(());
     };
     if current.role == ManagementRole::Root {
         protect_last_root(conn, user_id).await?;
     }
-    sqlx::query("DELETE FROM users WHERE id = ?")
+    sqlx::query(
+        "UPDATE users \
+         SET deleted_at = ?, enabled = 0, email = 'deleted.' || id || '.' || email \
+         WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(now)
+    .bind(user_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    // 外键级联不再触发（行还在），必须显式吊销会话，否则归档用户的浏览器仍能用。
+    sqlx::query("UPDATE management_sessions SET revoked = 1 WHERE user_id = ?")
         .bind(user_id)
         .execute(&mut *conn)
         .await
@@ -637,7 +665,7 @@ async fn get_user_on_conn(
     id: i64,
 ) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ?",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -648,7 +676,8 @@ async fn get_user_on_conn(
 
 async fn protect_last_root(conn: &mut SqliteConnection, user_id: i64) -> Result<(), StoreError> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE role = 'root' AND enabled != 0 AND id != ?",
+        "SELECT COUNT(*) FROM users \
+         WHERE role = 'root' AND enabled != 0 AND deleted_at IS NULL AND id != ?",
     )
     .bind(user_id)
     .fetch_one(&mut *conn)
@@ -668,7 +697,7 @@ pub async fn authenticate_password(
 ) -> Result<Option<UserRecord>, StoreError> {
     let email = normalize_email(email);
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, password_hash FROM users WHERE email = ?",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, password_hash FROM users WHERE email = ? AND deleted_at IS NULL",
     )
     .bind(&email)
     .fetch_optional(pool)
@@ -766,7 +795,7 @@ pub async fn user_for_session(
                 s.expires_at, s.revoked \
          FROM management_sessions s \
          JOIN users u ON u.id = s.user_id \
-         WHERE s.token_hash = ?",
+         WHERE s.token_hash = ? AND u.deleted_at IS NULL",
     )
     .bind(&token_hash)
     .fetch_optional(pool)

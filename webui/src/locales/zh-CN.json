@@ -214,11 +214,11 @@
     "manageTabs": "用户管理",
     "updateSuccess": "用户资料已更新",
     "rechargeSuccess": "充值成功",
-    "delete": "删除",
-    "deleteTitle": "删除用户",
-    "deleteMessage": "确定删除用户「{name}」？名下令牌将被一同删除且不可恢复。",
-    "bulkDeleteTitle": "批量删除用户",
-    "bulkDeleteMessage": "确定删除选中的 {count} 个用户？名下令牌将被一同删除且不可恢复。"
+    "delete": "归档",
+    "deleteTitle": "归档用户",
+    "deleteMessage": "确定归档用户「{name}」？账号停用、名下令牌立即失效；历史消费记录保留，原邮箱可重新注册。",
+    "bulkDeleteTitle": "批量归档用户",
+    "bulkDeleteMessage": "确定归档选中的 {count} 个用户？账号停用、名下令牌立即失效；历史消费记录保留。"
   },
   "account": {
     "profile": "基本资料",
