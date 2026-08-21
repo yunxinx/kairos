@@ -26,6 +26,19 @@ export function formatUsdMicros(micros: number): string {
   return `$${amount}`;
 }
 
+/** micro-USD 整数 → 固定保留两位小数的 `$` 美元字符串（如 `$0.00`、`$1.50`）。 */
+export function formatUsdFixed2(micros: number): string {
+  const negative = micros < 0;
+  const abs = negative ? -micros : micros;
+  const dollars = Math.trunc(abs / MICROS_PER_USD);
+  const cents = Math.round((abs % MICROS_PER_USD) / 10_000);
+  if (cents >= 100) {
+    return `${negative ? '-$' : '$'}${dollars + 1}.00`;
+  }
+  const fraction = cents.toString().padStart(2, '0');
+  return `${negative ? '-$' : '$'}${dollars}.${fraction}`;
+}
+
 /**
  * 美元可读字符串 → micro-USD 整数。
  *

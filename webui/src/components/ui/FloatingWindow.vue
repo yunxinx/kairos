@@ -194,7 +194,7 @@ onUnmounted(() => {
     :aria-labelledby="titleId"
     class="floating-window card flex max-h-[calc(100vh-1rem)] max-w-[calc(100vw-1rem)] flex-col"
     :class="[
-      extraWide ? 'w-[56rem]' : wide ? 'w-[34rem]' : 'w-[28rem]',
+      extraWide ? 'w-[56rem]' : wide ? 'w-[38rem]' : 'w-[28rem]',
       attention && 'floating-window-attention',
     ]"
     :style="{

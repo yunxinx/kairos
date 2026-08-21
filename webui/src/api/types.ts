@@ -237,17 +237,28 @@ export interface UserView {
   display_name: string;
   role: ManagementRole;
   enabled: boolean;
+  avatar?: string | null;
+  rate_limit_rpm?: number | null;
 }
 
-/** 当前用户：身份 + 可用组 + 钱包。 */
+/** 当前用户：身份 + 可用组 + 钱包 + 统计。 */
 export interface MeView extends UserView {
   assigned_groups: string[];
   balance_usd_micros: number;
   settled_usd_micros: number;
+  request_count?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  last_used_at?: number | null;
 }
 
-/** 用户管理列表/详情（与 `MeView` 同形）。 */
-export type UserAdminView = MeView;
+/** 用户管理列表/详情。 */
+export interface UserAdminView extends MeView {
+  request_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  last_used_at: number | null;
+}
 
 export interface LoginRequest {
   email: string;
@@ -265,6 +276,8 @@ export interface UserCreate {
   display_name: string;
   password: string;
   role: ManagementRole;
+  avatar?: string;
+  rate_limit_rpm?: number | null;
 }
 
 /** 当前用户改自己的资料。改密码时必须带 `current_password`。 */
@@ -273,6 +286,7 @@ export interface MeUpdate {
   display_name?: string;
   password?: string;
   current_password?: string;
+  avatar?: string;
 }
 
 export interface UserUpdate {
@@ -280,6 +294,8 @@ export interface UserUpdate {
   enabled?: boolean;
   password?: string;
   display_name?: string;
+  avatar?: string;
+  rate_limit_rpm?: number | null;
 }
 
 export interface AssignedGroupsView {

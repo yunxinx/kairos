@@ -120,8 +120,11 @@ test.describe('role navigation', () => {
     await expect(page.getByRole('columnheader', { name: 'Input ($)', exact: true })).toBeVisible();
 
     await page.goto('/admin/users');
+    await expect(page.locator('[data-testid="user-row"]', { hasText: 'root@' })).toHaveCount(0);
+    await expect(page.getByTestId('users-role-filter')).toHaveCount(0);
     const row = page.locator(`[data-testid="user-row"][data-user-id="${target.id}"]`);
-    await clickRowAction(row, page, 'user-groups');
+    await row.getByTestId('user-edit').click();
+    await page.getByTestId('user-tab-groups').click();
     await page.getByTestId('user-group-e2e-admin-assign').click();
     await page.getByTestId('user-groups-save').click();
     await expect(
