@@ -148,10 +148,15 @@ async function handleLogout() {
             <UiIcon name="user" class="text-fg-muted size-3.5" />
             <span>{{ t('nav.account') }}</span>
           </DropdownMenuItem>
+          <!--
+            主题与语言是就地切换的开关：@select.prevent 阻止 reka-ui 的默认关闭行为，
+            菜单保持展开，运营可以连着调整并立刻看到效果。
+            「账户」「退出登录」是导航动作，仍按默认行为关闭。
+          -->
           <DropdownMenuItem
             class="data-table-menu-item flex items-center justify-between"
             data-testid="nav-theme-toggle"
-            @select="handleToggleTheme"
+            @select.prevent="handleToggleTheme"
           >
             <div class="flex items-center gap-2">
               <UiIcon :name="isDark ? 'sun' : 'moon'" class="text-fg-muted size-3.5" />
@@ -164,7 +169,7 @@ async function handleLogout() {
           <DropdownMenuItem
             class="data-table-menu-item flex items-center justify-between"
             data-testid="nav-locale-toggle"
-            @select="toggleLocale()"
+            @select.prevent="toggleLocale()"
           >
             <div class="flex items-center gap-2">
               <UiIcon name="globe" class="text-fg-muted size-3.5" />

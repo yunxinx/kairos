@@ -65,6 +65,39 @@ test.describe('email password login', () => {
     await expect(page).toHaveURL(/\/login/);
   });
 
+  test('account menu stays open when toggling theme and language', async ({ page }) => {
+    await page.goto('/login');
+    await page.locator('#login-email').fill(E2E_ADMIN_EMAIL);
+    await page.locator('#login-password').fill(E2E_ADMIN_PASSWORD);
+    await page.getByRole('button', { name: /sign in|登录/i }).click();
+    await page.waitForURL('**/overview');
+
+    const themeToggle = page.getByTestId('nav-theme-toggle');
+    const localeToggle = page.getByTestId('nav-locale-toggle');
+
+    await page.getByTestId('account-menu-trigger').click();
+    await expect(themeToggle).toBeVisible();
+
+    // 切主题：菜单保持展开，且主题确实变了（就地开关，不该逼用户重开菜单）。
+    const before = await page.evaluate(() =>
+      document.documentElement.classList.contains('dark'),
+    );
+    await themeToggle.click();
+    await expect(themeToggle).toBeVisible();
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.classList.contains('dark')))
+      .not.toBe(before);
+
+    // 切语言：菜单同样保持展开。
+    await localeToggle.click();
+    await expect(localeToggle).toBeVisible();
+
+    // 「账户」是导航动作，仍应关闭菜单。
+    await page.getByTestId('nav-account').click();
+    await page.waitForURL('**/account');
+    await expect(themeToggle).toHaveCount(0);
+  });
+
   test('account page can update display name and toggle top avatar visibility', async ({ page }) => {
     await page.goto('/login');
     await page.locator('#login-email').fill(E2E_ADMIN_EMAIL);
