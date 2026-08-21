@@ -30,7 +30,13 @@ import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
 import TokenEditorWindow from '@/features/tokens/TokenEditorWindow.vue';
-import { formatUnixMillis, formatUsdMicros, maskTokenKey, relativeTimeParts } from '@/lib/format';
+import {
+  formatUnixMillis,
+  formatUsdFixed2,
+  formatUsdMicros,
+  maskTokenKey,
+  relativeTimeParts,
+} from '@/lib/format';
 import { groupDisplayName } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
@@ -39,9 +45,9 @@ type TokenWindowPayload =
   | { kind: 'delete'; token: TokenRow }
   | BulkDeletePayload;
 
-/** 额度进度条颜色分档：<70% 绿、70–90% 黄、≥90% 红。 */
-const QUOTA_WARN_RATIO = 0.7;
-const QUOTA_DANGER_RATIO = 0.9;
+/** 额度剩余比例分档：>50% 绿、20%–50% 黄、≤20% 红。 */
+const REMAINING_WARN_RATIO = 0.5;
+const REMAINING_DANGER_RATIO = 0.2;
 /** 相对时间展示的刷新间隔（毫秒）。 */
 const RELATIVE_TIME_TICK_MS = 30_000;
 /** 复制成功后对号停留时长，与日志 body 复制反馈对齐。 */
@@ -156,23 +162,21 @@ async function copyKey(key: string) {
 }
 
 function quotaRatio(token: TokenRow): number {
-  const limit = token.limit_usd_micros;
-  if (limit === null || limit <= 0) return 0;
-  return Math.min(1, Math.max(0, token.settled_usd_micros / limit));
+  const total = token.settled_usd_micros + token.balance_usd_micros;
+  if (total <= 0) return 0;
+  return Math.min(1, Math.max(0, token.balance_usd_micros / total));
 }
 
 function quotaColorClass(ratio: number): string {
-  if (ratio >= QUOTA_DANGER_RATIO) return 'bg-[var(--danger)]';
-  if (ratio >= QUOTA_WARN_RATIO) return 'bg-[var(--warn)]';
+  if (ratio <= REMAINING_DANGER_RATIO) return 'bg-[var(--danger)]';
+  if (ratio <= REMAINING_WARN_RATIO) return 'bg-[var(--warn)]';
   return 'bg-[var(--success)]';
 }
 
 function quotaLabel(token: TokenRow): string {
   const settled = formatUsdMicros(token.settled_usd_micros);
-  if (token.limit_usd_micros === null) {
-    return t('tokens.quotaUnlimitedUsage', { settled });
-  }
-  return t('tokens.quotaUsage', { settled, limit: formatUsdMicros(token.limit_usd_micros) });
+  const balance = formatUsdMicros(token.balance_usd_micros);
+  return t('tokens.quotaUsage', { settled, balance });
 }
 
 function formatRelative(millis: number): string {
@@ -336,6 +340,7 @@ function openBulkDelete() {
             <TableHead>{{ t('tokens.modelGroup') }}</TableHead>
             <TableHead class="min-w-56">{{ t('tokens.key') }}</TableHead>
             <TableHead>{{ t('tokens.quota') }}</TableHead>
+            <TableHead align="center">{{ t('tokens.rateLimitRpm') }}</TableHead>
             <TableHead align="center">{{ t('tokens.status') }}</TableHead>
             <TableHead align="center">{{ t('tokens.createdAt') }}</TableHead>
             <TableHead align="center">{{ t('tokens.lastUsedAt') }}</TableHead>
@@ -343,7 +348,7 @@ function openBulkDelete() {
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="9" />
+          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="10" />
           <template v-else>
             <TableRow
               v-for="token in filteredTokens"
@@ -395,19 +400,14 @@ function openBulkDelete() {
                 </span>
               </TableCell>
               <TableCell>
-                <div
-                  v-if="token.limit_usd_micros === null"
-                  class="text-fg-muted text-xs"
-                  :title="quotaLabel(token)"
-                >
-                  {{ t('common.unlimited') }}
-                </div>
-                <div v-else class="w-32" :title="quotaLabel(token)">
+                <div class="w-32" :title="quotaLabel(token)">
                   <div class="text-fg-muted mb-1 flex justify-between font-mono text-xs">
                     <span data-testid="token-settled">{{
-                      formatUsdMicros(token.settled_usd_micros)
+                      formatUsdFixed2(token.settled_usd_micros)
                     }}</span>
-                    <span>{{ formatUsdMicros(token.limit_usd_micros) }}</span>
+                    <span data-testid="token-balance">{{
+                      formatUsdFixed2(token.balance_usd_micros)
+                    }}</span>
                   </div>
                   <div
                     class="bg-surface-alt h-1.5 w-full overflow-hidden rounded-full"
@@ -420,6 +420,13 @@ function openBulkDelete() {
                     />
                   </div>
                 </div>
+              </TableCell>
+              <TableCell align="center" class="text-fg-muted font-mono text-xs" data-testid="token-rpm">
+                {{
+                  token.rate_limit_rpm !== null
+                    ? `${token.rate_limit_rpm} RPM`
+                    : t('common.unlimited')
+                }}
               </TableCell>
               <TableCell align="center">
                 <button
@@ -472,7 +479,7 @@ function openBulkDelete() {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredTokens.length === 0">
-              <TableCell :colspan="9" class="h-24 whitespace-normal">
+              <TableCell :colspan="10" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('tokens.create') }}

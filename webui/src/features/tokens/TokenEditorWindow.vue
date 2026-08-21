@@ -1,6 +1,5 @@
 <script setup lang="ts">
-// 令牌编辑器浮窗：定义字段 + 启用开关 + 余额调整（充值/扣减并入编辑）。
-// 每个实例自持草稿，向窗口栈上报脏状态以供淘汰判定。
+// 令牌编辑器浮窗：定义字段 + 启用开关 + 余额快捷调整（并入编辑，按用户钱包充扣）。
 import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
@@ -55,7 +54,6 @@ const { error } = useToast();
 const uid = useId();
 const nameInputId = `token-editor-name-${uid}`;
 const groupInputId = `token-editor-group-${uid}`;
-const limitInputId = `token-editor-limit-${uid}`;
 const rpmInputId = `token-editor-rpm-${uid}`;
 const enabledInputId = `token-editor-enabled-${uid}`;
 const amountInputId = `token-editor-amount-${uid}`;
@@ -68,7 +66,10 @@ const canListAllGroups = computed(() => {
   const role = me.value?.role;
   return role !== undefined && roleAtLeast(role, 'admin');
 });
-const canAdjustBalance = computed(() => me.value?.role === 'root');
+const canAdjustBalance = computed(() => {
+  const role = me.value?.role;
+  return role === 'root' || role === 'admin';
+});
 
 const groupsQuery = useQuery({
   queryKey: ['model-groups'],
@@ -78,10 +79,6 @@ const groupsQuery = useQuery({
 
 const initialKey = props.initial ? props.initial.token_key : '';
 const initialName = props.initial ? props.initial.name : '';
-const initialLimit =
-  props.initial && props.initial.limit_usd_micros !== null
-    ? formatUsdAmount(props.initial.limit_usd_micros)
-    : '';
 const initialRpm =
   props.initial && props.initial.rate_limit_rpm !== null
     ? String(props.initial.rate_limit_rpm)
@@ -98,7 +95,6 @@ const initialGroup = (() => {
 })();
 
 const editorName = ref(initialName);
-const editorLimit = ref(initialLimit);
 const editorRpm = ref(initialRpm);
 const editorEnabled = ref(initialEnabled);
 const editorGroup = ref(initialGroup);
@@ -131,7 +127,6 @@ const quickDelta = ref(0);
 const dirty = computed(
   () =>
     editorName.value !== initialName ||
-    editorLimit.value !== initialLimit ||
     editorRpm.value !== initialRpm ||
     editorEnabled.value !== initialEnabled ||
     editorGroup.value !== initialGroup ||
@@ -195,7 +190,6 @@ function balanceDelta(): number {
 function handleSave() {
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
-    { name: 'limit', value: editorLimit.value, rules: [{ kind: 'usd', min: 0 }] },
     { name: 'rateLimitRpm', value: editorRpm.value, rules: [{ kind: 'uint', min: 0 }] },
   ];
   if (props.initial !== null && canAdjustBalance.value) {
@@ -207,7 +201,6 @@ function handleSave() {
   }
   if (!validate(specs, t)) return;
   const name = editorName.value.trim();
-  const limit = parseUsdToMicros(editorLimit.value);
   const rpmRaw = editorRpm.value.trim();
   const rate_limit_rpm = rpmRaw === '' ? null : Number(rpmRaw);
   const enabled = editorEnabled.value;
@@ -216,7 +209,7 @@ function handleSave() {
       kind: 'create',
       body: {
         name,
-        limit_usd_micros: limit,
+        limit_usd_micros: null,
         rate_limit_rpm,
         enabled,
         model_group: editorGroup.value,
@@ -228,7 +221,7 @@ function handleSave() {
       body: {
         token_key: initialKey,
         name,
-        limit_usd_micros: limit,
+        limit_usd_micros: null,
         rate_limit_rpm,
         enabled,
         model_group: editorGroup.value,
@@ -293,26 +286,6 @@ function applyQuick(deltaUsd: number) {
           >
             {{ t('tokens.groupUnusableHint') }}
           </p>
-        </FormField>
-        <FormField
-          field-name="limit"
-          :label="t('tokens.limit')"
-          :input-id="limitInputId"
-          :error="fieldError('limit')"
-          :guide="t('tokens.limitGuide')"
-        >
-          <template #default="{ hintId, invalid }">
-            <FormTextInput
-              :id="limitInputId"
-              v-model="editorLimit"
-              type="text"
-              inputmode="decimal"
-              class="font-mono"
-              :invalid="invalid"
-              :hint-id="hintId"
-              v-on="fieldInputHandlers('limit')"
-            />
-          </template>
         </FormField>
         <FormField
           field-name="rateLimitRpm"
@@ -397,6 +370,7 @@ function applyQuick(deltaUsd: number) {
                   type="text"
                   inputmode="decimal"
                   class="font-mono"
+                  data-testid="token-editor-amount"
                   :invalid="Boolean(fieldError('amount'))"
                   :hint-id="`${amountInputId}-error`"
                   v-on="fieldInputHandlers('amount')"
