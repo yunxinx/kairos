@@ -227,14 +227,18 @@ async fn admin_auth(
         .unwrap_or("");
     let now = super::logging::unix_millis();
     match users::user_for_session(&auth.pool, provided, now).await {
-        Ok(Some(user)) => {
+        Ok(users::SessionLookup::Valid(user)) => {
             request.extensions_mut().insert(ManagementIdentity { user });
             next.run(request).await
         }
-        Ok(None) => {
+        // 形态不符或查不到该哈希：可能在猜，计入限流。
+        Ok(users::SessionLookup::Unknown) => {
             auth.throttle.record_failure(ip, max_failures, window);
             unauthorized_response()
         }
+        // 会话确实存在，只是过期/被吊销：这是每 8 小时必然发生一次的正常事件，
+        // 计进失败计数会让多标签页过夜的用户把自己所在 IP 的登录一起限掉。
+        Ok(users::SessionLookup::Inactive) => unauthorized_response(),
         Err(err) => AdminError::Store(err).into_response(),
     }
 }
@@ -341,6 +345,9 @@ async fn login(
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
+    // 顺带清理已过期或已吊销的会话行（每次登录都新增一行，没有清理就只增不减）。
+    // 不在事务内做：这是维护性清理，不是登录逻辑的一环；失败了不该影响登录。
+    let _ = users::purge_expired_sessions(&deps.pool, now).await;
     Ok(Json(LoginView {
         token,
         expires_at,
@@ -519,6 +526,7 @@ async fn update_user(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<UserUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UserView>, AdminError> {
     let update = body.map_err(AdminError::bad_body)?.0;
@@ -540,6 +548,15 @@ async fn update_user(
     }
     if let Some(password) = update.password {
         users::set_password(&mut tx, id, &password)
+            .await
+            .map_err(map_user_store_err)?;
+        // 改密后吊销该用户的其他会话（留下当前这条）：否则已被窃取的会话在改密后
+        // 仍有效整整 8 小时。
+        let keep = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        users::revoke_user_sessions(&mut tx, id, keep)
             .await
             .map_err(map_user_store_err)?;
     }
@@ -828,7 +845,12 @@ fn reject_user_management(
     new_role: Option<ManagementRole>,
 ) -> Result<(), AdminError> {
     match actor.role() {
-        ManagementRole::User => return Err(AdminError::Forbidden),
+        ManagementRole::User => {
+            // 普通用户只能改自己，且不能改 role（本就不在 UserUpdate 里）。
+            if actor.user.id != target.id {
+                return Err(AdminError::Forbidden);
+            }
+        }
         ManagementRole::Admin => {
             if target.role != ManagementRole::User {
                 return Err(AdminError::Forbidden);

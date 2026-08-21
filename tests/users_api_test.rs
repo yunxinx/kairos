@@ -493,3 +493,136 @@ async fn user_rate_limit_rpm_can_be_cleared_with_null() {
         "回读也应为空，而不是旧值复活"
     );
 }
+
+/// 改密码后吊销该用户的其他会话，留下当前这条。
+#[tokio::test]
+async fn changing_password_revokes_other_sessions() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    let (user_id, session1) = create_role(&gw, "pwd@example.com", "user").await;
+
+    // 再登录一次，拿到第二条会话。
+    let login2 = reqwest::Client::new()
+        .post(format!("{}/login", gw.admin_base_url()))
+        .json(&json!({ "email": "pwd@example.com", "password": "password1" }))
+        .send()
+        .await
+        .expect("应可登录");
+    assert_eq!(login2.status(), StatusCode::OK);
+    let session2 = login2.json::<Value>().await.expect("应可解析")["token"]
+        .as_str()
+        .expect("应有 token")
+        .to_string();
+
+    // 两条会话都能访问 /me。
+    assert_eq!(
+        get_req(&gw, &session1, "/me").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_req(&gw, &session2, "/me").await.status(),
+        StatusCode::OK
+    );
+
+    // 用 session1 改密码：session1 保留，session2 被吊销。
+    let changed = json_req(
+        &gw,
+        &session1,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "password": "new-password" }),
+    )
+    .await;
+    assert_eq!(changed.status(), StatusCode::OK);
+
+    assert_eq!(
+        get_req(&gw, &session1, "/me").await.status(),
+        StatusCode::OK,
+        "当前会话应保留"
+    );
+    assert_eq!(
+        get_req(&gw, &session2, "/me").await.status(),
+        StatusCode::UNAUTHORIZED,
+        "其他会话应被吊销"
+    );
+}
+
+/// 会话过期不计入认证失败限流：这是每 8 小时必然发生一次的正常事件。
+#[tokio::test]
+async fn expired_session_does_not_count_toward_rate_limit() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    let (_, session) = create_role(&gw, "expire@example.com", "user").await;
+
+    // 手动把会话改成 1 秒后过期。
+    sqlx::query("UPDATE management_sessions SET expires_at = ? WHERE token_hash = ?")
+        .bind(kairos::gateway::logging::unix_millis() + 1000)
+        .bind(kairos::store::users::hash_session_token(&session))
+        .execute(&gw.pool)
+        .await
+        .expect("应能改过期时间");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // 连续用过期会话访问 10 次（认证失败上限是 5），每次都 401，但不触发限流。
+    for _ in 0..10 {
+        assert_eq!(
+            get_req(&gw, &session, "/me").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // 正常登录仍可达，说明 IP 未被限流。
+    let login = reqwest::Client::new()
+        .post(format!("{}/login", gw.admin_base_url()))
+        .json(&json!({ "email": "expire@example.com", "password": "password1" }))
+        .send()
+        .await
+        .expect("应可登录");
+    assert_eq!(login.status(), StatusCode::OK, "过期会话不应计入限流");
+}
+
+/// 登录时顺带清理已过期或已吊销的会话行。
+#[tokio::test]
+async fn login_purges_expired_and_revoked_sessions() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    let (user_id, _) = create_role(&gw, "gc@example.com", "user").await;
+
+    // 手写几条会话：过期的、吊销的、正常的。
+    let now = kairos::gateway::logging::unix_millis();
+    for (offset, revoked) in [(-(3600 * 1000), 0), (0, 1), (3600 * 1000, 0)] {
+        sqlx::query(
+            "INSERT INTO management_sessions (user_id, token_hash, expires_at, revoked, created_at)              VALUES (?, 'hash-' || ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(offset)
+        .bind(now + offset)
+        .bind(revoked)
+        .bind(now)
+        .execute(&gw.pool)
+        .await
+        .expect("应能写");
+    }
+
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM management_sessions")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计");
+    assert_eq!(before.0, 5, "3 条手写 + root 的 + create_role 时登录的");
+
+    // 登录：触发 GC。
+    let login = reqwest::Client::new()
+        .post(format!("{}/login", gw.admin_base_url()))
+        .json(&json!({ "email": "gc@example.com", "password": "password1" }))
+        .send()
+        .await
+        .expect("应可登录");
+    assert_eq!(login.status(), StatusCode::OK);
+
+    let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM management_sessions")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能统计");
+    assert_eq!(
+        after.0, 4,
+        "过期的 1 条 + 吊销的 1 条被清理，留下正常的 1 条 + root 的 + create_role 的 + 本次登录的"
+    );
+}

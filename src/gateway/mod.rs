@@ -6,7 +6,7 @@
 mod admin;
 mod failover;
 mod http;
-mod logging;
+pub mod logging;
 mod protocol;
 mod rate_limit;
 mod routing;

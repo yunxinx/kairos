@@ -242,7 +242,7 @@ pub(super) fn protocol_name(inbound_protocol: Protocol) -> &'static str {
 }
 
 /// 当前 unix 毫秒时间戳。
-pub(super) fn unix_millis() -> i64 {
+pub fn unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

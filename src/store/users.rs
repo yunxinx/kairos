@@ -704,14 +704,19 @@ pub async fn authenticate_password(
     .await
     .map_err(StoreError::Query)?;
     let Some(row) = row else {
+        // 也走一次同参数校验：否则不存在的账号 ~1ms 返回、存在的 ~80ms，攻击者据此
+        // 就能枚举账号（响应体一致挡不住时序侧信道）。
+        verify_password(password, &TIMING_EQUALIZER_HASH).await?;
         return Ok(None);
     };
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
     if enabled == 0 {
+        verify_password(password, &TIMING_EQUALIZER_HASH).await?;
         return Ok(None);
     }
     let password_hash: Option<String> = row.try_get("password_hash").map_err(StoreError::Query)?;
     let Some(password_hash) = password_hash else {
+        verify_password(password, &TIMING_EQUALIZER_HASH).await?;
         return Ok(None);
     };
     if !verify_password(password, &password_hash).await? {
@@ -780,14 +785,28 @@ pub async fn issue_session(
     Ok((token, expires_at))
 }
 
-/// 按明文会话令牌取出仍有效的用户；无效/过期/吊销/禁用返回 `None`。
+/// 会话查询结果：把「可能在猜凭证」与「正常生命周期结束」分开。
+///
+/// 会话到期是每 8 小时必然发生一次的事，不该和爆破共用同一个失败计数器——多开几个
+/// 标签页过夜就能把自己所在 IP 的登录也一起限掉。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionLookup {
+    /// 会话有效，用户可用。
+    Valid(UserRecord),
+    /// 形态不符或查不到该哈希：可能在猜，计入认证失败限流。
+    Unknown,
+    /// 会话确实存在，但已过期/被吊销/用户已停用或归档：不计入限流。
+    Inactive,
+}
+
+/// 按明文会话令牌取出仍有效的用户。
 pub async fn user_for_session(
     pool: &SqlitePool,
     session_token: &str,
     now: i64,
-) -> Result<Option<UserRecord>, StoreError> {
+) -> Result<SessionLookup, StoreError> {
     if !session_token.starts_with(SESSION_TOKEN_PREFIX) {
-        return Ok(None);
+        return Ok(SessionLookup::Unknown);
     }
     let token_hash = hash_session_token(session_token);
     let row = sqlx::query(
@@ -802,15 +821,59 @@ pub async fn user_for_session(
     .await
     .map_err(StoreError::Query)?;
     let Some(row) = row else {
-        return Ok(None);
+        return Ok(SessionLookup::Unknown);
     };
     let revoked: i64 = row.try_get("revoked").map_err(StoreError::Query)?;
     let expires_at: i64 = row.try_get("expires_at").map_err(StoreError::Query)?;
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
     if revoked != 0 || expires_at <= now || enabled == 0 {
-        return Ok(None);
+        return Ok(SessionLookup::Inactive);
     }
-    Ok(Some(map_user_row(&row)?))
+    Ok(SessionLookup::Valid(map_user_row(&row)?))
+}
+
+/// 吊销某用户的会话；`keep` 给出要保留的明文令牌（改自己的密码时保住当前这条）。
+///
+/// 改密码/改邮箱后必须调用：否则已被窃取的会话在改密后仍有效整整 8 小时。
+pub async fn revoke_user_sessions(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    keep: Option<&str>,
+) -> Result<(), StoreError> {
+    match keep {
+        Some(token) if token.starts_with(SESSION_TOKEN_PREFIX) => {
+            sqlx::query(
+                "UPDATE management_sessions SET revoked = 1 \
+                 WHERE user_id = ? AND token_hash != ?",
+            )
+            .bind(user_id)
+            .bind(hash_session_token(token))
+            .execute(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+        }
+        _ => {
+            sqlx::query("UPDATE management_sessions SET revoked = 1 WHERE user_id = ?")
+                .bind(user_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(StoreError::Query)?;
+        }
+    }
+    Ok(())
+}
+
+/// 删除已过期或已吊销的会话行，返回清理条数。
+///
+/// 每次登录都新增一行，没有清理就只增不减。
+pub async fn purge_expired_sessions(pool: &SqlitePool, now: i64) -> Result<u64, StoreError> {
+    let result =
+        sqlx::query("DELETE FROM management_sessions WHERE expires_at <= ? OR revoked != 0")
+            .bind(now)
+            .execute(pool)
+            .await
+            .map_err(StoreError::Query)?;
+    Ok(result.rows_affected())
 }
 
 /// 吊销会话；不存在视为成功。
@@ -831,6 +894,20 @@ pub async fn revoke_session(pool: &SqlitePool, session_token: &str) -> Result<()
 pub fn root_user_id() -> i64 {
     ROOT_USER_ID
 }
+
+/// 抹平时序差用的固定 Argon2 哈希，参数与真实口令一致。
+///
+/// 首次用到时算一次（约 80ms），之后复用。
+static TIMING_EQUALIZER_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use argon2::Argon2;
+    use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};
+    let salt = SaltString::generate(&mut OsRng);
+    // 固定长度口令 + 生成的盐，Argon2 默认参数下不会失败。
+    Argon2::default()
+        .hash_password(b"kairos-timing-equalizer", &salt)
+        .expect("默认参数下固定口令的 Argon2 哈希不会失败")
+        .to_string()
+});
 
 async fn hash_password(password: &str) -> Result<String, StoreError> {
     let password = password.to_string();
@@ -877,7 +954,7 @@ fn new_session_token() -> String {
     format!("{SESSION_TOKEN_PREFIX}{}", hex_encode(&bytes))
 }
 
-fn hash_session_token(session_token: &str) -> String {
+pub fn hash_session_token(session_token: &str) -> String {
     hex_encode(Sha256::digest(session_token.as_bytes()).as_ref())
 }
 
