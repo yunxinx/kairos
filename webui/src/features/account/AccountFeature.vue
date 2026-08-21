@@ -7,20 +7,30 @@ import type { MeUpdate } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
+import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
+import OverflowChips from '@/components/ui/OverflowChips.vue';
+import UiIcon from '@/components/ui/UiIcon.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import { formatUsdMicros } from '@/lib/format';
 import type { FieldValidationSpec } from '@/lib/form-validation';
+import { useNavAvatarPreference } from '@/lib/preferences';
 import { setMe, useCurrentUser } from '@/lib/session';
 
 const { t } = useI18n();
 const { error, success } = useToast();
-const { fieldError, fieldInputHandlers, validate, showFieldError } = useFormValidation();
+const profileValidation = useFormValidation();
+const passwordValidation = useFormValidation();
 const me = useCurrentUser();
+const { showNavAvatar } = useNavAvatarPreference();
 
 const email = ref('');
 const displayName = ref('');
+const avatarData = ref<string | null>(null);
+const fileInputRef = ref<HTMLInputElement | null>(null);
+
 const currentPassword = ref('');
 const newPassword = ref('');
 const confirmPassword = ref('');
@@ -31,25 +41,29 @@ watch(
     if (!user) return;
     email.value = user.email;
     displayName.value = user.display_name;
+    avatarData.value = user.avatar ?? null;
   },
   { immediate: true },
 );
 
-// 只改邮箱/名称不必带当前密码；三个密码框任一有字才走改密，后端会再校验 current_password。
-const changingPassword = computed(
-  () =>
-    currentPassword.value.length > 0 ||
-    newPassword.value.length > 0 ||
-    confirmPassword.value.length > 0,
-);
+const roleLabel = computed(() => {
+  const role = me.value?.role;
+  if (role === 'root') return t('users.roleRoot');
+  if (role === 'admin') return t('users.roleAdmin');
+  return t('users.roleUser');
+});
 
-const saveMutation = useMutation({
+const roleBadgeClass = computed(() => {
+  const role = me.value?.role;
+  if (role === 'root') return 'badge-unified';
+  if (role === 'admin') return 'badge-info';
+  return 'badge-neutral';
+});
+
+const profileMutation = useMutation({
   mutationFn: (body: MeUpdate) => apiClient.updateMe(body),
   onSuccess: async () => {
     setMe(await apiClient.getMe());
-    currentPassword.value = '';
-    newPassword.value = '';
-    confirmPassword.value = '';
     success(t('account.saveSuccess'));
   },
   onError: (err) => {
@@ -57,154 +71,340 @@ const saveMutation = useMutation({
   },
 });
 
-function handleSave() {
+const passwordMutation = useMutation({
+  mutationFn: (body: MeUpdate) => apiClient.updateMe(body),
+  onSuccess: async () => {
+    setMe(await apiClient.getMe());
+    currentPassword.value = '';
+    newPassword.value = '';
+    confirmPassword.value = '';
+    success(t('account.passwordChanged'));
+  },
+  onError: (err) => {
+    error(extractApiError(err).message);
+  },
+});
+
+function triggerAvatarUpload() {
+  fileInputRef.value?.click();
+}
+
+function handleAvatarFileChange(e: Event) {
+  const target = e.target as HTMLInputElement;
+  const file = target.files?.[0];
+  if (!file) return;
+  if (!file.type.startsWith('image/')) {
+    error(t('account.invalidImage'));
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    const result = event.target?.result as string;
+    avatarData.value = result;
+    profileMutation.mutate({
+      avatar: result,
+    });
+  };
+  reader.readAsDataURL(file);
+  target.value = '';
+}
+
+function handleRemoveAvatar() {
+  avatarData.value = null;
+  profileMutation.mutate({
+    avatar: '',
+  });
+}
+
+function handleSaveProfile() {
   const specs: FieldValidationSpec[] = [
     { name: 'email', value: email.value, rules: [{ kind: 'required' }] },
     { name: 'displayName', value: displayName.value, rules: [{ kind: 'required' }] },
   ];
-  if (changingPassword.value) {
-    specs.push(
-      { name: 'currentPassword', value: currentPassword.value, rules: [{ kind: 'required' }] },
-      {
-        name: 'newPassword',
-        value: newPassword.value,
-        rules: [{ kind: 'required' }, { kind: 'minLength', min: 8 }],
-      },
-      { name: 'confirmPassword', value: confirmPassword.value, rules: [{ kind: 'required' }] },
-    );
-  }
-  if (!validate(specs, t)) return;
-  if (changingPassword.value && newPassword.value !== confirmPassword.value) {
-    showFieldError('confirmPassword', t('account.passwordMismatch'));
-    return;
-  }
-  const body: MeUpdate = {
+  if (!profileValidation.validate(specs, t)) return;
+  profileMutation.mutate({
     email: email.value.trim(),
     display_name: displayName.value.trim(),
-  };
-  if (changingPassword.value) {
-    body.password = newPassword.value;
-    body.current_password = currentPassword.value;
+  });
+}
+
+function handleChangePassword() {
+  const specs: FieldValidationSpec[] = [
+    { name: 'currentPassword', value: currentPassword.value, rules: [{ kind: 'required' }] },
+    {
+      name: 'newPassword',
+      value: newPassword.value,
+      rules: [{ kind: 'required' }, { kind: 'minLength', min: 8 }],
+    },
+    { name: 'confirmPassword', value: confirmPassword.value, rules: [{ kind: 'required' }] },
+  ];
+  if (!passwordValidation.validate(specs, t)) return;
+  if (newPassword.value !== confirmPassword.value) {
+    passwordValidation.showFieldError('confirmPassword', t('account.passwordMismatch'));
+    return;
   }
-  saveMutation.mutate(body);
+  passwordMutation.mutate({
+    password: newPassword.value,
+    current_password: currentPassword.value,
+  });
 }
 </script>
 
 <template>
-  <div class="flex flex-col">
+  <div class="w-full space-y-6">
     <PageHeader :title="t('nav.account')" />
 
     <InlineError v-if="!me" :message="t('account.missingProfile')" />
 
-    <form v-else novalidate class="max-w-xl" @submit.prevent="handleSave">
-      <div class="card">
-        <div class="card-body space-y-4">
-          <FormField
-            field-name="email"
-            :label="t('account.email')"
-            input-id="account-email"
-            :error="fieldError('email')"
-            :guide="t('account.emailGuide')"
+    <div v-else class="w-full space-y-6">
+      <!-- 顶部个人画像与资产总览 Hero 卡片 -->
+      <div class="card p-5 sm:p-6">
+        <div class="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
+          <div class="flex items-center gap-4">
+            <!-- 头像区域 -->
+            <div class="group relative size-14 shrink-0">
+              <div
+                class="border-seed bg-surface-elevated text-fg-muted relative flex size-full items-center justify-center overflow-hidden rounded-full border text-xl font-bold shadow-sm"
+              >
+                <img
+                  v-if="avatarData"
+                  :src="avatarData"
+                  alt="avatar"
+                  class="size-full object-cover"
+                  data-testid="account-avatar-img"
+                />
+                <UiIcon v-else name="user" class="size-7" />
+              </div>
+        <input
+          ref="fileInputRef"
+          type="file"
+          accept="image/*"
+          aria-label="Upload avatar"
+          class="hidden"
+          data-testid="account-avatar-input"
+          @change="handleAvatarFileChange"
+        />
+              <button
+                type="button"
+                class="absolute inset-0 flex cursor-pointer items-center justify-center rounded-full bg-black/50 text-white opacity-0 transition-opacity group-hover:opacity-100"
+                data-testid="account-avatar-upload"
+                :title="t('account.changeAvatar')"
+                @click="triggerAvatarUpload"
+              >
+                <UiIcon name="pencil" class="size-4" />
+              </button>
+            </div>
+
+            <div class="min-w-0">
+              <div class="flex flex-wrap items-center gap-2">
+                <h2 class="truncate text-lg font-bold tracking-tight">
+                  {{ me.display_name || t('nav.account') }}
+                </h2>
+                <span class="badge" :class="roleBadgeClass">{{ roleLabel }}</span>
+                <span class="badge badge-success text-[11px]">{{ t('users.statusEnabled') }}</span>
+              </div>
+              <p class="text-fg-muted mt-0.5 truncate font-mono text-xs">{{ me.email }}</p>
+              <div v-if="avatarData" class="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  class="btn btn-sm btn-ghost text-danger text-xs"
+                  data-testid="account-remove-avatar-btn"
+                  @click="handleRemoveAvatar"
+                >
+                  {{ t('account.removeAvatar') }}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 余额总览与模型组指标 -->
+          <div
+            class="bg-surface-elevated border-seed flex shrink-0 items-center justify-between gap-6 rounded-md border px-5 py-3 sm:min-w-64"
           >
-            <template #default="{ hintId, invalid }">
-              <FormTextInput
-                id="account-email"
-                v-model="email"
-                type="email"
-                autocomplete="email"
-                data-testid="account-email"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('email')"
-              />
-            </template>
-          </FormField>
-          <FormField
-            field-name="displayName"
-            :label="t('account.displayName')"
-            input-id="account-display-name"
-            :error="fieldError('displayName')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormTextInput
-                id="account-display-name"
-                v-model="displayName"
-                autocomplete="nickname"
-                data-testid="account-display-name"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('displayName')"
-              />
-            </template>
-          </FormField>
-          <FormField
-            field-name="currentPassword"
-            :label="t('account.currentPassword')"
-            input-id="account-current-password"
-            :error="fieldError('currentPassword')"
-            :guide="t('account.currentPasswordGuide')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormPasswordInput
-                id="account-current-password"
-                v-model="currentPassword"
-                autocomplete="current-password"
-                data-testid="account-current-password"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('currentPassword')"
-              />
-            </template>
-          </FormField>
-          <FormField
-            field-name="newPassword"
-            :label="t('account.newPassword')"
-            input-id="account-new-password"
-            :error="fieldError('newPassword')"
-            :guide="t('users.passwordGuide')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormPasswordInput
-                id="account-new-password"
-                v-model="newPassword"
-                autocomplete="new-password"
-                data-testid="account-new-password"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('newPassword')"
-              />
-            </template>
-          </FormField>
-          <FormField
-            field-name="confirmPassword"
-            :label="t('account.confirmPassword')"
-            input-id="account-confirm-password"
-            :error="fieldError('confirmPassword')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormPasswordInput
-                id="account-confirm-password"
-                v-model="confirmPassword"
-                autocomplete="new-password"
-                data-testid="account-confirm-password"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('confirmPassword')"
-              />
-            </template>
-          </FormField>
+            <div>
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.balance') }}</p>
+              <p class="font-mono text-xl font-bold tracking-tight">
+                {{ formatUsdMicros(me.balance_usd_micros) }}
+              </p>
+            </div>
+            <div v-if="me.role === 'user'" class="text-right">
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.assignedGroups') }}</p>
+              <p class="font-mono text-base font-semibold">
+                {{ me.assigned_groups.length }}
+              </p>
+            </div>
+          </div>
         </div>
-        <div class="card-footer card-body flex justify-end">
-          <button
-            type="submit"
-            class="btn btn-primary"
-            data-testid="account-save"
-            :disabled="saveMutation.isPending.value"
-          >
-            {{ t('common.save') }}
-          </button>
+
+        <div v-if="me.role === 'user' && me.assigned_groups.length > 0" class="border-seed mt-4 border-t pt-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-fg-muted text-xs font-medium">{{ t('account.assignedGroups') }}:</span>
+            <div class="min-w-0 flex-1">
+              <OverflowChips :items="me.assigned_groups" :threshold="6" class="inline-flex" />
+            </div>
+          </div>
         </div>
       </div>
-    </form>
+
+      <!-- 双栏并排设定卡片 -->
+      <div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
+        <!-- 基本资料卡片 -->
+        <form novalidate class="card flex flex-col" @submit.prevent="handleSaveProfile">
+          <div class="card-body space-y-4 flex-1">
+            <div class="border-seed border-b pb-3">
+              <h3 class="text-sm font-semibold tracking-tight">{{ t('account.profile') }}</h3>
+              <p class="text-fg-muted text-xs">{{ t('account.profileGuide') }}</p>
+            </div>
+
+            <FormField
+              field-name="email"
+              :label="t('account.email')"
+              input-id="account-email"
+              :error="profileValidation.fieldError('email')"
+              :guide="t('account.emailGuide')"
+            >
+              <template #default="{ hintId, invalid }">
+                <FormTextInput
+                  id="account-email"
+                  v-model="email"
+                  type="email"
+                  autocomplete="email"
+                  data-testid="account-email"
+                  :invalid="invalid"
+                  :hint-id="hintId"
+                  v-on="profileValidation.fieldInputHandlers('email')"
+                />
+              </template>
+            </FormField>
+
+            <FormField
+              field-name="displayName"
+              :label="t('account.displayName')"
+              input-id="account-display-name"
+              :error="profileValidation.fieldError('displayName')"
+            >
+              <template #default="{ hintId, invalid }">
+                <FormTextInput
+                  id="account-display-name"
+                  v-model="displayName"
+                  autocomplete="nickname"
+                  data-testid="account-display-name"
+                  :invalid="invalid"
+                  :hint-id="hintId"
+                  v-on="profileValidation.fieldInputHandlers('displayName')"
+                />
+              </template>
+            </FormField>
+
+            <FormField
+              field-name="showNavAvatar"
+              layout="inline"
+              :label="t('account.showNavAvatar')"
+              :guide="t('account.showNavAvatarGuide')"
+              input-id="account-show-nav-avatar"
+            >
+              <FormSwitch
+                id="account-show-nav-avatar"
+                v-model="showNavAvatar"
+                data-testid="account-show-nav-avatar"
+              />
+            </FormField>
+          </div>
+
+          <div class="card-footer card-body flex justify-end">
+            <button
+              type="submit"
+              class="btn btn-primary"
+              data-testid="account-save"
+              :disabled="profileMutation.isPending.value"
+            >
+              {{ t('common.save') }}
+            </button>
+          </div>
+        </form>
+
+        <!-- 安全与修改密码卡片 -->
+        <form novalidate class="card flex flex-col" @submit.prevent="handleChangePassword">
+          <div class="card-body space-y-4 flex-1">
+            <div class="border-seed border-b pb-3">
+              <h3 class="text-sm font-semibold tracking-tight">{{ t('account.security') }}</h3>
+              <p class="text-fg-muted text-xs">{{ t('account.securityGuide') }}</p>
+            </div>
+
+            <FormField
+              field-name="currentPassword"
+              :label="t('account.currentPassword')"
+              input-id="account-current-password"
+              :error="passwordValidation.fieldError('currentPassword')"
+              :guide="t('account.currentPasswordGuide')"
+            >
+              <template #default="{ hintId, invalid }">
+                <FormPasswordInput
+                  id="account-current-password"
+                  v-model="currentPassword"
+                  autocomplete="current-password"
+                  data-testid="account-current-password"
+                  :invalid="invalid"
+                  :hint-id="hintId"
+                  v-on="passwordValidation.fieldInputHandlers('currentPassword')"
+                />
+              </template>
+            </FormField>
+
+            <!-- 新密码与确认密码双栏排列 -->
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <FormField
+                field-name="newPassword"
+                :label="t('account.newPassword')"
+                input-id="account-new-password"
+                :error="passwordValidation.fieldError('newPassword')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormPasswordInput
+                    id="account-new-password"
+                    v-model="newPassword"
+                    autocomplete="new-password"
+                    data-testid="account-new-password"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="passwordValidation.fieldInputHandlers('newPassword')"
+                  />
+                </template>
+              </FormField>
+
+              <FormField
+                field-name="confirmPassword"
+                :label="t('account.confirmPassword')"
+                input-id="account-confirm-password"
+                :error="passwordValidation.fieldError('confirmPassword')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormPasswordInput
+                    id="account-confirm-password"
+                    v-model="confirmPassword"
+                    autocomplete="new-password"
+                    data-testid="account-confirm-password"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="passwordValidation.fieldInputHandlers('confirmPassword')"
+                  />
+                </template>
+              </FormField>
+            </div>
+          </div>
+
+          <div class="card-footer card-body flex justify-end">
+            <button
+              type="submit"
+              class="btn"
+              data-testid="account-password-save"
+              :disabled="passwordMutation.isPending.value"
+            >
+              {{ t('account.changePassword') }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
   </div>
 </template>

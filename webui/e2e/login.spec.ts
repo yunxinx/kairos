@@ -65,18 +65,33 @@ test.describe('email password login', () => {
     await expect(page).toHaveURL(/\/login/);
   });
 
-  test('account page can update display name', async ({ page }) => {
+  test('account page can update display name and toggle top avatar visibility', async ({ page }) => {
     await page.goto('/login');
     await page.locator('#login-email').fill(E2E_ADMIN_EMAIL);
     await page.locator('#login-password').fill(E2E_ADMIN_PASSWORD);
     await page.getByRole('button', { name: /sign in|登录/i }).click();
     await page.waitForURL('**/overview');
+
+    // 默认显示头像
+    await expect(page.getByTestId('account-menu-avatar')).toBeVisible();
+
+    // 菜单展开后无头像
     await page.getByTestId('account-menu-trigger').click();
+    await expect(page.locator('.data-table-menu [data-testid="account-menu-avatar"]')).toHaveCount(0);
+
     await page.getByTestId('nav-account').click();
     await page.waitForURL('**/account');
     await page.getByTestId('account-display-name').fill('Root operator');
     await page.getByTestId('account-save').click();
-    await expect(page.getByText(/account saved|账户已保存/i)).toBeVisible();
+    await expect(page.getByTestId('toast')).toContainText(/account saved|账户已保存/i);
     await expect(page.getByTestId('account-menu-trigger')).toContainText('Root operator');
+
+    // 切换隐藏右上角头像
+    await page.getByTestId('account-show-nav-avatar').click();
+    await expect(page.getByTestId('account-menu-avatar')).toHaveCount(0);
+
+    // 切换恢复右上角头像
+    await page.getByTestId('account-show-nav-avatar').click();
+    await expect(page.getByTestId('account-menu-avatar')).toBeVisible();
   });
 });

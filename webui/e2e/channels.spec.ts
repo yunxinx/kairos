@@ -504,7 +504,8 @@ test.describe('channel manual model add', () => {
       await expect(unpriced.getByTestId('inventory-unpriced')).toBeVisible();
 
       await page.goto('/channel');
-      await page.getByRole('button', { name: '中 / EN' }).click();
+      await page.getByTestId('account-menu-trigger').hover();
+      await page.getByTestId('nav-locale-toggle').click();
       await channelRow.getByTestId('channel-edit').click();
       await expect(page.getByTestId('channel-add-model')).toHaveText('添加');
       await page.getByTestId('channel-add-model').click();

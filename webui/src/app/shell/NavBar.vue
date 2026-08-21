@@ -2,8 +2,6 @@
 import { computed } from 'vue';
 import { Link } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
-import ThemeToggle from '@/app/shell/ThemeToggle.vue';
-import LocaleToggle from '@/app/shell/LocaleToggle.vue';
 import AccountMenu from '@/app/shell/AccountMenu.vue';
 import { navTabsFor } from '@/lib/nav';
 import { prefetchAdminRoute } from '@/lib/prefetch-admin';
@@ -31,9 +29,7 @@ const tabs = computed(() => navTabsFor(me.value?.role));
           {{ t(tab.labelKey) }}
         </Link>
       </div>
-      <div class="flex shrink-0 items-center gap-3">
-        <LocaleToggle />
-        <ThemeToggle />
+      <div class="flex shrink-0 items-center">
         <AccountMenu />
       </div>
     </div>
