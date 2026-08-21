@@ -199,9 +199,15 @@ test.describe('request logs page', () => {
     await page
       .locator('[data-testid="system-logs-level-filter-option"][data-value="warn"]')
       .click();
-    await expect(page.getByTestId('system-log-row')).toHaveCount(1);
-    await expect(page.getByTestId('system-log-target')).toHaveText('catalog');
-    await expect(page.getByTestId('system-log-message')).toContainText('e2e catalog warning');
+    // 同样不断言总数：登录失败也记 warn（审计），整个 e2e 跑共用一个库。
+    const warned = page
+      .getByTestId('system-log-row')
+      .filter({ hasText: 'e2e catalog warning' });
+    await expect(warned).toHaveCount(1);
+    await expect(warned.getByTestId('system-log-target')).toHaveText('catalog');
+    await expect(
+      page.getByTestId('system-log-row').filter({ hasText: 'e2e settlement failed' }),
+    ).toHaveCount(0, { timeout: 5000 });
 
     await page.keyboard.press('Escape');
     await page.getByTestId('system-logs-clear-filters').click();

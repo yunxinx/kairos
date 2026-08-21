@@ -7,7 +7,7 @@ test.describe.configure({ mode: 'serial' });
 const GENERATED_KEY_PATTERN = /^ks-[A-Za-z0-9]{64}$/;
 
 test.describe('token resource page', () => {
-  test('creates, edits with balance draft, toggles status, and deletes a token', async ({
+  test('creates, edits definition fields, toggles status, and deletes a token', async ({
     page,
   }) => {
     await page.goto('/tokens');
