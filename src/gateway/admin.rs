@@ -182,6 +182,14 @@ impl ManagementIdentity {
         self.user.id
     }
 
+    /// 审计事件的操作者。
+    fn actor(&self) -> store::Actor<'_> {
+        store::Actor {
+            user_id: self.user.id,
+            email: &self.user.email,
+        }
+    }
+
     /// 只读聚合与日志查询的归属范围：普通用户钉自己，admin/root 不限。
     ///
     /// ADR-0009 给 `user` 的可见面只有「自己的令牌、余额与用量」；日志与统计
@@ -337,6 +345,15 @@ async fn login(
         .map_err(AdminError::Store)?
     else {
         deps.throttle.record_failure(ip, max_failures, window);
+        // 失败登录记 warn 且不带 actor：此刻还没认出是谁，邮箱只是对方声称的。
+        store::record_audit_detached(
+            &deps.pool,
+            None,
+            "warn",
+            "auth",
+            &format!("登录失败：{} from {}", body.email, ip),
+        )
+        .await;
         return Err(AdminError::Unauthorized);
     };
     let now = super::logging::unix_millis();
@@ -345,6 +362,17 @@ async fn login(
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
+    store::record_audit_detached(
+        &deps.pool,
+        Some(store::Actor {
+            user_id: user.id,
+            email: &user.email,
+        }),
+        "info",
+        "auth",
+        &format!("登录成功 from {ip}"),
+    )
+    .await;
     // 顺带清理已过期或已吊销的会话行（每次登录都新增一行，没有清理就只增不减）。
     // 不在事务内做：这是维护性清理，不是登录逻辑的一环；失败了不该影响登录。
     let _ = users::purge_expired_sessions(&deps.pool, now).await;
@@ -490,6 +518,19 @@ async fn create_user(
     )
     .await
     .map_err(map_user_store_err)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "users",
+        &format!(
+            "创建用户 {} ({}) role={}",
+            user.id,
+            user.email,
+            user.role.as_str()
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok((StatusCode::CREATED, Json(UserView::from_record(user))))
@@ -546,6 +587,7 @@ async fn update_user(
             .await
             .map_err(map_user_store_err)?;
     }
+    let password_changed = update.password.is_some();
     if let Some(password) = update.password {
         users::set_password(&mut tx, id, &password)
             .await
@@ -560,7 +602,8 @@ async fn update_user(
             .await
             .map_err(map_user_store_err)?;
     }
-    if let Some(display_name) = update.display_name {
+    let mut display_name_changed: Option<String> = None;
+    if let Some(display_name) = update.display_name.as_deref() {
         let name = display_name.trim();
         if name.is_empty() {
             return Err(AdminError::InvalidBody("display_name 不能为空".to_string()));
@@ -571,12 +614,14 @@ async fn update_user(
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        display_name_changed = Some(name.to_string());
     }
-    if let Some(avatar) = update.avatar {
+    let avatar_changed = update.avatar.is_some();
+    if let Some(avatar) = update.avatar.as_deref() {
         let avatar_val = if avatar.trim().is_empty() {
             None
         } else {
-            Some(avatar.as_str())
+            Some(avatar)
         };
         users::set_avatar(&mut tx, id, avatar_val)
             .await
@@ -586,6 +631,43 @@ async fn update_user(
         users::set_rate_limit_rpm(&mut tx, id, rpm_update)
             .await
             .map_err(map_user_store_err)?;
+    }
+    // 逐字段记变更前后值：审计要能回答「改了什么」，不只是「被改过」。
+    let mut changes: Vec<String> = Vec::new();
+    if let Some(role) = update.role {
+        changes.push(format!("role {} → {}", target.role.as_str(), role.as_str()));
+    }
+    if let Some(enabled) = update.enabled {
+        changes.push(format!("enabled {} → {}", target.enabled, enabled));
+    }
+    if password_changed {
+        changes.push("重置密码（并吊销其他会话）".to_string());
+    }
+    if let Some(name) = display_name_changed.as_deref() {
+        changes.push(format!(
+            "display_name「{}」→「{}」",
+            target.display_name, name
+        ));
+    }
+    if avatar_changed {
+        changes.push("更新头像".to_string());
+    }
+    if let Some(rpm_update) = update.rate_limit_rpm {
+        let before = target
+            .rate_limit_rpm
+            .map_or_else(|| "跟随全局".to_string(), |n| n.to_string());
+        let after = rpm_update.map_or_else(|| "跟随全局".to_string(), |n| n.to_string());
+        changes.push(format!("rate_limit_rpm {before} → {after}"));
+    }
+    if !changes.is_empty() {
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "users",
+            &format!("修改用户 {} ({})：{}", id, target.email, changes.join("；")),
+        )
+        .await
+        .map_err(AdminError::Store)?;
     }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
@@ -610,6 +692,17 @@ async fn delete_user(
     users::delete_user(&mut tx, id, super::logging::unix_millis())
         .await
         .map_err(map_user_store_err)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "users",
+        &format!(
+            "归档用户 {} ({})：停用、令牌失效、会话吊销",
+            id, target.email
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -655,9 +748,29 @@ async fn replace_user_model_groups(
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let before = users::list_assigned_groups(&deps.pool, id)
+        .await
+        .map_err(AdminError::Store)?;
     let groups = users::replace_assigned_groups(&mut tx, id, &body.groups)
         .await
         .map_err(map_user_store_err)?;
+    if before != groups {
+        // 撤组会让已绑该组的令牌立即失效（ADR-0010），值得留痕。
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "users",
+            &format!(
+                "调整用户 {} ({}) 可用模型组：[{}] → [{}]",
+                id,
+                target.email,
+                before.join(", "),
+                groups.join(", ")
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(AssignedGroupsView { groups }))
@@ -762,12 +875,45 @@ async fn recharge_user(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    store::adjust_user_balance(&mut tx, id, delta)
+    let (before, _) = store::get_user_wallet(&deps.pool, id)
         .await
         .map_err(map_user_store_err)?;
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let (after, _) = store::adjust_user_balance(&mut tx, id, delta)
+        .await
+        .map_err(map_user_store_err)?;
+    if delta != 0 {
+        // 钱是最需要留痕的一类改动：记 delta 与前后余额，别只记「被改过」。
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "billing",
+            &format!(
+                "用户 {} ({}) 余额 {}{} USD（{} → {}）",
+                id,
+                target.email,
+                if delta > 0 { "+" } else { "-" },
+                format_usd_micros(delta.abs()),
+                format_usd_micros(before),
+                format_usd_micros(after)
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
     tx.commit().await.map_err(db_err)?;
     user_admin_view(&deps.pool, target, None).await.map(Json)
+}
+
+/// micro-USD 整数 → 两位小数的美元串，供审计文案使用。
+///
+/// 负数按绝对值格式化，符号由调用方按语义决定。
+fn format_usd_micros(micros: i64) -> String {
+    let negative = micros < 0;
+    let abs = micros.unsigned_abs();
+    let dollars = abs / 1_000_000;
+    let cents = (abs % 1_000_000) / 10_000;
+    format!("{}{dollars}.{cents:02}", if negative { "-" } else { "" })
 }
 
 async fn list_user_tokens(
@@ -1056,6 +1202,25 @@ async fn update_token(
     crate::store::resources::upsert_token(&mut tx, &token, super::logging::unix_millis())
         .await
         .map_err(AdminError::Store)?;
+    if existing.token.user_id != identity.user_id() {
+        // 跨归属的改动（运营禁用他人令牌）必须留痕；改自己的不记，否则用户日常
+        // 编辑就能把审计表刷满。
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "tokens",
+            &format!(
+                "修改用户 {} 的令牌 {}（{}）enabled {} → {}",
+                existing.token.user_id,
+                id,
+                existing.token.name,
+                existing.token.enabled,
+                token.enabled
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_token_record(&deps, id).await?;
@@ -1132,6 +1297,7 @@ async fn list_channels(
 /// 新建渠道：同名已存在则冲突（409），否则写库 + 换快照 + 返回新渠道视图。
 async fn create_channel(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<Channel>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<ChannelView>), AdminError> {
     let mut channel = body.map_err(AdminError::bad_body)?;
@@ -1165,6 +1331,20 @@ async fn create_channel(
         .await
         .map_err(AdminError::Store)?;
     enroll_channel_models(&mut tx, id, None, &channel).await?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "channels",
+        &format!(
+            "创建渠道 {} ({}) protocol={} base_url={}",
+            id,
+            channel.name,
+            super::logging::protocol_name(channel.protocol),
+            channel.base_url
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_channel_record(&deps, id).await?;
@@ -1176,6 +1356,7 @@ async fn create_channel(
 /// `name` 变化即改名，id 保持不变；新名已被其它渠道占用返回 409。
 async fn update_channel(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(raw_id): Path<String>,
     body: Result<Json<Channel>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ChannelView>, AdminError> {
@@ -1225,6 +1406,17 @@ async fn update_channel(
     .await
     .map_err(AdminError::Store)?;
     enroll_channel_models(&mut tx, id, Some(&previous), &channel).await?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "channels",
+        &format!(
+            "修改渠道 {} ({} → {}) enabled={} base_url={}",
+            id, previous.name, channel.name, channel.enabled, channel.base_url
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_channel_record(&deps, id).await?;
@@ -1234,6 +1426,7 @@ async fn update_channel(
 /// 删除渠道（按路径 `id`）：不存在则 404，否则删除并返回被删渠道视图。
 async fn delete_channel(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(raw_id): Path<String>,
 ) -> Result<Json<ChannelView>, AdminError> {
     let id = parse_channel_id(raw_id)?;
@@ -1242,6 +1435,14 @@ async fn delete_channel(
     crate::store::resources::delete_channel(&mut tx, id)
         .await
         .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "channels",
+        &format!("删除渠道 {} ({})", id, deleted.channel.name),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(ChannelView::from_record(deleted)))
@@ -1539,18 +1740,62 @@ async fn get_settings(State(deps): State<AdminDeps>) -> Result<Json<Settings>, A
 /// 与同渠道退避的变更立刻作用于后续请求。
 async fn update_settings(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<Settings>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Settings>, AdminError> {
     let settings = body.map_err(AdminError::bad_body)?;
     validate_settings(&settings)?;
+    let before = read_settings(&deps).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_settings(&mut tx, &settings)
         .await
         .map_err(AdminError::Store)?;
+    let changes = settings_changes(&before, &settings);
+    if !changes.is_empty() {
+        // 设置改动直接影响网关行为（body 上限、限流、重试），必须可追溯到人。
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "settings",
+            &format!("修改设置：{}", changes.join("；")),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_settings(&deps).await?;
     Ok(Json(updated))
+}
+
+/// 列出两版设置之间实际变化的项，形如 `键 旧 → 新`。
+fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
+    let mut changes = Vec::new();
+    macro_rules! diff {
+        ($field:ident) => {
+            if before.$field != after.$field {
+                changes.push(format!(
+                    "{} {} → {}",
+                    stringify!($field),
+                    before.$field,
+                    after.$field
+                ));
+            }
+        };
+    }
+    diff!(full_body);
+    diff!(max_request_bytes);
+    diff!(max_response_bytes);
+    diff!(log_body_max_bytes);
+    diff!(catalog_sync_interval_days);
+    diff!(auth_throttle_max_failures);
+    diff!(auth_throttle_window_secs);
+    diff!(sse_reassembly_max_bytes);
+    diff!(retry_backoff_ms);
+    diff!(retry_backoff_cap_ms);
+    diff!(retry_after_cap_secs);
+    diff!(rate_limit_rpm);
+    changes
 }
 
 /// 校验设置字段：须为正的阈值写成 0 属运营误配；认证失败次数允许 0（关闭限流）。
@@ -1942,6 +2187,20 @@ async fn close_unsettled_log(
         }
         store::UnsettledLogAction::Closed => {}
     }
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "billing",
+        &format!(
+            "{}未结算日志 {}（用户 {}，{} USD）",
+            if charge { "补扣" } else { "豁免" },
+            id,
+            log.user_id,
+            format_usd_micros(log.cost_usd_micros)
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     let log = store::get_request_log(&deps.pool, id)
         .await
@@ -1961,6 +2220,7 @@ struct SystemLogQueryParams {
     to_created_at: Option<i64>,
     level: Option<String>,
     target: Option<String>,
+    actor_user_id: Option<i64>,
     sort_by: Option<store::SystemLogSortBy>,
     sort_dir: Option<store::SortDir>,
     page: Option<u64>,
@@ -1974,6 +2234,9 @@ struct SystemLogEntry {
     level: String,
     target: String,
     message: String,
+    /// 操作者；系统自身产生的运维事件为 null。
+    actor_user_id: Option<i64>,
+    actor_email: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2001,6 +2264,7 @@ async fn query_system_logs(
     filter.to_created_at = params.to_created_at;
     filter.levels = parse_comma_list(params.level.as_deref());
     filter.targets = parse_comma_list(params.target.as_deref());
+    filter.actor_user_id = params.actor_user_id;
     filter.sort_by = params.sort_by.unwrap_or_default();
     filter.sort_dir = params.sort_dir.unwrap_or_default();
     let page = store::query_system_log_page(&deps.pool, &filter)
@@ -2016,6 +2280,8 @@ async fn query_system_logs(
                 level: log.level,
                 target: log.target,
                 message: log.message,
+                actor_user_id: log.actor_user_id,
+                actor_email: log.actor_email,
             })
             .collect(),
         page: filter.page,

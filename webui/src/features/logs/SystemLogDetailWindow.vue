@@ -140,6 +140,17 @@ function copyMessage() {
               <span class="code-chip rounded px-1.5 py-0.5">{{ entry.target }}</span>
             </dd>
           </div>
+          <!-- 运维事件由系统自身产生，没有操作者；审计事件才有。 -->
+          <div class="col-span-2">
+            <dt class="text-fg-muted text-[11px]">{{ t('logs.actor') }}</dt>
+            <dd class="mt-0.5 font-mono text-xs" data-testid="system-log-detail-actor">
+              <span v-if="entry.actor_email">
+                {{ entry.actor_email }}
+                <span class="text-fg-subtle">(#{{ entry.actor_user_id }})</span>
+              </span>
+              <span v-else class="text-fg-subtle">{{ t('logs.actorSystem') }}</span>
+            </dd>
+          </div>
         </dl>
       </div>
 

@@ -631,7 +631,10 @@
     "systemMessageFull": "Full Log Message & Stack Trace",
     "copyMessage": "Copy Log Content",
     "copiedMessage": "Copied",
-    "routeFlow": "Routing"
+    "routeFlow": "Routing",
+    "actor": "Operator",
+    "actorSystem": "System",
+    "actorFilter": "Filter by this operator"
   },
   "a11y": {
     "skipToContent": "Skip to main content",

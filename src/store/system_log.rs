@@ -18,6 +18,19 @@ pub struct SystemLog {
     pub level: String,
     pub target: String,
     pub message: String,
+    /// 操作者 id；系统自身产生的运维事件为 `None`。
+    pub actor_user_id: Option<i64>,
+    /// 操作者邮箱（写入时冗余定格）。
+    ///
+    /// 不只存 id：用户可被归档改名，审计行要能独立还原「当时是谁」。
+    pub actor_email: Option<String>,
+}
+
+/// 审计事件的操作者。
+#[derive(Debug, Clone, Copy)]
+pub struct Actor<'a> {
+    pub user_id: i64,
+    pub email: &'a str,
 }
 
 /// 系统日志可排序列：只有时间有顺序。
@@ -38,6 +51,8 @@ pub struct SystemLogQuery {
     pub levels: Vec<String>,
     /// 精确匹配的目标；空表示不限。
     pub targets: Vec<String>,
+    /// 按操作者过滤；`None` 表示不限。
+    pub actor_user_id: Option<i64>,
     /// 排序列；缺省时间。
     pub sort_by: SystemLogSortBy,
     /// 排序方向；缺省倒序。
@@ -87,6 +102,69 @@ pub async fn insert_system_log(
     .await
     .map_err(StoreError::Query)?;
     Ok(result.last_insert_rowid())
+}
+
+/// 记一条带操作者的审计事件（info 级），与业务写在同一事务内。
+///
+/// 接 `&mut SqliteConnection` 而非 `&SqlitePool`：审计行必须与它描述的那次改动
+/// 同生共死——业务回滚了却留下一条「已充值」的审计行，比没有审计更糟。
+///
+/// 只记写入与认证事件，不记读取：`GET /users` 被导航 hover 预取反复触发，逐次
+/// 落库会把这张表淹掉。
+pub async fn record_audit(
+    conn: &mut SqliteConnection,
+    actor: Actor<'_>,
+    target: &str,
+    message: &str,
+) -> Result<(), StoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    sqlx::query(
+        "INSERT INTO system_log (created_at, level, target, message, actor_user_id, actor_email) \
+         VALUES (?, 'info', ?, ?, ?, ?)",
+    )
+    .bind(now)
+    .bind(target)
+    .bind(message)
+    .bind(actor.user_id)
+    .bind(actor.email)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 同 [`record_audit`]，但不参与调用方事务、失败只打 tracing。
+///
+/// 供登录这类「没有业务事务可挂」的路径使用。
+pub async fn record_audit_detached(
+    pool: &SqlitePool,
+    actor: Option<Actor<'_>>,
+    level: &str,
+    target: &str,
+    message: &str,
+) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let result = sqlx::query(
+        "INSERT INTO system_log (created_at, level, target, message, actor_user_id, actor_email) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(now)
+    .bind(level)
+    .bind(target)
+    .bind(message)
+    .bind(actor.map(|a| a.user_id))
+    .bind(actor.map(|a| a.email.to_string()))
+    .execute(pool)
+    .await;
+    if let Err(err) = result {
+        tracing::error!(target: "system_log", "审计日志落库失败: {err}");
+    }
 }
 
 /// 记录一条 error 级系统日志，同时打 tracing；落库失败只再记 tracing，避免递归。
@@ -143,6 +221,10 @@ fn push_system_log_filters(
     }
     push_created_at_range(qb, &mut first, filter.from_created_at, filter.to_created_at);
     push_column_in(qb, &mut first, "level", &filter.levels);
+    if let Some(actor_user_id) = filter.actor_user_id {
+        push_where_cond(qb, &mut first, "actor_user_id = ");
+        qb.push_bind(actor_user_id);
+    }
     if include_target {
         push_column_in(qb, &mut first, "target", &filter.targets);
     }
@@ -164,8 +246,10 @@ async fn query_system_logs_on(
     conn: &mut SqliteConnection,
     filter: &SystemLogQuery,
 ) -> Result<Vec<SystemLog>, StoreError> {
-    let mut qb =
-        sqlx::QueryBuilder::new("SELECT id, created_at, level, target, message FROM system_log");
+    let mut qb = sqlx::QueryBuilder::new(
+        "SELECT id, created_at, level, target, message, actor_user_id, actor_email \
+             FROM system_log",
+    );
     push_system_log_filters(&mut qb, filter, true);
     push_system_log_order(&mut qb, filter);
     push_limit_offset(&mut qb, filter.page, filter.page_size);
@@ -182,6 +266,8 @@ async fn query_system_logs_on(
             level: row.try_get("level").map_err(StoreError::Query)?,
             target: row.try_get("target").map_err(StoreError::Query)?,
             message: row.try_get("message").map_err(StoreError::Query)?,
+            actor_user_id: row.try_get("actor_user_id").map_err(StoreError::Query)?,
+            actor_email: row.try_get("actor_email").map_err(StoreError::Query)?,
         });
     }
     Ok(logs)

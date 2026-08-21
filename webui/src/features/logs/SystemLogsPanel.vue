@@ -33,17 +33,18 @@ type SystemLogWindowPayload = {
   entry: SystemLogEntry;
 };
 
-type SystemLogColumnId = 'created' | 'level' | 'target' | 'message' | 'actions';
+type SystemLogColumnId = 'created' | 'level' | 'target' | 'actor' | 'message' | 'actions';
 
 const SYSTEM_LOG_COLUMNS: ColumnVisibilitySpec<SystemLogColumnId>[] = [
   { id: 'created', locked: true },
   { id: 'level' },
   { id: 'target' },
+  { id: 'actor' },
   { id: 'message' },
   { id: 'actions', locked: true },
 ];
 
-const SYSTEM_LOG_HIDEABLE: SystemLogColumnId[] = ['level', 'target', 'message'];
+const SYSTEM_LOG_HIDEABLE: SystemLogColumnId[] = ['level', 'target', 'actor', 'message'];
 
 const LEVELS = ['error', 'warn', 'info'] as const;
 
@@ -74,6 +75,8 @@ const {
 
 const appliedLevels = ref<string[]>([]);
 const appliedTargets = ref<string[]>([]);
+/** 按操作者收窄；null 表示不限。审计行才有操作者，运维事件没有。 */
+const appliedActor = ref<number | null>(null);
 const autoRefreshSeconds = ref<string>('0');
 
 const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
@@ -99,6 +102,7 @@ const columnLabels = computed((): Record<SystemLogColumnId, string> => ({
   created: t('logs.created'),
   level: t('logs.level'),
   target: t('logs.target'),
+  actor: t('logs.actor'),
   message: t('logs.message'),
   actions: t('common.actions'),
 }));
@@ -121,6 +125,7 @@ const refreshOptions = computed(() => [
 
 watch(appliedLevels, resetResults);
 watch(appliedTargets, resetResults);
+watch(appliedActor, resetResults);
 
 function buildQuery(): SystemLogQuery {
   const query: SystemLogQuery = {
@@ -143,6 +148,9 @@ function buildQuery(): SystemLogQuery {
   if (appliedTargets.value.length > 0) {
     query.target = appliedTargets.value;
   }
+  if (appliedActor.value !== null) {
+    query.actor_user_id = appliedActor.value;
+  }
   query.sort_by = 'created';
   query.sort_dir = sortDir.value;
   return query;
@@ -163,6 +171,7 @@ const systemLogsQuery = useQuery({
     appliedTo,
     appliedLevels,
     appliedTargets,
+    appliedActor,
     sortDir,
   ],
   queryFn: () => apiClient.querySystemLogs(buildQuery()),
@@ -186,7 +195,14 @@ const paging = computed(() => pagination(total.value));
 function clearFilters() {
   appliedLevels.value = [];
   appliedTargets.value = [];
+  appliedActor.value = null;
   clearBaseFilters();
+}
+
+/** 点操作者旁的漏斗：收窄到该操作者；再点一次取消。 */
+function onQuickFilterActor(actorUserId: number | null) {
+  if (actorUserId === null) return;
+  appliedActor.value = appliedActor.value === actorUserId ? null : actorUserId;
 }
 
 function openDetailWindow(event: MouseEvent, entry: SystemLogEntry) {
@@ -315,6 +331,7 @@ function levelBadgeClass(level: string): string {
           </TableHead>
           <TableHead v-if="visible.level" class="w-24">{{ t('logs.level') }}</TableHead>
           <TableHead v-if="visible.target" class="w-56">{{ t('logs.target') }}</TableHead>
+          <TableHead v-if="visible.actor" class="w-48">{{ t('logs.actor') }}</TableHead>
           <TableHead v-if="visible.message">{{ t('logs.message') }}</TableHead>
           <TableHead align="center">{{ t('common.actions') }}</TableHead>
         </TableRow>
@@ -360,6 +377,27 @@ function levelBadgeClass(level: string): string {
                   <UiIcon name="filter" :size="11" />
                 </button>
               </div>
+            </TableCell>
+            <!-- 运维事件由系统自身产生，没有操作者；审计事件才有。 -->
+            <TableCell
+              v-if="visible.actor"
+              truncate
+              class="font-mono text-xs"
+              data-testid="system-log-actor"
+              :title="entry.actor_email ?? t('logs.actorSystem')"
+            >
+              <span v-if="entry.actor_email" class="inline-flex items-center gap-1">
+                <span class="truncate">{{ entry.actor_email }}</span>
+                <button
+                  type="button"
+                  class="rounded p-0.5 text-[var(--fg-muted)] opacity-0 transition-opacity group-hover:opacity-100 hover:text-[var(--seed-primary)]"
+                  :title="t('logs.actorFilter')"
+                  @click.stop="onQuickFilterActor(entry.actor_user_id ?? null)"
+                >
+                  <UiIcon name="filter" :size="11" />
+                </button>
+              </span>
+              <span v-else class="text-fg-subtle">{{ t('logs.actorSystem') }}</span>
             </TableCell>
             <TableCell
               v-if="visible.message"

@@ -11,8 +11,9 @@ mod system_log;
 pub mod users;
 
 pub use system_log::{
-    SystemLog, SystemLogList, SystemLogQuery, SystemLogSortBy, insert_system_log,
-    query_system_log_page, record_system_error, record_system_warn,
+    Actor, SystemLog, SystemLogList, SystemLogQuery, SystemLogSortBy, insert_system_log,
+    query_system_log_page, record_audit, record_audit_detached, record_system_error,
+    record_system_warn,
 };
 
 use std::collections::HashMap;

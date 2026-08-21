@@ -631,7 +631,10 @@
     "systemMessageFull": "完整日志消息与堆栈",
     "copyMessage": "复制日志内容",
     "copiedMessage": "已复制",
-    "routeFlow": "路由映射"
+    "routeFlow": "路由映射",
+    "actor": "操作者",
+    "actorSystem": "系统",
+    "actorFilter": "只看该操作者"
   },
   "a11y": {
     "skipToContent": "跳到主内容",

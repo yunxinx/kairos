@@ -377,11 +377,16 @@ export interface SystemLogEntry {
   level: string;
   target: string;
   message: string;
+  /** 操作者；系统自身产生的运维事件为 null。 */
+  actor_user_id?: number | null;
+  actor_email?: string | null;
 }
 
 /** 系统日志查询。`level` / `target` 为分面多选，请求时拼成逗号列表。 */
 export interface SystemLogQuery {
   keyword?: string;
+  /** 按操作者收窄；缺省不限。 */
+  actor_user_id?: number;
   from_created_at?: number;
   to_created_at?: number;
   level?: string[];
