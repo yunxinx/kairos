@@ -178,6 +178,24 @@ async fn update_me_email_and_password_with_current() {
     .await;
     assert_eq!(changed.status(), StatusCode::OK);
 
+    let avatar_update = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        "/me",
+        json!({
+            "avatar": "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
+        }),
+    )
+    .await;
+    assert_eq!(avatar_update.status(), StatusCode::OK);
+    let me: Value = bearer_get(&gw, &gw.session, "/me")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(me["avatar"], "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=");
+
     let old_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
         .json(&json!({
@@ -317,4 +335,126 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     assert_eq!(delete_last.status(), StatusCode::CONFLICT);
     let delete_body: Value = delete_last.json().await.expect("应可解析");
     assert_eq!(delete_body["error"]["code"], "last_root_protected");
+}
+
+#[tokio::test]
+async fn user_rate_limit_and_stats_roundtrip() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let user_res = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "rpm-user@example.com",
+            "display_name": "限速用户",
+            "password": "password1",
+            "role": "user",
+            "rate_limit_rpm": 2
+        }),
+    )
+    .await;
+    assert_eq!(user_res.status(), StatusCode::CREATED);
+    let user_view: Value = user_res.json().await.expect("json");
+    let user_id = user_view["id"].as_i64().expect("user_id");
+
+    // 给用户钱包充值
+    let recharge = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        &format!("/users/{user_id}/balance"),
+        json!({ "delta_usd_micros": 10_000_000 }),
+    )
+    .await;
+    assert_eq!(recharge.status(), StatusCode::OK);
+
+    // 用户登录并创建令牌
+    let login = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({
+            "email": "rpm-user@example.com",
+            "password": "password1"
+        }))
+        .send()
+        .await
+        .expect("登录");
+    assert_eq!(login.status(), StatusCode::OK);
+    let session_token = login.json::<Value>().await.expect("json")["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    let token_res = bearer_json(
+        &gw,
+        &session_token,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({
+            "name": "User RPM Token",
+            "model_group": "default",
+            "rate_limit_rpm": 100, // 令牌自己配了 100，但全局被用户 2 RPM 压制
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(token_res.status(), StatusCode::CREATED);
+    let token_view: Value = token_res.json().await.expect("json");
+    let token_key = token_view["token_key"]
+        .as_str()
+        .expect("token_key")
+        .to_string();
+
+    // 发起调用
+    let call1 = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(&token_key)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("call 1");
+    assert_eq!(call1.status(), StatusCode::OK);
+
+    let call2 = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(&token_key)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("call 2");
+    assert_eq!(call2.status(), StatusCode::OK);
+
+    // 第 3 次超限 429
+    let call3 = reqwest::Client::new()
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(&token_key)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("call 3");
+    assert_eq!(call3.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Root 查询 /users 列表，验证统计数据已聚合
+    let users_list: Vec<Value> = bearer_get(&gw, &gw.session, "/users")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let user_stats = users_list
+        .iter()
+        .find(|u| u["id"] == user_id)
+        .expect("user exists");
+    assert_eq!(user_stats["rate_limit_rpm"], 2);
+    assert_eq!(user_stats["request_count"], 2);
+    assert!(user_stats["last_used_at"].as_i64().is_some());
 }

@@ -178,6 +178,8 @@ pub struct UserRecord {
     pub display_name: String,
     pub role: ManagementRole,
     pub enabled: bool,
+    pub avatar: Option<String>,
+    pub rate_limit_rpm: Option<u64>,
 }
 
 /// 新建管理用户时的字段。
@@ -186,6 +188,7 @@ pub struct NewUser<'a> {
     pub display_name: &'a str,
     pub password: &'a str,
     pub role: ManagementRole,
+    pub rate_limit_rpm: Option<u64>,
 }
 
 /// 会话默认有效期：8 小时（与旧 Kairos 管理面一致）。
@@ -297,11 +300,13 @@ pub fn normalize_email(email: &str) -> String {
 
 /// 按 id 读用户；不存在返回 `None`。
 pub async fn get_user(pool: &SqlitePool, id: i64) -> Result<Option<UserRecord>, StoreError> {
-    let row = sqlx::query("SELECT id, email, display_name, role, enabled FROM users WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await
-        .map_err(StoreError::Query)?;
+    let row = sqlx::query(
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(StoreError::Query)?;
     row.as_ref().map(map_user_row).transpose()
 }
 
@@ -311,24 +316,29 @@ pub async fn get_user_by_email(
     email: &str,
 ) -> Result<Option<UserRecord>, StoreError> {
     let email = normalize_email(email);
-    let row =
-        sqlx::query("SELECT id, email, display_name, role, enabled FROM users WHERE email = ?")
-            .bind(email)
-            .fetch_optional(pool)
-            .await
-            .map_err(StoreError::Query)?;
+    let row = sqlx::query(
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ?",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await
+    .map_err(StoreError::Query)?;
     row.as_ref().map(map_user_row).transpose()
 }
 
 fn map_user_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserRecord, StoreError> {
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
     let role: String = row.try_get("role").map_err(StoreError::Query)?;
+    let avatar: Option<String> = row.try_get("avatar").map_err(StoreError::Query)?;
+    let rate_limit_rpm: Option<i64> = row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
     Ok(UserRecord {
         id: row.try_get("id").map_err(StoreError::Query)?,
         email: row.try_get("email").map_err(StoreError::Query)?,
         display_name: row.try_get("display_name").map_err(StoreError::Query)?,
         role: ManagementRole::parse(&role)?,
         enabled: enabled != 0,
+        avatar,
+        rate_limit_rpm: rate_limit_rpm.and_then(|n| u64::try_from(n).ok()),
     })
 }
 
@@ -352,15 +362,17 @@ pub async fn insert_user(
         return Err(StoreError::EmailTaken);
     }
     let password_hash = hash_password(new_user.password).await?;
+    let rpm_val = new_user.rate_limit_rpm.map(|n| n as i64);
     let result = sqlx::query(
-        "INSERT INTO users (email, display_name, password_hash, role, enabled, created_at) \
-         VALUES (?, ?, ?, ?, 1, ?)",
+        "INSERT INTO users (email, display_name, password_hash, role, enabled, created_at, rate_limit_rpm) \
+         VALUES (?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(&email)
     .bind(display_name)
     .bind(&password_hash)
     .bind(new_user.role.as_str())
     .bind(now)
+    .bind(rpm_val)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -386,15 +398,19 @@ pub async fn insert_user(
         display_name: display_name.to_string(),
         role: new_user.role,
         enabled: true,
+        avatar: None,
+        rate_limit_rpm: new_user.rate_limit_rpm,
     })
 }
 
 /// 列出全部管理用户（不含密码）。
 pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError> {
-    let rows = sqlx::query("SELECT id, email, display_name, role, enabled FROM users")
-        .fetch_all(pool)
-        .await
-        .map_err(StoreError::Query)?;
+    let rows = sqlx::query(
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
     rows.iter().map(map_user_row).collect()
 }
 
@@ -480,12 +496,13 @@ async fn get_user_by_email_on_conn(
     conn: &mut SqliteConnection,
     email: &str,
 ) -> Result<Option<UserRecord>, StoreError> {
-    let row =
-        sqlx::query("SELECT id, email, display_name, role, enabled FROM users WHERE email = ?")
-            .bind(email)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(StoreError::Query)?;
+    let row = sqlx::query(
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ?",
+    )
+    .bind(email)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
     row.as_ref().map(map_user_row).transpose()
 }
 
@@ -619,11 +636,13 @@ async fn get_user_on_conn(
     conn: &mut SqliteConnection,
     id: i64,
 ) -> Result<Option<UserRecord>, StoreError> {
-    let row = sqlx::query("SELECT id, email, display_name, role, enabled FROM users WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
+    let row = sqlx::query(
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
     row.as_ref().map(map_user_row).transpose()
 }
 
@@ -649,7 +668,7 @@ pub async fn authenticate_password(
 ) -> Result<Option<UserRecord>, StoreError> {
     let email = normalize_email(email);
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, password_hash FROM users WHERE email = ?",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, password_hash FROM users WHERE email = ?",
     )
     .bind(&email)
     .fetch_optional(pool)
@@ -670,6 +689,43 @@ pub async fn authenticate_password(
         return Ok(None);
     }
     Ok(Some(map_user_row(&row)?))
+}
+
+/// 修改用户头像（data URL 或图片 URL；None 表示清除头像）。
+pub async fn set_avatar(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    avatar: Option<&str>,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE users SET avatar = ? WHERE id = ?")
+        .bind(avatar)
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::UserNotFound(user_id));
+    }
+    Ok(())
+}
+
+/// 设置用户每分钟请求上限（RPM）。`None` 或 `0` 表示不限制。
+pub async fn set_rate_limit_rpm(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    rate_limit_rpm: Option<u64>,
+) -> Result<(), StoreError> {
+    let rpm_val = rate_limit_rpm.map(|n| n as i64);
+    let result = sqlx::query("UPDATE users SET rate_limit_rpm = ? WHERE id = ?")
+        .bind(rpm_val)
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::UserNotFound(user_id));
+    }
+    Ok(())
 }
 
 /// 签发会话：返回明文令牌（只此一次）与过期时间（unix 毫秒）。
@@ -706,7 +762,7 @@ pub async fn user_for_session(
     }
     let token_hash = hash_session_token(session_token);
     let row = sqlx::query(
-        "SELECT u.id, u.email, u.display_name, u.role, u.enabled, \
+        "SELECT u.id, u.email, u.display_name, u.role, u.enabled, u.avatar, u.rate_limit_rpm, \
                 s.expires_at, s.revoked \
          FROM management_sessions s \
          JOIN users u ON u.id = s.user_id \
@@ -804,4 +860,85 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// 用户级聚合统计：请求次数、Token 消耗以及最后活跃时间。
+#[derive(Debug, Clone, Default)]
+pub struct UserStatsRecord {
+    pub request_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub last_used_at: Option<i64>,
+}
+
+/// 批量查出所有用户的聚合统计（按 user_id 汇总）。
+pub async fn list_users_stats(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashMap<i64, UserStatsRecord>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT t.user_id, \
+                COUNT(DISTINCT COALESCE(l.request_id, CAST(l.id AS TEXT))) AS request_count, \
+                COALESCE(SUM(l.input_tokens), 0) AS input_tokens, \
+                COALESCE(SUM(l.output_tokens), 0) AS output_tokens, \
+                MAX(t.last_used_at) AS last_used_at \
+         FROM tokens t \
+         LEFT JOIN request_log l ON l.token_key = t.token_key \
+         GROUP BY t.user_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    let mut map = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
+        let request_count: i64 = row.try_get("request_count").map_err(StoreError::Query)?;
+        let input_tokens: i64 = row.try_get("input_tokens").map_err(StoreError::Query)?;
+        let output_tokens: i64 = row.try_get("output_tokens").map_err(StoreError::Query)?;
+        let last_used_at: Option<i64> = row.try_get("last_used_at").map_err(StoreError::Query)?;
+        map.insert(
+            user_id,
+            UserStatsRecord {
+                request_count: request_count.max(0) as u64,
+                input_tokens: input_tokens.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
+                last_used_at,
+            },
+        );
+    }
+    Ok(map)
+}
+
+/// 单个用户的聚合统计。
+pub async fn get_user_stats(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<UserStatsRecord, StoreError> {
+    let row = sqlx::query(
+        "SELECT COUNT(DISTINCT COALESCE(l.request_id, CAST(l.id AS TEXT))) AS request_count, \
+                COALESCE(SUM(l.input_tokens), 0) AS input_tokens, \
+                COALESCE(SUM(l.output_tokens), 0) AS output_tokens, \
+                MAX(t.last_used_at) AS last_used_at \
+         FROM tokens t \
+         LEFT JOIN request_log l ON l.token_key = t.token_key \
+         WHERE t.user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    let Some(row) = row else {
+        return Ok(UserStatsRecord::default());
+    };
+    let request_count: i64 = row.try_get("request_count").map_err(StoreError::Query)?;
+    let input_tokens: i64 = row.try_get("input_tokens").map_err(StoreError::Query)?;
+    let output_tokens: i64 = row.try_get("output_tokens").map_err(StoreError::Query)?;
+    let last_used_at: Option<i64> = row.try_get("last_used_at").map_err(StoreError::Query)?;
+    Ok(UserStatsRecord {
+        request_count: request_count.max(0) as u64,
+        input_tokens: input_tokens.max(0) as u64,
+        output_tokens: output_tokens.max(0) as u64,
+        last_used_at,
+    })
 }

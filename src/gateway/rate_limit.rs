@@ -49,9 +49,24 @@ impl RequestRateLimiter {
     }
 }
 
-/// 令牌未写 RPM 时用全局兜底；令牌写出的值（含 `0`）覆盖全局。
-pub(super) fn effective_rate_limit_rpm(token_rpm: Option<u64>, global_rpm: u64) -> u64 {
-    token_rpm.unwrap_or(global_rpm)
+/// 令牌生效上限：令牌 `token_rpm` 缺省用全局 `global_rpm` 兜底；
+/// 若所属用户配有 `user_rpm`（非 0），则作为用户的硬性全局上限约束（二者取较小值）。
+pub(super) fn effective_rate_limit_rpm(
+    token_rpm: Option<u64>,
+    user_rpm: Option<u64>,
+    global_rpm: u64,
+) -> u64 {
+    let base = token_rpm.unwrap_or(global_rpm);
+    match user_rpm {
+        Some(user_limit) if user_limit > 0 => {
+            if base == 0 {
+                user_limit
+            } else {
+                base.min(user_limit)
+            }
+        }
+        _ => base,
+    }
 }
 
 fn prune_expired(map: &mut HashMap<String, VecDeque<Instant>>, now: Instant) {
@@ -88,9 +103,14 @@ mod tests {
     }
 
     #[test]
-    fn token_override_replaces_global() {
-        assert_eq!(effective_rate_limit_rpm(None, 60), 60);
-        assert_eq!(effective_rate_limit_rpm(Some(120), 60), 120);
-        assert_eq!(effective_rate_limit_rpm(Some(0), 60), 0);
+    fn token_override_replaces_global_and_user_limits() {
+        assert_eq!(effective_rate_limit_rpm(None, None, 60), 60);
+        assert_eq!(effective_rate_limit_rpm(Some(120), None, 60), 120);
+        assert_eq!(effective_rate_limit_rpm(Some(0), None, 60), 0);
+        assert_eq!(effective_rate_limit_rpm(Some(120), Some(50), 60), 50);
+        assert_eq!(effective_rate_limit_rpm(Some(30), Some(50), 60), 30);
+        assert_eq!(effective_rate_limit_rpm(None, Some(50), 60), 50);
+        assert_eq!(effective_rate_limit_rpm(None, Some(100), 60), 60);
+        assert_eq!(effective_rate_limit_rpm(Some(0), Some(50), 60), 50);
     }
 }

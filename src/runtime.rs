@@ -75,12 +75,13 @@ pub struct RuntimeSnapshot {
     pub rate_limit_rpm: u64,
 }
 
-/// 快照里的管理用户：请求路径只读启停、角色与可用组。
+/// 快照里的管理用户：请求路径只读启停、角色、可用组与用户级限速。
 #[derive(Debug, Clone)]
 pub struct RuntimeUser {
     pub role: ManagementRole,
     pub enabled: bool,
     pub assigned_groups: HashSet<String>,
+    pub rate_limit_rpm: Option<u64>,
 }
 
 impl RuntimeSnapshot {
@@ -192,6 +193,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
                 role: record.role,
                 enabled: record.enabled,
                 assigned_groups: HashSet::new(),
+                rate_limit_rpm: record.rate_limit_rpm,
             },
         );
     }

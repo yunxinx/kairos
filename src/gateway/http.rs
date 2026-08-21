@@ -2227,15 +2227,19 @@ async fn error_response(
     (status, Json(body)).into_response()
 }
 
-/// 令牌生效 RPM：缺省跟随全局兜底，令牌写出的值（含 `0`）覆盖全局。
+/// 令牌生效 RPM：缺省跟随全局兜底，令牌写出的值（含 `0`）覆盖全局；同时受所属用户 RPM 约束。
 fn token_rate_limited(
     deps: &Deps,
     token: &Token,
     snapshot: &RuntimeSnapshot,
 ) -> Result<(), Duration> {
+    let user_rpm = snapshot
+        .users
+        .get(&token.user_id)
+        .and_then(|u| u.rate_limit_rpm);
     deps.request_rate.try_acquire(
         &token.token_key,
-        effective_rate_limit_rpm(token.rate_limit_rpm, snapshot.rate_limit_rpm),
+        effective_rate_limit_rpm(token.rate_limit_rpm, user_rpm, snapshot.rate_limit_rpm),
     )
 }
 

@@ -277,6 +277,8 @@ struct UserView {
     display_name: String,
     role: ManagementRole,
     enabled: bool,
+    avatar: Option<String>,
+    rate_limit_rpm: Option<u64>,
 }
 
 impl UserView {
@@ -287,6 +289,8 @@ impl UserView {
             display_name: record.display_name,
             role: record.role,
             enabled: record.enabled,
+            avatar: record.avatar,
+            rate_limit_rpm: record.rate_limit_rpm,
         }
     }
 }
@@ -351,7 +355,11 @@ async fn get_me(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<UserAdminView>, AdminError> {
-    user_admin_view(&deps.pool, identity.user).await.map(Json)
+    let user = users::get_user(&deps.pool, identity.user_id())
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", identity.user_id())))?;
+    user_admin_view(&deps.pool, user, None).await.map(Json)
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,6 +370,7 @@ struct MeUpdate {
     /// 改密码时必填；只改邮箱/展示名不必带。防止有人拿已窃会话静默换口令。
     current_password: Option<String>,
     display_name: Option<String>,
+    avatar: Option<String>,
 }
 
 /// 当前用户改自己的邮箱、展示名或密码。
@@ -408,6 +417,16 @@ async fn update_me(
             .await
             .map_err(db_err)?;
     }
+    if let Some(avatar) = update.avatar {
+        let avatar_val = if avatar.trim().is_empty() {
+            None
+        } else {
+            Some(avatar.as_str())
+        };
+        users::set_avatar(&mut tx, user_id, avatar_val)
+            .await
+            .map_err(map_user_store_err)?;
+    }
     tx.commit().await.map_err(db_err)?;
     let user = users::get_user(&deps.pool, user_id)
         .await
@@ -423,6 +442,8 @@ struct UserCreate {
     display_name: String,
     password: String,
     role: ManagementRole,
+    #[serde(default)]
+    rate_limit_rpm: Option<u64>,
 }
 
 async fn create_user(
@@ -445,6 +466,7 @@ async fn create_user(
             display_name: &create.display_name,
             password: &create.password,
             role: create.role,
+            rate_limit_rpm: create.rate_limit_rpm,
         },
         now,
     )
@@ -462,6 +484,9 @@ struct UserUpdate {
     enabled: Option<bool>,
     password: Option<String>,
     display_name: Option<String>,
+    avatar: Option<String>,
+    #[serde(default)]
+    rate_limit_rpm: Option<Option<u64>>,
 }
 
 async fn update_user(
@@ -503,6 +528,21 @@ async fn update_user(
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+    }
+    if let Some(avatar) = update.avatar {
+        let avatar_val = if avatar.trim().is_empty() {
+            None
+        } else {
+            Some(avatar.as_str())
+        };
+        users::set_avatar(&mut tx, id, avatar_val)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    if let Some(rpm_update) = update.rate_limit_rpm {
+        users::set_rate_limit_rpm(&mut tx, id, rpm_update)
+            .await
+            .map_err(map_user_store_err)?;
     }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
@@ -587,14 +627,21 @@ struct UserAdminView {
     display_name: String,
     role: ManagementRole,
     enabled: bool,
+    avatar: Option<String>,
+    rate_limit_rpm: Option<u64>,
     assigned_groups: Vec<String>,
     balance_usd_micros: i64,
     settled_usd_micros: i64,
+    request_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    last_used_at: Option<i64>,
 }
 
 async fn user_admin_view(
     pool: &SqlitePool,
     record: UserRecord,
+    stats: Option<users::UserStatsRecord>,
 ) -> Result<UserAdminView, AdminError> {
     let groups = users::list_assigned_groups(pool, record.id)
         .await
@@ -602,15 +649,27 @@ async fn user_admin_view(
     let (balance_usd_micros, settled_usd_micros) = store::get_user_wallet(pool, record.id)
         .await
         .map_err(AdminError::Store)?;
+    let stats = match stats {
+        Some(s) => s,
+        None => users::get_user_stats(pool, record.id)
+            .await
+            .map_err(AdminError::Store)?,
+    };
     Ok(UserAdminView {
         id: record.id,
         email: record.email,
         display_name: record.display_name,
         role: record.role,
         enabled: record.enabled,
+        avatar: record.avatar,
+        rate_limit_rpm: record.rate_limit_rpm,
         assigned_groups: groups,
         balance_usd_micros,
         settled_usd_micros,
+        request_count: stats.request_count,
+        input_tokens: stats.input_tokens,
+        output_tokens: stats.output_tokens,
+        last_used_at: stats.last_used_at,
     })
 }
 
@@ -624,9 +683,13 @@ async fn list_management_users(
     if identity.role() == ManagementRole::Admin {
         records.retain(|record| record.role == ManagementRole::User);
     }
+    let stats_map = users::list_users_stats(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?;
     let mut views = Vec::with_capacity(records.len());
     for record in records {
-        views.push(user_admin_view(&deps.pool, record).await?);
+        let stats = stats_map.get(&record.id).cloned();
+        views.push(user_admin_view(&deps.pool, record, stats).await?);
     }
     Ok(Json(views))
 }
@@ -641,7 +704,7 @@ async fn get_management_user(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    user_admin_view(&deps.pool, target).await.map(Json)
+    user_admin_view(&deps.pool, target, None).await.map(Json)
 }
 
 async fn recharge_user(
@@ -661,7 +724,7 @@ async fn recharge_user(
         .await
         .map_err(map_user_store_err)?;
     tx.commit().await.map_err(db_err)?;
-    user_admin_view(&deps.pool, target).await.map(Json)
+    user_admin_view(&deps.pool, target, None).await.map(Json)
 }
 
 async fn list_user_tokens(
