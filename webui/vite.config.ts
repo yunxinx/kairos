@@ -7,23 +7,6 @@ import { defineConfig } from 'vite';
 const adminPort = process.env.KAIROS_E2E_ADMIN_PORT ?? '8788';
 const adminTarget = `http://127.0.0.1:${adminPort}`;
 
-/** 管理 API 路径（无 `/api` 前缀）；dev server 代理到本地管理监听。 */
-const adminApiPrefixes = [
-  '/tokens',
-  '/channels',
-  '/prices',
-  '/model-groups',
-  '/unified-models',
-  '/catalog',
-  '/settings',
-  '/logs',
-  '/system-logs',
-  '/stats',
-  '/logout',
-  '/me',
-  '/users',
-];
-
 export default defineConfig({
   plugins: [
     tanstackRouter({
@@ -45,20 +28,10 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 5173,
     strictPort: true,
+    // 管理 API 整体在 `/api` 下，SPA 独占根命名空间：一条规则即可，
+    // 不再需要逐个列出资源路径，也不再需要给 `/login` 做 method 级 bypass。
     proxy: {
-      ...Object.fromEntries(
-        adminApiPrefixes.map((prefix) => [prefix, { target: adminTarget, changeOrigin: true }]),
-      ),
-      '/login': {
-        target: adminTarget,
-        changeOrigin: true,
-        // POST 登录走管理 API；GET 留给 Vite，避免文档导航打到网关 dist。
-        bypass(req) {
-          if (req.method !== 'POST') {
-            return req.url ?? '/index.html';
-          }
-        },
-      },
+      '/api': { target: adminTarget, changeOrigin: true },
     },
   },
 });

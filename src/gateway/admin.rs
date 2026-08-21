@@ -156,13 +156,28 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
             },
             admin_auth,
         ));
-    Router::new()
+    // 管理 API 整体挂在 `/api` 下，SPA 独占根命名空间。
+    //
+    // 此前两者共用一个扁平命名空间，于是每个 SPA 路由都得起个别名来躲开同名 API
+    // （`/token` 躲 `/tokens`、`/config` 躲 `/settings`、`/admin/users` 躲 `/users`），
+    // `/login` 更是只能按 method 拆成「POST 给 API、GET 给 SPA」。两个参考项目都给
+    // 管理 API 加了前缀（旧 kairos `baseURL: '/api'`、one-api `router.Group("/api")`）。
+    let api = Router::new()
         .merge(protected)
-        // POST 是登录 API；GET/HEAD 走 SPA（仅 POST 时 axum 对 GET 返回 405，登录页刷新/深链打不开）。
-        .route("/login", post(login).get(super::webui::serve))
+        .route("/login", post(login))
+        // `/api` 子路由必须有自己的 fallback：否则未匹配的 `/api/typo` 会落到顶层
+        // fallback 上，把 index.html 当成 API 响应回给调用方。
+        .fallback(api_not_found);
+    Router::new()
+        .nest("/api", api)
         // fallback 不走 route_layer：静态资源与 SPA 回退免认证；API 路由仍受中间件保护。
         .fallback(super::webui::serve)
         .with_state(deps)
+}
+
+/// `/api` 下未匹配的路径：返回结构化 404，而不是 SPA 的 index.html。
+async fn api_not_found() -> Response {
+    AdminError::NotFound("接口不存在".to_string()).into_response()
 }
 
 /// 已认证主体：一条未吊销的管理会话对应用户。

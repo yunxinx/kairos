@@ -54,7 +54,7 @@ test.describe('request logs page', () => {
       },
     ]);
 
-    await page.goto('/requests');
+    await page.goto('/logs');
     await expect(page.getByRole('tab', { name: /request logs/i })).toBeVisible();
 
     await page.locator('#logs-search').fill('sk-e2e-logs-page');
@@ -128,7 +128,7 @@ test.describe('request logs page', () => {
       },
     ]);
 
-    await page.goto('/requests');
+    await page.goto('/logs');
     await page.locator('#logs-search').fill('sk-e2e-logs-alias');
     const row = page.locator('[data-testid="log-row"][data-model="fast"]');
     await expect(row.getByTestId('log-model')).toHaveText('fast');
@@ -177,7 +177,7 @@ test.describe('request logs page', () => {
       },
     ]);
 
-    await page.goto('/requests');
+    await page.goto('/logs');
     await expect(page.getByTestId('logs-unsettled-total')).toContainText('1');
     await page.getByTestId('logs-settled-filter').click();
     await page.locator('[data-testid="logs-settled-filter-option"][data-value="false"]').click();
@@ -223,7 +223,7 @@ test.describe('request logs page', () => {
     await page.addInitScript(() => {
       localStorage.removeItem('kairos-logs-columns');
     });
-    await page.goto('/requests');
+    await page.goto('/logs');
     await page.locator('#logs-search').fill('sk-e2e-logs-columns');
     const row = page.locator('[data-testid="log-row"][data-model="e2e-columns-model"]');
     await expect(row).toBeVisible();
@@ -250,7 +250,7 @@ test.describe('request logs page', () => {
     await page.addInitScript(() => {
       localStorage.removeItem('kairos-system-logs-columns');
     });
-    await page.goto('/requests');
+    await page.goto('/logs');
     await page.getByTestId('logs-tab-system').click();
     const row = page.getByTestId('system-log-row').filter({ hasText: 'e2e column visibility' });
     await expect(row).toBeVisible();
@@ -284,7 +284,7 @@ test.describe('request logs page', () => {
       },
     ]);
 
-    await page.goto('/requests');
+    await page.goto('/logs');
     await page.locator('#logs-search').fill('sk-e2e-logs-sort');
     await expect(page.getByTestId('log-row')).toHaveCount(2);
     await expect(page.getByTestId('log-row').first()).toHaveAttribute(
@@ -333,7 +333,7 @@ test.describe('request logs page', () => {
       },
     ]);
 
-    await page.goto('/requests');
+    await page.goto('/logs');
     await page.locator('#logs-search').fill('sk-e2e-logs-protocol');
     await expect(page.getByTestId('log-row')).toHaveCount(2);
     await expect(
@@ -371,7 +371,7 @@ test.describe('request logs page', () => {
       },
     ]);
 
-    await page.goto('/requests');
+    await page.goto('/logs');
     await page.locator('#logs-search').fill('sk-e2e-exact-filter');
     await expect(page.getByTestId('log-row')).toHaveCount(2);
 

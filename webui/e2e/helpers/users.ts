@@ -7,7 +7,7 @@ export async function seedUser(
   page: Page,
   body: { email: string; role: ManagementRole; password?: string; display_name?: string },
 ): Promise<{ id: number }> {
-  const resp = await page.request.post('/users', {
+  const resp = await page.request.post('/api/users', {
     headers: await e2eRootHeaders(page.request),
     data: {
       display_name: body.display_name ?? body.email,
@@ -25,7 +25,7 @@ export async function openSession(
   email: string,
   password = 'password1',
 ): Promise<void> {
-  const resp = await page.request.post('/login', { data: { email, password } });
+  const resp = await page.request.post('/api/login', { data: { email, password } });
   expect(resp.ok(), await resp.text()).toBeTruthy();
   const body = (await resp.json()) as { token: string };
   await page.goto('/login');

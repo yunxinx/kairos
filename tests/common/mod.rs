@@ -605,7 +605,7 @@ impl TestGateway {
                 .await
                 .expect("管理面服务应运行");
             });
-            let session = login_root_session(&format!("http://{admin_addr}")).await;
+            let session = login_root_session(&format!("http://{admin_addr}/api")).await;
             (Some(admin_addr), session)
         } else {
             (None, String::new())
@@ -695,7 +695,18 @@ impl TestGateway {
     }
 
     /// 管理面 base URL；未启用管理面时 panic（调用方应先 `start_with_admin`）。
+    /// 管理 API 基址（含 `/api` 前缀）。
+    ///
+    /// 前缀在这里一次性拼上：各测试文件的 `admin_url(gw, "/tokens")` 因此无需逐个改。
     pub fn admin_base_url(&self) -> String {
+        let addr = self
+            .admin_addr
+            .expect("管理面未启用：请用 start_with_admin 启动");
+        format!("http://{addr}/api")
+    }
+
+    /// 管理监听的根地址（不含 `/api`），供断言 SPA 回退用。
+    pub fn admin_origin(&self) -> String {
         let addr = self
             .admin_addr
             .expect("管理面未启用：请用 start_with_admin 启动");

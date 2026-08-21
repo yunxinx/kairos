@@ -10,7 +10,7 @@ async function savedChannelModels(
   page: import('@playwright/test').Page,
   name: string,
 ): Promise<string[] | undefined> {
-  const resp = await page.request.get('/channels', {
+  const resp = await page.request.get('/api/channels', {
     headers: await e2eRootHeaders(page.request),
   });
   const channels = (await resp.json()) as Array<{ name: string; models: string[] }>;
@@ -42,7 +42,7 @@ test.describe('channel resource page', () => {
     const failUpstream = await startProbeUpstream(500, { models: ['gpt-4o-mini'] });
     const errUpstream = await startProbeUpstream(404);
     try {
-      await page.goto('/channel');
+      await page.goto('/channels');
       await expect(page.getByRole('heading', { name: /channels/i })).toBeVisible();
 
       await page.getByTestId('create-channel').click();
@@ -367,14 +367,14 @@ test.describe('channel manual model add', () => {
     const channelName = 'manual-add-channel';
     const manualId = 'manual-only-id';
     try {
-      const tokenResp = await page.request.post('/tokens', {
+      const tokenResp = await page.request.post('/api/tokens', {
         headers: await e2eRootHeaders(page.request),
         data: { name: 'manual-add-token', limit_usd_micros: null, enabled: true },
       });
       expect(tokenResp.ok()).toBeTruthy();
       const token = (await tokenResp.json()) as { token_key: string };
 
-      await page.goto('/channel');
+      await page.goto('/channels');
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-name"]').fill(channelName);
       await page.locator('[id^="channel-editor-base-url"]').fill(upstream.baseUrl);
@@ -426,7 +426,7 @@ test.describe('channel manual model add', () => {
         page.locator(`[data-testid="inventory-row"][data-model="${manualId}"]`),
       ).toHaveCount(0);
 
-      await page.goto('/channel');
+      await page.goto('/channels');
       await channelRow.getByTestId('channel-edit').click();
 
       await page.getByTestId('channel-add-model').click();
@@ -503,7 +503,7 @@ test.describe('channel manual model add', () => {
       await expect(unpriced).toBeVisible();
       await expect(unpriced.getByTestId('inventory-unpriced')).toBeVisible();
 
-      await page.goto('/channel');
+      await page.goto('/channels');
       await page.getByTestId('account-menu-trigger').hover();
       await page.getByTestId('nav-locale-toggle').click();
       await channelRow.getByTestId('channel-edit').click();
@@ -532,7 +532,7 @@ test.describe('channel alias occupancy', () => {
     const channelName = 'e2e-occ-channel';
     const upstream = await startProbeUpstream(200, { models: [alpha, beta, gamma] });
     try {
-      await page.goto('/channel');
+      await page.goto('/channels');
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-name"]').fill(channelName);
       await page.locator('[id^="channel-editor-base-url"]').fill(upstream.baseUrl);
@@ -615,7 +615,7 @@ test.describe('channel editor model overflow', () => {
   test('shows 9 chips then +N, and the popover lists only the overflowed models', async ({
     page,
   }) => {
-    await page.goto('/channel');
+    await page.goto('/channels');
     await page.getByTestId('create-channel').click();
     const form = page.getByTestId('channel-form');
     for (let i = 1; i <= 10; i += 1) {
@@ -657,7 +657,7 @@ test.describe('channel editor model overflow', () => {
       api_key: longKey,
     });
 
-    await page.goto('/channel');
+    await page.goto('/channels');
     await page.getByTestId('create-channel').click();
     await expect(page.locator('[id^="channel-editor-api-key"]')).toHaveAttribute('type', 'text');
     await page.getByRole('button', { name: /cancel|取消/i }).click();

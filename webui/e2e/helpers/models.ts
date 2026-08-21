@@ -15,7 +15,7 @@ export async function seedChannel(
   body: Partial<Channel> & Pick<Channel, 'name' | 'models'>,
 ): Promise<{ id: number }> {
   const headers = await e2eRootHeaders(page.request);
-  const resp = await page.request.post('/channels', {
+  const resp = await page.request.post('/api/channels', {
     headers,
     data: {
       protocol: 'openai_chat',
@@ -37,7 +37,7 @@ export async function seedChannel(
 
 /** 经管理 API 写入一条价格。 */
 export async function seedPrice(page: Page, body: Price): Promise<void> {
-  const resp = await page.request.post('/prices', {
+  const resp = await page.request.post('/api/prices', {
     headers: await e2eRootHeaders(page.request),
     data: body,
   });
@@ -46,7 +46,7 @@ export async function seedPrice(page: Page, body: Price): Promise<void> {
 
 /** 经管理 API 写入一个统一模型。 */
 export async function seedUnifiedModel(page: Page, body: UnifiedModel): Promise<void> {
-  const resp = await page.request.post('/unified-models', {
+  const resp = await page.request.post('/api/unified-models', {
     headers: await e2eRootHeaders(page.request),
     data: body,
   });
@@ -55,7 +55,7 @@ export async function seedUnifiedModel(page: Page, body: UnifiedModel): Promise<
 
 /** 经管理 API 写入一个模型组。 */
 export async function seedModelGroup(page: Page, body: ModelGroup): Promise<void> {
-  const resp = await page.request.post('/model-groups', {
+  const resp = await page.request.post('/api/model-groups', {
     headers: await e2eRootHeaders(page.request),
     data: body,
   });
@@ -67,7 +67,7 @@ export async function seedToken(
   page: Page,
   body: Partial<{ name: string; model_group: string }> & { name: string },
 ): Promise<{ token_key: string }> {
-  const resp = await page.request.post('/tokens', {
+  const resp = await page.request.post('/api/tokens', {
     headers: await e2eRootHeaders(page.request),
     data: {
       limit_usd_micros: null,
@@ -93,7 +93,7 @@ export async function seedCatalog(
     cache_write_micros: number | null;
   }>,
 ): Promise<void> {
-  const resp = await page.request.put('/catalog', {
+  const resp = await page.request.put('/api/catalog', {
     headers: await e2eRootHeaders(page.request),
     data: { models },
   });
@@ -107,14 +107,14 @@ export async function updateChannel(
   patch: Partial<Channel>,
 ): Promise<void> {
   const headers = await e2eRootHeaders(page.request);
-  const listed = await page.request.get('/channels', { headers });
+  const listed = await page.request.get('/api/channels', { headers });
   expect(listed.ok(), await listed.text()).toBeTruthy();
   const channels = (await listed.json()) as ChannelView[];
   const current = channels.find((channel) => channel.id === id);
   if (current === undefined) {
     throw new Error(`channel ${id} not found`);
   }
-  const resp = await page.request.put(`/channels/${id}`, {
+  const resp = await page.request.put(`/api/channels/${id}`, {
     headers,
     data: { ...channelWriteBody(current), ...patch },
   });
@@ -123,7 +123,7 @@ export async function updateChannel(
 
 /** 删除渠道。 */
 export async function deleteChannel(page: Page, id: number): Promise<void> {
-  const resp = await page.request.delete(`/channels/${id}`, {
+  const resp = await page.request.delete(`/api/channels/${id}`, {
     headers: await e2eRootHeaders(page.request),
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();

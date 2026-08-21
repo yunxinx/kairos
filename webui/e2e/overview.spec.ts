@@ -10,7 +10,7 @@ import { formatCount, formatTokensMillions } from '../src/lib/format';
 test.describe.configure({ mode: 'serial' });
 
 async function fetchStats(request: APIRequestContext, days: number): Promise<StatsView> {
-  const resp = await request.get(`/stats?days=${days}`, {
+  const resp = await request.get(`/api/stats?days=${days}`, {
     headers: await e2eRootHeaders(request),
   });
   expect(resp.ok()).toBeTruthy();
@@ -18,7 +18,7 @@ async function fetchStats(request: APIRequestContext, days: number): Promise<Sta
 }
 
 async function fetchLifetimeStats(request: APIRequestContext): Promise<LifetimeStats> {
-  const resp = await request.get('/stats/lifetime', {
+  const resp = await request.get('/api/stats/lifetime', {
     headers: await e2eRootHeaders(request),
   });
   expect(resp.ok()).toBeTruthy();

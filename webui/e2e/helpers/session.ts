@@ -14,7 +14,7 @@ export function e2eRootBearer(request: APIRequestContext): Promise<string> {
   const cached = sessionByRequest.get(request);
   if (cached) return cached;
   const pending = (async () => {
-    const resp = await request.post('/login', {
+    const resp = await request.post('/api/login', {
       data: { email: E2E_ADMIN_EMAIL, password: E2E_ADMIN_PASSWORD },
     });
     expect(resp.ok(), await resp.text()).toBeTruthy();

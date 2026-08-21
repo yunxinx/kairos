@@ -10,7 +10,7 @@ test.describe('settings page', () => {
     page,
     request,
   }) => {
-    await page.goto('/config');
+    await page.goto('/settings');
     await expect(page.getByRole('tablist', { name: /settings/i })).toBeVisible();
 
     await page.locator('#settings-max-request-bytes').fill('0.01');
@@ -30,7 +30,7 @@ test.describe('settings page', () => {
   });
 
   test('shows a readable invalid_body error for a zero body limit', async ({ page }) => {
-    await page.goto('/config');
+    await page.goto('/settings');
     await page.locator('#settings-max-request-bytes').fill('0');
     await page.getByTestId('settings-save').click();
     await expect(page.locator('[data-form-field="maxRequestBytes"]')).toContainText(
@@ -39,7 +39,7 @@ test.describe('settings page', () => {
   });
 
   test('saves the full_body switch and keeps it after refresh', async ({ page, request }) => {
-    await page.goto('/config');
+    await page.goto('/settings');
     const checkbox = page.getByTestId('settings-full-body');
     await expect(checkbox).toBeVisible();
     if (await checkbox.isChecked()) {
@@ -51,7 +51,7 @@ test.describe('settings page', () => {
     await page.getByTestId('settings-save').click();
     await expect(page.getByTestId('toast')).toContainText(/saved|已保存/);
 
-    const resp = await request.get('/settings', {
+    const resp = await request.get('/api/settings', {
       headers: await e2eRootHeaders(page.request),
     });
     expect(resp.ok()).toBeTruthy();

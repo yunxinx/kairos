@@ -183,7 +183,7 @@ test.describe('models page', () => {
     await expect(canonical.getByTestId('price-cache-read')).toHaveText('0.000001');
     await expect(canonical.getByTestId('price-cache-write')).toHaveText('—');
 
-    const listed = await page.request.get('/prices', {
+    const listed = await page.request.get('/api/prices', {
       headers: await e2eRootHeaders(page.request),
     });
     const prices = (await listed.json()) as Array<{
@@ -452,7 +452,7 @@ test.describe('models page', () => {
     await expect(page.locator('[data-testid="visible-model"][data-model="coding"]')).toBeVisible();
     await expect(page.getByTestId('visible-unified-order')).toContainText('e2e-code-haiku');
 
-    await page.goto('/token');
+    await page.goto('/tokens');
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('coding');
     await page.getByTestId('token-editor-group').click();
@@ -473,7 +473,7 @@ test.describe('models page', () => {
         status_code: 200,
       },
     ]);
-    await page.goto('/requests');
+    await page.goto('/logs');
     await page.locator('#logs-search').fill('sk-e2e-coding');
     const logRow = page.locator('[data-testid="log-row"][data-model="coding"]');
     await expect(logRow.getByTestId('log-model')).toHaveText('coding');
@@ -627,7 +627,7 @@ test.describe('models page', () => {
     await expect(rowB.getByTestId('price-input')).toHaveText('4');
     await expect(rowB.getByTestId('price-output')).toHaveText('5');
 
-    const listed = await page.request.get('/prices', {
+    const listed = await page.request.get('/api/prices', {
       headers: await e2eRootHeaders(page.request),
     });
     const prices = (await listed.json()) as Array<{
@@ -786,7 +786,7 @@ test.describe('models page', () => {
     await page.getByRole('dialog').getByTestId('group-delete-confirm').click();
     await expect(groupRow).toHaveCount(0);
 
-    const listed = await page.request.get('/tokens', {
+    const listed = await page.request.get('/api/tokens', {
       headers: await e2eRootHeaders(page.request),
     });
     const tokens = (await listed.json()) as Array<{ token_key: string; model_group: string }>;

@@ -12,15 +12,15 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as SplatRouteImport } from './routes/$'
 import { Route as AccountRouteImport } from './routes/account'
-import { Route as ChannelRouteImport } from './routes/channel'
-import { Route as ConfigRouteImport } from './routes/config'
+import { Route as ChannelsRouteImport } from './routes/channels'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as LogsRouteImport } from './routes/logs'
 import { Route as ModelsRouteImport } from './routes/models'
 import { Route as OverviewRouteImport } from './routes/overview'
 import { Route as PricingRouteImport } from './routes/pricing'
-import { Route as RequestsRouteImport } from './routes/requests'
-import { Route as TokenRouteImport } from './routes/token'
-import { Route as AdminUsersRouteImport } from './routes/admin.users'
+import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as TokensRouteImport } from './routes/tokens'
+import { Route as UsersRouteImport } from './routes/users'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -37,19 +37,19 @@ const AccountRoute = AccountRouteImport.update({
   path: '/account',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ChannelRoute = ChannelRouteImport.update({
-  id: '/channel',
-  path: '/channel',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ConfigRoute = ConfigRouteImport.update({
-  id: '/config',
-  path: '/config',
+const ChannelsRoute = ChannelsRouteImport.update({
+  id: '/channels',
+  path: '/channels',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LogsRoute = LogsRouteImport.update({
+  id: '/logs',
+  path: '/logs',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ModelsRoute = ModelsRouteImport.update({
@@ -67,19 +67,19 @@ const PricingRoute = PricingRouteImport.update({
   path: '/pricing',
   getParentRoute: () => rootRouteImport,
 } as any)
-const RequestsRoute = RequestsRouteImport.update({
-  id: '/requests',
-  path: '/requests',
+const SettingsRoute = SettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
   getParentRoute: () => rootRouteImport,
 } as any)
-const TokenRoute = TokenRouteImport.update({
-  id: '/token',
-  path: '/token',
+const TokensRoute = TokensRouteImport.update({
+  id: '/tokens',
+  path: '/tokens',
   getParentRoute: () => rootRouteImport,
 } as any)
-const AdminUsersRoute = AdminUsersRouteImport.update({
-  id: '/admin/users',
-  path: '/admin/users',
+const UsersRoute = UsersRouteImport.update({
+  id: '/users',
+  path: '/users',
   getParentRoute: () => rootRouteImport,
 } as any)
 
@@ -87,44 +87,44 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
   '/account': typeof AccountRoute
-  '/channel': typeof ChannelRoute
-  '/config': typeof ConfigRoute
+  '/channels': typeof ChannelsRoute
   '/login': typeof LoginRoute
+  '/logs': typeof LogsRoute
   '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
   '/pricing': typeof PricingRoute
-  '/requests': typeof RequestsRoute
-  '/token': typeof TokenRoute
-  '/admin/users': typeof AdminUsersRoute
+  '/settings': typeof SettingsRoute
+  '/tokens': typeof TokensRoute
+  '/users': typeof UsersRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
   '/account': typeof AccountRoute
-  '/channel': typeof ChannelRoute
-  '/config': typeof ConfigRoute
+  '/channels': typeof ChannelsRoute
   '/login': typeof LoginRoute
+  '/logs': typeof LogsRoute
   '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
   '/pricing': typeof PricingRoute
-  '/requests': typeof RequestsRoute
-  '/token': typeof TokenRoute
-  '/admin/users': typeof AdminUsersRoute
+  '/settings': typeof SettingsRoute
+  '/tokens': typeof TokensRoute
+  '/users': typeof UsersRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/$': typeof SplatRoute
   '/account': typeof AccountRoute
-  '/channel': typeof ChannelRoute
-  '/config': typeof ConfigRoute
+  '/channels': typeof ChannelsRoute
   '/login': typeof LoginRoute
+  '/logs': typeof LogsRoute
   '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
   '/pricing': typeof PricingRoute
-  '/requests': typeof RequestsRoute
-  '/token': typeof TokenRoute
-  '/admin/users': typeof AdminUsersRoute
+  '/settings': typeof SettingsRoute
+  '/tokens': typeof TokensRoute
+  '/users': typeof UsersRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -132,58 +132,58 @@ export interface FileRouteTypes {
     | '/'
     | '/$'
     | '/account'
-    | '/channel'
-    | '/config'
+    | '/channels'
     | '/login'
+    | '/logs'
     | '/models'
     | '/overview'
     | '/pricing'
-    | '/requests'
-    | '/token'
-    | '/admin/users'
+    | '/settings'
+    | '/tokens'
+    | '/users'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/$'
     | '/account'
-    | '/channel'
-    | '/config'
+    | '/channels'
     | '/login'
+    | '/logs'
     | '/models'
     | '/overview'
     | '/pricing'
-    | '/requests'
-    | '/token'
-    | '/admin/users'
+    | '/settings'
+    | '/tokens'
+    | '/users'
   id:
     | '__root__'
     | '/'
     | '/$'
     | '/account'
-    | '/channel'
-    | '/config'
+    | '/channels'
     | '/login'
+    | '/logs'
     | '/models'
     | '/overview'
     | '/pricing'
-    | '/requests'
-    | '/token'
-    | '/admin/users'
+    | '/settings'
+    | '/tokens'
+    | '/users'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   SplatRoute: typeof SplatRoute
   AccountRoute: typeof AccountRoute
-  ChannelRoute: typeof ChannelRoute
-  ConfigRoute: typeof ConfigRoute
+  ChannelsRoute: typeof ChannelsRoute
   LoginRoute: typeof LoginRoute
+  LogsRoute: typeof LogsRoute
   ModelsRoute: typeof ModelsRoute
   OverviewRoute: typeof OverviewRoute
   PricingRoute: typeof PricingRoute
-  RequestsRoute: typeof RequestsRoute
-  TokenRoute: typeof TokenRoute
-  AdminUsersRoute: typeof AdminUsersRoute
+  SettingsRoute: typeof SettingsRoute
+  TokensRoute: typeof TokensRoute
+  UsersRoute: typeof UsersRoute
 }
 
 declare module '@tanstack/vue-router' {
@@ -209,18 +209,11 @@ declare module '@tanstack/vue-router' {
       preLoaderRoute: typeof AccountRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/channel': {
-      id: '/channel'
-      path: '/channel'
-      fullPath: '/channel'
-      preLoaderRoute: typeof ChannelRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/config': {
-      id: '/config'
-      path: '/config'
-      fullPath: '/config'
-      preLoaderRoute: typeof ConfigRouteImport
+    '/channels': {
+      id: '/channels'
+      path: '/channels'
+      fullPath: '/channels'
+      preLoaderRoute: typeof ChannelsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -228,6 +221,13 @@ declare module '@tanstack/vue-router' {
       path: '/login'
       fullPath: '/login'
       preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/logs': {
+      id: '/logs'
+      path: '/logs'
+      fullPath: '/logs'
+      preLoaderRoute: typeof LogsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/models': {
@@ -251,25 +251,25 @@ declare module '@tanstack/vue-router' {
       preLoaderRoute: typeof PricingRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/requests': {
-      id: '/requests'
-      path: '/requests'
-      fullPath: '/requests'
-      preLoaderRoute: typeof RequestsRouteImport
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/token': {
-      id: '/token'
-      path: '/token'
-      fullPath: '/token'
-      preLoaderRoute: typeof TokenRouteImport
+    '/tokens': {
+      id: '/tokens'
+      path: '/tokens'
+      fullPath: '/tokens'
+      preLoaderRoute: typeof TokensRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/admin/users': {
-      id: '/admin/users'
-      path: '/admin/users'
-      fullPath: '/admin/users'
-      preLoaderRoute: typeof AdminUsersRouteImport
+    '/users': {
+      id: '/users'
+      path: '/users'
+      fullPath: '/users'
+      preLoaderRoute: typeof UsersRouteImport
       parentRoute: typeof rootRouteImport
     }
   }
@@ -279,15 +279,15 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   SplatRoute: SplatRoute,
   AccountRoute: AccountRoute,
-  ChannelRoute: ChannelRoute,
-  ConfigRoute: ConfigRoute,
+  ChannelsRoute: ChannelsRoute,
   LoginRoute: LoginRoute,
+  LogsRoute: LogsRoute,
   ModelsRoute: ModelsRoute,
   OverviewRoute: OverviewRoute,
   PricingRoute: PricingRoute,
-  RequestsRoute: RequestsRoute,
-  TokenRoute: TokenRoute,
-  AdminUsersRoute: AdminUsersRoute,
+  SettingsRoute: SettingsRoute,
+  TokensRoute: TokensRoute,
+  UsersRoute: UsersRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

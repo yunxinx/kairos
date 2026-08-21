@@ -11,7 +11,7 @@ test.describe('users page', () => {
     page,
   }) => {
     await seedModelGroup(page, { name: 'e2e-user-group', models: [] });
-    await page.goto('/admin/users');
+    await page.goto('/users');
     await expect(page.getByRole('heading', { name: /users/i })).toBeVisible();
 
     await page.getByTestId('create-user').click();
@@ -47,18 +47,18 @@ test.describe('users page', () => {
     await expect(row.getByTestId('user-toggle-enabled')).toHaveText(/disabled/i);
 
     const created = await seedUser(page, { email: 'e2e-tokens@example.com', role: 'user' });
-    const tokenResp = await page.request.post('/tokens', {
+    const tokenResp = await page.request.post('/api/tokens', {
       headers: await e2eRootHeaders(page.request),
       data: { name: 'will-not-belong', limit_usd_micros: null, enabled: true },
     });
     expect(tokenResp.ok()).toBeTruthy();
 
-    const session = await page.request.post('/login', {
+    const session = await page.request.post('/api/login', {
       data: { email: 'e2e-tokens@example.com', password: 'password1' },
     });
     expect(session.ok()).toBeTruthy();
     const sessionBody = (await session.json()) as { token: string };
-    const own = await page.request.post('/tokens', {
+    const own = await page.request.post('/api/tokens', {
       headers: { Authorization: `Bearer ${sessionBody.token}` },
       data: { name: 'owned', limit_usd_micros: null, enabled: true },
     });
@@ -66,7 +66,7 @@ test.describe('users page', () => {
     // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态。
     const owned = (await own.json()) as { id: number; token_key: string };
 
-    await page.goto('/admin/users');
+    await page.goto('/users');
     const tokenOwner = page.locator(`[data-testid="user-row"][data-user-id="${created.id}"]`);
     await tokenOwner.getByTestId('user-edit').click();
     await page.getByTestId('user-tab-tokens').click();
@@ -101,7 +101,7 @@ test.describe('users page', () => {
       localStorage.removeItem('kairos-users-columns');
     });
 
-    await page.goto('/admin/users');
+    await page.goto('/users');
     await expect(page.locator('[data-testid="user-row"]').first()).toBeVisible();
 
     // 检查列隐藏：隐藏 Rate Limit 列

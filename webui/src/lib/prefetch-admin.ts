@@ -21,13 +21,13 @@ export function prefetchAdminRoute(to: string): void {
         queryFn: () => apiClient.getLifetimeStats(),
       });
       return;
-    case '/token':
+    case '/tokens':
       void queryClient.prefetchQuery({
         queryKey: ['tokens'],
         queryFn: loadTokenRows,
       });
       return;
-    case '/channel':
+    case '/channels':
       void queryClient.prefetchQuery({
         queryKey: ['channels'],
         queryFn: () => apiClient.listChannels(),
@@ -51,7 +51,7 @@ export function prefetchAdminRoute(to: string): void {
         queryFn: () => apiClient.listModelGroups(),
       });
       return;
-    case '/config':
+    case '/settings':
       void queryClient.prefetchQuery({
         queryKey: ['settings'],
         queryFn: () => apiClient.getSettings(),
@@ -61,14 +61,14 @@ export function prefetchAdminRoute(to: string): void {
         queryFn: () => apiClient.getCatalogMeta(),
       });
       return;
-    case '/requests':
+    case '/logs':
       void queryClient.prefetchQuery({
         queryKey: LOGS_INITIAL_QUERY_KEY,
         queryFn: () =>
           apiClient.queryLogs({ page: LOGS_INITIAL_PAGE, page_size: LOGS_INITIAL_PAGE_SIZE }),
       });
       return;
-    case '/admin/users':
+    case '/users':
       void queryClient.prefetchQuery({
         queryKey: ['users'],
         queryFn: () => apiClient.listUsers(),

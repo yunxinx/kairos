@@ -10,7 +10,7 @@ test.describe('token resource page', () => {
   test('creates, edits with balance draft, toggles status, and deletes a token', async ({
     page,
   }) => {
-    await page.goto('/token');
+    await page.goto('/tokens');
     await expect(page.getByRole('heading', { name: /tokens/i })).toBeVisible();
 
     // 新建不接受指定 key：窗口内无 key 输入，key 由系统生成。
@@ -84,7 +84,7 @@ test.describe('token resource page', () => {
   });
 
   test('creates each token with a unique system-generated key', async ({ page }) => {
-    await page.goto('/token');
+    await page.goto('/tokens');
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('First');
     await page.getByTestId('token-save').click();
@@ -104,7 +104,7 @@ test.describe('token resource page', () => {
   });
 
   test('rejects a negative target balance without saving', async ({ page }) => {
-    await page.goto('/token');
+    await page.goto('/tokens');
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('Negative');
     await page.getByTestId('token-save').click();
@@ -119,7 +119,7 @@ test.describe('token resource page', () => {
   });
 
   test('bulk selects tokens and deletes them from the floating bulk bar', async ({ page }) => {
-    await page.goto('/token');
+    await page.goto('/tokens');
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('Bulk A');
     await page.getByTestId('token-save').click();

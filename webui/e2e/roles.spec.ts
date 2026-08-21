@@ -19,13 +19,13 @@ test.describe('role navigation', () => {
     await expect(nav.getByRole('link', { name: /^users$/i })).toHaveCount(0);
     await expect(nav.getByRole('link', { name: /^settings$/i })).toHaveCount(0);
 
-    await page.goto('/channel');
+    await page.goto('/channels');
     await expect(page).toHaveURL(/\/overview/);
-    await page.goto('/admin/users');
+    await page.goto('/users');
     await expect(page).toHaveURL(/\/overview/);
     await page.goto('/models');
     await expect(page).toHaveURL(/\/overview/);
-    await page.goto('/config');
+    await page.goto('/settings');
     await expect(page).toHaveURL(/\/overview/);
   });
 
@@ -39,9 +39,9 @@ test.describe('role navigation', () => {
     await expect(nav.getByRole('link', { name: /^channels$/i })).toHaveCount(0);
     await expect(nav.getByRole('link', { name: /^settings$/i })).toHaveCount(0);
 
-    await page.goto('/channel');
+    await page.goto('/channels');
     await expect(page).toHaveURL(/\/overview/);
-    await page.goto('/config');
+    await page.goto('/settings');
     await expect(page).toHaveURL(/\/overview/);
   });
 
@@ -49,14 +49,14 @@ test.describe('role navigation', () => {
     await seedModelGroup(page, { name: 'e2e-assigned', models: [] });
     await seedModelGroup(page, { name: 'e2e-hidden', models: [] });
     const user = await seedUser(page, { email: 'nav-groups@example.com', role: 'user' });
-    const assign = await page.request.put(`/users/${user.id}/model-groups`, {
+    const assign = await page.request.put(`/api/users/${user.id}/model-groups`, {
       headers: await e2eRootHeaders(page.request),
       data: { groups: ['e2e-assigned'] },
     });
     expect(assign.ok(), await assign.text()).toBeTruthy();
 
     await openSession(page, 'nav-groups@example.com');
-    await page.goto('/token');
+    await page.goto('/tokens');
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('assigned-token');
     await page.getByTestId('token-editor-group').click();
@@ -72,18 +72,18 @@ test.describe('role navigation', () => {
   test('withdrawn group marks the bound token unusable', async ({ page }) => {
     await seedModelGroup(page, { name: 'e2e-withdraw', models: [] });
     const user = await seedUser(page, { email: 'nav-withdraw@example.com', role: 'user' });
-    const assign = await page.request.put(`/users/${user.id}/model-groups`, {
+    const assign = await page.request.put(`/api/users/${user.id}/model-groups`, {
       headers: await e2eRootHeaders(page.request),
       data: { groups: ['e2e-withdraw'] },
     });
     expect(assign.ok(), await assign.text()).toBeTruthy();
 
-    const session = await page.request.post('/login', {
+    const session = await page.request.post('/api/login', {
       data: { email: 'nav-withdraw@example.com', password: 'password1' },
     });
     expect(session.ok(), await session.text()).toBeTruthy();
     const sessionBody = (await session.json()) as { token: string };
-    const created = await page.request.post('/tokens', {
+    const created = await page.request.post('/api/tokens', {
       headers: { Authorization: `Bearer ${sessionBody.token}` },
       data: {
         name: 'withdraw-me',
@@ -95,14 +95,14 @@ test.describe('role navigation', () => {
     expect(created.ok(), await created.text()).toBeTruthy();
     const owned = (await created.json()) as { token_key: string };
 
-    const withdraw = await page.request.put(`/users/${user.id}/model-groups`, {
+    const withdraw = await page.request.put(`/api/users/${user.id}/model-groups`, {
       headers: await e2eRootHeaders(page.request),
       data: { groups: [] },
     });
     expect(withdraw.ok(), await withdraw.text()).toBeTruthy();
 
     await openSession(page, 'nav-withdraw@example.com');
-    await page.goto('/token');
+    await page.goto('/tokens');
     const row = page.locator(`[data-testid="token-row"][data-token-key="${owned.token_key}"]`);
     await expect(row.getByTestId('token-group-unusable')).toBeVisible();
     await row.getByTestId('token-edit').click();
@@ -119,7 +119,7 @@ test.describe('role navigation', () => {
     await expect(page.getByRole('tablist', { name: /model workspace/i })).toBeVisible();
     await expect(page.getByRole('columnheader', { name: 'Input ($)', exact: true })).toBeVisible();
 
-    await page.goto('/admin/users');
+    await page.goto('/users');
     await expect(page.locator('[data-testid="user-row"]', { hasText: 'root@' })).toHaveCount(0);
     await expect(page.getByTestId('users-role-filter')).toHaveCount(0);
     const row = page.locator(`[data-testid="user-row"][data-user-id="${target.id}"]`);

@@ -6,15 +6,15 @@ export interface NavTab {
   minRole: ManagementRole;
 }
 
-/** 管理面导航。路径避开资源 API（`/tokens` `/channels` `/settings` `/logs` `/users`）。 */
+/** 管理面导航。管理 API 在 `/api` 下，SPA 独占根命名空间，路径直接用领域词。 */
 export const NAV_TABS: NavTab[] = [
   { to: '/overview', labelKey: 'nav.overview', minRole: 'user' },
-  { to: '/token', labelKey: 'nav.tokens', minRole: 'user' },
-  { to: '/channel', labelKey: 'nav.channel', minRole: 'root' },
+  { to: '/tokens', labelKey: 'nav.tokens', minRole: 'user' },
+  { to: '/channels', labelKey: 'nav.channel', minRole: 'root' },
   { to: '/models', labelKey: 'nav.models', minRole: 'admin' },
-  { to: '/admin/users', labelKey: 'nav.users', minRole: 'admin' },
-  { to: '/requests', labelKey: 'nav.logs', minRole: 'user' },
-  { to: '/config', labelKey: 'nav.settings', minRole: 'root' },
+  { to: '/users', labelKey: 'nav.users', minRole: 'admin' },
+  { to: '/logs', labelKey: 'nav.logs', minRole: 'user' },
+  { to: '/settings', labelKey: 'nav.settings', minRole: 'root' },
 ];
 
 /** 按角色过滤可见导航。未知角色时不展示，避免闪出越权入口。 */

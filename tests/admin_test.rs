@@ -3290,7 +3290,7 @@ fn is_html(resp: &reqwest::Response) -> bool {
 async fn admin_get_root_serves_html_without_auth() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let resp = reqwest::Client::new()
-        .get(gw.admin_base_url())
+        .get(gw.admin_origin())
         .send()
         .await
         .expect("管理监听应可达");
@@ -3309,7 +3309,7 @@ async fn admin_get_root_serves_html_without_auth() {
 async fn admin_spa_deep_link_serves_html_without_auth() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let resp = reqwest::Client::new()
-        .get(format!("{}/overview", gw.admin_base_url()))
+        .get(format!("{}/overview", gw.admin_origin()))
         .send()
         .await
         .expect("管理监听应可达");
@@ -3321,21 +3321,37 @@ async fn admin_spa_deep_link_serves_html_without_auth() {
     assert!(is_html(&resp), "深链回退应为 text/html");
 }
 
-/// `POST /login` 占用同路径时，GET 仍须回退 SPA，不能 405。
+/// 登录页 `GET /login` 回退 SPA；登录 API 在 `/api/login`，两者不再抢同一路径。
 #[tokio::test]
 async fn admin_get_login_serves_html_without_auth() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let resp = reqwest::Client::new()
-        .get(format!("{}/login", gw.admin_base_url()))
+        .get(format!("{}/login", gw.admin_origin()))
         .send()
         .await
         .expect("管理监听应可达");
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
-        "GET /login 应返回登录页，不能 405"
+        "GET /login 应返回登录页"
     );
     assert!(is_html(&resp), "GET /login 应为 text/html");
+}
+
+/// `/api` 下未匹配的路径返回结构化 404，不能把 index.html 当 API 响应回给调用方。
+#[tokio::test]
+async fn unknown_api_path_returns_json_404_not_spa() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/does-not-exist", gw.admin_base_url()))
+        .bearer_auth(&gw.session)
+        .send()
+        .await
+        .expect("管理监听应可达");
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert!(!is_html(&resp), "/api 下不应回退 SPA");
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "not_found");
 }
 
 /// 静态资源免认证；资源 API 未带 key 仍 401。
@@ -3346,7 +3362,7 @@ async fn admin_static_is_public_api_still_requires_key() {
     let admin = gw.admin_base_url();
 
     let favicon = client
-        .get(format!("{admin}/favicon.svg"))
+        .get(format!("{}/favicon.svg", gw.admin_origin()))
         .send()
         .await
         .expect("应可请求静态资源");
@@ -3378,7 +3394,11 @@ async fn admin_root_never_5xx_and_api_still_works() {
     let client = reqwest::Client::new();
     let admin = gw.admin_base_url();
 
-    let root = client.get(&admin).send().await.expect("管理监听应可达");
+    let root = client
+        .get(gw.admin_origin())
+        .send()
+        .await
+        .expect("管理监听应可达");
     assert!(
         root.status().as_u16() < 500,
         "UI 缺失或存在时 GET / 都不得 5xx，实际 {}",

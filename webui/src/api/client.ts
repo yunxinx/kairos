@@ -57,7 +57,8 @@ function buildQuery(params: object): string {
 }
 
 /**
- * 调用管理 API。路径无 `/api` 前缀；认证为 `Authorization: Bearer <会话令牌>`。
+ * 调用管理 API。各方法传领域路径（如 `/tokens`），此处统一拼 `/api` 前缀；
+ * 认证为 `Authorization: Bearer <会话令牌>`。
  * 会话来自 `POST /login`，不是配置里的登录密码。
  *
  * `keyOverride` 用于登录试探：失败时不清除已持有的凭据。
@@ -72,7 +73,7 @@ async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: strin
     headers.set('Authorization', `Bearer ${key}`);
   }
 
-  const response = await fetch(path, { ...init, headers });
+  const response = await fetch(`/api${path}`, { ...init, headers });
   if (!response.ok) {
     if (response.status === 401 && key && keyOverride === undefined) {
       invalidateAdminKey();
