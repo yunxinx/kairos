@@ -21,7 +21,7 @@ use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, Path, Query, Request, State},
     http::StatusCode,
-    middleware::{self, Next},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -44,28 +44,18 @@ use crate::{
     store::users::{self, ManagementRole, NewUser, UserRecord},
 };
 
+use super::admin_auth::{self, AdminAuth, ManagementIdentity};
 use super::http::{OutboundAuth, extract_bearer};
 use super::protocol;
 use super::throttle::AuthThrottle;
 
 /// 管理面依赖：存储连接池 + 运行时快照句柄（写后原子替换）+ 出站 HTTP 客户端。
 #[derive(Clone)]
-struct AdminDeps {
-    pool: SqlitePool,
-    snapshot: crate::runtime::SnapshotHandle,
-    client: reqwest::Client,
-    throttle: AuthThrottle,
-}
-
-/// 管理认证中间件状态：认证失败限流 + 会话查库。
-///
-/// 故意不持有配置里的 `admin_password`：持有它会诱使中间件做常数时间比较，
-/// 把登录口令重新变成机器 API 密钥。
-#[derive(Clone)]
-struct AdminAuth {
-    throttle: AuthThrottle,
-    snapshot: crate::runtime::SnapshotHandle,
-    pool: SqlitePool,
+pub(super) struct AdminDeps {
+    pub(super) pool: SqlitePool,
+    pub(super) snapshot: crate::runtime::SnapshotHandle,
+    pub(super) client: reqwest::Client,
+    pub(super) throttle: AuthThrottle,
 }
 
 /// 组装管理面路由：资源 CRUD 挂在认证中间件之后；`/login` 与静态 UI 免认证。
@@ -92,7 +82,7 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
         .route("/channels/{id}", put(update_channel).delete(delete_channel))
         .route("/channels/{id}/test", post(test_channel))
         .route("/settings", get(get_settings).put(update_settings))
-        .route_layer(middleware::from_fn(require_root));
+        .route_layer(middleware::from_fn(admin_auth::require_root));
     let admin_plus = Router::new()
         .route("/prices", get(list_prices).post(create_price))
         .route(
@@ -118,18 +108,23 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
         .route("/catalog", get(get_catalog).put(put_catalog))
         .route("/catalog/meta", get(get_catalog_meta))
         .route("/catalog/sync", post(sync_catalog))
-        .route("/users", get(list_management_users))
-        .route("/users/{id}", get(get_management_user))
+        .route("/users", get(list_management_users).post(create_user))
+        .route(
+            "/users/{id}",
+            get(get_management_user)
+                .put(update_user)
+                .delete(delete_user),
+        )
         .route("/users/{id}/balance", post(recharge_user))
         .route("/users/{id}/tokens", get(list_user_tokens))
         .route(
             "/users/{id}/model-groups",
             get(get_user_model_groups).put(replace_user_model_groups),
         )
-        .route("/logs/{id}/settle", post(settle_log))
-        .route("/logs/{id}/waive", post(waive_log))
+        .route("/logs/{id}/settle", post(super::admin_billing::settle_log))
+        .route("/logs/{id}/waive", post(super::admin_billing::waive_log))
         .route("/system-logs", get(query_system_logs))
-        .route_layer(middleware::from_fn(require_admin));
+        .route_layer(middleware::from_fn(admin_auth::require_admin));
     // 此层等于「所有登录用户可见」。在这里新增端点前必须先回答：它是否要按归属
     // 收窄？需要收窄的（日志、统计）由处理器用 `owner_scope` 注入 user_id；
     // 与归属无关的运营端点应放进 `admin_plus` / `root_only`，而不是留在这里。
@@ -141,9 +136,7 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
         .route("/stats", get(get_stats))
         .route("/stats/lifetime", get(get_lifetime_stats))
         .route("/me", get(get_me).put(update_me))
-        .route("/logout", post(logout))
-        .route("/users", post(create_user))
-        .route("/users/{id}", put(update_user).delete(delete_user));
+        .route("/logout", post(logout));
     let protected = Router::new()
         .merge(root_only)
         .merge(admin_plus)
@@ -154,7 +147,7 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
                 snapshot,
                 pool,
             },
-            admin_auth,
+            admin_auth::admin_auth,
         ));
     // 管理 API 整体挂在 `/api` 下，SPA 独占根命名空间。
     //
@@ -178,127 +171,6 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
 /// `/api` 下未匹配的路径：返回结构化 404，而不是 SPA 的 index.html。
 async fn api_not_found() -> Response {
     AdminError::NotFound("接口不存在".to_string()).into_response()
-}
-
-/// 已认证主体：一条未吊销的管理会话对应用户。
-///
-/// Bearer 必须是 `POST /login` 签发的 `ksess_…`，与用户登录口令不是同一种东西。
-#[derive(Clone)]
-struct ManagementIdentity {
-    user: UserRecord,
-}
-
-impl ManagementIdentity {
-    fn role(&self) -> ManagementRole {
-        self.user.role
-    }
-
-    fn user_id(&self) -> i64 {
-        self.user.id
-    }
-
-    /// 审计事件的操作者。
-    fn actor(&self) -> store::Actor<'_> {
-        store::Actor {
-            user_id: self.user.id,
-            email: &self.user.email,
-        }
-    }
-
-    /// 只读聚合与日志查询的归属范围：普通用户钉自己，admin/root 不限。
-    ///
-    /// ADR-0009 给 `user` 的可见面只有「自己的令牌、余额与用量」；日志与统计
-    /// 都必须过这道收窄，否则登录即可读到全站流量与他人对话 body。
-    fn owner_scope(&self) -> Option<i64> {
-        if self.role().at_least(ManagementRole::Admin) {
-            None
-        } else {
-            Some(self.user_id())
-        }
-    }
-}
-
-/// 管理认证：Bearer 仅为未吊销的会话。失败 401，窗口内过多则 429。
-///
-/// 只走 `user_for_session`（查 `ksess_…` 哈希）。不把配置密码、库内 Argon2 哈希
-/// 或任何静态密钥拿来和 Bearer 比较——否则登录口令会退化成机器 API 密钥。
-async fn admin_auth(
-    State(auth): State<AdminAuth>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    let ip = addr.ip();
-    let snapshot = auth.snapshot.read().await;
-    let max_failures = snapshot.auth_throttle_max_failures;
-    let window = snapshot.auth_throttle_window();
-    drop(snapshot);
-    if auth.throttle.is_blocked(ip, max_failures, window) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(
-                json!({ "error": { "code": "rate_limited", "message": "认证尝试过于频繁，请稍后再试" } }),
-            ),
-        )
-            .into_response();
-    }
-    let provided = request
-        .headers()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(extract_bearer)
-        .unwrap_or("");
-    let now = super::logging::unix_millis();
-    match users::user_for_session(&auth.pool, provided, now).await {
-        Ok(users::SessionLookup::Valid(user)) => {
-            request.extensions_mut().insert(ManagementIdentity { user });
-            next.run(request).await
-        }
-        // 形态不符或查不到该哈希：可能在猜，计入限流。
-        Ok(users::SessionLookup::Unknown) => {
-            auth.throttle.record_failure(ip, max_failures, window);
-            unauthorized_response()
-        }
-        // 会话确实存在，只是过期/被吊销：这是每 8 小时必然发生一次的正常事件，
-        // 计进失败计数会让多标签页过夜的用户把自己所在 IP 的登录一起限掉。
-        Ok(users::SessionLookup::Inactive) => unauthorized_response(),
-        Err(err) => AdminError::Store(err).into_response(),
-    }
-}
-
-fn unauthorized_response() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": { "code": "unauthorized", "message": "无效或缺失的管理凭证" } })),
-    )
-        .into_response()
-}
-
-fn forbidden_response() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({ "error": { "code": "forbidden", "message": "权限不足" } })),
-    )
-        .into_response()
-}
-
-async fn require_root(request: Request, next: Next) -> Response {
-    require_min_role(request, next, ManagementRole::Root).await
-}
-
-async fn require_admin(request: Request, next: Next) -> Response {
-    require_min_role(request, next, ManagementRole::Admin).await
-}
-
-async fn require_min_role(request: Request, next: Next, min: ManagementRole) -> Response {
-    let Some(identity) = request.extensions().get::<ManagementIdentity>() else {
-        return unauthorized_response();
-    };
-    if identity.role().at_least(min) {
-        next.run(request).await
-    } else {
-        forbidden_response()
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,9 +260,6 @@ async fn login(
         &format!("登录成功 from {ip}"),
     )
     .await;
-    // 顺带清理已过期或已吊销的会话行（每次登录都新增一行，没有清理就只增不减）。
-    // 不在事务内做：这是维护性清理，不是登录逻辑的一环；失败了不该影响登录。
-    let _ = users::purge_expired_sessions(&deps.pool, now).await;
     Ok(Json(LoginView {
         token,
         expires_at,
@@ -474,35 +343,50 @@ struct MeUpdate {
 async fn update_me(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
+    headers: axum::http::HeaderMap,
     body: Result<Json<MeUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UserView>, AdminError> {
     let update = body.map_err(AdminError::bad_body)?.0;
     let user_id = identity.user_id();
+    let mut tx = deps.pool.begin().await.map_err(db_err)?;
     if update.password.is_some() {
         let Some(current) = update.current_password.as_deref() else {
             return Err(AdminError::InvalidBody(
                 "修改密码需要提供当前密码".to_string(),
             ));
         };
-        let matches = users::password_matches(&deps.pool, user_id, current)
+        let matches = users::password_matches_on_conn(&mut tx, user_id, current)
             .await
             .map_err(AdminError::Store)?;
         if !matches {
             return Err(AdminError::InvalidBody("当前密码不正确".to_string()));
         }
     }
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    if let Some(email) = update.email {
-        users::set_email(&mut tx, user_id, &email)
+    let email_after = update.email.as_deref().map(users::normalize_email);
+    let email_changed = email_after
+        .as_deref()
+        .is_some_and(|email| email != identity.user.email);
+    let password_changed = update.password.is_some();
+    let mut changes = Vec::new();
+    if let Some(email) = update.email.as_deref() {
+        users::set_email(&mut tx, user_id, email)
             .await
             .map_err(map_user_store_err)?;
+        if email_changed {
+            changes.push(format!(
+                "email {} → {}",
+                identity.user.email,
+                email_after.as_deref().unwrap_or(email)
+            ));
+        }
     }
-    if let Some(password) = update.password {
-        users::set_password(&mut tx, user_id, &password)
+    if let Some(password) = update.password.as_deref() {
+        users::set_password(&mut tx, user_id, password)
             .await
             .map_err(map_user_store_err)?;
+        changes.push("修改密码".to_string());
     }
-    if let Some(display_name) = update.display_name {
+    if let Some(display_name) = update.display_name.as_deref() {
         let name = display_name.trim();
         if name.is_empty() {
             return Err(AdminError::InvalidBody("display_name 不能为空".to_string()));
@@ -513,16 +397,46 @@ async fn update_me(
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        if name != identity.user.display_name {
+            changes.push(format!(
+                "display_name「{}」→「{}」",
+                identity.user.display_name, name
+            ));
+        }
     }
-    if let Some(avatar) = update.avatar {
+    if let Some(avatar) = update.avatar.as_deref() {
         let avatar_val = if avatar.trim().is_empty() {
             None
         } else {
-            Some(avatar.as_str())
+            Some(avatar)
         };
         users::set_avatar(&mut tx, user_id, avatar_val)
             .await
             .map_err(map_user_store_err)?;
+        if avatar_val != identity.user.avatar.as_deref() {
+            changes.push("更新头像".to_string());
+        }
+    }
+    if email_changed || password_changed {
+        users::revoke_user_sessions(&mut tx, user_id, bearer_from_headers(&headers))
+            .await
+            .map_err(map_user_store_err)?;
+        changes.push("吊销其他会话".to_string());
+    }
+    if !changes.is_empty() {
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "users",
+            &format!(
+                "用户 {} ({}) 修改自己的账户：{}",
+                user_id,
+                identity.user.email,
+                changes.join("；")
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
     }
     tx.commit().await.map_err(db_err)?;
     let user = users::get_user(&deps.pool, user_id)
@@ -645,10 +559,9 @@ async fn update_user(
             .map_err(map_user_store_err)?;
         // 改密后吊销该用户的其他会话（留下当前这条）：否则已被窃取的会话在改密后
         // 仍有效整整 8 小时。
-        let keep = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
+        let keep = (identity.user_id() == id)
+            .then(|| bearer_from_headers(&headers))
+            .flatten();
         users::revoke_user_sessions(&mut tx, id, keep)
             .await
             .map_err(map_user_store_err)?;
@@ -909,13 +822,15 @@ async fn list_management_users(
     }
     let views = records
         .into_iter()
-        .map(|record| {
+        .map(|record| -> Result<UserAdminView, AdminError> {
             let stats = stats_map.get(&record.id).cloned().unwrap_or_default();
-            let (balance_usd_micros, settled_usd_micros) =
-                wallets.get(&record.id).copied().unwrap_or((0, 0));
+            let (balance_usd_micros, settled_usd_micros) = wallets
+                .get(&record.id)
+                .copied()
+                .ok_or_else(|| AdminError::Store(StoreError::MissingWallet(record.id)))?;
             let mut assigned_groups = groups_by_user.remove(&record.id).unwrap_or_default();
             assigned_groups.sort();
-            UserAdminView {
+            Ok(UserAdminView {
                 id: record.id,
                 email: record.email,
                 display_name: record.display_name,
@@ -929,9 +844,9 @@ async fn list_management_users(
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
                 last_used_at: stats.last_used_at,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(views))
 }
 
@@ -960,11 +875,8 @@ async fn recharge_user(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    let (before, _) = store::get_user_wallet(&deps.pool, id)
-        .await
-        .map_err(map_user_store_err)?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    let (after, _) = store::adjust_user_balance(&mut tx, id, delta)
+    let change = store::adjust_user_balance(&mut tx, id, delta)
         .await
         .map_err(map_user_store_err)?;
     if delta != 0 {
@@ -977,10 +889,10 @@ async fn recharge_user(
                 "用户 {} ({}) 余额 {}{} USD（{} → {}）",
                 id,
                 target.email,
-                if delta > 0 { "+" } else { "-" },
-                format_usd_micros(delta.abs()),
-                format_usd_micros(before),
-                format_usd_micros(after)
+                if delta > 0 { "+" } else { "" },
+                format_usd_micros(delta),
+                format_usd_micros(change.before_usd_micros),
+                format_usd_micros(change.after_usd_micros)
             ),
         )
         .await
@@ -992,8 +904,8 @@ async fn recharge_user(
 
 /// micro-USD 整数 → 两位小数的美元串，供审计文案使用。
 ///
-/// 负数按绝对值格式化，符号由调用方按语义决定。
-fn format_usd_micros(micros: i64) -> String {
+/// 符号由金额本身决定；使用无符号绝对值以覆盖 `i64::MIN`。
+pub(super) fn format_usd_micros(micros: i64) -> String {
     let negative = micros < 0;
     let abs = micros.unsigned_abs();
     let dollars = abs / 1_000_000;
@@ -1068,7 +980,7 @@ fn disable_only_token_change(existing: &Token, next: &Token) -> bool {
 }
 
 /// admin 不能管理 admin/root；user 不能管理任何人；改角色到更高档需 root。
-fn reject_user_management(
+pub(super) fn reject_user_management(
     actor: &ManagementIdentity,
     target: &UserRecord,
     new_role: Option<ManagementRole>,
@@ -2072,7 +1984,7 @@ struct LogQueryParams {
 /// `GET /logs` 列表不读 BLOB，`request_body` / `response_body` 为 null；
 /// `GET /logs/{id}` 才返回落库的 body。
 #[derive(Debug, Serialize)]
-struct LogEntry {
+pub(super) struct LogEntry {
     id: i64,
     created_at: i64,
     token_name: String,
@@ -2100,7 +2012,7 @@ struct LogEntry {
 
 impl LogEntry {
     /// 从存储行构造 wire 条目；完整 body 字节以 base64 编码；令牌 key 按 UI 同款规则脱敏。
-    fn from_store_log(log: store::RequestLog) -> Self {
+    pub(super) fn from_store_log(log: store::RequestLog) -> Self {
         Self {
             id: log.id,
             created_at: log.created_at,
@@ -2202,92 +2114,9 @@ async fn get_log(
 }
 
 /// 解析路径中的日志 id；非整数视为不存在。
-fn parse_log_id(raw: &str) -> Result<i64, AdminError> {
+pub(super) fn parse_log_id(raw: &str) -> Result<i64, AdminError> {
     raw.parse()
         .map_err(|_| AdminError::NotFound(format!("日志 {raw} 不存在")))
-}
-
-/// 对未结算日志补扣：按行上费用写入余额（允许透支），再标为已结算。
-async fn settle_log(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(raw): Path<String>,
-) -> Result<Json<LogEntry>, AdminError> {
-    close_unsettled_log(&deps, &identity, &raw, true).await
-}
-
-/// 豁免未结算日志：只翻 `settled`，不改余额。
-async fn waive_log(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(raw): Path<String>,
-) -> Result<Json<LogEntry>, AdminError> {
-    close_unsettled_log(&deps, &identity, &raw, false).await
-}
-
-/// 未结算闭环：`charge` 为 true 时补扣，否则豁免。
-///
-/// 路由层已要求 admin+；这里再按日志归属用户过一次 [`reject_user_management`]，
-/// 使 admin 只能处理普通用户的行，不能动 root/其他 admin 的账。
-async fn close_unsettled_log(
-    deps: &AdminDeps,
-    identity: &ManagementIdentity,
-    raw: &str,
-    charge: bool,
-) -> Result<Json<LogEntry>, AdminError> {
-    let id = parse_log_id(raw)?;
-    let log = store::get_request_log(&deps.pool, id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
-    // 存量行的 user_id 为 0（迁移前无归属），此时无从判定越权，只允许 root 处理。
-    if log.user_id == 0 {
-        if identity.role() != ManagementRole::Root {
-            return Err(AdminError::Forbidden);
-        }
-    } else {
-        let owner = users::get_user(&deps.pool, log.user_id)
-            .await
-            .map_err(AdminError::Store)?
-            .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", log.user_id)))?;
-        reject_user_management(identity, &owner, None)?;
-    }
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    let outcome = if charge {
-        store::settle_unsettled_log(&mut tx, id).await
-    } else {
-        store::waive_unsettled_log(&mut tx, id).await
-    }
-    .map_err(AdminError::Store)?;
-    match outcome {
-        store::UnsettledLogAction::NotFound => {
-            return Err(AdminError::NotFound(format!("日志 {id} 不存在")));
-        }
-        store::UnsettledLogAction::AlreadySettled => {
-            return Err(AdminError::Conflict(format!("日志 {id} 已结算")));
-        }
-        store::UnsettledLogAction::Closed => {}
-    }
-    store::record_audit(
-        &mut tx,
-        identity.actor(),
-        "billing",
-        &format!(
-            "{}未结算日志 {}（用户 {}，{} USD）",
-            if charge { "补扣" } else { "豁免" },
-            id,
-            log.user_id,
-            format_usd_micros(log.cost_usd_micros)
-        ),
-    )
-    .await
-    .map_err(AdminError::Store)?;
-    tx.commit().await.map_err(db_err)?;
-    let log = store::get_request_log(&deps.pool, id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
-    Ok(Json(LogEntry::from_store_log(log)))
 }
 
 /// `/system-logs` 查询参数：关键字、时间窗、级别与目标可选。
@@ -2805,8 +2634,16 @@ fn upstream_unreachable_message(err: &reqwest::Error) -> String {
 ///
 /// 各 CRUD 处理器内联调用（事务生命周期与处理器局部资源绑定，不宜用闭包抽象），
 /// 此处只提供事务开启/提交的 sqlx 错误到 `AdminError` 的映射。
-fn db_err(err: sqlx::Error) -> AdminError {
+pub(super) fn db_err(err: sqlx::Error) -> AdminError {
     AdminError::Store(StoreError::Query(err))
+}
+
+/// 从请求头取当前管理会话明文，供只保留当前会话的凭据更新使用。
+fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer)
 }
 
 /// 提交后全量重载快照并原子替换，使新资源即时生效且与库一致。
@@ -3333,7 +3170,7 @@ fn validate_price(price: &Price) -> Result<(), AdminError> {
 }
 
 /// 管理面错误：全部以统一结构化 JSON 返回给调用方。
-enum AdminError {
+pub(super) enum AdminError {
     /// 请求体非法（400）：JSON 解析失败或字段校验失败。
     InvalidBody(String),
     /// 未认证（401）。
@@ -3418,5 +3255,10 @@ mod tests {
         let set: UserUpdate =
             serde_json::from_value(json!({ "rate_limit_rpm": 60 })).expect("数值应可解析");
         assert_eq!(set.rate_limit_rpm, Some(Some(60)), "数值表示设值");
+    }
+
+    #[test]
+    fn format_usd_micros_handles_i64_min_without_overflow() {
+        assert_eq!(format_usd_micros(i64::MIN), "-9223372036854.77");
     }
 }

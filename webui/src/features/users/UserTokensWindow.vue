@@ -39,22 +39,26 @@ const showSkeleton = computed(() => tokensQuery.isPending.value && !tokensQuery.
 const REMAINING_WARN_RATIO = 0.5;
 const REMAINING_DANGER_RATIO = 0.2;
 
-function quotaRatio(token: TokenView): number {
-  const total = token.settled_usd_micros + props.user.balance_usd_micros;
-  if (total <= 0) return 0;
-  return Math.min(1, Math.max(0, props.user.balance_usd_micros / total));
+function quotaRatio(token: TokenView): number | null {
+  const limit = token.limit_usd_micros;
+  if (limit === null || limit <= 0) return null;
+  return Math.min(1, Math.max(0, token.settled_usd_micros / limit));
 }
 
 function quotaColorClass(ratio: number): string {
-  if (ratio <= REMAINING_DANGER_RATIO) return 'bg-[var(--danger)]';
-  if (ratio <= REMAINING_WARN_RATIO) return 'bg-[var(--warn)]';
+  if (ratio >= 1 - REMAINING_DANGER_RATIO) return 'bg-[var(--danger)]';
+  if (ratio >= 1 - REMAINING_WARN_RATIO) return 'bg-[var(--warn)]';
   return 'bg-[var(--success)]';
 }
 
 function quotaLabel(token: TokenView): string {
+  const settled = formatUsdMicros(token.settled_usd_micros);
+  if (token.limit_usd_micros === null) {
+    return t('tokens.quotaUnlimitedUsage', { settled });
+  }
   return t('tokens.quotaUsage', {
-    settled: formatUsdMicros(token.settled_usd_micros),
-    balance: formatUsdMicros(props.user.balance_usd_micros),
+    settled,
+    limit: formatUsdMicros(token.limit_usd_micros),
   });
 }
 
@@ -136,18 +140,19 @@ const toggleMutation = useMutation({
                     <span data-testid="token-settled">{{
                       formatUsdFixed2(token.settled_usd_micros)
                     }}</span>
-                    <span data-testid="token-balance">{{
-                      formatUsdFixed2(user.balance_usd_micros)
-                    }}</span>
+                    <span v-if="token.limit_usd_micros !== null" data-testid="token-limit">
+                      / {{ formatUsdFixed2(token.limit_usd_micros) }}
+                    </span>
                   </div>
                   <div
+                    v-if="quotaRatio(token) !== null"
                     class="bg-surface-alt h-1.5 w-full overflow-hidden rounded-full"
                     data-testid="token-quota-track"
                   >
                     <div
                       class="h-full rounded-full transition-[width]"
-                      :class="quotaColorClass(quotaRatio(token))"
-                      :style="{ width: `${quotaRatio(token) * 100}%` }"
+                      :class="quotaColorClass(quotaRatio(token) ?? 0)"
+                      :style="{ width: `${(quotaRatio(token) ?? 0) * 100}%` }"
                     />
                   </div>
                 </div>

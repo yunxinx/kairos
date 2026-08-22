@@ -4,6 +4,7 @@
 //! root 不能删除、禁用或降级（ADR-0009）。
 
 use std::collections::HashSet;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -310,6 +311,24 @@ pub async fn get_user(pool: &SqlitePool, id: i64) -> Result<Option<UserRecord>, 
     row.as_ref().map(map_user_row).transpose()
 }
 
+/// 按 id 读用户，包含已经归档的行。
+///
+/// 仅供历史财务归属与审计使用；认证、快照和日常管理列表必须继续走 [`get_user`]，
+/// 避免把归档账户重新暴露为可用主体。
+pub async fn get_user_including_archived(
+    pool: &SqlitePool,
+    id: i64,
+) -> Result<Option<UserRecord>, StoreError> {
+    let row = sqlx::query(
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    row.as_ref().map(map_user_row).transpose()
+}
+
 /// 按邮箱读用户；不存在返回 `None`。
 pub async fn get_user_by_email(
     pool: &SqlitePool,
@@ -573,9 +592,19 @@ pub async fn password_matches(
     user_id: i64,
     password: &str,
 ) -> Result<bool, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    password_matches_on_conn(&mut conn, user_id, password).await
+}
+
+/// 在现有连接上校验当前口令，供凭据更新事务复用同一连接。
+pub async fn password_matches_on_conn(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    password: &str,
+) -> Result<bool, StoreError> {
     let row = sqlx::query("SELECT password_hash FROM users WHERE id = ? AND deleted_at IS NULL")
         .bind(user_id)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
     let Some(row) = row else {
@@ -859,8 +888,10 @@ pub async fn issue_session(
 pub enum SessionLookup {
     /// 会话有效，用户可用。
     Valid(UserRecord),
-    /// 形态不符或查不到该哈希：可能在猜，计入认证失败限流。
+    /// 形态正确但查不到该哈希：可能在猜，计入认证失败限流。
     Unknown,
+    /// 缺失、前缀错误或形态错误，不查询数据库也不计入认证失败限流。
+    Malformed,
     /// 会话确实存在，但已过期/被吊销/用户已停用或归档：不计入限流。
     Inactive,
 }
@@ -871,16 +902,23 @@ pub async fn user_for_session(
     session_token: &str,
     now: i64,
 ) -> Result<SessionLookup, StoreError> {
-    if !session_token.starts_with(SESSION_TOKEN_PREFIX) {
-        return Ok(SessionLookup::Unknown);
+    let Some(suffix) = session_token.strip_prefix(SESSION_TOKEN_PREFIX) else {
+        return Ok(SessionLookup::Malformed);
+    };
+    if suffix.len() != 64
+        || !suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Ok(SessionLookup::Malformed);
     }
     let token_hash = hash_session_token(session_token);
     let row = sqlx::query(
         "SELECT u.id, u.email, u.display_name, u.role, u.enabled, u.avatar, u.rate_limit_rpm, \
-                s.expires_at, s.revoked \
+                u.deleted_at, s.expires_at, s.revoked \
          FROM management_sessions s \
          JOIN users u ON u.id = s.user_id \
-         WHERE s.token_hash = ? AND u.deleted_at IS NULL",
+         WHERE s.token_hash = ?",
     )
     .bind(&token_hash)
     .fetch_optional(pool)
@@ -892,7 +930,8 @@ pub async fn user_for_session(
     let revoked: i64 = row.try_get("revoked").map_err(StoreError::Query)?;
     let expires_at: i64 = row.try_get("expires_at").map_err(StoreError::Query)?;
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
-    if revoked != 0 || expires_at <= now || enabled == 0 {
+    let deleted_at: Option<i64> = row.try_get("deleted_at").map_err(StoreError::Query)?;
+    if revoked != 0 || expires_at <= now || enabled == 0 || deleted_at.is_some() {
         return Ok(SessionLookup::Inactive);
     }
     Ok(SessionLookup::Valid(map_user_row(&row)?))
@@ -940,6 +979,28 @@ pub async fn purge_expired_sessions(pool: &SqlitePool, now: i64) -> Result<u64, 
             .await
             .map_err(StoreError::Query)?;
     Ok(result.rows_affected())
+}
+
+/// 每日清理过期或已吊销的管理会话。
+///
+/// 首次清理由进程启动路径同步执行；循环先等待一天，避免启动时重复清理。
+pub async fn run_session_cleanup_loop(pool: SqlitePool) {
+    const CLEANUP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+    loop {
+        tokio::time::sleep(CLEANUP_INTERVAL).await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        if let Err(err) = purge_expired_sessions(&pool, now).await {
+            crate::store::record_system_error(
+                &pool,
+                "auth",
+                &format!("管理会话定时清理失败: {err}"),
+            )
+            .await;
+        }
+    }
 }
 
 /// 吊销会话；不存在视为成功。

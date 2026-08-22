@@ -2435,6 +2435,134 @@ async fn unsettled_log_can_be_settled_or_waived() {
     assert_eq!(after_waive.0, 4_000_000, "豁免不应再扣余额");
 }
 
+/// 历史补扣使用日志冻结的用户归属：令牌删除、用户归档都不能抹掉待结算费用。
+#[tokio::test]
+async fn unsettled_log_survives_token_deletion_and_user_archival() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "historical-debt@example.com",
+            "display_name": "历史欠费",
+            "password": "password1",
+            "role": "user"
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let user_id = created.json::<Value>().await.expect("用户应可解析")["id"]
+        .as_i64()
+        .expect("应有用户 id");
+    let recharge = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        &format!("/users/{user_id}/balance"),
+        json!({ "delta_usd_micros": 5_000_000 }),
+    )
+    .await;
+    assert_eq!(recharge.status(), reqwest::StatusCode::OK);
+
+    let session = reqwest::Client::new()
+        .post(format!("{}/login", gw.admin_base_url()))
+        .json(&json!({
+            "email": "historical-debt@example.com",
+            "password": "password1"
+        }))
+        .send()
+        .await
+        .expect("登录应可达")
+        .json::<Value>()
+        .await
+        .expect("登录应可解析")["token"]
+        .as_str()
+        .expect("应有会话")
+        .to_string();
+    let token = reqwest::Client::new()
+        .post(format!("{}/tokens", gw.admin_base_url()))
+        .bearer_auth(&session)
+        .json(&json!({
+            "name": "temporary",
+            "model_group": "default",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("令牌创建应可达");
+    assert_eq!(token.status(), reqwest::StatusCode::CREATED);
+    let token: Value = token.json().await.expect("令牌应可解析");
+    let token_id = token["id"].as_i64().expect("应有令牌 id");
+    let token_key = token["token_key"].as_str().expect("应有令牌 key");
+
+    let mut log = store::RequestLog {
+        id: 0,
+        created_at: 1,
+        token_name: "temporary".to_string(),
+        token_key: token_key.to_string(),
+        user_id,
+        inbound_protocol: "openai_chat".to_string(),
+        model: "m".to_string(),
+        outbound_model: None,
+        channel: "c".to_string(),
+        status_code: 200,
+        latency_ms: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        price: kairos::core::billing::PriceSnapshot::default(),
+        cost_usd_micros: 1_000_000,
+        settled: false,
+        request_id: None,
+        request_body: None,
+        response_body: None,
+    };
+    let deleted_token_log = store::insert_request_log(&gw.pool, &log)
+        .await
+        .expect("应能写日志");
+    log.created_at = 2;
+    let archived_user_log = store::insert_request_log(&gw.pool, &log)
+        .await
+        .expect("应能写日志");
+
+    let deleted = reqwest::Client::new()
+        .delete(format!("{}/tokens/{token_id}", gw.admin_base_url()))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("令牌删除应可达");
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+
+    for log_id in [deleted_token_log, archived_user_log] {
+        if log_id == archived_user_log {
+            let archived = reqwest::Client::new()
+                .delete(format!("{}/users/{user_id}", gw.admin_base_url()))
+                .bearer_auth(&gw.session)
+                .send()
+                .await
+                .expect("归档应可达");
+            assert_eq!(archived.status(), reqwest::StatusCode::NO_CONTENT);
+        }
+        let settled = reqwest::Client::new()
+            .post(format!("{}/logs/{log_id}/settle", gw.admin_base_url()))
+            .bearer_auth(&gw.session)
+            .send()
+            .await
+            .expect("补扣应可达");
+        assert_eq!(settled.status(), reqwest::StatusCode::OK);
+    }
+
+    let wallet: (i64, i64) = sqlx::query_as(
+        "SELECT balance_usd_micros, settled_usd_micros FROM user_balance WHERE user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("归档钱包应保留");
+    assert_eq!(wallet, (3_000_000, 2_000_000));
+}
+
 /// 全局 RPM 兜底拦住未单独配置的令牌；令牌显式 `0` 可超过全局上限。
 #[tokio::test]
 async fn token_rate_limit_uses_global_fallback_and_token_override() {

@@ -523,13 +523,16 @@ async fn changing_password_revokes_other_sessions() {
         StatusCode::OK
     );
 
-    // 用 session1 改密码：session1 保留，session2 被吊销。
+    // 用自助端点改密码：必须校验当前密码；session1 保留，session2 被吊销。
     let changed = json_req(
         &gw,
         &session1,
         reqwest::Method::PUT,
-        &format!("/users/{user_id}"),
-        json!({ "password": "new-password" }),
+        "/me",
+        json!({
+            "password": "new-password",
+            "current_password": "password1"
+        }),
     )
     .await;
     assert_eq!(changed.status(), StatusCode::OK);
@@ -544,6 +547,36 @@ async fn changing_password_revokes_other_sessions() {
         StatusCode::UNAUTHORIZED,
         "其他会话应被吊销"
     );
+
+    // 邮箱变更同样吊销随后签发的其它会话，并留下当前会话。
+    let session3 = login(&gw, "pwd@example.com", "new-password").await;
+    let renamed = json_req(
+        &gw,
+        &session1,
+        reqwest::Method::PUT,
+        "/me",
+        json!({ "email": "pwd-renamed@example.com" }),
+    )
+    .await;
+    assert_eq!(renamed.status(), StatusCode::OK);
+    assert_eq!(
+        get_req(&gw, &session1, "/me").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_req(&gw, &session3, "/me").await.status(),
+        StatusCode::UNAUTHORIZED,
+        "改邮箱也应吊销其它会话"
+    );
+    let audit: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM system_log WHERE target = 'users' AND actor_user_id = ? \
+         AND message LIKE '%修改自己的账户%' AND message LIKE '%email%'",
+    )
+    .bind(user_id)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("自助身份变更应写审计");
+    assert_eq!(audit.0, 1);
 }
 
 /// 会话过期不计入认证失败限流：这是每 8 小时必然发生一次的正常事件。
@@ -580,9 +613,9 @@ async fn expired_session_does_not_count_toward_rate_limit() {
     assert_eq!(login.status(), StatusCode::OK, "过期会话不应计入限流");
 }
 
-/// 登录时顺带清理已过期或已吊销的会话行。
+/// 维护任务可独立清理已过期或已吊销的会话行，不依赖后续登录。
 #[tokio::test]
-async fn login_purges_expired_and_revoked_sessions() {
+async fn expired_and_revoked_sessions_can_be_purged_independently() {
     let gw = TestGateway::start_with_admin(common::empty_seed).await;
     let (user_id, _) = create_role(&gw, "gc@example.com", "user").await;
 
@@ -608,21 +641,39 @@ async fn login_purges_expired_and_revoked_sessions() {
         .expect("应能统计");
     assert_eq!(before.0, 5, "3 条手写 + root 的 + create_role 时登录的");
 
-    // 登录：触发 GC。
-    let login = reqwest::Client::new()
-        .post(format!("{}/login", gw.admin_base_url()))
-        .json(&json!({ "email": "gc@example.com", "password": "password1" }))
-        .send()
+    let removed = kairos::store::users::purge_expired_sessions(&gw.pool, now)
         .await
-        .expect("应可登录");
-    assert_eq!(login.status(), StatusCode::OK);
+        .expect("维护清理应成功");
+    assert_eq!(removed, 2);
 
     let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM management_sessions")
         .fetch_one(&gw.pool)
         .await
         .expect("应能统计");
     assert_eq!(
-        after.0, 4,
-        "过期的 1 条 + 吊销的 1 条被清理，留下正常的 1 条 + root 的 + create_role 的 + 本次登录的"
+        after.0, 3,
+        "过期的 1 条 + 吊销的 1 条被清理，留下正常的 1 条 + root 与用户的现有会话"
+    );
+}
+
+/// 用户批量视图不能把缺失钱包伪装成零余额。
+#[tokio::test]
+async fn users_list_reports_missing_wallet_as_corruption() {
+    let gw = TestGateway::start_with_admin(common::empty_seed).await;
+    let (user_id, _) = create_role(&gw, "broken-wallet@example.com", "user").await;
+    sqlx::query("DELETE FROM user_balance WHERE user_id = ?")
+        .bind(user_id)
+        .execute(&gw.pool)
+        .await
+        .expect("应能构造缺失钱包");
+
+    let response = get_req(&gw, &gw.session, "/users").await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: Value = response.json().await.expect("错误应可解析");
+    assert_eq!(body["error"]["code"], "store_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("缺少钱包"))
     );
 }

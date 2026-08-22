@@ -293,42 +293,67 @@ pub async fn settle_charge(
     token_key: &str,
     cost_usd_micros: i64,
 ) -> Result<TokenBalance, StoreError> {
+    let user_id: Option<i64> = sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = ?")
+        .bind(token_key)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    let user_id = user_id.ok_or_else(|| StoreError::MissingToken(token_key.to_string()))?;
+    apply_charge(conn, user_id, token_key, cost_usd_micros, true).await?;
+
+    get_token_balance(conn, token_key)
+        .await?
+        .ok_or(StoreError::MissingToken(token_key.to_string()))
+}
+
+/// 向指定用户钱包结算，并在令牌仍存在时累计令牌结算额。
+///
+/// `require_token` 只供在线请求结算使用；历史日志已经冻结 `user_id`，令牌删除后仍须
+/// 能补扣钱包，因此历史路径把令牌累计视为可选的附属更新。
+async fn apply_charge(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    token_key: &str,
+    cost_usd_micros: i64,
+    require_token: bool,
+) -> Result<(), StoreError> {
     let updated = sqlx::query(
         "UPDATE user_balance \
          SET balance_usd_micros = balance_usd_micros - ?, \
              settled_usd_micros = settled_usd_micros + ? \
-         WHERE user_id = (SELECT user_id FROM tokens WHERE token_key = ?)",
+         WHERE user_id = ?",
     )
     .bind(cost_usd_micros)
     .bind(cost_usd_micros)
-    .bind(token_key)
+    .bind(user_id)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
     if updated.rows_affected() == 0 {
-        return Err(StoreError::MissingToken(token_key.to_string()));
+        return Err(StoreError::MissingWallet(user_id));
     }
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0);
-    sqlx::query(
+    let token_updated = sqlx::query(
         "INSERT INTO token_balance (token_key, settled_usd_micros, created_at) \
-         VALUES (?, ?, ?) \
+         SELECT token_key, ?, ? FROM tokens WHERE token_key = ? AND user_id = ? \
          ON CONFLICT(token_key) DO UPDATE SET \
            settled_usd_micros = settled_usd_micros + excluded.settled_usd_micros",
     )
-    .bind(token_key)
     .bind(cost_usd_micros)
     .bind(created_at)
+    .bind(token_key)
+    .bind(user_id)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
-
-    get_token_balance(conn, token_key)
-        .await?
-        .ok_or(StoreError::MissingToken(token_key.to_string()))
+    if require_token && token_updated.rows_affected() == 0 {
+        return Err(StoreError::MissingToken(token_key.to_string()));
+    }
+    Ok(())
 }
 
 /// 读用户钱包。插入用户时同步建行；缺失视为数据损坏。
@@ -364,31 +389,47 @@ pub async fn list_user_wallets(pool: &SqlitePool) -> Result<HashMap<i64, (i64, i
     Ok(wallets)
 }
 
-/// 相对调整用户钱包：充值传正数、扣减传负数。返回 `(剩余, 用户累计结算)`。
+/// 一次用户钱包相对调整产生的事实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalanceChange {
+    pub before_usd_micros: i64,
+    pub after_usd_micros: i64,
+    pub settled_usd_micros: i64,
+}
+
+/// 相对调整用户钱包：充值传正数、扣减传负数。
+///
+/// 前后值来自同一条原子 `UPDATE ... RETURNING`，调用方可直接用于审计，不需要在
+/// 事务外预读一个可能已过时的钱包快照。
 pub async fn adjust_user_balance(
     conn: &mut SqliteConnection,
     user_id: i64,
     delta_usd_micros: i64,
-) -> Result<(i64, i64), StoreError> {
-    let updated = sqlx::query(
-        "UPDATE user_balance SET balance_usd_micros = balance_usd_micros + ? WHERE user_id = ?",
+) -> Result<BalanceChange, StoreError> {
+    let row = sqlx::query(
+        "UPDATE user_balance SET balance_usd_micros = balance_usd_micros + ? \
+         WHERE user_id = ? RETURNING balance_usd_micros, settled_usd_micros",
     )
     .bind(delta_usd_micros)
     .bind(user_id)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::MissingWallet(user_id));
-    }
-    sqlx::query_as(
-        "SELECT balance_usd_micros, settled_usd_micros FROM user_balance WHERE user_id = ?",
-    )
-    .bind(user_id)
     .fetch_optional(&mut *conn)
     .await
-    .map_err(StoreError::Query)?
-    .ok_or(StoreError::MissingWallet(user_id))
+    .map_err(StoreError::Query)?;
+    let row = row.ok_or(StoreError::MissingWallet(user_id))?;
+    let after_usd_micros: i64 = row
+        .try_get("balance_usd_micros")
+        .map_err(StoreError::Query)?;
+    let settled_usd_micros: i64 = row
+        .try_get("settled_usd_micros")
+        .map_err(StoreError::Query)?;
+    let before_usd_micros = after_usd_micros
+        .checked_sub(delta_usd_micros)
+        .ok_or_else(|| StoreError::InvalidResource("余额调整超出整数范围".to_string()))?;
+    Ok(BalanceChange {
+        before_usd_micros,
+        after_usd_micros,
+        settled_usd_micros,
+    })
 }
 
 /// 全部令牌的累计结算额，供管理列表拼进读视图。
@@ -561,14 +602,24 @@ pub async fn settle_unsettled_log(
     conn: &mut SqliteConnection,
     id: i64,
 ) -> Result<UnsettledLogAction, StoreError> {
-    let Some((token_key, cost, settled)) = load_log_settlement(conn, id).await? else {
+    let Some((token_key, mut user_id, cost, settled)) = load_log_settlement(conn, id).await? else {
         return Ok(UnsettledLogAction::NotFound);
     };
     if settled {
         return Ok(UnsettledLogAction::AlreadySettled);
     }
     if cost > 0 {
-        settle_charge(conn, &token_key, cost).await?;
+        // 迁移前无法回填归属的存量行以 0 表示未知。仅这类行退回当前令牌关系；
+        // 新行始终以日志冻结的 user_id 为准，令牌删除也不会改变债务归属。
+        if user_id == 0 {
+            user_id = sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = ?")
+                .bind(&token_key)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(StoreError::Query)?
+                .ok_or_else(|| StoreError::MissingToken(token_key.clone()))?;
+        }
+        apply_charge(conn, user_id, &token_key, cost, false).await?;
     }
     mark_request_log_settled(conn, id).await?;
     Ok(UnsettledLogAction::Closed)
@@ -579,7 +630,7 @@ pub async fn waive_unsettled_log(
     conn: &mut SqliteConnection,
     id: i64,
 ) -> Result<UnsettledLogAction, StoreError> {
-    let Some((_, _, settled)) = load_log_settlement(conn, id).await? else {
+    let Some((_, _, _, settled)) = load_log_settlement(conn, id).await? else {
         return Ok(UnsettledLogAction::NotFound);
     };
     if settled {
@@ -593,23 +644,25 @@ pub async fn waive_unsettled_log(
 async fn load_log_settlement(
     conn: &mut SqliteConnection,
     id: i64,
-) -> Result<Option<(String, i64, bool)>, StoreError> {
-    let row =
-        sqlx::query("SELECT token_key, cost_usd_micros, settled FROM request_log WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(StoreError::Query)?;
+) -> Result<Option<(String, i64, i64, bool)>, StoreError> {
+    let row = sqlx::query(
+        "SELECT token_key, user_id, cost_usd_micros, settled FROM request_log WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
     let Some(row) = row else {
         return Ok(None);
     };
     let token_key: String = row.try_get("token_key").map_err(StoreError::Query)?;
+    let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
     let cost: i64 = row.try_get("cost_usd_micros").map_err(StoreError::Query)?;
     let settled = row
         .try_get::<i64, _>("settled")
         .map_err(StoreError::Query)?
         != 0;
-    Ok(Some((token_key, cost, settled)))
+    Ok(Some((token_key, user_id, cost, settled)))
 }
 
 async fn mark_request_log_settled(conn: &mut SqliteConnection, id: i64) -> Result<(), StoreError> {
@@ -1379,18 +1432,19 @@ mod tests {
             .await
             .expect("应能初始化余额");
 
-        let (balance, settled) = adjust_user_balance(&mut conn, resources::ROOT_USER_ID, 5_000_000)
+        let change = adjust_user_balance(&mut conn, resources::ROOT_USER_ID, 5_000_000)
             .await
             .expect("应能充值");
-        assert_eq!(balance, 15_000_000);
-        assert_eq!(settled, 0, "调账不动累计结算额");
+        assert_eq!(change.before_usd_micros, 10_000_000);
+        assert_eq!(change.after_usd_micros, 15_000_000);
+        assert_eq!(change.settled_usd_micros, 0, "调账不动累计结算额");
 
-        let (balance, settled) =
-            adjust_user_balance(&mut conn, resources::ROOT_USER_ID, -3_000_000)
-                .await
-                .expect("应能扣减");
-        assert_eq!(balance, 12_000_000);
-        assert_eq!(settled, 0);
+        let change = adjust_user_balance(&mut conn, resources::ROOT_USER_ID, -3_000_000)
+            .await
+            .expect("应能扣减");
+        assert_eq!(change.before_usd_micros, 15_000_000);
+        assert_eq!(change.after_usd_micros, 12_000_000);
+        assert_eq!(change.settled_usd_micros, 0);
 
         // 令牌视图读到的剩余就是所属用户的钱包。
         let view = get_token_balance(&mut conn, "sk-a")

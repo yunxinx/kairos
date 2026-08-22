@@ -48,6 +48,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // 会话维护属于进程生命周期，不应依赖下一次登录恰好发生。启动时先同步清理，
+    // 随后由独立的每日循环继续维护。
+    store::users::purge_expired_sessions(&pool, gateway::logging::unix_millis()).await?;
+    let session_cleanup_pool = pool.clone();
+    tokio::spawn(async move {
+        store::users::run_session_cleanup_loop(session_cleanup_pool).await;
+    });
     // 启动时从库加载全部运行时资源进内存快照；请求路径读快照，管理 API 写库后
     // 原子替换，使新资源即时生效。
     let snapshot = runtime::load_snapshot(&pool).await?;

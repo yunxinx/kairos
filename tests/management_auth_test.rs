@@ -267,6 +267,9 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
+    let user_id = created.json::<Value>().await.expect("用户应可解析")["id"]
+        .as_i64()
+        .expect("应有用户 id");
 
     let admin_created = bearer_json(
         &gw,
@@ -328,6 +331,29 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     .await;
     assert_eq!(user_creates.status(), StatusCode::FORBIDDEN);
 
+    let user_escalates_self = bearer_json(
+        &gw,
+        user_token,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "role": "root" }),
+    )
+    .await;
+    assert_eq!(user_escalates_self.status(), StatusCode::FORBIDDEN);
+
+    let user_resets_self_without_current = bearer_json(
+        &gw,
+        user_token,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "password": "stolen-session-reset" }),
+    )
+    .await;
+    assert_eq!(
+        user_resets_self_without_current.status(),
+        StatusCode::FORBIDDEN
+    );
+
     let admin_creates_admin = bearer_json(
         &gw,
         admin_token,
@@ -364,6 +390,34 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     assert_eq!(delete_last.status(), StatusCode::CONFLICT);
     let delete_body: Value = delete_last.json().await.expect("应可解析");
     assert_eq!(delete_body["error"]["code"], "last_root_protected");
+}
+
+/// 缺失或形态错误的凭证不是有效会话猜测，不应耗尽登录失败预算。
+#[tokio::test]
+async fn malformed_management_credentials_do_not_throttle_login() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    for _ in 0..10 {
+        let missing = reqwest::Client::new()
+            .get(admin_url(&gw, "/me"))
+            .send()
+            .await
+            .expect("请求应可达");
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let malformed = bearer_get(&gw, "not-a-session", "/me").await;
+        assert_eq!(malformed.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let login = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({
+            "email": common::TEST_ROOT_EMAIL,
+            "password": common::TEST_ROOT_PASSWORD
+        }))
+        .send()
+        .await
+        .expect("登录应可达");
+    assert_eq!(login.status(), StatusCode::OK);
 }
 
 #[tokio::test]
