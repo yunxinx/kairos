@@ -169,6 +169,18 @@ mod tests {
             .expect_err("应拒绝删除");
         assert!(matches!(err, StoreError::LastRootProtected));
     }
+
+    #[test]
+    fn rate_limit_rpm_rejects_values_outside_sqlite_integer_range() {
+        let max = u64::try_from(i64::MAX).expect("i64::MAX 应能转成 u64");
+        assert_eq!(
+            rate_limit_rpm_to_db(Some(max)).expect("边界值应可写"),
+            Some(i64::MAX)
+        );
+        assert!(rate_limit_rpm_to_db(Some(max + 1)).is_err());
+        assert!(rate_limit_rpm_to_db(Some(u64::MAX)).is_err());
+        assert!(rate_limit_rpm_from_db(Some(-1)).is_err());
+    }
 }
 
 /// 管理用户（不含密码哈希）。
@@ -180,6 +192,15 @@ pub struct UserRecord {
     pub role: ManagementRole,
     pub enabled: bool,
     pub avatar: Option<String>,
+    pub rate_limit_rpm: Option<u64>,
+}
+
+/// 快照加载所需的用户投影；不携带头像、邮箱等管理面字段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotUser {
+    pub id: i64,
+    pub role: ManagementRole,
+    pub enabled: bool,
     pub rate_limit_rpm: Option<u64>,
 }
 
@@ -350,6 +371,7 @@ fn map_user_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserRecord, StoreError>
     let role: String = row.try_get("role").map_err(StoreError::Query)?;
     let avatar: Option<String> = row.try_get("avatar").map_err(StoreError::Query)?;
     let rate_limit_rpm: Option<i64> = row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
+    let rate_limit_rpm = rate_limit_rpm_from_db(rate_limit_rpm)?;
     Ok(UserRecord {
         id: row.try_get("id").map_err(StoreError::Query)?,
         email: row.try_get("email").map_err(StoreError::Query)?,
@@ -357,7 +379,7 @@ fn map_user_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserRecord, StoreError>
         role: ManagementRole::parse(&role)?,
         enabled: enabled != 0,
         avatar,
-        rate_limit_rpm: rate_limit_rpm.and_then(|n| u64::try_from(n).ok()),
+        rate_limit_rpm,
     })
 }
 
@@ -381,7 +403,7 @@ pub async fn insert_user(
         return Err(StoreError::EmailTaken);
     }
     let password_hash = hash_password(new_user.password).await?;
-    let rpm_val = new_user.rate_limit_rpm.map(|n| n as i64);
+    let rpm_val = rate_limit_rpm_to_db(new_user.rate_limit_rpm)?;
     let result = sqlx::query(
         "INSERT INTO users (email, display_name, password_hash, role, enabled, created_at, rate_limit_rpm) \
          VALUES (?, ?, ?, ?, 1, ?, ?)",
@@ -438,9 +460,7 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError
 /// 不走 [`list_users`]：那个 SELECT 带 `avatar`（可能是 MB 级 base64 data URL），
 /// 而 `reload_and_swap` 在每次管理面写操作后都会重跑一遍全量快照加载——改一次渠道
 /// 价格就把所有用户的头像读出来再丢掉。
-pub async fn list_users_for_snapshot(
-    pool: &SqlitePool,
-) -> Result<Vec<(i64, ManagementRole, bool, Option<u64>)>, StoreError> {
+pub async fn list_users_for_snapshot(pool: &SqlitePool) -> Result<Vec<SnapshotUser>, StoreError> {
     let rows =
         sqlx::query("SELECT id, role, enabled, rate_limit_rpm FROM users WHERE deleted_at IS NULL")
             .fetch_all(pool)
@@ -452,12 +472,12 @@ pub async fn list_users_for_snapshot(
         let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
         let rate_limit_rpm: Option<i64> =
             row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
-        out.push((
-            row.try_get("id").map_err(StoreError::Query)?,
-            ManagementRole::parse(&role)?,
-            enabled != 0,
-            rate_limit_rpm.and_then(|n| u64::try_from(n).ok()),
-        ));
+        out.push(SnapshotUser {
+            id: row.try_get("id").map_err(StoreError::Query)?,
+            role: ManagementRole::parse(&role)?,
+            enabled: enabled != 0,
+            rate_limit_rpm: rate_limit_rpm_from_db(rate_limit_rpm)?,
+        });
     }
     Ok(out)
 }
@@ -844,7 +864,7 @@ pub async fn set_rate_limit_rpm(
     user_id: i64,
     rate_limit_rpm: Option<u64>,
 ) -> Result<(), StoreError> {
-    let rpm_val = rate_limit_rpm.map(|n| n as i64);
+    let rpm_val = rate_limit_rpm_to_db(rate_limit_rpm)?;
     let result = sqlx::query("UPDATE users SET rate_limit_rpm = ? WHERE id = ?")
         .bind(rpm_val)
         .bind(user_id)
@@ -855,6 +875,28 @@ pub async fn set_rate_limit_rpm(
         return Err(StoreError::UserNotFound(user_id));
     }
     Ok(())
+}
+
+/// 把 API 的无符号 RPM 安全转换成 SQLite 的有符号整数表示。
+fn rate_limit_rpm_to_db(rate_limit_rpm: Option<u64>) -> Result<Option<i64>, StoreError> {
+    rate_limit_rpm
+        .map(|rpm| {
+            i64::try_from(rpm).map_err(|_| {
+                StoreError::InvalidResource("rate_limit_rpm 超出数据库整数范围".to_string())
+            })
+        })
+        .transpose()
+}
+
+/// 把数据库整数还原成 API 的无符号 RPM；负值表示数据库已损坏，不能静默当作不限速。
+fn rate_limit_rpm_from_db(rate_limit_rpm: Option<i64>) -> Result<Option<u64>, StoreError> {
+    rate_limit_rpm
+        .map(|rpm| {
+            u64::try_from(rpm).map_err(|_| {
+                StoreError::InvalidResource("数据库中的 rate_limit_rpm 为负数".to_string())
+            })
+        })
+        .transpose()
 }
 
 /// 签发会话：返回明文令牌（只此一次）与过期时间（unix 毫秒）。
@@ -968,16 +1010,17 @@ pub async fn revoke_user_sessions(
     Ok(())
 }
 
-/// 删除已过期或已吊销的会话行，返回清理条数。
+/// 删除已失效且超过保留窗口的会话行，返回清理条数。
 ///
-/// 每次登录都新增一行，没有清理就只增不减。
+/// 失效行要保留一个会话 TTL：否则 GC 后同一枚旧 Bearer 会从 `Inactive` 重新变成
+/// `Unknown`，再次消耗认证失败限流。保留窗口结束后才允许彻底删除。
 pub async fn purge_expired_sessions(pool: &SqlitePool, now: i64) -> Result<u64, StoreError> {
-    let result =
-        sqlx::query("DELETE FROM management_sessions WHERE expires_at <= ? OR revoked != 0")
-            .bind(now)
-            .execute(pool)
-            .await
-            .map_err(StoreError::Query)?;
+    let retention_cutoff = now.saturating_sub(SESSION_TTL_MS);
+    let result = sqlx::query("DELETE FROM management_sessions WHERE expires_at <= ?")
+        .bind(retention_cutoff)
+        .execute(pool)
+        .await
+        .map_err(StoreError::Query)?;
     Ok(result.rows_affected())
 }
 

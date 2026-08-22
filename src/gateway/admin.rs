@@ -9,7 +9,7 @@
 //!
 //! 资源 CRUD（令牌/渠道/价格/模型组/统一模型）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
-//! 另承载设置读写（`/settings`）、令牌余额相对调整（`/tokens/{key}/balance`）、
+//! 另承载设置读写（`/settings`）、用户钱包相对调整（`/users/{id}/balance`）、
 //! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）、渠道连通性探测
 //! （`/channels/{id}/test`）与按渠道草稿拉取上游模型列表（`/channels/models`）。
 
@@ -25,7 +25,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use base64::prelude::{BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
@@ -45,6 +44,7 @@ use crate::{
 };
 
 use super::admin_auth::{self, AdminAuth, ManagementIdentity};
+use super::admin_logs::{get_log, query_logs, query_system_logs};
 use super::http::{OutboundAuth, extract_bearer};
 use super::protocol;
 use super::throttle::AuthThrottle;
@@ -541,13 +541,64 @@ async fn update_user(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, update.role)?;
+
+    let role_changed = match update.role {
+        Some(role) => role != target.role,
+        None => false,
+    };
+    let enabled_changed = match update.enabled {
+        Some(enabled) => enabled != target.enabled,
+        None => false,
+    };
+    let display_name_after = match update.display_name.as_deref() {
+        Some(raw) => {
+            let name = raw.trim();
+            if name.is_empty() {
+                return Err(AdminError::InvalidBody("display_name 不能为空".to_string()));
+            }
+            Some(name.to_string())
+        }
+        None => None,
+    };
+    let display_name_changed = display_name_after
+        .as_deref()
+        .filter(|name| *name != target.display_name)
+        .map(str::to_string);
+    let avatar_after = update.avatar.as_deref().map(|avatar| {
+        if avatar.trim().is_empty() {
+            None
+        } else {
+            Some(avatar.to_string())
+        }
+    });
+    let avatar_changed = match avatar_after.as_ref() {
+        Some(after) => target.avatar.as_deref() != after.as_deref(),
+        None => false,
+    };
+    let rpm_changed = match update.rate_limit_rpm {
+        Some(rpm) => rpm != target.rate_limit_rpm,
+        None => false,
+    };
+    let password_changed = update.password.is_some();
+
+    // 规范化后的目标值与当前记录相同时，直接返回，避免无意义的写入、审计和快照替换。
+    if !role_changed
+        && !enabled_changed
+        && !password_changed
+        && display_name_changed.is_none()
+        && !avatar_changed
+        && !rpm_changed
+    {
+        return Ok(Json(UserView::from_record(target)));
+    }
+
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
-    if let Some(role) = update.role {
+    if role_changed && let Some(role) = update.role {
         users::set_user_role(&mut tx, id, role)
             .await
             .map_err(map_user_store_err)?;
     }
-    if let Some(enabled) = update.enabled {
+    if enabled_changed && let Some(enabled) = update.enabled {
         users::set_user_enabled(&mut tx, id, enabled)
             .await
             .map_err(map_user_store_err)?;
@@ -566,42 +617,31 @@ async fn update_user(
             .await
             .map_err(map_user_store_err)?;
     }
-    let mut display_name_changed: Option<String> = None;
-    if let Some(display_name) = update.display_name.as_deref() {
-        let name = display_name.trim();
-        if name.is_empty() {
-            return Err(AdminError::InvalidBody("display_name 不能为空".to_string()));
-        }
+    if let Some(name) = display_name_changed.as_deref() {
         sqlx::query("UPDATE users SET display_name = ? WHERE id = ?")
             .bind(name)
             .bind(id)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        display_name_changed = Some(name.to_string());
     }
-    let avatar_changed = update.avatar.is_some();
-    if let Some(avatar) = update.avatar.as_deref() {
-        let avatar_val = if avatar.trim().is_empty() {
-            None
-        } else {
-            Some(avatar)
-        };
-        users::set_avatar(&mut tx, id, avatar_val)
+    if avatar_changed {
+        let avatar = avatar_after.as_ref().and_then(|avatar| avatar.as_deref());
+        users::set_avatar(&mut tx, id, avatar)
             .await
             .map_err(map_user_store_err)?;
     }
-    if let Some(rpm_update) = update.rate_limit_rpm {
+    if rpm_changed && let Some(rpm_update) = update.rate_limit_rpm {
         users::set_rate_limit_rpm(&mut tx, id, rpm_update)
             .await
             .map_err(map_user_store_err)?;
     }
     // 逐字段记变更前后值：审计要能回答「改了什么」，不只是「被改过」。
     let mut changes: Vec<String> = Vec::new();
-    if let Some(role) = update.role {
+    if role_changed && let Some(role) = update.role {
         changes.push(format!("role {} → {}", target.role.as_str(), role.as_str()));
     }
-    if let Some(enabled) = update.enabled {
+    if enabled_changed && let Some(enabled) = update.enabled {
         changes.push(format!("enabled {} → {}", target.enabled, enabled));
     }
     if password_changed {
@@ -616,7 +656,7 @@ async fn update_user(
     if avatar_changed {
         changes.push("更新头像".to_string());
     }
-    if let Some(rpm_update) = update.rate_limit_rpm {
+    if rpm_changed && let Some(rpm_update) = update.rate_limit_rpm {
         let before = target
             .rate_limit_rpm
             .map_or_else(|| "跟随全局".to_string(), |n| n.to_string());
@@ -926,7 +966,7 @@ async fn list_user_tokens(
     let records = store::resources::list_token_records_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
-    let settled = store::list_token_settled(&deps.pool)
+    let settled = store::list_token_settled_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(
@@ -972,7 +1012,8 @@ async fn reject_token_mutation(
 
 /// 除 `enabled` 外，定义字段必须与现有令牌一致（跨用户禁用不得改名/改绑/改限额）。
 fn disable_only_token_change(existing: &Token, next: &Token) -> bool {
-    next.token_key == existing.token_key
+    !next.enabled
+        && next.token_key == existing.token_key
         && next.name == existing.name
         && next.limit_usd_micros == existing.limit_usd_micros
         && next.rate_limit_rpm == existing.rate_limit_rpm
@@ -987,8 +1028,8 @@ pub(super) fn reject_user_management(
 ) -> Result<(), AdminError> {
     match actor.role() {
         ManagementRole::User => {
-            // 普通用户只能改自己，且不能改 role（本就不在 UserUpdate 里）。
-            if actor.user.id != target.id {
+            // 普通用户不能调用用户管理写接口，也不能借未来路由把自己升权。
+            if actor.user.id != target.id || new_role.is_some() {
                 return Err(AdminError::Forbidden);
             }
         }
@@ -1072,6 +1113,16 @@ async fn token_view(
     Ok(TokenView::from_record(record, settled))
 }
 
+async fn token_view_masked(
+    pool: &SqlitePool,
+    record: store::resources::TokenRecord,
+) -> Result<TokenView, AdminError> {
+    let settled = store::get_token_settled(pool, &record.token.token_key)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(TokenView::from_record_masked(record, settled))
+}
+
 /// 列出当前用户的令牌（按库生成 id 排序，保证确定性）。
 ///
 /// 直接读库而非快照：`last_used_at` 随请求路径刷新、不进快照，列表需要库内最新值。
@@ -1083,7 +1134,7 @@ async fn list_tokens(
     let records = store::resources::list_token_records_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
-    let settled = store::list_token_settled(&deps.pool)
+    let settled = store::list_token_settled_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(
@@ -1154,8 +1205,7 @@ async fn create_token(
     crate::store::resources::upsert_token(&mut tx, &token, now)
         .await
         .map_err(AdminError::Store)?;
-    // 令牌定义与累计结算行分离：新建时同步建零额结算行，并把后续充值记入所属用户钱包
-    // （`adjust_balance` 的 UPDATE 按令牌找用户，缺结算行仍可读钱包）。
+    // 令牌定义与累计结算行分离；新建时同步建零额结算行，后续请求路径可直接累计。
     crate::store::ensure_token_balance(&mut tx, &token.token_key, 0.0, now)
         .await
         .map_err(AdminError::Store)?;
@@ -1168,7 +1218,7 @@ async fn create_token(
     ))
 }
 
-/// 整体替换令牌（按路径 `token_key`，路径权威）：写库 + 换快照 + 返回新令牌。
+/// 整体替换令牌（按库生成的路径 `id`，路径权威）：写库 + 换快照 + 返回新令牌。
 ///
 /// 不存在则 404，不借 PUT 隐式创建（与 POST 只生成系统 key 对齐）。upsert 的冲突
 /// 分支不触碰创建时间与最后使用时间，属性编辑不重置生命周期元数据。
@@ -1181,9 +1231,10 @@ async fn update_token(
     let id = parse_token_id(&raw_id)?;
     let mut token = body.map_err(AdminError::bad_body)?.0;
     let existing = read_token_record(&deps, id).await?;
-    // key 由库内记录权威给出：请求体里的 `token_key`（含脱敏形态）一律忽略，
-    // 免得运营把界面上看到的掩码当真值写回来、把密钥改坏。
+    // 路径记录对 key 与归属拥有最终决定权：请求体里的 `token_key`（含脱敏形态）
+    // 和 `user_id` 一律忽略，既不允许把掩码当真值写回，也不允许借 PUT 改绑令牌。
     token.token_key = existing.token.token_key.clone();
+    token.user_id = existing.token.user_id;
     token.model_group = token.model_group.trim().to_string();
     reject_token_mutation(&deps, &identity, &existing, Some(&token)).await?;
     if existing.token.user_id == identity.user_id() {
@@ -1217,14 +1268,18 @@ async fn update_token(
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_token_record(&deps, id).await?;
-    Ok(Json(token_view(&deps.pool, updated).await?))
+    let view = if updated.token.user_id == identity.user_id() {
+        token_view(&deps.pool, updated).await?
+    } else {
+        token_view_masked(&deps.pool, updated).await?
+    };
+    Ok(Json(view))
 }
 
 /// 删除令牌：不存在则 404，否则删除并返回被删令牌。
 ///
-/// 同事务先删余额、后删令牌定义：`token_balance.token_key` 外键指向 `tokens`
-/// （ON DELETE CASCADE 兜底）；显式清理余额行，不依赖级联语义。余额行残留会
-/// 让同 key 重建的令牌复活旧余额。
+/// 同事务先删累计结算行、后删令牌定义：`token_balance.token_key` 外键指向
+/// `tokens`（ON DELETE CASCADE 兜底）；显式清理结算行，不依赖级联语义。
 async fn delete_token(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
@@ -1867,7 +1922,7 @@ struct CatalogQuery {
 }
 
 /// 把逗号分隔的查询参数拆成精确匹配列表；空段丢弃。
-fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
+pub(super) fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
     raw.unwrap_or("")
         .split(',')
         .map(str::trim)
@@ -1942,263 +1997,15 @@ fn catalog_err(err: catalog::CatalogError) -> AdminError {
     }
 }
 
-// --- 令牌余额调整 ---
+// --- 用户钱包调整 ---
 
 /// 余额调整请求体：`delta_usd_micros` 为相对量（正数充值、负数扣减）。
 ///
-/// 钱包记在用户上（ADR-0008），只经 `POST /users/{id}/balance` 调整。此前另有一个
-/// 按令牌寻址的 `/tokens/{key}/balance`：名为「令牌余额」实则改所属用户的钱包，
-/// 强化了 ADR-0008 要消除的「令牌自带钱包」心智模型，已删除。
+/// 钱包记在用户上（ADR-0008），只经 `POST /users/{id}/balance` 调整。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BalanceAdjustment {
     delta_usd_micros: i64,
-}
-
-// --- 请求日志查询 ---
-
-/// `/logs` 查询参数：全部过滤维度可选，缺省即不限。
-///
-/// `deny_unknown_fields`：参数拼写错误若被静默忽略，会返回未过滤的结果误导运营，
-/// 与 body 契约拒绝未知字段的决策一致。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LogQueryParams {
-    token_key: Option<String>,
-    token_name: Option<String>,
-    model: Option<String>,
-    channel: Option<String>,
-    keyword: Option<String>,
-    from_created_at: Option<i64>,
-    to_created_at: Option<i64>,
-    settled: Option<bool>,
-    inbound_protocol: Option<String>,
-    sort_by: Option<store::RequestLogSortBy>,
-    sort_dir: Option<store::SortDir>,
-    page: Option<u64>,
-    page_size: Option<u64>,
-}
-
-/// 请求日志条目 wire 契约：完整 body 以 base64 编码（二进制安全）。
-///
-/// `GET /logs` 列表不读 BLOB，`request_body` / `response_body` 为 null；
-/// `GET /logs/{id}` 才返回落库的 body。
-#[derive(Debug, Serialize)]
-pub(super) struct LogEntry {
-    id: i64,
-    created_at: i64,
-    token_name: String,
-    token_key: String,
-    inbound_protocol: String,
-    model: String,
-    outbound_model: Option<String>,
-    channel: String,
-    status_code: i64,
-    latency_ms: i64,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_write_tokens: u64,
-    input_price_usd_micros: i64,
-    output_price_usd_micros: i64,
-    cache_read_price_usd_micros: i64,
-    cache_write_price_usd_micros: i64,
-    cost_usd_micros: i64,
-    /// 费用是否已写入 `token_balance`。
-    settled: bool,
-    request_body: Option<String>,
-    response_body: Option<String>,
-}
-
-impl LogEntry {
-    /// 从存储行构造 wire 条目；完整 body 字节以 base64 编码；令牌 key 按 UI 同款规则脱敏。
-    pub(super) fn from_store_log(log: store::RequestLog) -> Self {
-        Self {
-            id: log.id,
-            created_at: log.created_at,
-            token_name: log.token_name,
-            token_key: mask_token_key(&log.token_key),
-            inbound_protocol: log.inbound_protocol,
-            model: log.model,
-            outbound_model: log.outbound_model,
-            channel: log.channel,
-            status_code: log.status_code,
-            latency_ms: log.latency_ms,
-            input_tokens: log.input_tokens,
-            output_tokens: log.output_tokens,
-            cache_read_tokens: log.cache_read_tokens,
-            cache_write_tokens: log.cache_write_tokens,
-            input_price_usd_micros: log.price.input_micros,
-            output_price_usd_micros: log.price.output_micros,
-            cache_read_price_usd_micros: log.price.cache_read_micros,
-            cache_write_price_usd_micros: log.price.cache_write_micros,
-            cost_usd_micros: log.cost_usd_micros,
-            settled: log.settled,
-            request_body: log.request_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
-            response_body: log.response_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
-        }
-    }
-}
-
-/// 分页响应：本页条目 + 实际采用的页码/每页条数 + 满足过滤的总数。
-#[derive(Debug, Serialize)]
-struct LogPage {
-    items: Vec<LogEntry>,
-    page: u64,
-    page_size: u64,
-    total: u64,
-    /// 当前过滤条件下 `settled = false` 的条数（忽略 settled 查询维）。
-    unsettled_total: u64,
-}
-
-/// 分页查询请求日志（缺省时间倒序），按令牌 key/名、模型、渠道、综合关键字、时间范围过滤，只读。
-///
-/// `page`/`page_size` 缺省 1/20；`page_size` 上限 200（由存储层夹取），响应的
-/// `page`/`page_size` 反映实际采用值。非法查询参数（如非数字页码）返回结构化 400。
-async fn query_logs(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    query: Result<Query<LogQueryParams>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<LogPage>, AdminError> {
-    let params = query
-        .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
-        .0;
-    let mut filter =
-        store::RequestLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
-    // 归属范围由会话身份决定，不接受查询参数覆盖：普通用户改不了自己的可见面。
-    filter.user_id = identity.owner_scope();
-    filter.token_key = params.token_key;
-    filter.token_name = params.token_name;
-    filter.model = params.model;
-    filter.channel = params.channel;
-    filter.keyword = params.keyword.filter(|keyword| !keyword.trim().is_empty());
-    filter.from_created_at = params.from_created_at;
-    filter.to_created_at = params.to_created_at;
-    filter.settled = params.settled;
-    filter.inbound_protocols = parse_comma_list(params.inbound_protocol.as_deref());
-    filter.sort_by = params.sort_by.unwrap_or_default();
-    filter.sort_dir = params.sort_dir.unwrap_or_default();
-
-    let (rows, total, unsettled_total) = store::query_request_log_page(&deps.pool, &filter)
-        .await
-        .map_err(AdminError::Store)?;
-    Ok(Json(LogPage {
-        items: rows.into_iter().map(LogEntry::from_store_log).collect(),
-        page: filter.page,
-        page_size: filter.page_size,
-        total,
-        unsettled_total,
-    }))
-}
-
-/// 按 id 读取一条请求日志（含 body）。不存在、id 非法或不属于本人一律 404。
-///
-/// 越权按「不存在」而非 403 应答：403 会确认该 id 存在，让普通用户能靠遍历 id
-/// 摸出全站的流量规模。
-async fn get_log(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(raw): Path<String>,
-) -> Result<Json<LogEntry>, AdminError> {
-    let id = parse_log_id(&raw)?;
-    let log = store::get_request_log(&deps.pool, id)
-        .await
-        .map_err(AdminError::Store)?
-        .filter(|log| {
-            identity
-                .owner_scope()
-                .is_none_or(|owner| owner == log.user_id)
-        })
-        .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
-    Ok(Json(LogEntry::from_store_log(log)))
-}
-
-/// 解析路径中的日志 id；非整数视为不存在。
-pub(super) fn parse_log_id(raw: &str) -> Result<i64, AdminError> {
-    raw.parse()
-        .map_err(|_| AdminError::NotFound(format!("日志 {raw} 不存在")))
-}
-
-/// `/system-logs` 查询参数：关键字、时间窗、级别与目标可选。
-///
-/// `level` / `target` 为逗号分隔列表；axum 标准 `Query` 不会把重复键收成 `Vec`。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SystemLogQueryParams {
-    keyword: Option<String>,
-    from_created_at: Option<i64>,
-    to_created_at: Option<i64>,
-    level: Option<String>,
-    target: Option<String>,
-    actor_user_id: Option<i64>,
-    sort_by: Option<store::SystemLogSortBy>,
-    sort_dir: Option<store::SortDir>,
-    page: Option<u64>,
-    page_size: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-struct SystemLogEntry {
-    id: i64,
-    created_at: i64,
-    level: String,
-    target: String,
-    message: String,
-    /// 操作者；系统自身产生的运维事件为 null。
-    actor_user_id: Option<i64>,
-    actor_email: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SystemLogPage {
-    items: Vec<SystemLogEntry>,
-    page: u64,
-    page_size: u64,
-    total: u64,
-    /// 当前关键字/时间/级别下出现过的 target，供分面筛选。
-    targets: Vec<String>,
-}
-
-/// 分页查询系统日志（缺省时间倒序）。
-async fn query_system_logs(
-    State(deps): State<AdminDeps>,
-    query: Result<Query<SystemLogQueryParams>, axum::extract::rejection::QueryRejection>,
-) -> Result<Json<SystemLogPage>, AdminError> {
-    let params = query
-        .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
-        .0;
-    let mut filter =
-        store::SystemLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
-    filter.keyword = params.keyword.filter(|keyword| !keyword.trim().is_empty());
-    filter.from_created_at = params.from_created_at;
-    filter.to_created_at = params.to_created_at;
-    filter.levels = parse_comma_list(params.level.as_deref());
-    filter.targets = parse_comma_list(params.target.as_deref());
-    filter.actor_user_id = params.actor_user_id;
-    filter.sort_by = params.sort_by.unwrap_or_default();
-    filter.sort_dir = params.sort_dir.unwrap_or_default();
-    let page = store::query_system_log_page(&deps.pool, &filter)
-        .await
-        .map_err(AdminError::Store)?;
-    Ok(Json(SystemLogPage {
-        items: page
-            .items
-            .into_iter()
-            .map(|log| SystemLogEntry {
-                id: log.id,
-                created_at: log.created_at,
-                level: log.level,
-                target: log.target,
-                message: log.message,
-                actor_user_id: log.actor_user_id,
-                actor_email: log.actor_email,
-            })
-            .collect(),
-        page: filter.page,
-        page_size: filter.page_size,
-        total: page.total,
-        targets: page.targets,
-    }))
 }
 
 // --- stats 聚合 ---
@@ -3055,12 +2862,12 @@ fn reject_non_http_url(raw: &str) -> Result<(), AdminError> {
     }
 }
 
-/// 与 Web UI `maskTokenKey` 同款：按 Unicode 标量计长度，大于 16 时保留前后 8 个字符。
-fn mask_token_key(key: &str) -> String {
+/// 与 Web UI `maskTokenKey` 同款：长 key 保留前后 8 个字符，短 key 完全掩码。
+pub(super) fn mask_token_key(key: &str) -> String {
     const EDGE: usize = 8;
     let chars: Vec<char> = key.chars().collect();
     if chars.len() <= EDGE * 2 {
-        key.to_string()
+        "******".to_string()
     } else {
         let prefix: String = chars[..EDGE].iter().collect();
         let suffix: String = chars[chars.len() - EDGE..].iter().collect();
@@ -3260,5 +3067,33 @@ mod tests {
     #[test]
     fn format_usd_micros_handles_i64_min_without_overflow() {
         assert_eq!(format_usd_micros(i64::MIN), "-9223372036854.77");
+    }
+
+    #[test]
+    fn token_keys_are_always_masked_for_aggregate_views() {
+        assert_eq!(mask_token_key("sk-short"), "******");
+        assert_eq!(mask_token_key("0123456789abcdef"), "******");
+        assert_eq!(
+            mask_token_key("0123456789abcdefg"),
+            "01234567******9abcdefg"
+        );
+    }
+
+    #[test]
+    fn cross_owner_token_mutation_only_allows_disabling() {
+        let existing = Token {
+            token_key: "sk-owned".to_string(),
+            name: "owned".to_string(),
+            limit_usd_micros: None,
+            rate_limit_rpm: None,
+            enabled: true,
+            model_group: "default".to_string(),
+            user_id: 7,
+        };
+        let mut next = existing.clone();
+        next.enabled = false;
+        assert!(disable_only_token_change(&existing, &next));
+        next.enabled = true;
+        assert!(!disable_only_token_change(&existing, &next));
     }
 }

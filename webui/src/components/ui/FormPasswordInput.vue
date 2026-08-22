@@ -13,7 +13,7 @@ const props = defineProps<{
   invalid?: boolean;
   /** 校验失败时关联 `FormField` 气泡的 id。 */
   hintId?: string | undefined;
-  /** 锁定时按 `maskTokenKey` 展示（短密钥仍用 password 圆点，避免 ≤16 字符原样露出）。 */
+  /** 锁定时按 `maskTokenKey` 展示。 */
   maskWhileHidden?: boolean;
 }>();
 
@@ -22,12 +22,9 @@ const model = defineModel<string | number | null | undefined>();
 const { t } = useI18n();
 const visible = ref(false);
 
-/** 与 `maskTokenKey` 一致：不超过此前缀+后缀长度时掩码等于原文。 */
-const TOKEN_KEY_MASK_MIN = 16;
-
 const keyText = computed(() => String(model.value ?? ''));
 const showMaskedText = computed(
-  () => props.maskWhileHidden && !visible.value && keyText.value.length > TOKEN_KEY_MASK_MIN,
+  () => props.maskWhileHidden && !visible.value && keyText.value.length > 0,
 );
 const maskedDisplay = computed(() => maskTokenKey(keyText.value));
 const inputType = computed(() => (visible.value ? 'text' : 'password'));

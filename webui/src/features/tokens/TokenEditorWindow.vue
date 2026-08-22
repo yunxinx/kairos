@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // 令牌编辑器浮窗：只编辑令牌定义与启用开关。
 //
-// 不含余额：钱包记在所属用户上（ADR-0008），令牌不持有钱包。在这里放「本令牌余额」
-// 会让同一用户的每把令牌显示同一个数字、改一处动全部。充值统一在用户管理页。
+// 不含钱包余额：钱包记在所属用户上（ADR-0008），这里只编辑令牌定义与累计结算展示。
+// 充值统一在用户管理页，避免同一用户的每把令牌重复显示同一个钱包数字。
 import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';

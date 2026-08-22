@@ -319,7 +319,7 @@ export interface LogEntry {
   cache_read_price_usd_micros: number;
   cache_write_price_usd_micros: number;
   cost_usd_micros: number;
-  /** 费用是否已写入 token_balance。 */
+  /** 费用是否已完成所属用户钱包结算。 */
   settled: boolean;
   /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
   request_body: string | null;

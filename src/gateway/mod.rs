@@ -6,9 +6,10 @@
 mod admin;
 mod admin_auth;
 mod admin_billing;
+mod admin_logs;
 mod failover;
 mod http;
-pub mod logging;
+mod logging;
 mod protocol;
 mod rate_limit;
 mod routing;
@@ -18,4 +19,5 @@ mod webui;
 
 pub use admin::router as admin_router;
 pub use http::{Deps, router};
+pub use logging::unix_millis;
 pub use webui::is_available as webui_available;

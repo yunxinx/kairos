@@ -92,6 +92,19 @@ async fn user_and_balance_mutations_are_audited() {
     .await;
     assert_eq!(disabled.status(), StatusCode::OK);
 
+    // 重复提交已经生效的值不应制造伪变更或新的审计行。
+    let before_noop = audit_rows(&gw).await.len();
+    let noop = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(noop.status(), StatusCode::OK);
+    assert_eq!(audit_rows(&gw).await.len(), before_noop);
+
     // 纯读取：不应产生审计行。
     let before_reads = audit_rows(&gw).await.len();
     admin_get(&gw, &gw.session, "/users").await;

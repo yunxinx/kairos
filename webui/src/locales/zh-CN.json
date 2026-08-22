@@ -556,7 +556,7 @@
     "waiveCharge": "豁免",
     "settleSuccess": "已按日志费用补扣并结算",
     "waiveSuccess": "已豁免，未扣余额",
-    "settleGuide": "按该行费用扣减令牌余额，允许透支。",
+    "settleGuide": "按该行费用扣减所属用户钱包，允许透支。",
     "waiveGuide": "只把该行标为已结算，不改余额。",
     "levelFilter": "级别",
     "targetFilter": "目标",

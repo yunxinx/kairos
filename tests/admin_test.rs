@@ -2171,7 +2171,7 @@ async fn alias_logs_inbound_and_outbound_model() {
     assert_eq!(entry["channel"], "test-channel");
 }
 
-/// GET `/logs` 对长令牌 key 按前 8 + `******` + 后 8 脱敏；短测试 key 保持明文。
+/// GET `/logs` 对长令牌 key 按前 8 + `******` + 后 8 脱敏，短 key 也全量掩码。
 #[tokio::test]
 async fn logs_redact_long_token_keys() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
@@ -2228,6 +2228,48 @@ async fn logs_redact_long_token_keys() {
     );
     assert!(!masked.contains(&"a".repeat(20)), "中间明文不应出现");
     assert_eq!(long_entry["settled"], true);
+
+    let short_key = "sk-short";
+    store::insert_request_log(
+        &gw.pool,
+        &store::RequestLog {
+            id: 0,
+            created_at: 2,
+            token_name: "short".to_string(),
+            token_key: short_key.to_string(),
+            user_id: 1,
+            inbound_protocol: "openai_chat".to_string(),
+            model: "m".to_string(),
+            outbound_model: None,
+            channel: "c".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            price: kairos::core::billing::PriceSnapshot::default(),
+            cost_usd_micros: 0,
+            settled: true,
+            request_id: None,
+            request_body: None,
+            response_body: None,
+        },
+    )
+    .await
+    .expect("应能写短 key 日志");
+    let page: Value = admin_get(&gw, "/logs?page_size=10")
+        .await
+        .json()
+        .await
+        .expect("日志应可解析");
+    let short_entry = page["items"]
+        .as_array()
+        .expect("应有 items")
+        .iter()
+        .find(|item| item["token_name"] == "short")
+        .expect("应有短 key 行");
+    assert_eq!(short_entry["token_key"], "******");
 }
 
 /// GET `/logs` 按 Unicode 标量掩码多字节 token_key，不会按字节切片 panic。

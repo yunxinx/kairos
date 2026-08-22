@@ -2,7 +2,7 @@
 //!
 //! 本模块承载请求日志（`request_log`）、系统日志（`system_log`）、冒烟记录
 //! （`smoke_probe`）、管理用户钱包（`user_balance`）与令牌累计结算
-//! （`token_balance`）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats` 与
+//! （`token_balance`，只保存令牌累计结算）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats` 与
 //! `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
 pub mod catalog;
@@ -133,7 +133,7 @@ pub struct RequestLog {
     pub price: PriceSnapshot,
     /// 本次费用（micro-USD）。
     pub cost_usd_micros: i64,
-    /// 费用是否已写入 `token_balance`；结算失败时为 `false`，供对账补扣。
+    /// 费用是否已完成所属用户钱包结算；结算失败时为 `false`，供对账补扣。
     pub settled: bool,
     /// 一次下游入站请求的身份；同一请求的多次出站尝试共用。存量行可能为 `None`。
     pub request_id: Option<String>,
@@ -449,6 +449,31 @@ pub async fn list_token_settled(pool: &SqlitePool) -> Result<HashMap<String, i64
     Ok(settled)
 }
 
+/// 读取指定用户令牌的累计结算额，避免令牌列表为每个用户扫描整张结算表。
+pub async fn list_token_settled_for_user(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<HashMap<String, i64>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT tb.token_key, tb.settled_usd_micros \
+         FROM token_balance tb JOIN tokens t ON t.token_key = tb.token_key \
+         WHERE t.user_id = ?",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    let mut settled = HashMap::with_capacity(rows.len());
+    for row in rows {
+        settled.insert(
+            row.try_get("token_key").map_err(StoreError::Query)?,
+            row.try_get("settled_usd_micros")
+                .map_err(StoreError::Query)?,
+        );
+    }
+    Ok(settled)
+}
+
 /// 单令牌累计结算额；无结算行视为 0。
 pub async fn get_token_settled(pool: &SqlitePool, token_key: &str) -> Result<i64, StoreError> {
     sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
@@ -513,7 +538,7 @@ pub struct RequestLogQuery {
     pub from_created_at: Option<i64>,
     /// 只返回 `created_at <= to_created_at`。
     pub to_created_at: Option<i64>,
-    /// 按是否已写入 `token_balance` 过滤；`None` 表示不限。
+    /// 按是否已完成所属用户钱包结算过滤；`None` 表示不限。
     pub settled: Option<bool>,
     /// 精确匹配的入站协议；空表示不限。
     pub inbound_protocols: Vec<String>,

@@ -556,7 +556,7 @@
     "waiveCharge": "Waive",
     "settleSuccess": "Charged the log cost and marked settled",
     "waiveSuccess": "Waived without changing the balance",
-    "settleGuide": "Deduct this log's cost from the token balance. Overdraft is allowed.",
+    "settleGuide": "Deduct this log's cost from the owner's wallet. Overdraft is allowed.",
     "waiveGuide": "Mark this log settled without changing the balance.",
     "levelFilter": "Level",
     "targetFilter": "Target",

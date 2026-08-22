@@ -8,11 +8,9 @@ use axum::{Extension, Json, extract::Path, extract::State};
 use crate::store;
 use crate::store::users::{self, ManagementRole};
 
-use super::admin::{
-    AdminDeps, AdminError, LogEntry, db_err, format_usd_micros, parse_log_id,
-    reject_user_management,
-};
+use super::admin::{AdminDeps, AdminError, db_err, format_usd_micros, reject_user_management};
 use super::admin_auth::ManagementIdentity;
+use super::admin_logs::{LogEntry, parse_log_id};
 
 /// 对未结算日志补扣：按行上费用写入余额（允许透支），再标为已结算。
 pub(super) async fn settle_log(

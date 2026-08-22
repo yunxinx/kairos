@@ -182,6 +182,36 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     )
     .await;
     assert_eq!(disable.status(), StatusCode::OK);
+    let disabled_view: Value = disable.json().await.expect("禁用响应应可解析");
+    let disabled_key = disabled_view["token_key"]
+        .as_str()
+        .expect("禁用响应应有 key");
+    assert_ne!(disabled_key, mine_key, "跨归属操作不应回显明文 key");
+    assert!(
+        disabled_key.contains("******"),
+        "跨归属操作应返回脱敏 key，实际 {disabled_key}"
+    );
+
+    let enable = json_req(
+        &gw,
+        &admin_token,
+        reqwest::Method::PUT,
+        &format!("/tokens/{mine_id}"),
+        json!({
+            "token_key": mine_key,
+            "name": "mine",
+            "limit_usd_micros": null,
+            "rate_limit_rpm": null,
+            "enabled": true,
+            "model_group": "default"
+        }),
+    )
+    .await;
+    assert_eq!(
+        enable.status(),
+        StatusCode::FORBIDDEN,
+        "运营只能禁用普通用户令牌，不能重新启用"
+    );
 
     let rename = json_req(
         &gw,
@@ -222,6 +252,29 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
     )
     .await;
     assert_eq!(own_update.status(), StatusCode::OK);
+
+    // 更新契约不允许通过 body 改变令牌归属；路径对应的库记录才是权威。
+    let attempted_rebind = json_req(
+        &gw,
+        &admin_token,
+        reqwest::Method::PUT,
+        &format!("/tokens/{admin_token_id}"),
+        json!({
+            "token_key": admin_token_key,
+            "name": "admin-renamed",
+            "limit_usd_micros": null,
+            "enabled": true,
+            "user_id": user_id
+        }),
+    )
+    .await;
+    assert_eq!(attempted_rebind.status(), StatusCode::OK);
+    let owner_after: (i64,) = sqlx::query_as("SELECT user_id FROM tokens WHERE id = ?")
+        .bind(admin_token_id)
+        .fetch_one(&gw.pool)
+        .await
+        .expect("令牌应仍存在");
+    assert_eq!(owner_after.0, owner.0, "更新不得改令牌归属");
 
     let recharge_root = json_req(
         &gw,
@@ -587,13 +640,21 @@ async fn expired_session_does_not_count_toward_rate_limit() {
 
     // 手动把会话改成 1 秒后过期。
     sqlx::query("UPDATE management_sessions SET expires_at = ? WHERE token_hash = ?")
-        .bind(kairos::gateway::logging::unix_millis() + 1000)
+        .bind(kairos::gateway::unix_millis() + 1000)
         .bind(kairos::store::users::hash_session_token(&session))
         .execute(&gw.pool)
         .await
         .expect("应能改过期时间");
 
     std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // 普通 GC 只能清理超过保留窗口的失效行；当前这条仍需保留，以便旧 token
+    // 继续被识别为 Inactive，而不是退化成会计入限流的 Unknown。
+    let removed_early =
+        kairos::store::users::purge_expired_sessions(&gw.pool, kairos::gateway::unix_millis())
+            .await
+            .expect("维护清理应成功");
+    assert_eq!(removed_early, 0);
 
     // 连续用过期会话访问 10 次（认证失败上限是 5），每次都 401，但不触发限流。
     for _ in 0..10 {
@@ -611,6 +672,20 @@ async fn expired_session_does_not_count_toward_rate_limit() {
         .await
         .expect("应可登录");
     assert_eq!(login.status(), StatusCode::OK, "过期会话不应计入限流");
+
+    let (expires_at,): (i64,) =
+        sqlx::query_as("SELECT expires_at FROM management_sessions WHERE token_hash = ?")
+            .bind(kairos::store::users::hash_session_token(&session))
+            .fetch_one(&gw.pool)
+            .await
+            .expect("失效会话在保留窗口内应仍存在");
+    let removed_late = kairos::store::users::purge_expired_sessions(
+        &gw.pool,
+        expires_at + kairos::store::users::SESSION_TTL_MS + 1,
+    )
+    .await
+    .expect("保留窗口结束后应能清理");
+    assert_eq!(removed_late, 1);
 }
 
 /// 维护任务可独立清理已过期或已吊销的会话行，不依赖后续登录。
@@ -619,14 +694,19 @@ async fn expired_and_revoked_sessions_can_be_purged_independently() {
     let gw = TestGateway::start_with_admin(common::empty_seed).await;
     let (user_id, _) = create_role(&gw, "gc@example.com", "user").await;
 
-    // 手写几条会话：过期的、吊销的、正常的。
-    let now = kairos::gateway::logging::unix_millis();
-    for (offset, revoked) in [(-(3600 * 1000), 0), (0, 1), (3600 * 1000, 0)] {
+    // 手写几条已经超过保留窗口的失效会话，以及一条正常会话。
+    let now = kairos::gateway::unix_millis();
+    let old_offset = -(kairos::store::users::SESSION_TTL_MS + 3600 * 1000);
+    for (suffix, offset, revoked) in [
+        ("expired", old_offset, 0),
+        ("revoked", old_offset, 1),
+        ("normal", 3600 * 1000, 0),
+    ] {
         sqlx::query(
             "INSERT INTO management_sessions (user_id, token_hash, expires_at, revoked, created_at)              VALUES (?, 'hash-' || ?, ?, ?, ?)",
         )
         .bind(user_id)
-        .bind(offset)
+        .bind(suffix)
         .bind(now + offset)
         .bind(revoked)
         .bind(now)
@@ -652,7 +732,7 @@ async fn expired_and_revoked_sessions_can_be_purged_independently() {
         .expect("应能统计");
     assert_eq!(
         after.0, 3,
-        "过期的 1 条 + 吊销的 1 条被清理，留下正常的 1 条 + root 与用户的现有会话"
+        "超过保留窗口的 1 条过期 + 1 条吊销会话被清理，留下正常的 1 条 + root 与用户的现有会话"
     );
 }
 

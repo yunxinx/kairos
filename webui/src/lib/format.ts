@@ -84,14 +84,14 @@ export function formatUnixMillis(millis: number, locale?: string): string {
   return new Date(millis).toLocaleString(resolveNumberLocale(locale));
 }
 
-/** 掩码中段后仍保留明文的最小长度：前 8 + 掩码 + 后 8。 */
+/** 长 key 掩码时保留明文边缘的长度。 */
 const TOKEN_KEY_VISIBLE_EDGE = 8;
 const TOKEN_KEY_MASK = '******';
 
-/** 令牌 key 掩码展示：前、后各保留 8 位明文，中间固定以六个 `*` 代替。 */
+/** 令牌 key 掩码展示：短 key 全量掩码，长 key 前、后各保留 8 位明文。 */
 export function maskTokenKey(key: string): string {
   if (key.length <= TOKEN_KEY_VISIBLE_EDGE * 2) {
-    return key;
+    return TOKEN_KEY_MASK;
   }
   return `${key.slice(0, TOKEN_KEY_VISIBLE_EDGE)}${TOKEN_KEY_MASK}${key.slice(-TOKEN_KEY_VISIBLE_EDGE)}`;
 }

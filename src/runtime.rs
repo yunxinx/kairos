@@ -187,14 +187,14 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
     let user_rows = users::list_users_for_snapshot(pool).await?;
     let assigned_rows = users::list_all_assigned_groups(pool).await?;
     let mut users: HashMap<i64, RuntimeUser> = HashMap::new();
-    for (id, role, enabled, rate_limit_rpm) in user_rows {
+    for user in user_rows {
         users.insert(
-            id,
+            user.id,
             RuntimeUser {
-                role,
-                enabled,
+                role: user.role,
+                enabled: user.enabled,
                 assigned_groups: HashSet::new(),
-                rate_limit_rpm,
+                rate_limit_rpm: user.rate_limit_rpm,
             },
         );
     }
