@@ -575,11 +575,16 @@ async fn handle_request(
     };
     // 剩余在用户钱包：建行发生在创建用户/令牌时，准入只读、不写。
     // 令牌或钱包缺失视为 0，由后续 402 挡住，不在热路径 INSERT。
-    let balance = match store::get_token_balance(&mut conn, &token.token_key).await {
-        Ok(Some(balance)) => balance,
-        Ok(None) => store::TokenBalance {
-            balance_usd_micros: 0,
-            settled_usd_micros: 0,
+    let balance = match store::get_admission_snapshot(&mut conn, &token.token_key).await {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => store::AdmissionSnapshot {
+            wallet: store::UserWallet {
+                balance_usd_micros: 0,
+                settled_usd_micros: 0,
+            },
+            token: store::TokenSettlement {
+                settled_usd_micros: 0,
+            },
         },
         Err(err) => {
             return db_error_response(
@@ -596,10 +601,10 @@ async fn handle_request(
             .await;
         }
     };
-    if balance.balance_usd_micros <= 0 {
+    if balance.wallet.balance_usd_micros <= 0 {
         let message = format!(
             "用户余额不足（当前 {:.2} USD）",
-            balance.balance_usd_micros as f64 / 1_000_000.0
+            balance.wallet.balance_usd_micros as f64 / 1_000_000.0
         );
         return error_response(
             StatusCode::PAYMENT_REQUIRED,
@@ -616,7 +621,7 @@ async fn handle_request(
         .await;
     }
     if let Some(limit) = token.limit_usd_micros
-        && balance.settled_usd_micros >= limit
+        && balance.token.settled_usd_micros >= limit
     {
         let message = format!(
             "令牌 {} 累计结算已超上限（limit_usd_micros = {limit}）",
@@ -638,11 +643,11 @@ async fn handle_request(
     }
     if let Some(max_tokens) = request.max_tokens.filter(|&n| n > 0) {
         let estimate = estimate_admission_cost_micros(&hops, &snapshot, max_tokens);
-        if estimate > balance.balance_usd_micros {
+        if estimate > balance.wallet.balance_usd_micros {
             let message = format!(
                 "用户余额不足以覆盖预估费用（预估 {:.2} USD，当前 {:.2} USD）",
                 estimate as f64 / 1_000_000.0,
-                balance.balance_usd_micros as f64 / 1_000_000.0
+                balance.wallet.balance_usd_micros as f64 / 1_000_000.0
             );
             return error_response(
                 StatusCode::PAYMENT_REQUIRED,
@@ -659,7 +664,7 @@ async fn handle_request(
             .await;
         }
         if let Some(limit) = token.limit_usd_micros
-            && balance.settled_usd_micros.saturating_add(estimate) > limit
+            && balance.token.settled_usd_micros.saturating_add(estimate) > limit
         {
             let message = format!(
                 "令牌 {} 预估费用将超过累计结算上限（limit_usd_micros = {limit}）",

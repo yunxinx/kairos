@@ -159,6 +159,13 @@ export const apiClient = {
     });
   },
 
+  setTokenEnabled(id: number, enabled: boolean): Promise<TokenView> {
+    return apiFetch(`/tokens/${id}/enabled`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    });
+  },
+
   deleteToken(id: number): Promise<TokenView> {
     return apiFetch(`/tokens/${id}`, { method: 'DELETE' });
   },

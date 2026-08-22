@@ -3,14 +3,26 @@
 //! 结算与豁免共享一个事务闭环：先以日志冻结的用户归属做授权，再在 store 中原子
 //! 更新钱包和日志状态，最后写同一事务的审计行。资源 CRUD 不需要了解这些细节。
 
-use axum::{Extension, Json, extract::Path, extract::State};
+use axum::{
+    Extension, Json, Router,
+    extract::{Path, State},
+    routing::post,
+};
 
 use crate::store;
 use crate::store::users::{self, ManagementRole};
 
-use super::admin::{AdminDeps, AdminError, db_err, format_usd_micros, reject_user_management};
-use super::admin_auth::ManagementIdentity;
-use super::admin_logs::{LogEntry, parse_log_id};
+use super::auth::ManagementIdentity;
+use super::logs::{LogEntry, parse_log_id};
+use super::{
+    AdminDeps, AdminError, begin_write, db_err, format_usd_micros, reject_user_management,
+};
+
+pub(super) fn routes() -> Router<AdminDeps> {
+    Router::new()
+        .route("/logs/{id}/settle", post(settle_log))
+        .route("/logs/{id}/waive", post(waive_log))
+}
 
 /// 对未结算日志补扣：按行上费用写入余额（允许透支），再标为已结算。
 pub(super) async fn settle_log(
@@ -42,7 +54,8 @@ async fn close_unsettled_log(
     charge: bool,
 ) -> Result<Json<LogEntry>, AdminError> {
     let id = parse_log_id(raw)?;
-    let log = store::get_request_log(&deps.pool, id)
+    let mut tx = begin_write(deps).await?;
+    let log = store::get_request_log_on_conn(&mut tx, id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
@@ -52,13 +65,12 @@ async fn close_unsettled_log(
             return Err(AdminError::Forbidden);
         }
     } else {
-        let owner = users::get_user_including_archived(&deps.pool, log.user_id)
+        let owner = users::get_user_including_archived_on_conn(&mut tx, log.user_id)
             .await
             .map_err(AdminError::Store)?
             .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", log.user_id)))?;
         reject_user_management(identity, &owner, None)?;
     }
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
     let outcome = if charge {
         store::settle_unsettled_log(&mut tx, id).await
     } else {

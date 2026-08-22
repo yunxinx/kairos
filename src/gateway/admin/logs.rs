@@ -3,14 +3,29 @@
 //! 日志读取只负责把查询参数转换成存储层过滤条件，并把结果映射成管理面契约。
 //! 归属范围由认证身份注入，不能由客户端参数覆盖。
 
-use axum::{Extension, Json, extract::Path, extract::Query, extract::State};
+use axum::{
+    Extension, Json, Router,
+    extract::{Path, Query, State},
+    routing::get,
+};
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::store;
 
-use super::admin::{AdminDeps, AdminError, mask_token_key, parse_comma_list};
-use super::admin_auth::ManagementIdentity;
+use super::auth::ManagementIdentity;
+use super::tokens::mask_token_key;
+use super::{AdminDeps, AdminError, parse_comma_list};
+
+pub(super) fn signed_in_routes() -> Router<AdminDeps> {
+    Router::new()
+        .route("/logs", get(query_logs))
+        .route("/logs/{id}", get(get_log))
+}
+
+pub(super) fn admin_routes() -> Router<AdminDeps> {
+    Router::new().route("/system-logs", get(query_system_logs))
+}
 
 /// 请求日志条目 wire 契约：完整 body 以 base64 编码（二进制安全）。
 #[derive(Debug, Serialize)]

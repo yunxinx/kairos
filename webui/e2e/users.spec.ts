@@ -7,7 +7,7 @@ import { seedUser } from './helpers/users';
 test.describe.configure({ mode: 'serial' });
 
 test.describe('users page', () => {
-  test('lists /users and supports create, edit, recharge, groups, disable, and archive', async ({
+  test('lists /users and supports create, edit, recharge, groups, token toggles, and archive', async ({
     page,
   }) => {
     await seedModelGroup(page, { name: 'e2e-user-group', models: [] });
@@ -75,6 +75,8 @@ test.describe('users page', () => {
     await expect(tokenRow).not.toContainText(owned.token_key);
     await tokenRow.getByTestId('user-token-toggle-enabled').click();
     await expect(tokenRow).toContainText(/disabled/i);
+    await tokenRow.getByTestId('user-token-toggle-enabled').click();
+    await expect(tokenRow).toContainText(/enabled/i);
 
     // 删除用户
     await page.keyboard.press('Escape');

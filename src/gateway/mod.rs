@@ -4,9 +4,6 @@
 //! facade，使二进制入口和端到端测试继续使用稳定的 `gateway::router` API。
 
 mod admin;
-mod admin_auth;
-mod admin_billing;
-mod admin_logs;
 mod failover;
 mod http;
 mod logging;

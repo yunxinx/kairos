@@ -459,10 +459,11 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         )
         .await
         .expect("应能播种令牌");
-        store::ensure_token_balance(
+        let initial_balance_usd_micros = (token.balance_usd * 1_000_000.0).round() as i64;
+        store::initialize_token_settlement(
             &mut conn,
             &token.token_key,
-            token.balance_usd,
+            initial_balance_usd_micros,
             unix_millis(),
         )
         .await

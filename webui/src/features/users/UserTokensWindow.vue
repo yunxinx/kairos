@@ -3,7 +3,7 @@ import { computed, ref } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { tokenWriteBody, type TokenView, type UserAdminView } from '@/api/types';
+import type { TokenView, UserAdminView } from '@/api/types';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
@@ -66,7 +66,7 @@ const togglingId = ref<number | null>(null);
 const toggleMutation = useMutation({
   mutationFn: async (token: TokenView) => {
     togglingId.value = token.id;
-    await apiClient.updateToken(token.id, tokenWriteBody({ ...token, enabled: !token.enabled }));
+    await apiClient.setTokenEnabled(token.id, !token.enabled);
   },
   onSuccess: async () => {
     await queryClient.invalidateQueries({ queryKey: ['users', props.user.id, 'tokens'] });

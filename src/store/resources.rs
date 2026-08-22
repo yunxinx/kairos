@@ -708,12 +708,21 @@ pub async fn get_token_record(
     pool: &SqlitePool,
     id: i64,
 ) -> Result<Option<TokenRecord>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    get_token_record_on_conn(&mut conn, id).await
+}
+
+/// 在现有连接/事务上按稳定 id 读取令牌。
+pub async fn get_token_record_on_conn(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> Result<Option<TokenRecord>, StoreError> {
     let row = sqlx::query(
         "SELECT id, token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, last_used_at, model_group, user_id \
          FROM tokens WHERE id = ?",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
 
@@ -743,6 +752,13 @@ pub async fn get_token_record_by_key(
 fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreError> {
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
     let rate_limit_rpm: Option<i64> = row.try_get("rate_limit_rpm").map_err(StoreError::Query)?;
+    let rate_limit_rpm = rate_limit_rpm
+        .map(|rpm| {
+            u64::try_from(rpm).map_err(|_| {
+                StoreError::InvalidResource("数据库中的令牌 rate_limit_rpm 为负数".to_string())
+            })
+        })
+        .transpose()?;
     let model_group: Option<String> = row.try_get("model_group").map_err(StoreError::Query)?;
     Ok(TokenRecord {
         id: row.try_get("id").map_err(StoreError::Query)?,
@@ -750,7 +766,7 @@ fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreE
             token_key: row.try_get("token_key").map_err(StoreError::Query)?,
             name: row.try_get("name").map_err(StoreError::Query)?,
             limit_usd_micros: row.try_get("limit_usd_micros").map_err(StoreError::Query)?,
-            rate_limit_rpm: rate_limit_rpm.and_then(|n| u64::try_from(n).ok()),
+            rate_limit_rpm,
             enabled: enabled != 0,
             model_group: model_group.unwrap_or_default(),
             user_id: row.try_get("user_id").map_err(StoreError::Query)?,
@@ -780,7 +796,7 @@ pub async fn upsert_token(
     .bind(&token.token_key)
     .bind(&token.name)
     .bind(token.limit_usd_micros)
-    .bind(bind_rate_limit_rpm(token.rate_limit_rpm))
+    .bind(bind_rate_limit_rpm(token.rate_limit_rpm)?)
     .bind(token.enabled)
     .bind(created_at)
     .bind(bind_token_model_group(&token.model_group))
@@ -796,9 +812,14 @@ fn bind_token_model_group(group: &str) -> Option<&str> {
     if group.is_empty() { None } else { Some(group) }
 }
 
-/// 令牌 RPM 落库为可空整数；超出 `i64` 的值截到 `i64::MAX`（管理面校验会先拦住）。
-fn bind_rate_limit_rpm(rpm: Option<u64>) -> Option<i64> {
-    rpm.map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+/// 令牌 RPM 落库为可空整数；超出 SQLite 整数范围时拒绝写入。
+fn bind_rate_limit_rpm(rpm: Option<u64>) -> Result<Option<i64>, StoreError> {
+    rpm.map(|n| {
+        i64::try_from(n).map_err(|_| {
+            StoreError::InvalidResource("令牌 rate_limit_rpm 超出数据库整数范围".to_string())
+        })
+    })
+    .transpose()
 }
 
 /// 刷新令牌的最后使用时间；供网关在请求通过计费准入后调用。
@@ -810,6 +831,24 @@ pub async fn touch_token_used(
     sqlx::query("UPDATE tokens SET last_used_at = ? WHERE token_key = ?")
         .bind(at)
         .bind(token_key)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 只替换令牌启用状态。
+///
+/// 管理面跨归属操作使用这个窄写入原语，避免为了切换一个布尔值而重写令牌定义。
+/// 调用方必须先在同一写事务中读取并完成归属授权。
+pub async fn set_token_enabled(
+    conn: &mut SqliteConnection,
+    id: i64,
+    enabled: bool,
+) -> Result<(), StoreError> {
+    sqlx::query("UPDATE tokens SET enabled = ? WHERE id = ?")
+        .bind(enabled)
+        .bind(id)
         .execute(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
@@ -1453,7 +1492,7 @@ mod tests {
         )
         .await
         .expect("应能写令牌");
-        crate::store::ensure_token_balance(&mut conn, "sk-a", 3.0, 1)
+        crate::store::initialize_token_settlement(&mut conn, "sk-a", 3_000_000, 1)
             .await
             .expect("应能初始化余额");
         let before = list_tokens(&pool).await.expect("应能读令牌");
@@ -1475,11 +1514,14 @@ mod tests {
         .await
         .expect("应能更新令牌");
 
-        let balance = crate::store::get_token_balance(&mut conn, "sk-a")
+        let balance = crate::store::get_admission_snapshot(&mut conn, "sk-a")
             .await
             .expect("应能读余额")
             .expect("余额应存在");
-        assert_eq!(balance.balance_usd_micros, 3_000_000, "改属性不应重置余额");
+        assert_eq!(
+            balance.wallet.balance_usd_micros, 3_000_000,
+            "改属性不应重置余额"
+        );
         let after = list_tokens(&pool).await.expect("应能读令牌");
         assert_eq!(after[0].name, "v2");
         assert_eq!(after[0].limit_usd_micros, Some(9_000_000));

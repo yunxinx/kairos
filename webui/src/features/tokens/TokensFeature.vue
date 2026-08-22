@@ -3,7 +3,6 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { tokenWriteBody } from '@/api/types';
 import { loadTokenRows, type TokenRow } from '@/api/token-rows';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
@@ -247,10 +246,10 @@ const deletingId = computed(() =>
   deleteMutation.isPending.value ? (deleteMutation.variables.value ?? null) : null,
 );
 
-// 启用/禁用：整体替换写（PUT 携带完整定义），成功后重取列表。
+// 启用/禁用：只提交状态字段，成功后重取列表。
 const toggleMutation = useMutation({
   mutationFn: (token: TokenRow) =>
-    apiClient.updateToken(token.id, tokenWriteBody({ ...token, enabled: !token.enabled })),
+    apiClient.setTokenEnabled(token.id, !token.enabled),
   onSuccess: async () => {
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },

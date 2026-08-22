@@ -197,11 +197,11 @@ pub struct UserRecord {
 
 /// 快照加载所需的用户投影；不携带头像、邮箱等管理面字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SnapshotUser {
-    pub id: i64,
-    pub role: ManagementRole,
-    pub enabled: bool,
-    pub rate_limit_rpm: Option<u64>,
+pub(crate) struct SnapshotUser {
+    pub(crate) id: i64,
+    pub(crate) role: ManagementRole,
+    pub(crate) enabled: bool,
+    pub(crate) rate_limit_rpm: Option<u64>,
 }
 
 /// 新建管理用户时的字段。
@@ -336,15 +336,16 @@ pub async fn get_user(pool: &SqlitePool, id: i64) -> Result<Option<UserRecord>, 
 ///
 /// 仅供历史财务归属与审计使用；认证、快照和日常管理列表必须继续走 [`get_user`]，
 /// 避免把归档账户重新暴露为可用主体。
-pub async fn get_user_including_archived(
-    pool: &SqlitePool,
+/// 在现有连接/事务上按 id 读取用户，包含归档行。
+pub(crate) async fn get_user_including_archived_on_conn(
+    conn: &mut SqliteConnection,
     id: i64,
 ) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
         "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ?",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
     row.as_ref().map(map_user_row).transpose()
@@ -460,7 +461,9 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError
 /// 不走 [`list_users`]：那个 SELECT 带 `avatar`（可能是 MB 级 base64 data URL），
 /// 而 `reload_and_swap` 在每次管理面写操作后都会重跑一遍全量快照加载——改一次渠道
 /// 价格就把所有用户的头像读出来再丢掉。
-pub async fn list_users_for_snapshot(pool: &SqlitePool) -> Result<Vec<SnapshotUser>, StoreError> {
+pub(crate) async fn list_users_for_snapshot(
+    pool: &SqlitePool,
+) -> Result<Vec<SnapshotUser>, StoreError> {
     let rows =
         sqlx::query("SELECT id, role, enabled, rate_limit_rpm FROM users WHERE deleted_at IS NULL")
             .fetch_all(pool)
@@ -507,9 +510,18 @@ pub async fn list_assigned_groups(
     pool: &SqlitePool,
     user_id: i64,
 ) -> Result<Vec<String>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    list_assigned_groups_on_conn(&mut conn, user_id).await
+}
+
+/// 在现有连接/事务上读取用户可用模型组。
+pub(crate) async fn list_assigned_groups_on_conn(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+) -> Result<Vec<String>, StoreError> {
     let rows = sqlx::query("SELECT group_name FROM user_model_groups WHERE user_id = ?")
         .bind(user_id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
     let mut names = Vec::with_capacity(rows.len());
@@ -738,7 +750,7 @@ pub async fn delete_user(
     Ok(())
 }
 
-async fn get_user_on_conn(
+pub(crate) async fn get_user_on_conn(
     conn: &mut SqliteConnection,
     id: i64,
 ) -> Result<Option<UserRecord>, StoreError> {
@@ -1124,7 +1136,7 @@ fn new_session_token() -> String {
     format!("{SESSION_TOKEN_PREFIX}{}", hex_encode(&bytes))
 }
 
-pub fn hash_session_token(session_token: &str) -> String {
+fn hash_session_token(session_token: &str) -> String {
     hex_encode(Sha256::digest(session_token.as_bytes()).as_ref())
 }
 

@@ -1,4 +1,4 @@
-//! 用户管理 API 与令牌只本人建：列表、充值、自有令牌过滤、admin 禁用。
+//! 用户管理 API 与令牌只本人建：列表、充值、自有令牌过滤、admin 启停。
 
 mod common;
 
@@ -109,9 +109,9 @@ async fn users_list_and_recharge_are_admin_plus() {
     assert_eq!(body["balance_usd_micros"], 1_000_000);
 }
 
-/// POST /tokens 属当前用户；user 列表只含自己的；admin 可禁用普通用户令牌但不能代建。
+/// POST /tokens 属当前用户；user 列表只含自己的；admin 可启停普通用户令牌但不能代建。
 #[tokio::test]
-async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
+async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let seeded_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
     let (user_id, user_token) = create_role(&gw, "user@example.com", "user").await;
@@ -170,15 +170,8 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &admin_token,
         reqwest::Method::PUT,
-        &format!("/tokens/{mine_id}"),
-        json!({
-            "token_key": mine_key,
-            "name": "mine",
-            "limit_usd_micros": null,
-            "rate_limit_rpm": null,
-            "enabled": false,
-            "model_group": "default"
-        }),
+        &format!("/tokens/{mine_id}/enabled"),
+        json!({ "enabled": false }),
     )
     .await;
     assert_eq!(disable.status(), StatusCode::OK);
@@ -196,21 +189,43 @@ async fn tokens_are_owned_by_session_user_and_admin_can_disable() {
         &gw,
         &admin_token,
         reqwest::Method::PUT,
-        &format!("/tokens/{mine_id}"),
-        json!({
-            "token_key": mine_key,
-            "name": "mine",
-            "limit_usd_micros": null,
-            "rate_limit_rpm": null,
-            "enabled": true,
-            "model_group": "default"
-        }),
+        &format!("/tokens/{mine_id}/enabled"),
+        json!({ "enabled": true }),
+    )
+    .await;
+    assert_eq!(enable.status(), StatusCode::OK);
+    let enabled_view: Value = enable.json().await.expect("启用响应应可解析");
+    assert_eq!(enabled_view["enabled"], true);
+    assert!(
+        enabled_view["token_key"]
+            .as_str()
+            .is_some_and(|key| key.contains("******")),
+        "跨归属启用也必须保持 key 脱敏"
+    );
+
+    // 双向启停都由稳定 id 驱动；后续断言再次关闭，避免只覆盖读回而不覆盖第二次写入。
+    let disable_again = json_req(
+        &gw,
+        &admin_token,
+        reqwest::Method::PUT,
+        &format!("/tokens/{mine_id}/enabled"),
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(disable_again.status(), StatusCode::OK);
+
+    let smuggled_field = json_req(
+        &gw,
+        &admin_token,
+        reqwest::Method::PUT,
+        &format!("/tokens/{mine_id}/enabled"),
+        json!({ "enabled": true, "name": "hijacked" }),
     )
     .await;
     assert_eq!(
-        enable.status(),
-        StatusCode::FORBIDDEN,
-        "运营只能禁用普通用户令牌，不能重新启用"
+        smuggled_field.status(),
+        StatusCode::BAD_REQUEST,
+        "启停接口必须拒绝 enabled 以外的字段"
     );
 
     let rename = json_req(
@@ -636,12 +651,12 @@ async fn changing_password_revokes_other_sessions() {
 #[tokio::test]
 async fn expired_session_does_not_count_toward_rate_limit() {
     let gw = TestGateway::start_with_admin(common::empty_seed).await;
-    let (_, session) = create_role(&gw, "expire@example.com", "user").await;
+    let (user_id, session) = create_role(&gw, "expire@example.com", "user").await;
 
     // 手动把会话改成 1 秒后过期。
-    sqlx::query("UPDATE management_sessions SET expires_at = ? WHERE token_hash = ?")
+    sqlx::query("UPDATE management_sessions SET expires_at = ? WHERE user_id = ?")
         .bind(kairos::gateway::unix_millis() + 1000)
-        .bind(kairos::store::users::hash_session_token(&session))
+        .bind(user_id)
         .execute(&gw.pool)
         .await
         .expect("应能改过期时间");
@@ -674,8 +689,8 @@ async fn expired_session_does_not_count_toward_rate_limit() {
     assert_eq!(login.status(), StatusCode::OK, "过期会话不应计入限流");
 
     let (expires_at,): (i64,) =
-        sqlx::query_as("SELECT expires_at FROM management_sessions WHERE token_hash = ?")
-            .bind(kairos::store::users::hash_session_token(&session))
+        sqlx::query_as("SELECT expires_at FROM management_sessions WHERE user_id = ?")
+            .bind(user_id)
             .fetch_one(&gw.pool)
             .await
             .expect("失效会话在保留窗口内应仍存在");
@@ -686,6 +701,25 @@ async fn expired_session_does_not_count_toward_rate_limit() {
     .await
     .expect("保留窗口结束后应能清理");
     assert_eq!(removed_late, 1);
+
+    // GC 后旧会话会查不到存储行，但它仍属于会话认证失败，不能污染密码登录桶。
+    for _ in 0..10 {
+        assert_eq!(
+            get_req(&gw, &session, "/me").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let login_after_gc = reqwest::Client::new()
+        .post(format!("{}/login", gw.admin_base_url()))
+        .json(&json!({ "email": "expire@example.com", "password": "password1" }))
+        .send()
+        .await
+        .expect("GC 后仍应可登录");
+    assert_eq!(
+        login_after_gc.status(),
+        StatusCode::OK,
+        "已 GC 的旧会话不应占用密码登录失败预算"
+    );
 }
 
 /// 维护任务可独立清理已过期或已吊销的会话行，不依赖后续登录。
