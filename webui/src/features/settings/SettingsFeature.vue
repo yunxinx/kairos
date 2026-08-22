@@ -12,13 +12,17 @@ import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
+import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
-import { formatBytesAsMb, formatUnixMillis, parseMbToBytes } from '@/lib/format';
+import { formatBytesAsMb, formatCount, formatUnixMillis, parseMbToBytes } from '@/lib/format';
 
-type SettingsSection = 'logging' | 'gateway' | 'catalog';
+type SettingsSection = 'logging' | 'gateway' | 'catalog' | 'maintenance';
 
-const { t } = useI18n();
+/** 日志清理窗口预设（天）：按占用量手动选档，不做自动周期。 */
+const CLEANUP_WINDOWS = [7, 14, 30, 90, 180, 365] as const;
+
+const { t, locale } = useI18n();
 const { error, success } = useToast();
 const section = ref<SettingsSection>('logging');
 const queryClient = useQueryClient();
@@ -265,6 +269,61 @@ function syncedLabel(meta: CatalogMeta | undefined): string {
   return formatUnixMillis(meta.synced_at);
 }
 
+// --- 日志维护（root-only 页签；端点同样只对 root 开放） ---
+
+const logsSizeQuery = useQuery({
+  queryKey: ['logs-size'],
+  queryFn: () => apiClient.getLogsSize(),
+});
+
+const cleanupWindowDays = ref('30');
+/** 两步确认：false 普通态，true 为已展示警告待确认。 */
+const cleanupConfirming = ref(false);
+watch(cleanupWindowDays, () => {
+  cleanupConfirming.value = false;
+});
+
+const cleanupMutation = useMutation({
+  mutationFn: (days: number) => apiClient.cleanupLogs(days),
+  onSuccess: async (result) => {
+    cleanupConfirming.value = false;
+    success(
+      t('settings.maintenanceDone', {
+        requests: result.removed_request_logs,
+        system: result.removed_system_logs,
+      }),
+    );
+    // 删除的行直接改变统计口径：把所有受影响的查询缓存一并失效，否则 30 秒
+    // staleTime 内概览/用户/日志页还会展示已删除的数据，与「已删除明细不再
+    // 计入统计」的文案自相矛盾。前缀失效覆盖各自的全部参数化键。
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['logs-size'] }),
+      queryClient.invalidateQueries({ queryKey: ['stats'] }),
+      queryClient.invalidateQueries({ queryKey: ['users'] }),
+      queryClient.invalidateQueries({ queryKey: ['logs'] }),
+      queryClient.invalidateQueries({ queryKey: ['system-logs'] }),
+    ]);
+  },
+  onError: (err) => {
+    error(extractApiError(err).message);
+  },
+});
+
+function handleCleanup() {
+  if (!cleanupConfirming.value) {
+    cleanupConfirming.value = true;
+    return;
+  }
+  cleanupMutation.mutate(Number(cleanupWindowDays.value));
+}
+
+const windowOptions = computed(() =>
+  CLEANUP_WINDOWS.map((days) => ({
+    value: String(days),
+    label: t('settings.maintenanceWindowOption', { days }),
+  })),
+);
+
 const tabsAria = computed(() => t('settings.sections'));
 </script>
 
@@ -294,6 +353,13 @@ const tabsAria = computed(() => t('settings.sections'));
             data-testid="settings-section-catalog"
           >
             {{ t('settings.section.catalog') }}
+          </TabsTrigger>
+          <TabsTrigger
+            value="maintenance"
+            class="page-tab-switch-btn"
+            data-testid="settings-section-maintenance"
+          >
+            {{ t('settings.section.maintenance') }}
           </TabsTrigger>
         </TabsList>
       </template>
@@ -620,6 +686,150 @@ const tabsAria = computed(() => t('settings.sections'));
                     v-on="fieldInputHandlers('rateLimitRpm')"
                   />
                 </template>
+              </FormField>
+            </div>
+          </TabsContent>
+          <TabsContent value="maintenance" class="card-body">
+            <InlineError
+              v-if="logsSizeQuery.isError.value && !logsSizeQuery.data.value"
+              :message="extractApiError(logsSizeQuery.error.value).message"
+              @retry="() => logsSizeQuery.refetch()"
+            />
+            <div v-else class="settings-fields-row">
+              <FormField
+                field-name="maintenanceSize"
+                layout="inline"
+                :label="t('settings.maintenanceSize')"
+                input-id="settings-maintenance-size"
+              >
+                <div class="flex flex-wrap items-center gap-2">
+                  <p
+                    id="settings-maintenance-size"
+                    class="font-mono text-sm"
+                    data-testid="settings-maintenance-size"
+                    :title="
+                      logsSizeQuery.data.value
+                        ? t('settings.maintenanceSizeBreakdown', {
+                            main: formatBytesAsMb(logsSizeQuery.data.value.db_size_bytes),
+                            wal: formatBytesAsMb(logsSizeQuery.data.value.wal_size_bytes),
+                          })
+                        : undefined
+                    "
+                  >
+                    {{
+                      logsSizeQuery.data.value
+                        ? `${formatBytesAsMb(
+                            logsSizeQuery.data.value.db_size_bytes +
+                              logsSizeQuery.data.value.wal_size_bytes,
+                          )} MB`
+                        : '—'
+                    }}
+                  </p>
+                  <button
+                    type="button"
+                    class="btn inline-flex items-center gap-1.5"
+                    data-testid="settings-maintenance-refresh"
+                    :disabled="logsSizeQuery.isFetching.value"
+                    @click="() => logsSizeQuery.refetch()"
+                  >
+                    <UiIcon
+                      v-if="logsSizeQuery.isFetching.value"
+                      name="loader-circle"
+                      :size="14"
+                      class="animate-spin"
+                    />
+                    {{ t('settings.maintenanceRefresh') }}
+                  </button>
+                </div>
+              </FormField>
+              <FormField
+                field-name="maintenanceRequestRows"
+                layout="inline"
+                :label="t('settings.maintenanceRequestRows')"
+                input-id="settings-maintenance-request-rows"
+              >
+                <p
+                  id="settings-maintenance-request-rows"
+                  class="font-mono text-sm"
+                  data-testid="settings-maintenance-request-rows"
+                >
+                  {{
+                    logsSizeQuery.data.value
+                      ? formatCount(logsSizeQuery.data.value.request_log_rows, locale)
+                      : '—'
+                  }}
+                </p>
+              </FormField>
+              <FormField
+                field-name="maintenanceSystemRows"
+                layout="inline"
+                :label="t('settings.maintenanceSystemRows')"
+                input-id="settings-maintenance-system-rows"
+              >
+                <p
+                  id="settings-maintenance-system-rows"
+                  class="font-mono text-sm"
+                  data-testid="settings-maintenance-system-rows"
+                >
+                  {{
+                    logsSizeQuery.data.value
+                      ? formatCount(logsSizeQuery.data.value.system_log_rows, locale)
+                      : '—'
+                  }}
+                </p>
+              </FormField>
+              <FormField
+                field-name="maintenanceWindow"
+                layout="inline"
+                :label="t('settings.maintenanceWindow')"
+                input-id="settings-maintenance-window"
+                :guide="t('settings.maintenanceWindowGuide')"
+              >
+                <div class="flex flex-wrap items-center gap-2">
+                  <UiSelect
+                    id="settings-maintenance-window"
+                    v-model="cleanupWindowDays"
+                    :options="windowOptions"
+                    :disabled="cleanupMutation.isPending.value"
+                    data-testid="settings-maintenance-window"
+                  />
+                  <template v-if="!cleanupConfirming">
+                    <button
+                      type="button"
+                      class="btn btn-danger-filled"
+                      data-testid="settings-maintenance-cleanup"
+                      :disabled="cleanupMutation.isPending.value"
+                      @click="handleCleanup"
+                    >
+                      {{ t('settings.maintenanceAction') }}
+                    </button>
+                  </template>
+                  <template v-else>
+                    <p
+                      class="text-danger text-xs"
+                      data-testid="settings-maintenance-warning"
+                    >
+                      {{ t('settings.maintenanceWarning', { days: Number(cleanupWindowDays) }) }}
+                    </p>
+                    <button
+                      type="button"
+                      class="btn"
+                      data-testid="settings-maintenance-cancel"
+                      @click="cleanupConfirming = false"
+                    >
+                      {{ t('common.cancel') }}
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-danger-filled"
+                      data-testid="settings-maintenance-confirm"
+                      :disabled="cleanupMutation.isPending.value"
+                      @click="handleCleanup"
+                    >
+                      {{ t('common.confirm') }}
+                    </button>
+                  </template>
+                </div>
               </FormField>
             </div>
           </TabsContent>

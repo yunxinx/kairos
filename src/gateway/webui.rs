@@ -6,7 +6,7 @@
 use axum::{
     http::{
         HeaderValue, Method, StatusCode, Uri,
-        header::{CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS},
+        header::{self, CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS},
     },
     response::{IntoResponse, Response},
 };
@@ -66,11 +66,23 @@ fn file_response(path: &str, data: std::borrow::Cow<'static, [u8]>) -> Response 
                 HeaderValue::from_static(cache_control_for(path)),
             ),
             (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(CSP),
+            ),
         ],
         data,
     )
         .into_response()
 }
+
+/// 管理台内容安全策略：全部资源仅同源 + 头像 data URL。
+///
+/// `style-src` 放开 `unsafe-inline` 是 Vue `:style` 绑定（内联 style 属性）所需，
+/// 脚本无此豁免——主题引导已外置为 `/bootstrap.js`，Vite 产物全部同源打包。
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+                   img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; \
+                   base-uri 'self'; frame-ancestors 'none'";
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "路径未实现").into_response()
@@ -112,5 +124,35 @@ fn content_type_for(path: &str) -> &'static str {
         Some("json") | Some("map") => "application/json",
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve;
+    use axum::http::{Method, StatusCode, header};
+
+    /// 所有静态响应都带 CSP 与 nosniff；脚本只允许同源。
+    /// `webui/dist` 缺失（纯 API 构建）时无静态响应可测，直接跳过。
+    #[tokio::test]
+    async fn static_responses_carry_csp() {
+        if !super::is_available() {
+            return;
+        }
+        let response = serve("/".parse().expect("URI 应能构造"), Method::GET).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .expect("应有 CSP 头");
+        assert!(csp.contains("script-src 'self'"), "{csp}");
+        assert!(!csp.contains("script-src 'unsafe-inline'"), "{csp}");
+        assert!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .is_some()
+        );
     }
 }

@@ -9,6 +9,8 @@ import type {
   LogQuery,
   LogPage,
   LogEntry,
+  LogSizeView,
+  CleanupResultView,
   SystemLogQuery,
   SystemLogPage,
   LoginRequest,
@@ -301,6 +303,17 @@ export const apiClient = {
 
   querySystemLogs(query: SystemLogQuery = {}): Promise<SystemLogPage> {
     return apiFetch(`/system-logs${buildQuery(query)}`);
+  },
+
+  getLogsSize(): Promise<LogSizeView> {
+    return apiFetch('/logs/size');
+  },
+
+  cleanupLogs(olderThanDays: number): Promise<CleanupResultView> {
+    return apiFetch('/logs/cleanup', {
+      method: 'POST',
+      body: JSON.stringify({ older_than_days: olderThanDays }),
+    });
   },
 
   getStats(days?: number): Promise<StatsView> {

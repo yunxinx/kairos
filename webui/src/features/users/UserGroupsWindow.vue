@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { UserAdminView } from '@/api/types';
+import { roleAtLeast, type UserAdminView } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import InlineError from '@/components/ui/InlineError.vue';
@@ -24,7 +24,9 @@ const { t } = useI18n();
 const { error, success } = useToast();
 const queryClient = useQueryClient();
 
-const isRootUser = computed(() => props.user.role === 'root');
+// admin+ 的令牌准入不经过可用组名单（token_group_assigned 直接放行），分配对其
+// 无效；只有普通用户才编辑名单。
+const unrestricted = computed(() => roleAtLeast(props.user.role, 'admin'));
 
 const selected = ref<string[]>([...props.user.assigned_groups]);
 const filterText = ref('');
@@ -32,7 +34,7 @@ const filterText = ref('');
 const groupsQuery = useQuery({
   queryKey: ['model-groups'],
   queryFn: () => apiClient.listModelGroups(),
-  enabled: !isRootUser.value,
+  enabled: !unrestricted.value,
 });
 
 const allGroupNames = computed(() => {
@@ -49,8 +51,24 @@ const filteredGroupNames = computed(() => {
   return allGroupNames.value.filter((name) => name.toLowerCase().includes(q));
 });
 
+/** 本次保存将移除的组；非空时须先过影响确认（撤组令牌立即失效，ADR-0010）。 */
+const removedGroups = computed(() =>
+  props.user.assigned_groups.filter((name) => !selected.value.includes(name)),
+);
+
+/** 影响确认态：null 为普通态；数字为将被波及的令牌数；'unknown' 为计数拉取失败。 */
+const revokeImpact = ref<number | 'unknown' | null>(null);
+/** 影响数拉取进行中：禁用保存按钮，防连点并发请求。 */
+const impactLoading = ref(false);
+/** 选择版本号：拉取期间选择又变时，丢弃按旧选择算出的过期计数。 */
+let selectionVersion = 0;
+watch(selected, () => {
+  selectionVersion += 1;
+  revokeImpact.value = null;
+});
+
 const dirty = computed(() => {
-  if (isRootUser.value) return false;
+  if (unrestricted.value) return false;
   const next = [...selected.value].sort();
   const prev = [...props.user.assigned_groups].sort();
   return next.length !== prev.length || next.some((name, index) => name !== prev[index]);
@@ -88,20 +106,45 @@ const saveMutation = useMutation({
     error(extractApiError(err).message);
   },
 });
+
+/** 保存：有移除时先展示「将使多少令牌失效」的确认，确认后才真正提交。 */
+async function handleSave() {
+  if (removedGroups.value.length > 0 && revokeImpact.value === null) {
+    const version = selectionVersion;
+    impactLoading.value = true;
+    try {
+      const tokens = await apiClient.listUserTokens(props.user.id);
+      if (version !== selectionVersion) return; // 期间选择又变：计数已过时
+      const removed = new Set(removedGroups.value);
+      revokeImpact.value = tokens.filter((token) => removed.has(token.model_group)).length;
+    } catch (err) {
+      if (version !== selectionVersion) return;
+      // 拉不到令牌清单不阻塞流程，但绝不能按「0 把失效」展示——那会被读成
+      // 没有影响。退到 unknown 文案，破坏性后果如实可见。
+      error(extractApiError(err).message);
+      revokeImpact.value = 'unknown';
+    } finally {
+      impactLoading.value = false;
+    }
+    return;
+  }
+  revokeImpact.value = null;
+  saveMutation.mutate();
+}
 </script>
 
 <template>
   <div>
     <div class="card-body space-y-3">
       <div
-        v-if="isRootUser"
+        v-if="unrestricted"
         class="bg-surface-elevated border-seed rounded-md border p-6 text-center space-y-2"
       >
         <span class="badge badge-neutral font-mono text-xs px-3 py-1">
-          {{ t('users.rootGroupsUnlimited') }}
+          {{ t('users.groupsUnrestricted') }}
         </span>
         <p class="text-fg-muted text-xs max-w-sm mx-auto leading-relaxed">
-          {{ t('users.rootGroupsUnlimitedHint') }}
+          {{ t('users.groupsUnrestrictedHint') }}
         </p>
       </div>
 
@@ -112,7 +155,7 @@ const saveMutation = useMutation({
           @retry="() => groupsQuery.refetch()"
         />
         <template v-else>
-          <fieldset class="border-seed rounded-md border p-3">
+          <fieldset class="border-seed border p-3">
             <legend class="text-fg-muted flex w-full items-center gap-1.5 px-1 text-xs font-medium">
               {{ t('users.groups') }}
               <span
@@ -186,22 +229,55 @@ const saveMutation = useMutation({
     <div class="card-footer card-body flex justify-between gap-2">
       <button type="button" class="btn" @click="emit('close')">{{ t('common.cancel') }}</button>
       <button
-        v-if="!isRootUser"
-        type="submit"
-        class="btn btn-primary"
-        data-testid="user-groups-save"
-        :disabled="saveMutation.isPending.value || groupsQuery.isPending.value"
-        @click="saveMutation.mutate()"
-      >
-        {{ t('common.save') }}
-      </button>
-      <button
-        v-else
+        v-if="unrestricted"
         type="button"
         class="btn btn-primary"
         @click="emit('close')"
       >
         {{ t('common.confirm') }}
+      </button>
+      <!-- 撤组会使令牌立即失效：第一步展示影响，确认后才提交。 -->
+      <div v-else-if="revokeImpact !== null" class="flex items-center gap-2">
+        <p
+          class="text-danger max-w-xs text-right text-xs leading-relaxed"
+          data-testid="user-groups-revoke-warning"
+        >
+          {{
+            revokeImpact === 'unknown'
+              ? t('users.groupsRemoveUnknown', { groups: removedGroups.length })
+              : t('users.groupsRemoveWarning', {
+                  groups: removedGroups.length,
+                  tokens: revokeImpact,
+                })
+          }}
+        </p>
+        <button
+          type="button"
+          class="btn"
+          data-testid="user-groups-revoke-back"
+          @click="revokeImpact = null"
+        >
+          {{ t('common.cancel') }}
+        </button>
+        <button
+          type="button"
+          class="btn btn-danger-filled"
+          data-testid="user-groups-revoke-confirm"
+          :disabled="saveMutation.isPending.value"
+          @click="handleSave"
+        >
+          {{ t('common.confirm') }}
+        </button>
+      </div>
+      <button
+        v-else
+        type="button"
+        class="btn btn-primary"
+        data-testid="user-groups-save"
+        :disabled="saveMutation.isPending.value || groupsQuery.isPending.value || impactLoading"
+        @click="handleSave"
+      >
+        {{ impactLoading ? t('common.loading') : t('common.save') }}
       </button>
     </div>
   </div>

@@ -181,8 +181,6 @@
     "roleRoot": "Root",
     "rootProtectedGuide": "Root 角色受系统保护，不可修改。",
     "rootEnabledProtected": "Root 用户受系统保护，不可停用。",
-    "rootGroupsUnlimited": "全部模型组（无限制）",
-    "rootGroupsUnlimitedHint": "Root 用户不受模型组限制，默认拥有所有可用模型组的访问权限。",
     "rateLimitRpm": "每分钟请求上限",
     "rateLimitRpmGuide": "全局每分钟调用上限，0 或留空表示不限制。该用户下的所有令牌均受此上限约束。",
     "requestCount": "请求次数",
@@ -220,7 +218,12 @@
     "deleteTitle": "归档用户",
     "deleteMessage": "确定归档用户「{name}」？账号停用、名下令牌立即失效；历史消费记录保留，原邮箱可重新注册。",
     "bulkDeleteTitle": "批量归档用户",
-    "bulkDeleteMessage": "确定归档选中的 {count} 个用户？账号停用、名下令牌立即失效；历史消费记录保留。"
+    "bulkDeleteMessage": "确定归档选中的 {count} 个用户？账号停用、名下令牌立即失效；历史消费记录保留。",
+    "editEmailGuide": "修正登录邮箱（建号敲错等场景）；保存后该用户的其他会话将被吊销。",
+    "groupsUnrestricted": "不受可用组限制",
+    "groupsUnrestrictedHint": "root 与 admin 的令牌可调用全部模型组，可用组名单仅对普通用户生效。",
+    "groupsRemoveWarning": "将移除 {groups} 个可用组，绑定在这些组上的 {tokens} 把令牌将立即失效。",
+    "groupsRemoveUnknown": "将移除 {groups} 个可用组；绑定令牌数未知，相关令牌可能立即失效。"
   },
   "account": {
     "profile": "基本资料",
@@ -252,7 +255,9 @@
     "assignedGroupsCount": "{count} 个模型组",
     "noAssignedGroups": "暂无可用组",
     "registeredAt": "注册时间",
-    "lastLoginAt": "上次登录"
+    "lastLoginAt": "上次登录",
+    "emailChangePassword": "当前密码",
+    "emailChangePasswordGuide": "邮箱是登录标识，修改时需要提供当前密码验证身份。"
   },
   "time": {
     "secondsAgo": "{seconds} 秒前",
@@ -488,7 +493,8 @@
     "section": {
       "logging": "日志记录",
       "gateway": "网关",
-      "catalog": "目录"
+      "catalog": "目录",
+      "maintenance": "日志维护"
     },
     "fullBody": "记录完整请求与响应 body",
     "fullBodyGuide": "开启后，后续请求会把完整对话 body 明文写入 SQLite 请求日志。仅排障时使用，并配合下方日志 body 上限。",
@@ -522,7 +528,18 @@
     "catalogSyncing": "同步中…",
     "save": "保存设置",
     "saveSuccess": "设置已保存，对新的入站请求立即生效。",
-    "reset": "重置"
+    "reset": "重置",
+    "maintenanceSize": "数据库占用",
+    "maintenanceRequestRows": "请求日志行数",
+    "maintenanceSystemRows": "系统日志行数",
+    "maintenanceRefresh": "刷新",
+    "maintenanceWindow": "清理窗口",
+    "maintenanceWindowGuide": "删除所选天数之前的已结算请求日志与系统日志；未结算的请求日志保留待对账。已删除明细不再计入统计报表，钱包余额与累计结算不受影响。",
+    "maintenanceAction": "清理",
+    "maintenanceWarning": "将删除 {days} 天之前的日志，操作不可撤销。",
+    "maintenanceDone": "已删除 {requests} 条请求日志与 {system} 条系统日志。",
+    "maintenanceWindowOption": "{days} 天前",
+    "maintenanceSizeBreakdown": "主库 {main} MB + WAL {wal} MB（清理后会尝试截断 WAL；主库空闲页由后续写入复用）"
   },
   "dateRange": {
     "placeholder": "时间范围",

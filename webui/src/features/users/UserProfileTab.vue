@@ -35,7 +35,9 @@ const passwordId = `user-profile-password-${uid}`;
 const roleId = `user-profile-role-${uid}`;
 const rpmId = `user-profile-rpm-${uid}`;
 const enabledId = `user-profile-enabled-${uid}`;
+const emailId = `user-profile-email-${uid}`;
 
+const initialEmail = props.user.email;
 const initialName = props.user.display_name;
 const initialRole = props.user.role;
 const initialEnabled = props.user.enabled;
@@ -44,6 +46,7 @@ const initialRpm =
     ? String(props.user.rate_limit_rpm)
     : '';
 
+const email = ref(initialEmail);
 const displayName = ref(initialName);
 const password = ref('');
 const role = ref<ManagementRole>(initialRole);
@@ -68,8 +71,15 @@ const roleOptions = computed(() => {
   ];
 });
 
+/** 仅 ASCII 小写：与服务端 normalize_email（to_ascii_lowercase）同一算法，
+ * 避免 Unicode 大写（如 Á）导致前端判「已变化」而服务端 normalize 后判「未变」。 */
+function asciiLowercase(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
+
 const dirty = computed(
   () =>
+    asciiLowercase(email.value.trim()) !== initialEmail ||
     displayName.value !== initialName ||
     password.value !== '' ||
     role.value !== initialRole ||
@@ -82,6 +92,7 @@ const saveMutation = useMutation({
   mutationFn: async () => {
     const parsedRpm = rateLimitRpm.value.trim() === '' ? null : Number(rateLimitRpm.value);
     const body: {
+      email?: string;
       display_name?: string;
       role?: ManagementRole;
       enabled?: boolean;
@@ -92,6 +103,10 @@ const saveMutation = useMutation({
       enabled: enabled.value,
       rate_limit_rpm: parsedRpm,
     };
+    // 邮箱只在实际变化时提交：改登录标识会吊销该用户的其他会话。
+    if (asciiLowercase(email.value.trim()) !== initialEmail) {
+      body.email = email.value.trim();
+    }
     if (canPickRole.value) {
       body.role = role.value;
     }
@@ -114,6 +129,9 @@ function handleSave() {
   const specs: FieldValidationSpec[] = [
     { name: 'displayName', value: displayName.value, rules: [{ kind: 'required' }] },
   ];
+  if (asciiLowercase(email.value.trim()) !== initialEmail) {
+    specs.push({ name: 'email', value: email.value, rules: [{ kind: 'required' }] });
+  }
   if (password.value) {
     specs.push({
       name: 'password',
@@ -137,6 +155,27 @@ function handleSave() {
 <template>
   <form novalidate @submit.prevent="handleSave">
     <div class="card-body space-y-3">
+      <FormField
+        field-name="email"
+        :label="t('users.email')"
+        :input-id="emailId"
+        :error="fieldError('email')"
+        :guide="t('users.editEmailGuide')"
+      >
+        <template #default="{ hintId, invalid }">
+          <FormTextInput
+            :id="emailId"
+            v-model="email"
+            type="email"
+            autocomplete="off"
+            data-testid="user-profile-email"
+            :invalid="invalid"
+            :hint-id="hintId"
+            v-on="fieldInputHandlers('email')"
+          />
+        </template>
+      </FormField>
+
       <FormField
         field-name="displayName"
         :label="t('users.displayName')"

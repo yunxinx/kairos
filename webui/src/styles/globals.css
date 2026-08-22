@@ -2,23 +2,6 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* ── Fonts (CDN; see index.html + @font-face below) ── */
-@font-face {
-  font-family: 'ZSFT-443';
-  src: url('https://fontsapi.zeoseven.com/443/main.woff2') format('woff2');
-  font-style: normal;
-  font-weight: 100 900;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: 'ZSFT-443';
-  src: url('https://fontsapi.zeoseven.com/443/italic.woff2') format('woff2');
-  font-style: italic;
-  font-weight: 100 900;
-  font-display: swap;
-}
-
 /* ── Design Tokens ── */
 :root {
   color-scheme: light;
@@ -185,14 +168,17 @@ body:has(.dotted-bg)::before {
   outline: none;
 }
 
-/* ── Typography ── */
+/* ── Typography ──
+   全部使用系统字体：管理台不依赖第三方字体 CDN（离线可用、无供应链面）。
+   楷体气质的标题用系统楷体栈兜底（Kaiti SC / KaiTi / STKaiti）。 */
 :root {
   --font-serif: Charter, Georgia, Cambria, 'Times New Roman', serif;
-  --font-mono: 'ZSFT-443', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
 }
 
 html[lang='zh-CN'] {
-  --font-serif: 'LXGW ZhenKai GB', 'Source Han Serif SC', 'Noto Serif CJK SC', 'Songti SC', serif;
+  --font-serif: 'Kaiti SC', KaiTi, STKaiti, 'Source Han Serif SC', 'Noto Serif CJK SC',
+    'Songti SC', serif;
 }
 
 .font-serif {

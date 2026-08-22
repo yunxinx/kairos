@@ -35,6 +35,8 @@ const fileInputRef = ref<HTMLInputElement | null>(null);
 const currentPassword = ref('');
 const newPassword = ref('');
 const confirmPassword = ref('');
+/** 改邮箱时验证身份用的当前密码；仅在邮箱实际变化时要求并提交。 */
+const profileCurrentPassword = ref('');
 
 watch(
   me,
@@ -45,6 +47,17 @@ watch(
     avatarData.value = user.avatar ?? null;
   },
   { immediate: true },
+);
+
+/** 仅 ASCII 小写：与服务端 normalize_email（to_ascii_lowercase）同一算法，
+ * 避免 Unicode 大写（如 Á）导致前端判「已变化」而服务端 normalize 后判「未变」。 */
+function asciiLowercase(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
+
+/** 邮箱是唯一登录标识：实际变更时才需要当前密码（未改时隐藏输入框）。 */
+const emailChanged = computed(
+  () => !!me.value && asciiLowercase(email.value.trim()) !== me.value.email,
 );
 
 const roleLabel = computed(() => {
@@ -65,6 +78,7 @@ const profileMutation = useMutation({
   mutationFn: (body: MeUpdate) => apiClient.updateMe(body),
   onSuccess: async () => {
     setMe(await apiClient.getMe());
+    profileCurrentPassword.value = '';
     success(t('account.saveSuccess'));
   },
   onError: (err) => {
@@ -122,9 +136,12 @@ function handleSaveProfile() {
     { name: 'email', value: email.value, rules: [{ kind: 'required' }] },
     { name: 'displayName', value: displayName.value, rules: [{ kind: 'required' }] },
   ];
+  if (emailChanged.value) {
+    specs.push({ name: 'profileCurrentPassword', value: profileCurrentPassword.value, rules: [{ kind: 'required' }] });
+  }
   if (!profileValidation.validate(specs, t)) return;
   profileMutation.mutate({
-    email: email.value.trim(),
+    ...(emailChanged.value ? { email: email.value.trim(), current_password: profileCurrentPassword.value } : {}),
     display_name: displayName.value.trim(),
   });
 }
@@ -274,6 +291,27 @@ function handleChangePassword() {
                   :invalid="invalid"
                   :hint-id="hintId"
                   v-on="profileValidation.fieldInputHandlers('email')"
+                />
+              </template>
+            </FormField>
+
+            <FormField
+              v-if="emailChanged"
+              field-name="profileCurrentPassword"
+              :label="t('account.emailChangePassword')"
+              input-id="account-email-current-password"
+              :error="profileValidation.fieldError('profileCurrentPassword')"
+              :guide="t('account.emailChangePasswordGuide')"
+            >
+              <template #default="{ hintId, invalid }">
+                <FormPasswordInput
+                  id="account-email-current-password"
+                  v-model="profileCurrentPassword"
+                  autocomplete="current-password"
+                  data-testid="account-email-current-password"
+                  :invalid="invalid"
+                  :hint-id="hintId"
+                  v-on="profileValidation.fieldInputHandlers('profileCurrentPassword')"
                 />
               </template>
             </FormField>

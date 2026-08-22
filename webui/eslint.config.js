@@ -10,6 +10,9 @@ export default tseslint.config(
     ignores: [
       'dist',
       'node_modules',
+      // 首帧引导脚本（bootstrap.js）：无构建依赖的普通 JS，typed 规则没有
+      // 对应的 TS project service，lint 它只会让门禁崩溃。
+      'public',
       'src/routeTree.gen.ts',
       'eslint.config.js',
       'playwright.config.ts',

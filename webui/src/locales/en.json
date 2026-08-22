@@ -181,8 +181,6 @@
     "roleRoot": "Root",
     "rootProtectedGuide": "Root role is system protected and cannot be changed.",
     "rootEnabledProtected": "Root user is system protected and cannot be disabled.",
-    "rootGroupsUnlimited": "All model groups (Unlimited)",
-    "rootGroupsUnlimitedHint": "Root user is not restricted by model groups and has access to all available groups.",
     "rateLimitRpm": "Rate limit (RPM)",
     "rateLimitRpmGuide": "Global requests per minute limit. 0 or empty for no limit. All tokens under this user are bounded by this cap.",
     "requestCount": "Requests",
@@ -220,7 +218,12 @@
     "deleteTitle": "Archive user",
     "deleteMessage": "Archive user \"{name}\"? The account is disabled and its tokens stop working immediately. Usage history is kept and the email can be registered again.",
     "bulkDeleteTitle": "Archive users",
-    "bulkDeleteMessage": "Archive the {count} selected users? Their accounts are disabled and their tokens stop working immediately. Usage history is kept."
+    "bulkDeleteMessage": "Archive the {count} selected users? Their accounts are disabled and their tokens stop working immediately. Usage history is kept.",
+    "editEmailGuide": "Correct the login email (e.g. a typo at signup); the user's other sessions are revoked on save.",
+    "groupsUnrestricted": "Unrestricted",
+    "groupsUnrestrictedHint": "Root and admin tokens can call every model group; assigned groups only apply to regular users.",
+    "groupsRemoveWarning": "Removes {groups} assigned group(s); {tokens} token(s) bound to them will stop working immediately.",
+    "groupsRemoveUnknown": "Removes {groups} assigned group(s); the affected token count is unknown, bound tokens may stop working immediately."
   },
   "account": {
     "profile": "Profile",
@@ -252,7 +255,9 @@
     "assignedGroupsCount": "{count} model groups",
     "noAssignedGroups": "No groups assigned",
     "registeredAt": "Registered at",
-    "lastLoginAt": "Last login"
+    "lastLoginAt": "Last login",
+    "emailChangePassword": "Current password",
+    "emailChangePasswordGuide": "Your email is your login identifier; provide your current password to change it."
   },
   "time": {
     "secondsAgo": "{seconds} seconds ago",
@@ -488,7 +493,8 @@
     "section": {
       "logging": "Logging",
       "gateway": "Gateway",
-      "catalog": "Catalog"
+      "catalog": "Catalog",
+      "maintenance": "Maintenance"
     },
     "fullBody": "Log full request and response bodies",
     "fullBodyGuide": "When on, subsequent requests store complete conversation bodies in plaintext in SQLite. Use only for troubleshooting, and keep the log body cap below.",
@@ -522,7 +528,18 @@
     "catalogSyncing": "Syncing…",
     "save": "Save settings",
     "saveSuccess": "Settings saved. Changes apply to new inbound requests immediately.",
-    "reset": "Reset"
+    "reset": "Reset",
+    "maintenanceSize": "Database size",
+    "maintenanceRequestRows": "Request log rows",
+    "maintenanceSystemRows": "System log rows",
+    "maintenanceRefresh": "Refresh",
+    "maintenanceWindow": "Cleanup window",
+    "maintenanceWindowGuide": "Deletes settled request logs and system logs older than the selected window; unsettled request logs are kept for reconciliation. Deleted rows no longer count toward usage stats; wallet balance and settled totals are unaffected.",
+    "maintenanceAction": "Clean up",
+    "maintenanceWarning": "Logs older than {days} days will be deleted. This cannot be undone.",
+    "maintenanceDone": "Removed {requests} request logs and {system} system logs.",
+    "maintenanceWindowOption": "Older than {days} days",
+    "maintenanceSizeBreakdown": "Main DB {main} MB + WAL {wal} MB (cleanup attempts to truncate the WAL; free pages in the main file are reused by later writes)"
   },
   "dateRange": {
     "placeholder": "Time range",

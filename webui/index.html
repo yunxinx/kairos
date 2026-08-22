@@ -2,29 +2,9 @@
 <html>
   <head>
     <meta charset="UTF-8" />
-    <script>
-      document.documentElement.lang = localStorage.getItem('kairos-locale') ?? 'zh-CN';
-      (function () {
-        var stored = localStorage.getItem('kairos-theme');
-        var isDark =
-          stored === 'dark' ||
-          (stored !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
-        if (isDark) {
-          document.documentElement.classList.add('dark');
-        }
-      })();
-    </script>
+    <!-- 主题/语言引导须在首帧前同步执行；外置同源脚本以兼容 CSP `script-src 'self'`。 -->
+    <script src="/bootstrap.js"></script>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-    <link
-      href="https://fontsapi.zeoseven.com/2/main/result.css"
-      rel="preload"
-      as="style"
-      crossorigin
-      onload="this.rel = 'stylesheet'"
-    />
-    <noscript
-      ><link rel="stylesheet" href="https://fontsapi.zeoseven.com/2/main/result.css"
-    /></noscript>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"

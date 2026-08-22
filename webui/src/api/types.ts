@@ -275,7 +275,7 @@ export interface UserCreate {
   rate_limit_rpm?: number | null;
 }
 
-/** 当前用户改自己的资料。改密码时必须带 `current_password`。 */
+/** 当前用户改自己的资料。改密码或改邮箱时必须带 `current_password`。 */
 export interface MeUpdate {
   email?: string;
   display_name?: string;
@@ -285,6 +285,8 @@ export interface MeUpdate {
 }
 
 export interface UserUpdate {
+  /** 修正登录邮箱（建号敲错等场景）；改后目标的其他会话全部吊销。 */
+  email?: string;
   role?: ManagementRole;
   enabled?: boolean;
   password?: string;
@@ -400,6 +402,22 @@ export interface SystemLogQuery {
 /** 系统日志分页：额外带当前过滤下出现过的 target，供分面筛选。 */
 export interface SystemLogPage extends Page<SystemLogEntry> {
   targets: string[];
+}
+
+/** 日志占用快照（root 维护视图）。 */
+export interface LogSizeView {
+  /** 主库文件字节数（含空闲页，删除不回缩、后续写入复用）。 */
+  db_size_bytes: number;
+  /** WAL 边车字节数；清理收尾的 checkpoint 成功时会截断为零。 */
+  wal_size_bytes: number;
+  request_log_rows: number;
+  system_log_rows: number;
+}
+
+/** 按时间窗清理日志的结果。 */
+export interface CleanupResultView {
+  removed_request_logs: number;
+  removed_system_logs: number;
 }
 
 /** `/stats` 汇总卡片。 */
