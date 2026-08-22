@@ -126,16 +126,47 @@ async fn login_password_is_not_a_bearer_and_cannot_call_models() {
     assert_ne!(ok.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// 账户页：改邮箱不需当前密码；改密码必须带对的当前密码。
+/// 账户页：改邮箱与改密码都必须带对的当前密码——邮箱是唯一登录标识，
+/// 被盗会话若能静默改邮箱即等于永久劫持账户。
 #[tokio::test]
 async fn update_me_email_and_password_with_current() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
-    let email = bearer_json(
+    let missing_current = bearer_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
         "/me",
         json!({ "email": "root-renamed@example.com" }),
+    )
+    .await;
+    assert_eq!(
+        missing_current.status(),
+        StatusCode::BAD_REQUEST,
+        "改邮箱必须提供当前密码"
+    );
+
+    let wrong_current = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        "/me",
+        json!({
+            "email": "root-renamed@example.com",
+            "current_password": "not-the-password"
+        }),
+    )
+    .await;
+    assert_eq!(wrong_current.status(), StatusCode::BAD_REQUEST);
+
+    let email = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        "/me",
+        json!({
+            "email": "root-renamed@example.com",
+            "current_password": TEST_ROOT_PASSWORD
+        }),
     )
     .await;
     assert_eq!(email.status(), StatusCode::OK);
@@ -540,4 +571,208 @@ async fn user_rate_limit_and_stats_roundtrip() {
     assert_eq!(user_stats["rate_limit_rpm"], 2);
     assert_eq!(user_stats["request_count"], 2);
     assert!(user_stats["last_used_at"].as_i64().is_some());
+}
+
+/// 登录入口形状封顶：超长/控制字符输入按 400 拒绝，不进 Argon2、不写审计。
+#[tokio::test]
+async fn login_rejects_oversized_and_control_char_input() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let auth_rows = || async {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM system_log WHERE target = 'auth'")
+                .fetch_one(&gw.pool)
+                .await
+                .expect("应能数审计行");
+        count
+    };
+    let before = auth_rows().await;
+
+    let oversized = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({
+            "email": format!("{}@x.com", "a".repeat(400)),
+            "password": "password1"
+        }))
+        .send()
+        .await
+        .expect("登录应可达");
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+
+    let control_chars = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({ "email": "a\nb@c.com", "password": "password1" }))
+        .send()
+        .await
+        .expect("登录应可达");
+    assert_eq!(
+        control_chars.status(),
+        StatusCode::BAD_REQUEST,
+        "控制字符可伪造多行审计日志，应在入口拒绝"
+    );
+
+    let oversized_password = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({
+            "email": "root@localhost",
+            "password": "x".repeat(200)
+        }))
+        .send()
+        .await
+        .expect("登录应可达");
+    assert_eq!(oversized_password.status(), StatusCode::BAD_REQUEST);
+
+    let after = auth_rows().await;
+    assert_eq!(
+        before, after,
+        "形状违规不应消耗 Argon2，也不应留下 auth 审计行"
+    );
+}
+
+/// root 全局唯一：创建与晋升第二 root 都被 API 拒绝。
+#[tokio::test]
+async fn second_root_cannot_be_created_or_promoted() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let created = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "second-root@example.com",
+            "display_name": "第二个 root",
+            "password": "password1",
+            "role": "root"
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status(),
+        StatusCode::FORBIDDEN,
+        "创建接口不接受 root 角色"
+    );
+
+    // 晋升同样被拒：先建一个 admin，再试图提成 root。
+    let admin = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "promote-me@example.com",
+            "display_name": "待晋升",
+            "password": "password1",
+            "role": "admin"
+        }),
+    )
+    .await;
+    assert_eq!(admin.status(), StatusCode::CREATED);
+    let admin_id = admin.json::<Value>().await.expect("json")["id"]
+        .as_i64()
+        .expect("id");
+
+    let promoted = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/users/{admin_id}"),
+        json!({ "role": "root" }),
+    )
+    .await;
+    assert_eq!(
+        promoted.status(),
+        StatusCode::FORBIDDEN,
+        "root 是内置唯一账号，不能经 API 晋升"
+    );
+}
+
+/// 用户桶跨令牌共享：用户 1 RPM 时换第二把令牌也压不过（令牌写 0 同样无效）。
+#[tokio::test]
+async fn user_rate_limit_bucket_is_shared_across_tokens() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let user_res = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "shared-rpm@example.com",
+            "display_name": "共享限速用户",
+            "password": "password1",
+            "role": "user",
+            "rate_limit_rpm": 1
+        }),
+    )
+    .await;
+    assert_eq!(user_res.status(), StatusCode::CREATED);
+    let user_id = user_res.json::<Value>().await.expect("json")["id"]
+        .as_i64()
+        .expect("id");
+    let _ = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        &format!("/users/{user_id}/balance"),
+        json!({ "delta_usd_micros": 10_000_000 }),
+    )
+    .await;
+
+    let login = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({
+            "email": "shared-rpm@example.com",
+            "password": "password1"
+        }))
+        .send()
+        .await
+        .expect("登录");
+    let session_token = login.json::<Value>().await.expect("json")["token"]
+        .as_str()
+        .expect("token")
+        .to_string();
+
+    // 两把令牌都显式不限速（rate_limit_rpm: 0），只能被用户桶约束。
+    let mut keys = Vec::new();
+    for name in ["key-a", "key-b"] {
+        let token_res = bearer_json(
+            &gw,
+            &session_token,
+            reqwest::Method::POST,
+            "/tokens",
+            json!({
+                "name": name,
+                "model_group": "default",
+                "rate_limit_rpm": 0,
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(token_res.status(), StatusCode::CREATED);
+        keys.push(
+            token_res.json::<Value>().await.expect("json")["token_key"]
+                .as_str()
+                .expect("token_key")
+                .to_string(),
+        );
+    }
+
+    let call = |key: String| {
+        let gw = &gw;
+        async move {
+            reqwest::Client::new()
+                .get(format!("{}/v1/models", gw.base_url()))
+                .bearer_auth(&key)
+                .send()
+                .await
+                .expect("模型列表应可达")
+        }
+    };
+    // 第一把令牌的首次请求占用用户桶；换第二把（令牌桶全新）仍被用户桶挡住。
+    assert_eq!(call(keys[0].clone()).await.status(), StatusCode::OK);
+    assert_eq!(
+        call(keys[1].clone()).await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "用户级 RPM 是名下所有令牌合计的硬性上限"
+    );
 }

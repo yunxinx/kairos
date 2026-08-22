@@ -616,14 +616,18 @@ async fn changing_password_revokes_other_sessions() {
         "其他会话应被吊销"
     );
 
-    // 邮箱变更同样吊销随后签发的其它会话，并留下当前会话。
+    // 邮箱变更同样吊销随后签发的其它会话，并留下当前会话；
+    // 邮箱是登录标识，改它同样要求当前密码。
     let session3 = login(&gw, "pwd@example.com", "new-password").await;
     let renamed = json_req(
         &gw,
         &session1,
         reqwest::Method::PUT,
         "/me",
-        json!({ "email": "pwd-renamed@example.com" }),
+        json!({
+            "email": "pwd-renamed@example.com",
+            "current_password": "new-password"
+        }),
     )
     .await;
     assert_eq!(renamed.status(), StatusCode::OK);
@@ -790,4 +794,174 @@ async fn users_list_reports_missing_wallet_as_corruption() {
             .as_str()
             .is_some_and(|message| message.contains("缺少钱包"))
     );
+}
+
+/// admin 修正普通用户邮箱：改后目标旧会话全吊销，审计留前后值；自己保留。
+#[tokio::test]
+async fn admin_can_fix_user_email_and_target_sessions_revoked() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let (user_id, stale_session) = create_role(&gw, "typo@example.com", "user").await;
+
+    let fixed = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/users/{user_id}"),
+        json!({ "email": "fixed@example.com" }),
+    )
+    .await;
+    assert_eq!(fixed.status(), StatusCode::OK);
+    let body: Value = fixed.json().await.expect("应可解析");
+    assert_eq!(body["email"], "fixed@example.com");
+
+    // 旧邮箱登不上、被吊销的旧会话不可用，新邮箱可登录。
+    let old_login = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({ "email": "typo@example.com", "password": "password1" }))
+        .send()
+        .await
+        .expect("登录应可达");
+    assert_eq!(old_login.status(), StatusCode::UNAUTHORIZED);
+    let stale = get_req(&gw, &stale_session, "/me").await;
+    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED, "旧会话应被吊销");
+    let new_login = login(&gw, "fixed@example.com", "password1").await;
+    let me = get_req(&gw, &new_login, "/me").await;
+    assert_eq!(me.status(), StatusCode::OK);
+
+    // 审计行带前后值。
+    let (message,): (String,) = sqlx::query_as(
+        "SELECT message FROM system_log WHERE target = 'users' AND actor_user_id = 1 \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应有审计行");
+    assert!(message.contains("typo@example.com"), "{message}");
+    assert!(message.contains("fixed@example.com"), "{message}");
+}
+
+/// 归档用户的钱包：root 可补正（与补扣路径对称）；其他角色视角归档与不存在
+/// 同响应（404），不泄漏归档账户的存在。
+#[tokio::test]
+async fn archived_user_recharge_is_root_only() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let (user_id, _) = create_role(&gw, "archived-balance@example.com", "user").await;
+    let (_admin_id, admin_session) = create_role(&gw, "bal-admin@example.com", "admin").await;
+
+    let archive = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::DELETE,
+        &format!("/users/{user_id}"),
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(archive.status(), StatusCode::NO_CONTENT);
+
+    let as_admin = json_req(
+        &gw,
+        &admin_session,
+        reqwest::Method::POST,
+        &format!("/users/{user_id}/balance"),
+        json!({ "delta_usd_micros": 1_000_000 }),
+    )
+    .await;
+    assert_eq!(
+        as_admin.status(),
+        StatusCode::NOT_FOUND,
+        "非 root 视角归档与不存在同响应"
+    );
+
+    let never_existed = json_req(
+        &gw,
+        &admin_session,
+        reqwest::Method::POST,
+        "/users/999999/balance",
+        json!({ "delta_usd_micros": 1_000_000 }),
+    )
+    .await;
+    assert_eq!(never_existed.status(), StatusCode::NOT_FOUND);
+
+    let as_root = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        &format!("/users/{user_id}/balance"),
+        json!({ "delta_usd_micros": 1_000_000 }),
+    )
+    .await;
+    assert_eq!(as_root.status(), StatusCode::OK);
+    let (balance,): (i64,) =
+        sqlx::query_as("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("钱包应存在");
+    assert_eq!(balance, 1_000_000);
+
+    // 审计行标注归档。
+    let (message,): (String,) = sqlx::query_as(
+        "SELECT message FROM system_log WHERE target = 'billing' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应有审计行");
+    assert!(message.contains("已归档"), "{message}");
+}
+
+/// 写入端与登录端共用同一邮箱/口令形状标准：控制字符邮箱与超长口令在
+/// 改密/改邮箱/建号处直接 400，不可能写出「登不进来」的自锁账户。
+#[tokio::test]
+async fn write_paths_reject_invalid_email_and_password_shapes() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let (user_id, session) = create_role(&gw, "shape@example.com", "user").await;
+
+    // 自助改邮箱：控制字符被拒。
+    let bad_email = json_req(
+        &gw,
+        &session,
+        reqwest::Method::PUT,
+        "/me",
+        json!({
+            "email": "a\nb@example.com",
+            "current_password": "password1"
+        }),
+    )
+    .await;
+    assert_eq!(bad_email.status(), StatusCode::BAD_REQUEST);
+
+    // 自助改密：超长口令被拒（改密成功会吊销会话，先测改密避免影响后续）。
+    let bad_password = json_req(
+        &gw,
+        &session,
+        reqwest::Method::PUT,
+        "/me",
+        json!({
+            "password": "x".repeat(200),
+            "current_password": "password1"
+        }),
+    )
+    .await;
+    assert_eq!(bad_password.status(), StatusCode::BAD_REQUEST);
+    // 会话未被吊销（拒绝发生在写入前）。
+    let still_valid = get_req(&gw, &session, "/me").await;
+    assert_eq!(still_valid.status(), StatusCode::OK);
+
+    // 建号：控制字符邮箱被拒。
+    let bad_create = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "c\nd@example.com",
+            "display_name": "x",
+            "password": "password1",
+            "role": "user"
+        }),
+    )
+    .await;
+    assert_eq!(bad_create.status(), StatusCode::BAD_REQUEST);
+
+    let _ = user_id;
 }

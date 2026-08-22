@@ -14,7 +14,6 @@ use crate::store::resources::{Token, TokenRecord};
 use crate::store::users::{self, ManagementRole};
 
 use super::auth::ManagementIdentity;
-use super::models::reject_unknown_group;
 use super::{AdminDeps, AdminError, begin_write, db_err, reload_and_swap};
 
 pub(super) fn routes() -> Router<AdminDeps> {
@@ -198,20 +197,29 @@ fn token_key_charset_ok(key: &str) -> bool {
         .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
 }
 
-/// 普通用户只能绑到自己可用名单里的组；root/admin 只需组存在。
-async fn reject_unassigned_group(
-    deps: &AdminDeps,
+/// 事务内校验令牌可绑定的组：组必须存在；普通用户的组还必须在本人可用名单里。
+///
+/// 授权依据与写入须同一写事务（`mod.rs` 的 `BEGIN IMMEDIATE` 原则）：先读快照
+/// 再开事务的间隙里，组可能刚被删除或刚从该用户名单撤下。admin+ 不受名单约束。
+async fn reject_invalid_group_binding(
+    conn: &mut SqliteConnection,
     identity: &ManagementIdentity,
     group: &str,
 ) -> Result<(), AdminError> {
+    if crate::store::resources::get_model_group(conn, group)
+        .await
+        .map_err(AdminError::Store)?
+        .is_none()
+    {
+        return Err(AdminError::NotFound(format!("模型组 {group} 不存在")));
+    }
     if identity.role().at_least(ManagementRole::Admin) {
         return Ok(());
     }
-    let snapshot = deps.snapshot.read().await;
-    let Some(user) = snapshot.users.get(&identity.user_id()) else {
-        return Err(AdminError::Forbidden);
-    };
-    if user.assigned_groups.contains(group) {
+    let assigned = users::list_assigned_groups_on_conn(conn, identity.user_id())
+        .await
+        .map_err(AdminError::Store)?;
+    if assigned.iter().any(|name| name == group) {
         Ok(())
     } else {
         Err(AdminError::InvalidBody("模型组不在可用名单中".to_string()))
@@ -316,10 +324,9 @@ pub(super) async fn create_token(
         user_id: identity.user_id(),
     };
     validate_token(&token)?;
-    reject_unknown_group(&deps, &token.model_group).await?;
-    reject_unassigned_group(&deps, &identity, &token.model_group).await?;
     let now = logging::unix_millis();
     let mut tx = begin_write(&deps).await?;
+    reject_invalid_group_binding(&mut tx, &identity, &token.model_group).await?;
     crate::store::resources::upsert_token(&mut tx, &token, now)
         .await
         .map_err(AdminError::Store)?;
@@ -353,8 +360,7 @@ pub(super) async fn update_token(
     token.user_id = existing.token.user_id;
     token.model_group = token.model_group.trim().to_string();
     validate_token(&token)?;
-    reject_unknown_group(&deps, &token.model_group).await?;
-    reject_unassigned_group(&deps, &identity, &token.model_group).await?;
+    reject_invalid_group_binding(&mut tx, &identity, &token.model_group).await?;
     crate::store::resources::upsert_token(&mut tx, &token, logging::unix_millis())
         .await
         .map_err(AdminError::Store)?;

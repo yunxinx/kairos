@@ -307,3 +307,34 @@ async fn distinct_system_log_targets_on(
     }
     Ok(targets)
 }
+
+/// 单批删除的行数：与请求日志清理一致，批间提交避免长写锁。
+const SYSTEM_LOG_PURGE_BATCH_ROWS: u64 = 5_000;
+
+/// 删除早于截止时刻的系统日志，返回删除总行数。
+///
+/// 系统日志含审计行，但审计同样有保留期限诉求；本次清理自身的审计行写在
+/// 清理之后、`created_at` 为当下，不会被同一次调用删掉。分批提交的理由
+/// 同 [`super::purge_settled_request_logs_before`]。
+pub async fn purge_system_logs_before(
+    pool: &SqlitePool,
+    cutoff_created_at: i64,
+) -> Result<u64, StoreError> {
+    let mut removed = 0u64;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM system_log WHERE id IN ( \
+                SELECT id FROM system_log WHERE created_at < ? LIMIT ?)",
+        )
+        .bind(cutoff_created_at)
+        .bind(SYSTEM_LOG_PURGE_BATCH_ROWS as i64)
+        .execute(pool)
+        .await
+        .map_err(StoreError::Query)?;
+        let affected = result.rows_affected();
+        removed += affected;
+        if affected < SYSTEM_LOG_PURGE_BATCH_ROWS {
+            return Ok(removed);
+        }
+    }
+}

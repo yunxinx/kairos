@@ -277,6 +277,7 @@ pub async fn seed_builtin_root(
     if email.is_empty() || !email.contains('@') {
         return Err(StoreError::InvalidResource("邮箱不合法".to_string()));
     }
+    validate_email_shape(&email)?;
     if let Some(existing) = get_user_by_email(pool, &email).await?
         && existing.id != ROOT_USER_ID
     {
@@ -318,6 +319,30 @@ fn generate_alnum(len: usize) -> String {
 /// 规范化邮箱：去空白并转小写。UNIQUE NOCASE 仍要求应用层统一写入形态。
 pub fn normalize_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
+}
+
+/// 邮箱长度上限（字节）：RFC 3696 的 320。
+pub const EMAIL_MAX_LEN: usize = 320;
+/// 口令长度上限：远超任何人类口令，更长的输入只增加 Argon2 的无谓开销。
+pub const PASSWORD_MAX_LEN: usize = 128;
+
+/// 邮箱形状校验：限长且拒绝控制字符（换行可伪造多行审计日志）。
+///
+/// 登录入口与所有写入路径（改邮箱、建用户、播种 root）共用同一标准——
+/// 否则会出现「写进去的值登不进来」的自锁账户。
+pub fn validate_email_shape(email: &str) -> Result<(), StoreError> {
+    if email.len() > EMAIL_MAX_LEN || email.chars().any(char::is_control) {
+        return Err(StoreError::InvalidResource("邮箱不合法".to_string()));
+    }
+    Ok(())
+}
+
+/// 口令形状校验：登录入口与设密/改密路径共用（与 [`validate_email_shape`] 同理）。
+pub fn validate_password_shape(password: &str) -> Result<(), StoreError> {
+    if password.len() > PASSWORD_MAX_LEN {
+        return Err(StoreError::InvalidResource("密码不合法".to_string()));
+    }
+    Ok(())
 }
 
 /// 按 id 读用户；不存在返回 `None`。
@@ -394,6 +419,7 @@ pub async fn insert_user(
     if email.is_empty() || !email.contains('@') {
         return Err(StoreError::InvalidResource("邮箱不合法".to_string()));
     }
+    validate_email_shape(&email)?;
     let display_name = new_user.display_name.trim();
     if display_name.is_empty() {
         return Err(StoreError::InvalidResource(
@@ -600,6 +626,7 @@ pub async fn set_email(
     if email.is_empty() || !email.contains('@') {
         return Err(StoreError::InvalidResource("邮箱不合法".to_string()));
     }
+    validate_email_shape(&email)?;
     if let Some(existing) = get_user_by_email_on_conn(conn, &email).await? {
         if existing.id == user_id {
             return Ok(());
@@ -1099,6 +1126,7 @@ async fn hash_password(password: &str) -> Result<String, StoreError> {
     if password.len() < 8 {
         return Err(StoreError::InvalidResource("密码至少 8 个字符".to_string()));
     }
+    validate_password_shape(&password)?;
     tokio::task::spawn_blocking(move || {
         use argon2::Argon2;
         use argon2::password_hash::{PasswordHasher, SaltString, rand_core::OsRng};

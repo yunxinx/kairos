@@ -6,7 +6,7 @@ rust-version = "1.97"
 
 [dependencies]
 axum = "0.8.9"
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "time"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "net", "time", "fs"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream", "json"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "migrate", "runtime-tokio", "macros"] }
 serde = { version = "1.0", features = ["derive"] }

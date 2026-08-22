@@ -51,6 +51,9 @@ pub(super) struct AdminDeps {
     pub(super) snapshot: crate::runtime::SnapshotHandle,
     pub(super) client: reqwest::Client,
     pub(super) throttle: AuthThrottle,
+    /// 数据库文件路径：日志维护的磁盘占用统计需要读主库与 WAL 边车的实际大小，
+    /// SQL 层拿不到 WAL 文件尺寸，只能走文件系统。
+    pub(super) db_path: std::path::PathBuf,
 }
 
 /// 开启 SQLite 写事务并立即取得写保留锁。
@@ -71,7 +74,11 @@ pub(super) async fn begin_write(
 /// 路由以领域词直出（`/tokens`、`/channels`、`/prices`），集合端点 GET 列出、
 /// POST 新建；单资源端点 PUT 整体替换、DELETE 删除。UI 静态资源与未匹配的 GET
 /// 深链不经认证中间件。
-pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Router {
+pub fn router(
+    pool: SqlitePool,
+    snapshot: crate::runtime::SnapshotHandle,
+    db_path: std::path::PathBuf,
+) -> Router {
     // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
     // builder 事先记下错误时失败；本路径未设置会失败的选项。
     let client = reqwest::Client::builder()
@@ -83,11 +90,13 @@ pub fn router(pool: SqlitePool, snapshot: crate::runtime::SnapshotHandle) -> Rou
         snapshot: snapshot.clone(),
         client,
         throttle: throttle.clone(),
+        db_path,
     };
     let root_only = Router::new()
         .merge(channels::routes())
         .merge(probes::routes())
         .merge(settings::routes())
+        .merge(logs::root_routes())
         .route_layer(middleware::from_fn(auth::require_root));
     let admin_plus = Router::new()
         .merge(models::routes())
@@ -148,11 +157,18 @@ pub(super) fn format_usd_micros(micros: i64) -> String {
 }
 
 /// admin 不能管理 admin/root；user 不能管理任何人；改角色到更高档需 root。
+///
+/// root 全局唯一（内置 id=1，ADR-0009 修订）：任何角色都不能把别人升成 root，
+/// 也不能经创建接口造出第二个 root。「最后一个 root」保护仍是兜底——它另经
+/// 直连数据库等旁路守住禁用/删除。
 pub(in crate::gateway::admin) fn reject_user_management(
     actor: &ManagementIdentity,
     target: &UserRecord,
     new_role: Option<ManagementRole>,
 ) -> Result<(), AdminError> {
+    if new_role == Some(ManagementRole::Root) {
+        return Err(AdminError::Forbidden);
+    }
     match actor.role() {
         ManagementRole::User => {
             if actor.user.id != target.id || new_role.is_some() {

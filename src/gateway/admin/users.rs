@@ -115,6 +115,9 @@ async fn login(
         return Err(AdminError::RateLimited);
     }
     let body = body.map_err(AdminError::bad_body)?.0;
+    // 形状封顶先于限流记账、Argon2 与审计写入：超长字段只会白白消耗 CPU，
+    // email 还会原样进审计行（放大 system_log）；控制字符可伪造多行日志。
+    validate_login_shape(&body.email, &body.password)?;
     let Some(user) = users::authenticate_password(&deps.pool, &body.email, &body.password)
         .await
         .map_err(AdminError::Store)?
@@ -153,6 +156,16 @@ async fn login(
         expires_at,
         user: UserView::from_record(user),
     }))
+}
+
+/// 登录入口的输入形状封顶：与写入路径共用 [`users::validate_email_shape`] /
+/// [`users::validate_password_shape`]，两端标准恒一致（否则会把可写入的账号
+/// 变成登不进来的自锁账户）。违规按 400 处理——这是请求形状错误，不是认证
+/// 结果，不应消耗认证失败限流。
+fn validate_login_shape(email: &str, password: &str) -> Result<(), AdminError> {
+    users::validate_email_shape(email).map_err(map_user_store_err)?;
+    users::validate_password_shape(password).map_err(map_user_store_err)?;
+    Ok(())
 }
 
 /// 吊销当前会话；非 `ksess_` 前缀视为无操作，仍 204。
@@ -221,7 +234,8 @@ async fn get_me(
 struct MeUpdate {
     email: Option<String>,
     password: Option<String>,
-    /// 改密码时必填；只改邮箱/展示名不必带。防止有人拿已窃会话静默换口令。
+    /// 改密码或改邮箱时必填；只改展示名/头像不必带。防止有人拿已窃会话静默换
+    /// 口令或登录标识——邮箱是唯一登录标识，免密改邮箱等于永久劫持账户。
     current_password: Option<String>,
     display_name: Option<String>,
     avatar: Option<String>,
@@ -237,10 +251,17 @@ async fn update_me(
     let update = body.map_err(AdminError::bad_body)?.0;
     let user_id = identity.user_id();
     let mut tx = begin_write(&deps).await?;
-    if update.password.is_some() {
+    let email_after = update.email.as_deref().map(users::normalize_email);
+    let email_changed = email_after
+        .as_deref()
+        .is_some_and(|email| email != identity.user.email);
+    // 邮箱是唯一登录标识：被盗会话若能静默改邮箱，就等于把账户永久劫持
+    // （原主人无法再登录，改密吊销还会保住攻击者的当前会话）。与改密码同
+    // 一威胁模型，同一条防线：改标识必须证明持有当前口令。
+    if update.password.is_some() || email_changed {
         let Some(current) = update.current_password.as_deref() else {
             return Err(AdminError::InvalidBody(
-                "修改密码需要提供当前密码".to_string(),
+                "修改密码或邮箱需要提供当前密码".to_string(),
             ));
         };
         let matches = users::password_matches_on_conn(&mut tx, user_id, current)
@@ -250,10 +271,6 @@ async fn update_me(
             return Err(AdminError::InvalidBody("当前密码不正确".to_string()));
         }
     }
-    let email_after = update.email.as_deref().map(users::normalize_email);
-    let email_changed = email_after
-        .as_deref()
-        .is_some_and(|email| email != identity.user.email);
     let password_changed = update.password.is_some();
     let mut changes = Vec::new();
     if let Some(email) = update.email.as_deref() {
@@ -352,8 +369,9 @@ async fn create_user(
 ) -> Result<(StatusCode, Json<UserView>), AdminError> {
     let create = body.map_err(AdminError::bad_body)?.0;
     match (identity.role(), create.role) {
-        (ManagementRole::Root, _) => {}
-        (ManagementRole::Admin, ManagementRole::User) => {}
+        // root 全局唯一：创建接口不接受 root，内置账号是唯一来源。
+        (_, ManagementRole::Root) => return Err(AdminError::Forbidden),
+        (ManagementRole::Root, _) | (ManagementRole::Admin, ManagementRole::User) => {}
         _ => return Err(AdminError::Forbidden),
     }
     let now = logging::unix_millis();
@@ -392,6 +410,8 @@ async fn create_user(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct UserUpdate {
+    /// 修正登录邮箱（建号敲错等场景）：走 `users::set_email`，改后吊销目标会话。
+    email: Option<String>,
     role: Option<ManagementRole>,
     enabled: Option<bool>,
     password: Option<String>,
@@ -452,6 +472,10 @@ async fn update_user(
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, update.role)?;
 
+    let email_after = update.email.as_deref().map(users::normalize_email);
+    let email_changed = email_after
+        .as_deref()
+        .is_some_and(|email| email != target.email);
     let role_changed = match update.role {
         Some(role) => role != target.role,
         None => false,
@@ -495,6 +519,7 @@ async fn update_user(
     if !role_changed
         && !enabled_changed
         && !password_changed
+        && !email_changed
         && display_name_changed.is_none()
         && !avatar_changed
         && !rpm_changed
@@ -502,6 +527,18 @@ async fn update_user(
         return Ok(Json(UserView::from_record(target)));
     }
 
+    if email_changed && let Some(email) = update.email.as_deref() {
+        users::set_email(&mut tx, id, email)
+            .await
+            .map_err(map_user_store_err)?;
+        // 登录标识变了，旧会话不能继续用；与改密同规则，操作者本人的当前会话保留。
+        let keep = (identity.user_id() == id)
+            .then(|| bearer_from_headers(&headers))
+            .flatten();
+        users::revoke_user_sessions(&mut tx, id, keep)
+            .await
+            .map_err(map_user_store_err)?;
+    }
     if role_changed && let Some(role) = update.role {
         users::set_user_role(&mut tx, id, role)
             .await
@@ -512,7 +549,6 @@ async fn update_user(
             .await
             .map_err(map_user_store_err)?;
     }
-    let password_changed = update.password.is_some();
     if let Some(password) = update.password {
         users::set_password(&mut tx, id, &password)
             .await
@@ -547,6 +583,13 @@ async fn update_user(
     }
     // 逐字段记变更前后值：审计要能回答「改了什么」，不只是「被改过」。
     let mut changes: Vec<String> = Vec::new();
+    if email_changed {
+        changes.push(format!(
+            "email {} → {}（并吊销其他会话）",
+            target.email,
+            email_after.as_deref().unwrap_or(&target.email)
+        ));
+    }
     if role_changed && let Some(role) = update.role {
         changes.push(format!("role {} → {}", target.role.as_str(), role.as_str()));
     }
@@ -820,10 +863,25 @@ async fn recharge_user(
 ) -> Result<Json<UserAdminView>, AdminError> {
     let delta = body.map_err(AdminError::bad_body)?.0.delta_usd_micros;
     let mut tx = begin_write(&deps).await?;
-    let target = users::get_user_on_conn(&mut tx, id)
+    // 归档用户的钱包仍须可对账：补扣路径（结算/豁免）已允许 root 触碰归档账户，
+    // 充值走同一语义。非 root 视角归档与不存在同响应（404）——归档账户不可见是
+    // 全库原则，不因充值端点泄漏「该 id 曾存在」。「非归档读不到、含归档读得到」
+    // 即归档判定，无需给 UserRecord 增加 deleted_at。
+    let (target, archived) = match users::get_user_on_conn(&mut tx, id)
         .await
         .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+    {
+        Some(target) => (target, false),
+        None => match users::get_user_including_archived_on_conn(&mut tx, id)
+            .await
+            .map_err(AdminError::Store)?
+        {
+            Some(target) if identity.role() == ManagementRole::Root => (target, true),
+            _ => {
+                return Err(AdminError::NotFound(format!("用户 {id} 不存在")));
+            }
+        },
+    };
     reject_user_management(&identity, &target, None)?;
     let change = store::adjust_user_balance(&mut tx, id, delta)
         .await
@@ -835,13 +893,14 @@ async fn recharge_user(
             identity.actor(),
             "billing",
             &format!(
-                "用户 {} ({}) 余额 {}{} USD（{} → {}）",
+                "用户 {} ({}) 余额 {}{} USD（{} → {}）{}",
                 id,
                 target.email,
                 if delta > 0 { "+" } else { "" },
                 format_usd_micros(delta),
                 format_usd_micros(change.before_usd_micros),
-                format_usd_micros(change.after_usd_micros)
+                format_usd_micros(change.after_usd_micros),
+                if archived { "（已归档）" } else { "" }
             ),
         )
         .await

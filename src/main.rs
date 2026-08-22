@@ -64,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
     // 可选的管理面：配置了 `admin_listen` 才启动独立管理监听；未配置即管理面
     // 整体关闭，协议监听不注册任何管理路由。管理面与协议面物理隔离。
     if let Some(admin_listen) = &cfg.admin_listen {
-        let admin_app = gateway::admin_router(pool.clone(), snapshot.clone());
+        let admin_app =
+            gateway::admin_router(pool.clone(), snapshot.clone(), cfg.database.path.clone());
         let admin_addr = format!("{}:{}", admin_listen.host, admin_listen.port);
         let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
         if gateway::webui_available() {

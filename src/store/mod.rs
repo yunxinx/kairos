@@ -12,12 +12,12 @@ pub mod users;
 
 pub use system_log::{
     Actor, SystemLog, SystemLogList, SystemLogQuery, SystemLogSortBy, insert_system_log,
-    query_system_log_page, record_audit, record_audit_detached, record_system_error,
-    record_system_warn,
+    purge_system_logs_before, query_system_log_page, record_audit, record_audit_detached,
+    record_system_error, record_system_warn,
 };
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,18 @@ pub enum StoreError {
     Migrate(sqlx::migrate::MigrateError),
     #[error("数据库操作失败: {0}")]
     Query(sqlx::Error),
+    #[error("读取数据库文件元数据 {path} 失败: {source}")]
+    FileMetadata {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(
+        "WAL checkpoint 被活动读事务阻塞（WAL 帧 {log_frames}，已 checkpoint {checkpointed_frames}）"
+    )]
+    WalCheckpointBusy {
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
     #[error("找不到令牌 {0} 所属用户的余额")]
     MissingToken(String),
     #[error("资源数据非法: {0}")]
@@ -788,6 +800,121 @@ pub async fn count_request_logs(
 ) -> Result<u64, StoreError> {
     let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
     count_request_logs_on(&mut conn, filter).await
+}
+
+/// 单批删除的行数：批间提交让请求路径的结算写入得以插队，避免单事务长写锁。
+const LOG_PURGE_BATCH_ROWS: u64 = 5_000;
+
+/// 删除早于截止时刻的**已结算**请求日志，返回删除总行数。
+///
+/// 未结算行是对账队列（补扣/豁免的依据），删除即坏账，永不清理。分批提交：
+/// SQLite 单写者下一次性删百万行会长时间占住写锁，把请求路径的结算写入
+/// 挤到 `busy_timeout` 之外。
+pub async fn purge_settled_request_logs_before(
+    pool: &SqlitePool,
+    cutoff_created_at: i64,
+) -> Result<u64, StoreError> {
+    let mut removed = 0u64;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM request_log WHERE id IN ( \
+                SELECT id FROM request_log WHERE created_at < ? AND settled != 0 \
+                LIMIT ?)",
+        )
+        .bind(cutoff_created_at)
+        .bind(LOG_PURGE_BATCH_ROWS as i64)
+        .execute(pool)
+        .await
+        .map_err(StoreError::Query)?;
+        let affected = result.rows_affected();
+        removed += affected;
+        if affected < LOG_PURGE_BATCH_ROWS {
+            return Ok(removed);
+        }
+    }
+}
+
+/// 日志存储占用与行数快照，供 root 在设置页决定何时清理。
+///
+/// 体积走**文件系统**：主库文件 + WAL 边车的实际字节数。SQL 的
+/// `page_count × page_size` 只覆盖主库文件，WAL（批量写入期间可能相当大，
+/// 见 [`purge_settled_request_logs_before`] 的分批提交）拿不到——判断磁盘
+/// 压力需要的是文件系统真相。两个 `COUNT(*)` 在清理后体量有界，按需拉取。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogStoreStats {
+    /// 主库文件字节数（含空闲页：删除不回缩，后续写入逐步复用）。
+    pub db_size_bytes: u64,
+    /// `<db>-wal` 边车字节数；边车不存在（checkpoint 成功截断或尚未写入）为 0。
+    pub wal_size_bytes: u64,
+    pub request_log_rows: u64,
+    pub system_log_rows: u64,
+}
+
+pub async fn log_store_stats(
+    pool: &SqlitePool,
+    db_path: &Path,
+) -> Result<LogStoreStats, StoreError> {
+    // 这是管理面的运维诊断：主库路径来自已经打开的配置，读取失败不能伪装成
+    // 「0 字节」。WAL 尚未创建是正常状态，只有 NotFound 才折算为 0。
+    let db_size_bytes = tokio::fs::metadata(db_path)
+        .await
+        .map_err(|source| StoreError::FileMetadata {
+            path: db_path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let mut wal_path = db_path.to_path_buf();
+    // 在 OsString 层追加后缀，保留非 UTF-8 路径的原始字节；display() 再拼接会
+    // 经过 lossy UTF-8 转换，导致合法的 Unix 路径找不到对应的 WAL 文件。
+    wal_path.as_mut_os_string().push("-wal");
+    let wal_size_bytes = match tokio::fs::metadata(&wal_path).await {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(source) => {
+            return Err(StoreError::FileMetadata {
+                path: wal_path,
+                source,
+            });
+        }
+    };
+    let request_log_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_log")
+        .fetch_one(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    let system_log_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_log")
+        .fetch_one(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(LogStoreStats {
+        db_size_bytes,
+        wal_size_bytes,
+        request_log_rows: as_count(request_log_rows),
+        system_log_rows: as_count(system_log_rows),
+    })
+}
+
+/// 清理后的收尾：尝试把 WAL 全量并入主库并将边车截断为零。
+///
+/// 批量删除的多批独立提交会让 WAL 持续增长，不收尾的话「删完日志磁盘占用
+/// 反而更大」会成为常态观感。TRUNCATE 模式会等待在途读事务（受
+/// busy_timeout 约束）。SQLite 会把读事务阻塞放在结果行的 `busy` 列中返回，
+/// 而不是报 SQL 错；本函数显式检查该列，失败由调用方降级处理。主库文件本身
+/// 不缩小（空闲页复用），由调用方的契约文案说明。
+pub async fn checkpoint_wal_truncate(pool: &SqlitePool) -> Result<(), StoreError> {
+    let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    let busy: i64 = row.try_get(0).map_err(StoreError::Query)?;
+    let log_frames: i64 = row.try_get(1).map_err(StoreError::Query)?;
+    let checkpointed_frames: i64 = row.try_get(2).map_err(StoreError::Query)?;
+    if busy != 0 {
+        return Err(StoreError::WalCheckpointBusy {
+            log_frames,
+            checkpointed_frames,
+        });
+    }
+    Ok(())
 }
 
 /// `/stats` 缺省时间窗（天）。
@@ -2541,6 +2668,50 @@ mod tests {
                 .expect("不存在也应成功")
                 .is_none()
         );
+    }
+
+    /// 主库文件读取失败必须显式报错，不能把路径错误伪装成零字节占用。
+    #[tokio::test]
+    async fn log_store_stats_reports_database_metadata_errors() {
+        let (dir, pool) = test_pool().await;
+        let missing_path = dir.path().join("missing.db");
+        let err = log_store_stats(&pool, &missing_path)
+            .await
+            .expect_err("主库 metadata 失败应向上返回");
+        assert!(matches!(
+            err,
+            StoreError::FileMetadata { path, source }
+                if path == missing_path && source.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    /// 活动读事务会令 SQLite 返回 busy=1；checkpoint 辅助必须检查结果行，不能只
+    /// 看 SQL 是否报错，否则调用方会误以为 WAL 已经截断。
+    #[tokio::test]
+    async fn checkpoint_wal_truncate_reports_busy_reader() {
+        let (_dir, pool) = test_pool().await;
+        let mut reader = pool.acquire().await.expect("应能取得读连接");
+        let mut read_tx = reader.begin().await.expect("应能开启读事务");
+        let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM smoke_probe")
+            .fetch_one(&mut *read_tx)
+            .await
+            .expect("应能建立读快照");
+
+        insert_smoke(&pool, "checkpoint-busy")
+            .await
+            .expect("应能追加 WAL");
+        let err = checkpoint_wal_truncate(&pool)
+            .await
+            .expect_err("活动读事务应报告 busy");
+        assert!(
+            matches!(err, StoreError::WalCheckpointBusy { log_frames, checkpointed_frames }
+            if log_frames > checkpointed_frames)
+        );
+
+        read_tx.rollback().await.expect("应能结束读事务");
+        checkpoint_wal_truncate(&pool)
+            .await
+            .expect("读事务结束后应能完成 checkpoint");
     }
 
     /// 系统日志分页与关键字过滤。

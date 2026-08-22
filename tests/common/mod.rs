@@ -591,7 +591,7 @@ impl TestGateway {
             )
             .await
             .expect("测试 root 应能播种登录凭证");
-            let admin_app = gateway::admin_router(pool.clone(), snapshot.clone());
+            let admin_app = gateway::admin_router(pool.clone(), snapshot.clone(), db_path.clone());
             let admin_listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("管理监听应能绑定随机端口");

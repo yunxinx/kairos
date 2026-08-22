@@ -6,7 +6,7 @@
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, post},
 };
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,13 @@ pub(super) fn signed_in_routes() -> Router<AdminDeps> {
 
 pub(super) fn admin_routes() -> Router<AdminDeps> {
     Router::new().route("/system-logs", get(query_system_logs))
+}
+
+/// 日志维护端点：只读体积统计与按时间窗清理，均要求 root（挂 `root_only` 层）。
+pub(super) fn root_routes() -> Router<AdminDeps> {
+    Router::new()
+        .route("/logs/size", get(log_size))
+        .route("/logs/cleanup", post(cleanup_logs))
 }
 
 /// 请求日志条目 wire 契约：完整 body 以 base64 编码（二进制安全）。
@@ -171,6 +178,97 @@ pub(super) async fn get_log(
 pub(super) fn parse_log_id(raw: &str) -> Result<i64, AdminError> {
     raw.parse()
         .map_err(|_| AdminError::NotFound(format!("日志 {raw} 不存在")))
+}
+
+/// 清理窗口上限（天）：超过即视为误操作（如把年份敲成毫秒）。
+const MAX_CLEANUP_DAYS: u64 = 3_650;
+const MS_PER_DAY: i64 = 86_400_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupBody {
+    older_than_days: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CleanupResultView {
+    removed_request_logs: u64,
+    removed_system_logs: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct LogSizeView {
+    /// 主库文件字节数（含空闲页，删除不回缩、后续写入复用）。
+    db_size_bytes: u64,
+    /// WAL 边车字节数；清理收尾的 checkpoint 成功时会把它截断为零。
+    wal_size_bytes: u64,
+    request_log_rows: u64,
+    system_log_rows: u64,
+}
+
+/// 日志占用快照：主库与 WAL 的文件系统实际大小 + 两张日志表的行数。
+async fn log_size(
+    State(deps): State<AdminDeps>,
+    Extension(_identity): Extension<ManagementIdentity>,
+) -> Result<Json<LogSizeView>, AdminError> {
+    let stats = store::log_store_stats(&deps.pool, &deps.db_path)
+        .await
+        .map_err(AdminError::Store)?;
+    Ok(Json(LogSizeView {
+        db_size_bytes: stats.db_size_bytes,
+        wal_size_bytes: stats.wal_size_bytes,
+        request_log_rows: stats.request_log_rows,
+        system_log_rows: stats.system_log_rows,
+    }))
+}
+
+/// 按时间窗手动清理：删除早于 N 天的已结算请求日志与系统日志。
+///
+/// 破坏性操作只交给 root 手动触发，不设自动周期——删多删少由人按占用决定。
+/// 口径提示：已删除明细不再计入 `/stats` 与用户用量统计（请求数/token 会缩水），
+/// 但钱包余额与累计结算金额独立于日志表，不受影响。删除后尽力把 WAL
+/// checkpoint 进主库并截断（多批提交期间 WAL 会涨）；主库文件不回缩，空闲页
+/// 由后续写入复用。
+async fn cleanup_logs(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<CleanupBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<CleanupResultView>, AdminError> {
+    let days = body.map_err(AdminError::bad_body)?.0.older_than_days;
+    if days == 0 || days > MAX_CLEANUP_DAYS {
+        return Err(AdminError::InvalidBody(format!(
+            "older_than_days 须在 1..={MAX_CLEANUP_DAYS} 天之间"
+        )));
+    }
+    let now = crate::gateway::logging::unix_millis();
+    let cutoff = now.saturating_sub((days as i64).saturating_mul(MS_PER_DAY));
+    let removed_request_logs = store::purge_settled_request_logs_before(&deps.pool, cutoff)
+        .await
+        .map_err(AdminError::Store)?;
+    let removed_system_logs = store::purge_system_logs_before(&deps.pool, cutoff)
+        .await
+        .map_err(AdminError::Store)?;
+    store::record_audit_detached(
+        &deps.pool,
+        Some(identity.actor()),
+        "info",
+        "logs",
+        &format!(
+            "清理日志：删除 {removed_request_logs} 条已结算请求日志与 \
+             {removed_system_logs} 条系统日志（早于 {days} 天）"
+        ),
+    )
+    .await;
+    // 正常路径以 checkpoint 收尾：审计行先落库，WAL 才能在最后截断为零。
+    // 行已删掉、审计已留痕，截断失败只记系统日志，不让清理整体报错；该告警
+    // 本身会产生少量 WAL，但避免把未完成的收尾伪报为成功。
+    if let Err(err) = store::checkpoint_wal_truncate(&deps.pool).await {
+        store::record_system_warn(&deps.pool, "logs", &format!("清理后 WAL 收尾失败: {err}")).await;
+    }
+    Ok(Json(CleanupResultView {
+        removed_request_logs,
+        removed_system_logs,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
