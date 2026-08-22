@@ -47,7 +47,7 @@ use crate::{
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
 use super::logging::{Billing, log_request, new_request_id, unix_millis};
-use super::rate_limit::{RequestRateLimiter, effective_rate_limit_rpm};
+use super::rate_limit::RequestRateLimiter;
 use super::sse::{
     OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
     take_frame,
@@ -2232,20 +2232,23 @@ async fn error_response(
     (status, Json(body)).into_response()
 }
 
-/// 令牌生效 RPM：缺省跟随全局兜底，令牌写出的值（含 `0`）覆盖全局；同时受所属用户 RPM 约束。
+/// 令牌生效 RPM：令牌桶上限 = 令牌 `rate_limit_rpm`（缺省跟随全局兜底，`0` 不限）；
+/// 所属用户配置了正数 RPM 时另开用户桶，跨该用户全部令牌共享（令牌写 `0` 也
+/// 压不过用户上限）。快照原子替换后，本函数每次调用重读两维上限，自动生效。
 fn token_rate_limited(
     deps: &Deps,
     token: &Token,
     snapshot: &RuntimeSnapshot,
 ) -> Result<(), Duration> {
-    let user_rpm = snapshot
+    let token_limit = token.rate_limit_rpm.unwrap_or(snapshot.rate_limit_rpm);
+    let user_limit = snapshot
         .users
         .get(&token.user_id)
-        .and_then(|u| u.rate_limit_rpm);
-    deps.request_rate.try_acquire(
-        &token.token_key,
-        effective_rate_limit_rpm(token.rate_limit_rpm, user_rpm, snapshot.rate_limit_rpm),
-    )
+        .and_then(|user| user.rate_limit_rpm)
+        .filter(|limit| *limit > 0)
+        .map(|limit| (token.user_id, limit));
+    deps.request_rate
+        .try_acquire(&token.token_key, token_limit, user_limit)
 }
 
 /// 令牌 RPM 超限：429 + `Retry-After`。
