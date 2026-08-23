@@ -215,6 +215,54 @@ export interface BalanceAdjustment {
   delta_usd_micros: number;
 }
 
+/** 套餐管理面能力开关。 */
+export interface PlanCapabilities {
+  manage_users: boolean;
+  assign_plan: boolean;
+  view_logs_stats: boolean;
+  settle_waive: boolean;
+  toggle_user_tokens: boolean;
+  view_own_plan_groups: boolean;
+  view_other_groups: boolean;
+  edit_prices: boolean;
+  edit_model_groups: boolean;
+  edit_unified_models: boolean;
+  edit_price_catalog: boolean;
+}
+
+/** 套餐读视图。`internal_name` 仅 root 可见。 */
+export interface PlanView {
+  id: number;
+  internal_name?: string;
+  display_name: string;
+  note: string;
+  note_visible_to_admin: boolean;
+  discount_bp: number;
+  default_rpm: number | null;
+  shared_rpm: number | null;
+  initial_grant_usd_micros: number;
+  capabilities: PlanCapabilities;
+  shared_with_admin: boolean;
+  builtin: boolean;
+  created_at: number;
+  groups: string[];
+}
+
+/** 套餐写契约。 */
+export interface PlanInput {
+  internal_name: string;
+  display_name: string;
+  note: string;
+  note_visible_to_admin: boolean;
+  discount_bp: number;
+  default_rpm: number | null;
+  shared_rpm: number | null;
+  initial_grant_usd_micros: number;
+  capabilities: PlanCapabilities;
+  shared_with_admin: boolean;
+  groups: string[];
+}
+
 /** 管理角色：上级含下级权限。 */
 export type ManagementRole = 'user' | 'admin' | 'root';
 
@@ -236,9 +284,13 @@ export interface UserView {
   rate_limit_rpm?: number | null;
 }
 
-/** 当前用户：身份 + 可用组 + 钱包 + 统计。 */
+/** 当前用户：身份 + 套餐 + 可用组 + 钱包 + 统计。 */
 export interface MeView extends UserView {
+  plan_id: number | null;
+  plan_display_name: string | null;
+  discount_bp: number;
   assigned_groups: string[];
+  capabilities: PlanCapabilities;
   balance_usd_micros: number;
   settled_usd_micros: number;
   request_count?: number;
@@ -248,7 +300,7 @@ export interface MeView extends UserView {
 }
 
 /** 用户管理列表/详情。不含 avatar：运营视图不渲染头像，自己的走 `/me`。 */
-export interface UserAdminView extends Omit<MeView, 'avatar'> {
+export interface UserAdminView extends Omit<MeView, 'avatar' | 'capabilities'> {
   request_count: number;
   input_tokens: number;
   output_tokens: number;
@@ -273,6 +325,7 @@ export interface UserCreate {
   role: ManagementRole;
   avatar?: string;
   rate_limit_rpm?: number | null;
+  plan_id?: number;
 }
 
 /** 当前用户改自己的资料。改密码或改邮箱时必须带 `current_password`。 */
@@ -293,10 +346,6 @@ export interface UserUpdate {
   display_name?: string;
   avatar?: string;
   rate_limit_rpm?: number | null;
-}
-
-export interface AssignedGroupsView {
-  groups: string[];
 }
 
 /** 请求日志条目；完整 body 为 base64。 */
@@ -320,6 +369,11 @@ export interface LogEntry {
   output_price_usd_micros: number;
   cache_read_price_usd_micros: number;
   cache_write_price_usd_micros: number;
+  /** 渠道原价（折扣前）。 */
+  base_cost_usd_micros: number;
+  /** 万分比折扣率；10000 表示原价。 */
+  discount_bp: number;
+  /** 实收（折后）。 */
   cost_usd_micros: number;
   /** 费用是否已完成所属用户钱包结算。 */
   settled: boolean;
@@ -364,6 +418,8 @@ export interface LogQuery {
   from_created_at?: number;
   to_created_at?: number;
   settled?: boolean;
+  /** 按该次使用的万分比折扣率精确过滤。 */
+  discount_bp?: number;
   /** 入站协议分面多选，请求时拼成逗号列表。 */
   inbound_protocol?: string[];
   sort_by?: RequestLogSortBy;

@@ -4,14 +4,15 @@ import { useI18n } from 'vue-i18n';
 import { TabsContent, TabsIndicator, TabsList, TabsRoot, TabsTrigger } from 'reka-ui';
 import type { UserAdminView } from '@/api/types';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
-import UserGroupsWindow from '@/features/users/UserGroupsWindow.vue';
+import UserPlanTab from '@/features/users/UserPlanTab.vue';
 import UserProfileTab from '@/features/users/UserProfileTab.vue';
 import UserRechargeWindow from '@/features/users/UserRechargeWindow.vue';
 import UserTokensWindow from '@/features/users/UserTokensWindow.vue';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
-export type UserManageTab = 'profile' | 'recharge' | 'groups' | 'tokens';
+export type UserManageTab = 'profile' | 'recharge' | 'plan' | 'tokens';
 
 const props = withDefaults(
   defineProps<{
@@ -35,16 +36,19 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const me = useCurrentUser();
 const isSelf = computed(() => me.value !== null && me.value.id === props.user.id);
+const isRootUser = computed(() => props.user.role === 'root');
+const canAssignPlan = computed(() => hasCapability(me.value, 'assign_plan'));
+const canToggleTokens = computed(() => hasCapability(me.value, 'toggle_user_tokens'));
 
 const initialTab = computed<UserManageTab>(() => {
-  if (isSelf.value && props.tab === 'tokens') return 'profile';
+  if (props.tab === 'tokens' && (isSelf.value || !canToggleTokens.value)) return 'profile';
+  if (props.tab === 'plan' && (isRootUser.value || !canAssignPlan.value)) return 'profile';
   return props.tab;
 });
 
 const activeTab = ref<UserManageTab>(initialTab.value);
 const profileDirty = ref(false);
 const rechargeDirty = ref(false);
-const groupsDirty = ref(false);
 
 const windowTitle = computed(() => {
   const name = props.user.display_name || props.user.email;
@@ -54,13 +58,13 @@ const windowTitle = computed(() => {
 
 watch(
   () => props.tab,
-  (tab) => {
-    activeTab.value = isSelf.value && tab === 'tokens' ? 'profile' : tab;
+  () => {
+    activeTab.value = initialTab.value;
   },
 );
 
 function emitDirty() {
-  emit('dirty-change', profileDirty.value || rechargeDirty.value || groupsDirty.value);
+  emit('dirty-change', profileDirty.value || rechargeDirty.value);
 }
 </script>
 
@@ -86,11 +90,16 @@ function emitDirty() {
           <TabsTrigger value="recharge" class="page-tab-switch-btn" data-testid="user-tab-recharge">
             {{ t('users.recharge') }}
           </TabsTrigger>
-          <TabsTrigger value="groups" class="page-tab-switch-btn" data-testid="user-tab-groups">
-            {{ t('users.assignGroups') }}
+          <TabsTrigger
+            v-if="canAssignPlan && !isRootUser"
+            value="plan"
+            class="page-tab-switch-btn"
+            data-testid="user-tab-plan"
+          >
+            {{ t('users.plan') }}
           </TabsTrigger>
           <TabsTrigger
-            v-if="!isSelf"
+            v-if="!isSelf && canToggleTokens"
             value="tokens"
             class="page-tab-switch-btn"
             data-testid="user-tab-tokens"
@@ -123,19 +132,18 @@ function emitDirty() {
           "
         />
       </TabsContent>
-      <TabsContent value="groups">
-        <UserGroupsWindow
+      <TabsContent v-if="canAssignPlan && !isRootUser" value="plan">
+        <UserPlanTab
           :user="user"
           @close="emit('close')"
           @dirty-change="
-            (dirty) => {
-              groupsDirty = dirty;
+            () => {
               emitDirty();
             }
           "
         />
       </TabsContent>
-      <TabsContent v-if="!isSelf" value="tokens">
+      <TabsContent v-if="!isSelf && canToggleTokens" value="tokens">
         <UserTokensWindow :user="user" />
       </TabsContent>
     </TabsRoot>

@@ -36,12 +36,10 @@ test.describe('users page', () => {
     await expect(row).toContainText('3.5');
 
     await row.getByTestId('user-edit').click();
-    await page.getByTestId('user-tab-groups').click();
-    await page.getByTestId('user-group-e2e-user-group').click();
-    await page.getByTestId('user-groups-save').click();
-    await expect(
-      row.getByTestId('user-group-chip').filter({ hasText: 'e2e-user-group' }),
-    ).toBeVisible();
+    await page.getByTestId('user-tab-plan').click();
+    await expect(page.getByTestId('user-plan-select')).toBeVisible();
+    await expect(page.getByTestId('user-current-plan')).toContainText(/standard/i);
+    await page.keyboard.press('Escape');
 
     await row.getByTestId('user-toggle-enabled').click();
     await expect(row.getByTestId('user-toggle-enabled')).toHaveText(/disabled/i);
@@ -149,32 +147,6 @@ test.describe('users page', () => {
     await page.locator('[data-testid="users-role-filter-option"][data-value="user"]').click();
     await page.keyboard.press('Escape');
     await page.locator('#users-search').fill('');
-
-    // 给 Low RPM 用户分配模型组后测试模型组筛选（Root 用户不应出现在特定组筛选结果中）
-    const lowUserRow = page.locator('[data-testid="user-row"]', { hasText: 'Low RPM User' });
-    await lowUserRow.getByTestId('user-edit').click();
-    await page.getByTestId('user-tab-groups').click();
-    await page.getByTestId('user-group-e2e-user-group').click();
-    await page.getByTestId('user-groups-save').click();
-
-    await page.getByTestId('users-group-filter').click();
-    await page
-      .locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]')
-      .click();
-    await page.keyboard.press('Escape');
-    // 只有 Low RPM 用户匹配该组，Root 用户（不受组限制）不应混入特定组筛选
-    await expect(page.locator('[data-testid="user-row"]')).toHaveCount(1);
-    await expect(page.locator('[data-testid="user-row"]')).toContainText('Low RPM User');
-    await expect(
-      page.locator('[data-testid="user-row"]', { hasText: 'root@localhost' }),
-    ).toHaveCount(0);
-
-    // 清除模型组筛选
-    await page.getByTestId('users-group-filter').click();
-    await page
-      .locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]')
-      .click();
-    await page.keyboard.press('Escape');
 
     // 查看 Root 用户
     const rootRow = page.locator('[data-testid="user-row"]', { hasText: 'root@localhost' });

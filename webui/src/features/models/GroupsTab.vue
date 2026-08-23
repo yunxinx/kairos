@@ -30,6 +30,8 @@ import GroupEditorWindow from '@/features/models/GroupEditorWindow.vue';
 import ModelSourceLines from '@/features/models/ModelSourceLines.vue';
 import { groupModelDisplayLines } from '@/lib/group-models';
 import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
+import { hasCapability } from '@/lib/capabilities';
+import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type GroupWindowPayload =
@@ -40,6 +42,8 @@ type GroupWindowPayload =
 const { t } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
+const me = useCurrentUser();
+const canEditGroups = computed(() => hasCapability(me.value, 'edit_model_groups'));
 const searchText = ref('');
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
@@ -209,6 +213,7 @@ function openBulkDelete() {
             />
             <template #actions>
               <button
+                v-if="canEditGroups"
                 type="button"
                 class="btn btn-primary"
                 data-testid="group-create"
@@ -267,7 +272,7 @@ function openBulkDelete() {
                   chip-test-id="group-source-channel"
                 />
               </TableCell>
-              <TableCell align="center">
+              <TableCell v-if="canEditGroups" align="center">
                 <span class="inline-flex items-center justify-center gap-1">
                   <button
                     type="button"
@@ -296,7 +301,7 @@ function openBulkDelete() {
             <TableRow v-if="filtered.length === 0">
               <TableCell :colspan="4" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.groupEmpty')">
-                  <button type="button" class="btn btn-primary" @click="openCreate">
+                  <button v-if="canEditGroups" type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('models.groupCreate') }}
                   </button>
                 </EmptyState>
@@ -306,6 +311,7 @@ function openBulkDelete() {
         </TableBody>
       </DataTable>
       <DataTableBulkBar
+        v-if="canEditGroups"
         :count="selection.count.value"
         data-testid="groups-bulk-bar"
         @clear="selection.clear"

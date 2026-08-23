@@ -203,6 +203,7 @@ struct MeView {
     plan_display_name: Option<String>,
     discount_bp: i64,
     assigned_groups: Vec<String>,
+    capabilities: plans::PlanCapabilities,
     balance_usd_micros: i64,
     settled_usd_micros: i64,
 }
@@ -240,6 +241,22 @@ async fn get_me(
         plan_display_name: plan.as_ref().map(|plan| plan.display_name.clone()),
         discount_bp: plan.as_ref().map_or(10_000, |plan| plan.discount_bp),
         assigned_groups,
+        capabilities: match plan.as_ref() {
+            Some(plan) => plan.capabilities,
+            None => plans::PlanCapabilities {
+                manage_users: true,
+                assign_plan: true,
+                view_logs_stats: true,
+                settle_waive: true,
+                toggle_user_tokens: true,
+                view_own_plan_groups: true,
+                view_other_groups: true,
+                edit_prices: true,
+                edit_model_groups: true,
+                edit_unified_models: true,
+                edit_price_catalog: true,
+            },
+        },
         balance_usd_micros: wallet.balance_usd_micros,
         settled_usd_micros: wallet.settled_usd_micros,
     }))

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useId, computed, ref, watch } from 'vue';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import { roleAtLeast, type ManagementRole, type UserAdminView } from '@/api/types';
@@ -12,6 +12,7 @@ import FormTextInput from '@/components/ui/FormTextInput.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
@@ -40,8 +41,14 @@ const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
 const me = useCurrentUser();
 
+const plansQuery = useQuery({
+  queryKey: ['plans'],
+  queryFn: () => apiClient.listPlans(),
+});
+
 const uid = useId();
 const emailId = `user-editor-email-${uid}`;
+const planId = `user-editor-plan-${uid}`;
 const nameId = `user-editor-name-${uid}`;
 const passwordId = `user-editor-password-${uid}`;
 const roleId = `user-editor-role-${uid}`;
@@ -56,6 +63,7 @@ const initialRpm =
   props.initial && props.initial.rate_limit_rpm !== null && props.initial.rate_limit_rpm !== undefined
     ? String(props.initial.rate_limit_rpm)
     : '';
+const initialPlanId = props.initial?.plan_id != null ? String(props.initial.plan_id) : '';
 
 const email = ref(initialEmail);
 const displayName = ref(initialName);
@@ -63,6 +71,7 @@ const password = ref('');
 const role = ref<ManagementRole>(initialRole);
 const rateLimitRpm = ref(initialRpm);
 const enabled = ref(initialEnabled);
+const selectedPlanId = ref(initialPlanId || defaultPlanForRole(initialRole));
 
 const isCreate = computed(() => props.initial === null);
 
@@ -85,6 +94,32 @@ const roleOptions = computed(() => [
   { value: 'admin', label: t('users.roleAdmin') },
 ]);
 
+const STANDARD_PLAN_ID = 1;
+const ADMIN_PLAN_ID = 2;
+
+function defaultPlanForRole(role: ManagementRole): string {
+  if (role === 'root') return '';
+  return role === 'admin' ? String(ADMIN_PLAN_ID) : String(STANDARD_PLAN_ID);
+}
+
+const planOptions = computed(() => {
+  const options = (plansQuery.data.value ?? []).map((plan) => ({
+    value: String(plan.id),
+    label: `${plan.display_name}${plan.internal_name ? ` (${plan.internal_name})` : ''}`,
+  }));
+  const selected = selectedPlanId.value;
+  if (selected && !options.some((option) => option.value === selected)) {
+    options.push({ value: selected, label: selected });
+  }
+  return options;
+});
+
+watch(role, (value) => {
+  if (isCreate.value) {
+    selectedPlanId.value = defaultPlanForRole(value);
+  }
+});
+
 const dirty = computed(() => {
   if (isCreate.value) {
     return (
@@ -92,7 +127,8 @@ const dirty = computed(() => {
       displayName.value.trim() !== '' ||
       password.value !== '' ||
       role.value !== 'user' ||
-      rateLimitRpm.value.trim() !== ''
+      rateLimitRpm.value.trim() !== '' ||
+      selectedPlanId.value !== defaultPlanForRole(role.value)
     );
   }
   return (
@@ -100,7 +136,8 @@ const dirty = computed(() => {
     password.value !== '' ||
     role.value !== initialRole ||
     enabled.value !== initialEnabled ||
-    rateLimitRpm.value.trim() !== initialRpm
+    rateLimitRpm.value.trim() !== initialRpm ||
+    selectedPlanId.value !== initialPlanId
   );
 });
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
@@ -115,6 +152,7 @@ const saveMutation = useMutation({
         password: password.value,
         role: canPickRole.value ? role.value : 'user',
         rate_limit_rpm: parsedRpm,
+        plan_id: Number(selectedPlanId.value),
       });
     } else if (props.initial) {
       const body: {
@@ -134,7 +172,15 @@ const saveMutation = useMutation({
       if (password.value) {
         body.password = password.value;
       }
-      return apiClient.updateUser(props.initial.id, body);
+      const updated = await apiClient.updateUser(props.initial.id, body);
+      if (
+        selectedPlanId.value &&
+        selectedPlanId.value !== initialPlanId &&
+        hasCapability(me.value, 'assign_plan')
+      ) {
+        await apiClient.assignUserPlan(props.initial.id, Number(selectedPlanId.value));
+      }
+      return updated;
     }
   },
   onSuccess: async () => {
@@ -259,6 +305,20 @@ function handleSave() {
             v-model="role"
             :options="roleOptions"
             data-testid="user-editor-role"
+          />
+        </FormField>
+
+        <FormField
+          field-name="plan"
+          :label="t('users.plan')"
+          :input-id="planId"
+          :guide="t('users.planGuide')"
+        >
+          <UiSelect
+            :id="planId"
+            v-model="selectedPlanId"
+            :options="planOptions"
+            data-testid="user-editor-plan"
           />
         </FormField>
 

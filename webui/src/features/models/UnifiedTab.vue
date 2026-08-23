@@ -31,6 +31,8 @@ import { useToast } from '@/composables/useToast';
 import UnifiedEditorWindow from '@/features/models/UnifiedEditorWindow.vue';
 import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
 import { unifiedUsesChannel } from '@/lib/unified-sources';
+import { hasCapability } from '@/lib/capabilities';
+import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type UnifiedWindowPayload =
@@ -41,6 +43,8 @@ type UnifiedWindowPayload =
 const { t } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
+const me = useCurrentUser();
+const canEditUnified = computed(() => hasCapability(me.value, 'edit_unified_models'));
 const searchText = ref('');
 const statusFilter = ref<string[]>([]);
 const selectedChannels = ref<string[]>([]);
@@ -245,6 +249,7 @@ function openBulkDelete() {
             />
             <template #actions>
               <button
+                v-if="canEditUnified"
                 type="button"
                 class="btn btn-primary"
                 data-testid="unified-create"
@@ -299,7 +304,7 @@ function openBulkDelete() {
                   {{ model.hide ? t('models.unifiedHideOn') : t('models.unifiedHideOff') }}
                 </span>
               </TableCell>
-              <TableCell align="center">
+              <TableCell v-if="canEditUnified" align="center">
                 <span class="inline-flex items-center justify-center gap-1">
                   <button
                     type="button"
@@ -328,7 +333,7 @@ function openBulkDelete() {
             <TableRow v-if="filtered.length === 0">
               <TableCell :colspan="5" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.unifiedEmpty')">
-                  <button type="button" class="btn btn-primary" @click="openCreate">
+                  <button v-if="canEditUnified" type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('models.unifiedCreate') }}
                   </button>
                 </EmptyState>
@@ -338,6 +343,7 @@ function openBulkDelete() {
         </TableBody>
       </DataTable>
       <DataTableBulkBar
+        v-if="canEditUnified"
         :count="selection.count.value"
         data-testid="unified-bulk-bar"
         @clear="selection.clear"

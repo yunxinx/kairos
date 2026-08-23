@@ -1,7 +1,6 @@
 import { invalidateAdminKey, getAdminKey } from '@/lib/session';
 import { ApiClientError, type ApiErrorBody } from '@/api/types';
 import type {
-  AssignedGroupsView,
   BalanceAdjustment,
   Channel,
   ChannelProbeResult,
@@ -36,6 +35,8 @@ import type {
   UserCreate,
   UserUpdate,
   UserView,
+  PlanInput,
+  PlanView,
 } from '@/api/types';
 
 function buildQuery(params: object): string {
@@ -131,15 +132,27 @@ export const apiClient = {
     return apiFetch(`/users/${id}/balance`, { method: 'POST', body: JSON.stringify(body) });
   },
 
-  getUserModelGroups(id: number): Promise<AssignedGroupsView> {
-    return apiFetch(`/users/${id}/model-groups`);
+  assignUserPlan(id: number, planId: number): Promise<UserView> {
+    return apiFetch(`/users/${id}/plan`, {
+      method: 'PUT',
+      body: JSON.stringify({ plan_id: planId }),
+    });
   },
 
-  replaceUserModelGroups(id: number, groups: string[]): Promise<AssignedGroupsView> {
-    return apiFetch(`/users/${id}/model-groups`, {
-      method: 'PUT',
-      body: JSON.stringify({ groups }),
-    });
+  listPlans(): Promise<PlanView[]> {
+    return apiFetch('/plans');
+  },
+
+  createPlan(body: PlanInput): Promise<PlanView> {
+    return apiFetch('/plans', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  updatePlan(id: number, body: PlanInput): Promise<PlanView> {
+    return apiFetch(`/plans/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+  },
+
+  deletePlan(id: number, force = false): Promise<PlanView> {
+    return apiFetch(`/plans/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' });
   },
 
   listUserTokens(id: number): Promise<TokenView[]> {

@@ -17,6 +17,8 @@ export interface SeedLogInput {
   latency_ms?: number;
   input_tokens?: number;
   output_tokens?: number;
+  base_cost_usd_micros?: number;
+  discount_bp?: number;
   cost_usd_micros?: number;
   settled?: boolean;
   request_body?: Uint8Array | null;
@@ -44,9 +46,10 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
          created_at, token_name, token_key, inbound_protocol, model, outbound_model, channel,
          status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens,
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros,
-         cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros,
+         cache_read_price_usd_micros, cache_write_price_usd_micros,
+         base_cost_usd_micros, discount_bp, cost_usd_micros,
          settled, request_body, response_body
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?)`,
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?)`,
     );
     const ids: number[] = [];
     db.exec('BEGIN');
@@ -64,6 +67,8 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
           log.latency_ms ?? 12,
           log.input_tokens ?? 0,
           log.output_tokens ?? 0,
+          log.base_cost_usd_micros ?? log.cost_usd_micros ?? 0,
+          log.discount_bp ?? 10000,
           log.cost_usd_micros ?? 0,
           log.settled === false ? 0 : 1,
           log.request_body ?? null,

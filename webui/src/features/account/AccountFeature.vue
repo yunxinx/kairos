@@ -15,7 +15,7 @@ import UiIcon from '@/components/ui/UiIcon.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import { downscaleAvatar, isAcceptedAvatarType } from '@/lib/avatar';
-import { formatUsdMicros } from '@/lib/format';
+import { formatDiscountBp, formatUsdMicros } from '@/lib/format';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import { useNavAvatarPreference } from '@/lib/preferences';
 import { setMe, useCurrentUser } from '@/lib/session';
@@ -235,7 +235,7 @@ function handleChangePassword() {
             </div>
           </div>
 
-          <!-- 余额总览与模型组指标 -->
+          <!-- 余额总览与套餐/模型组指标 -->
           <div
             class="bg-surface-elevated border-seed flex shrink-0 items-center justify-between gap-6 rounded-md border px-5 py-3 sm:min-w-64"
           >
@@ -245,7 +245,21 @@ function handleChangePassword() {
                 {{ formatUsdMicros(me.balance_usd_micros) }}
               </p>
             </div>
-            <div v-if="me.role === 'user'" class="text-right">
+            <div v-if="me.role !== 'root'" class="text-right">
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.plan') }}</p>
+              <p class="font-mono text-base font-semibold" data-testid="account-plan-name">
+                {{ me.plan_display_name || '—' }}
+              </p>
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.discount') }}</p>
+              <p class="font-mono text-base font-semibold" data-testid="account-discount">
+                {{ formatDiscountBp(me.discount_bp) }}
+              </p>
+            </div>
+            <div v-else class="text-right">
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.plan') }}</p>
+              <p class="font-mono text-base font-semibold">{{ t('common.unlimited') }}</p>
+            </div>
+            <div v-if="me.role !== 'root'" class="text-right">
               <p class="text-fg-muted text-xs font-medium">{{ t('account.assignedGroups') }}</p>
               <p class="font-mono text-base font-semibold">
                 {{ me.assigned_groups.length }}
@@ -254,7 +268,7 @@ function handleChangePassword() {
           </div>
         </div>
 
-        <div v-if="me.role === 'user' && me.assigned_groups.length > 0" class="border-seed mt-4 border-t pt-3">
+        <div v-if="me.role !== 'root' && me.assigned_groups.length > 0" class="border-seed mt-4 border-t pt-3">
           <div class="flex flex-wrap items-center gap-2">
             <span class="text-fg-muted text-xs font-medium">{{ t('account.assignedGroups') }}:</span>
             <div class="min-w-0 flex-1">

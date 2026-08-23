@@ -591,6 +591,8 @@ pub struct RequestLogQuery {
     pub to_created_at: Option<i64>,
     /// 按是否已完成所属用户钱包结算过滤；`None` 表示不限。
     pub settled: Option<bool>,
+    /// 按该次使用的万分比折扣率精确过滤；`None` 表示不限。
+    pub discount_bp: Option<i64>,
     /// 精确匹配的入站协议；空表示不限。
     pub inbound_protocols: Vec<String>,
     /// 排序列；缺省时间。
@@ -1477,6 +1479,10 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
     if let Some(settled) = filter.settled {
         push_where_cond(qb, &mut first, "settled = ");
         qb.push_bind(settled as i64);
+    }
+    if let Some(discount_bp) = filter.discount_bp {
+        push_where_cond(qb, &mut first, "discount_bp = ");
+        qb.push_bind(discount_bp);
     }
     push_column_in(
         qb,

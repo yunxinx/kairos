@@ -14,6 +14,7 @@ import {
   formatTokensCount,
   maskTokenKey,
   componentCostMicros,
+  formatDiscountBp,
 } from '@/lib/format';
 import { resolveOutboundProtocol } from '@/lib/protocol';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
@@ -332,9 +333,25 @@ const calculationSteps = computed(() => {
                 <tfoot>
                   <tr class="border-t border-[var(--seed-fg)]/70">
                     <td class="pt-1.5 font-medium text-[var(--seed-fg)]" colspan="3">
-                      {{ t('logs.costTotal') }}
+                      {{ t('logs.baseTotal') }}
                     </td>
-                    <td class="pt-1.5 text-right text-sm font-bold text-[var(--seed-fg)]">
+                    <td class="pt-1.5 text-right font-medium text-[var(--seed-fg)]" data-testid="log-base-cost">
+                      {{ formatUsdMicros(entry.base_cost_usd_micros) }}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="pt-1.5 font-medium text-[var(--fg-muted)]" colspan="3">
+                      {{ t('logs.discountRate') }}
+                    </td>
+                    <td class="pt-1.5 text-right font-medium text-[var(--fg-muted)]" data-testid="log-discount-rate">
+                      {{ formatDiscountBp(entry.discount_bp) }}
+                    </td>
+                  </tr>
+                  <tr>
+                    <td class="pt-1.5 font-bold text-[var(--seed-fg)]" colspan="3">
+                      {{ t('logs.chargedTotal') }}
+                    </td>
+                    <td class="pt-1.5 text-right text-sm font-bold text-[var(--seed-fg)]" data-testid="log-charged-cost">
                       {{ formatUsdMicros(entry.cost_usd_micros) }}
                     </td>
                   </tr>

@@ -7,7 +7,7 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { roleAtLeast, type Token, type TokenCreate } from '@/api/types';
+import type { Token, TokenCreate } from '@/api/types';
 import type { TokenRow } from '@/api/token-rows';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
@@ -59,10 +59,7 @@ const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
 const me = useCurrentUser();
 
-const canListAllGroups = computed(() => {
-  const role = me.value?.role;
-  return role !== undefined && roleAtLeast(role, 'admin');
-});
+const canListAllGroups = computed(() => me.value?.role === 'root');
 const groupsQuery = useQuery({
   queryKey: ['model-groups'],
   queryFn: () => apiClient.listModelGroups(),
@@ -79,7 +76,7 @@ const initialEnabled = props.initial ? props.initial.enabled : true;
 const initialGroup = (() => {
   if (props.initial) return props.initial.model_group;
   const user = me.value;
-  if (user?.role === 'user') {
+  if (user && user.role !== 'root') {
     if (user.assigned_groups.includes(DEFAULT_MODEL_GROUP)) return DEFAULT_MODEL_GROUP;
     return user.assigned_groups[0] ?? '';
   }
@@ -93,7 +90,7 @@ const editorGroup = ref(initialGroup);
 
 const groupOptions = computed(() => {
   const user = me.value;
-  if (user?.role === 'user') {
+  if (user && user.role !== 'root') {
     return assignedGroupOptions(
       user.assigned_groups,
       editorGroup.value,

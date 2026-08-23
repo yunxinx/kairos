@@ -2,10 +2,10 @@
 import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { TabsContent, TabsIndicator, TabsList, TabsRoot, TabsTrigger } from 'reka-ui';
-import { roleAtLeast } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import RequestLogsPanel from '@/features/logs/RequestLogsPanel.vue';
 import SystemLogsPanel from '@/features/logs/SystemLogsPanel.vue';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 
 const { t } = useI18n();
@@ -15,10 +15,7 @@ const me = useCurrentUser();
  * 系统日志是运维与审计视图，后端要求 admin+。
  * 普通用户不渲染该 tab，避免点进去只拿到 403。
  */
-const canReadSystemLogs = computed(() => {
-  const role = me.value?.role;
-  return role !== undefined && roleAtLeast(role, 'admin');
-});
+const canReadSystemLogs = computed(() => hasCapability(me.value, 'view_logs_stats'));
 </script>
 
 <template>

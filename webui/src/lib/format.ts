@@ -277,3 +277,16 @@ export function computeCacheHitRatio(readTokens: number, inputTokens: number): n
   if (total <= 0 || readTokens <= 0) return 0;
   return Math.round((readTokens / total) * 100);
 }
+
+/** 万分比折扣率 → 百分比展示（10000 = 100%）。 */
+export function formatDiscountBp(discountBp: number): string {
+  const percent = discountBp / 100;
+  const fixed = Number.isInteger(percent) ? String(percent) : percent.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  return `${fixed}%`;
+}
+
+/** 万分比折扣率 → 倍率展示（10000 = 1）。 */
+export function formatDiscountMultiplier(discountBp: number): string {
+  const value = discountBp / 10_000;
+  return value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+}

@@ -21,7 +21,8 @@
     "logs": "Logs",
     "users": "Users",
     "account": "Account",
-    "logout": "Sign out"
+    "logout": "Sign out",
+    "plans": "Plans"
   },
   "auth": {
     "loginTitle": "Kairos",
@@ -115,7 +116,9 @@
     "filterEmpty": "No results found.",
     "emptyCell": "—",
     "increment": "Increase",
-    "decrement": "Decrease"
+    "decrement": "Decrease",
+    "yes": "Yes",
+    "no": "No"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -223,7 +226,12 @@
     "groupsUnrestricted": "Unrestricted",
     "groupsUnrestrictedHint": "Root and admin tokens can call every model group; assigned groups only apply to regular users.",
     "groupsRemoveWarning": "Removes {groups} assigned group(s); {tokens} token(s) bound to them will stop working immediately.",
-    "groupsRemoveUnknown": "Removes {groups} assigned group(s); the affected token count is unknown, bound tokens may stop working immediately."
+    "groupsRemoveUnknown": "Removes {groups} assigned group(s); the affected token count is unknown, bound tokens may stop working immediately.",
+    "plan": "Plan",
+    "planGuide": "New users receive this plan’s groups, discount, default RPM, and initial grant.",
+    "planUpdated": "Plan updated",
+    "planTabGuide": "Changing the plan immediately changes the user’s available groups and discount; existing balance and token bindings remain.",
+    "currentPlan": "Current plan"
   },
   "account": {
     "profile": "Profile",
@@ -257,7 +265,9 @@
     "registeredAt": "Registered at",
     "lastLoginAt": "Last login",
     "emailChangePassword": "Current password",
-    "emailChangePasswordGuide": "Your email is your login identifier; provide your current password to change it."
+    "emailChangePasswordGuide": "Your email is your login identifier; provide your current password to change it.",
+    "plan": "Plan",
+    "discount": "Discount"
   },
   "time": {
     "secondsAgo": "{seconds} seconds ago",
@@ -651,7 +661,11 @@
     "routeFlow": "Routing",
     "actor": "Operator",
     "actorSystem": "System",
-    "actorFilter": "Filter by this operator"
+    "actorFilter": "Filter by this operator",
+    "discountFilter": "Discount",
+    "baseTotal": "Base total",
+    "discountRate": "Discount rate",
+    "chargedTotal": "Charged total"
   },
   "a11y": {
     "skipToContent": "Skip to main content",
@@ -683,5 +697,48 @@
     "routeErrorTitle": "Something went wrong",
     "routeErrorDescription": "This page could not be loaded. You can retry or return to a safe route.",
     "goHome": "Back to home"
+  },
+  "plans": {
+    "create": "Create plan",
+    "editorCreate": "New plan",
+    "editorEdit": "Edit plan",
+    "internalName": "Internal name",
+    "displayName": "Display name",
+    "note": "Note",
+    "noteVisible": "Note visible to admins",
+    "discount": "Discount",
+    "discountPercent": "Discount (%)",
+    "discountGuide": "100 means list price; 80 means 80%. You may also enter 0.8 for 80% or 1.2 for a 20% markup.",
+    "defaultRpm": "Default RPM",
+    "defaultRpmGuide": "Leave blank to follow the global fallback.",
+    "sharedRpm": "Shared RPM",
+    "sharedRpmGuide": "Aggregate RPM limit for all users on this plan; leave blank for unlimited.",
+    "initialGrant": "Initial grant (USD)",
+    "initialGrantGuide": "Credited once when a new user is created.",
+    "modelGroups": "Model groups",
+    "noModelGroups": "No model groups yet.",
+    "capabilities": {
+      "manage_users": "Manage users",
+      "assign_plan": "Assign plans",
+      "view_logs_stats": "View logs and stats",
+      "settle_waive": "Settle and waive",
+      "toggle_user_tokens": "Toggle user tokens",
+      "view_own_plan_groups": "View own plan groups",
+      "view_other_groups": "View other groups",
+      "edit_prices": "Edit prices",
+      "edit_model_groups": "Edit model groups",
+      "edit_unified_models": "Edit unified models",
+      "edit_price_catalog": "Edit price catalog"
+    },
+    "sharedWithAdmin": "Share with admins",
+    "sharedWithAdminGuide": "When enabled, admins may assign this plan to users; only root can edit the plan.",
+    "share": "Shared",
+    "builtin": "Built-in",
+    "groupsCount": "Groups",
+    "currentPlan": "Current plan",
+    "empty": "No plans yet",
+    "deleteTitle": "Delete plan",
+    "deleteMessage": "Delete plan “{name}”? Users on this plan will be moved to the built-in default plan.",
+    "capabilitiesTitle": "Management capabilities"
   }
 }

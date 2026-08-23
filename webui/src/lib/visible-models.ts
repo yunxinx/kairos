@@ -43,8 +43,8 @@ export function tokenGroupUsable(
   assignedGroups: readonly string[],
 ): boolean {
   if (modelGroup === '') return false;
-  if (role === 'user') return assignedGroups.includes(modelGroup);
-  return true;
+  if (role === 'root') return true;
+  return assignedGroups.includes(modelGroup);
 }
 
 /** 普通用户：只列出被分配的组名。编辑已绑且已撤的组时，把当前值附在末尾以便提示失效。 */

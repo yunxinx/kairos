@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useId, computed, ref, watch } from 'vue';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import { roleAtLeast, type ManagementRole, type UserAdminView } from '@/api/types';
@@ -11,6 +11,7 @@ import FormTextInput from '@/components/ui/FormTextInput.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 
@@ -36,6 +37,7 @@ const roleId = `user-profile-role-${uid}`;
 const rpmId = `user-profile-rpm-${uid}`;
 const enabledId = `user-profile-enabled-${uid}`;
 const emailId = `user-profile-email-${uid}`;
+const planId = `user-profile-plan-${uid}`;
 
 const initialEmail = props.user.email;
 const initialName = props.user.display_name;
@@ -45,6 +47,12 @@ const initialRpm =
   props.user.rate_limit_rpm !== null && props.user.rate_limit_rpm !== undefined
     ? String(props.user.rate_limit_rpm)
     : '';
+const initialPlanId = props.user.plan_id != null ? String(props.user.plan_id) : '';
+
+const plansQuery = useQuery({
+  queryKey: ['plans'],
+  queryFn: () => apiClient.listPlans(),
+});
 
 const email = ref(initialEmail);
 const displayName = ref(initialName);
@@ -52,6 +60,7 @@ const password = ref('');
 const role = ref<ManagementRole>(initialRole);
 const rateLimitRpm = ref(initialRpm);
 const enabled = ref(initialEnabled);
+const selectedPlanId = ref(initialPlanId);
 
 const isRootUser = computed(() => props.user.role === 'root');
 
@@ -71,6 +80,22 @@ const roleOptions = computed(() => {
   ];
 });
 
+const canAssignPlan = computed(() => hasCapability(me.value, 'assign_plan'));
+
+const planOptions = computed(() => {
+  const options = (plansQuery.data.value ?? []).map((plan) => ({
+    value: String(plan.id),
+    label: plan.display_name,
+  }));
+  if (initialPlanId && !options.some((option) => option.value === initialPlanId)) {
+    options.push({
+      value: initialPlanId,
+      label: props.user.plan_display_name || initialPlanId,
+    });
+  }
+  return options;
+});
+
 /** 仅 ASCII 小写：与服务端 normalize_email（to_ascii_lowercase）同一算法，
  * 避免 Unicode 大写（如 Á）导致前端判「已变化」而服务端 normalize 后判「未变」。 */
 function asciiLowercase(value: string): string {
@@ -84,7 +109,8 @@ const dirty = computed(
     password.value !== '' ||
     role.value !== initialRole ||
     enabled.value !== initialEnabled ||
-    rateLimitRpm.value.trim() !== initialRpm,
+    rateLimitRpm.value.trim() !== initialRpm ||
+    selectedPlanId.value !== initialPlanId,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -113,7 +139,15 @@ const saveMutation = useMutation({
     if (password.value) {
       body.password = password.value;
     }
-    return apiClient.updateUser(props.user.id, body);
+    const updated = await apiClient.updateUser(props.user.id, body);
+    if (
+      canAssignPlan.value &&
+      selectedPlanId.value &&
+      selectedPlanId.value !== initialPlanId
+    ) {
+      await apiClient.assignUserPlan(props.user.id, Number(selectedPlanId.value));
+    }
+    return updated;
   },
   onSuccess: async () => {
     success(t('users.updateSuccess'));
@@ -259,6 +293,21 @@ function handleSave() {
           />
         </FormField>
       </div>
+
+      <FormField
+        v-if="canAssignPlan && !isRootUser"
+        field-name="plan"
+        :label="t('users.plan')"
+        :input-id="planId"
+        :guide="t('users.planGuide')"
+      >
+        <UiSelect
+          :id="planId"
+          v-model="selectedPlanId"
+          :options="planOptions"
+          data-testid="user-editor-plan"
+        />
+      </FormField>
 
       <div
         :class="{

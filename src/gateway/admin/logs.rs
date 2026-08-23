@@ -110,6 +110,7 @@ pub(super) struct LogQueryParams {
     from_created_at: Option<i64>,
     to_created_at: Option<i64>,
     settled: Option<bool>,
+    discount_bp: Option<i64>,
     inbound_protocol: Option<String>,
     sort_by: Option<store::RequestLogSortBy>,
     sort_dir: Option<store::SortDir>,
@@ -147,6 +148,7 @@ pub(super) async fn query_logs(
     filter.from_created_at = params.from_created_at;
     filter.to_created_at = params.to_created_at;
     filter.settled = params.settled;
+    filter.discount_bp = params.discount_bp;
     filter.inbound_protocols = parse_comma_list(params.inbound_protocol.as_deref());
     filter.sort_by = params.sort_by.unwrap_or_default();
     filter.sort_dir = params.sort_dir.unwrap_or_default();

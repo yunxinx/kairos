@@ -21,7 +21,8 @@
     "logs": "日志",
     "users": "用户",
     "account": "账户",
-    "logout": "退出"
+    "logout": "退出",
+    "plans": "套餐"
   },
   "auth": {
     "loginTitle": "Kairos",
@@ -115,7 +116,9 @@
     "filterEmpty": "没有匹配项",
     "emptyCell": "—",
     "increment": "增加",
-    "decrement": "减少"
+    "decrement": "减少",
+    "yes": "是",
+    "no": "否"
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -223,7 +226,12 @@
     "groupsUnrestricted": "不受可用组限制",
     "groupsUnrestrictedHint": "root 与 admin 的令牌可调用全部模型组，可用组名单仅对普通用户生效。",
     "groupsRemoveWarning": "将移除 {groups} 个可用组，绑定在这些组上的 {tokens} 把令牌将立即失效。",
-    "groupsRemoveUnknown": "将移除 {groups} 个可用组；绑定令牌数未知，相关令牌可能立即失效。"
+    "groupsRemoveUnknown": "将移除 {groups} 个可用组；绑定令牌数未知，相关令牌可能立即失效。",
+    "plan": "套餐",
+    "planGuide": "新用户会获得该套餐的模型组、折扣率、默认限速与起步金。",
+    "planUpdated": "套餐已更新",
+    "planTabGuide": "换套餐会立即改变该用户的可用模型组与折扣；已有余额和令牌绑定不受影响。",
+    "currentPlan": "当前套餐"
   },
   "account": {
     "profile": "基本资料",
@@ -257,7 +265,9 @@
     "registeredAt": "注册时间",
     "lastLoginAt": "上次登录",
     "emailChangePassword": "当前密码",
-    "emailChangePasswordGuide": "邮箱是登录标识，修改时需要提供当前密码验证身份。"
+    "emailChangePasswordGuide": "邮箱是登录标识，修改时需要提供当前密码验证身份。",
+    "plan": "套餐",
+    "discount": "折扣率"
   },
   "time": {
     "secondsAgo": "{seconds} 秒前",
@@ -651,7 +661,11 @@
     "routeFlow": "路由映射",
     "actor": "操作者",
     "actorSystem": "系统",
-    "actorFilter": "只看该操作者"
+    "actorFilter": "只看该操作者",
+    "discountFilter": "折扣率",
+    "baseTotal": "原价合计",
+    "discountRate": "折扣率",
+    "chargedTotal": "实收合计"
   },
   "a11y": {
     "skipToContent": "跳到主内容",
@@ -683,5 +697,48 @@
     "routeErrorTitle": "页面加载失败",
     "routeErrorDescription": "当前页面未能完成加载。你可以重试，或返回安全页面。",
     "goHome": "返回首页"
+  },
+  "plans": {
+    "create": "创建套餐",
+    "editorCreate": "新建套餐",
+    "editorEdit": "编辑套餐",
+    "internalName": "内部名",
+    "displayName": "显示名",
+    "note": "备注",
+    "noteVisible": "管理员可见备注",
+    "discount": "折扣率",
+    "discountPercent": "折扣率（%）",
+    "discountGuide": "100 表示原价，80 表示八折；也可填 0.8 表示八折，1.2 表示加价 20%。",
+    "defaultRpm": "默认 RPM",
+    "defaultRpmGuide": "留空表示跟随系统兜底。",
+    "sharedRpm": "共享 RPM",
+    "sharedRpmGuide": "挂在该档的所有用户合计上限；留空表示不限制。",
+    "initialGrant": "起步金（美元）",
+    "initialGrantGuide": "仅新建用户时按此金额入账一次。",
+    "modelGroups": "模型组名单",
+    "noModelGroups": "还没有模型组。",
+    "capabilities": {
+      "manage_users": "管理普通用户",
+      "assign_plan": "给用户换套餐",
+      "view_logs_stats": "查看日志与统计",
+      "settle_waive": "补扣与豁免",
+      "toggle_user_tokens": "启停普通用户令牌",
+      "view_own_plan_groups": "只读本档模型组",
+      "view_other_groups": "查看本档以外模型组",
+      "edit_prices": "改价",
+      "edit_model_groups": "编辑模型组",
+      "edit_unified_models": "编辑统一模型",
+      "edit_price_catalog": "编辑价格目录"
+    },
+    "sharedWithAdmin": "分享给管理员",
+    "sharedWithAdminGuide": "开启后管理员可把该档赋给普通用户；配方仍只由 root 编辑。",
+    "share": "分享",
+    "builtin": "内置",
+    "groupsCount": "组数",
+    "currentPlan": "当前套餐",
+    "empty": "还没有套餐",
+    "deleteTitle": "删除套餐",
+    "deleteMessage": "确定删除套餐「{name}」？挂在该档的用户将自动改挂内置默认套餐。",
+    "capabilitiesTitle": "管理面能力开关"
   }
 }

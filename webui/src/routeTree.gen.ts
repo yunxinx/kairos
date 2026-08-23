@@ -17,6 +17,7 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as LogsRouteImport } from './routes/logs'
 import { Route as ModelsRouteImport } from './routes/models'
 import { Route as OverviewRouteImport } from './routes/overview'
+import { Route as PlansRouteImport } from './routes/plans'
 import { Route as PricingRouteImport } from './routes/pricing'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as TokensRouteImport } from './routes/tokens'
@@ -62,6 +63,11 @@ const OverviewRoute = OverviewRouteImport.update({
   path: '/overview',
   getParentRoute: () => rootRouteImport,
 } as any)
+const PlansRoute = PlansRouteImport.update({
+  id: '/plans',
+  path: '/plans',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PricingRoute = PricingRouteImport.update({
   id: '/pricing',
   path: '/pricing',
@@ -92,6 +98,7 @@ export interface FileRoutesByFullPath {
   '/logs': typeof LogsRoute
   '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
+  '/plans': typeof PlansRoute
   '/pricing': typeof PricingRoute
   '/settings': typeof SettingsRoute
   '/tokens': typeof TokensRoute
@@ -106,6 +113,7 @@ export interface FileRoutesByTo {
   '/logs': typeof LogsRoute
   '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
+  '/plans': typeof PlansRoute
   '/pricing': typeof PricingRoute
   '/settings': typeof SettingsRoute
   '/tokens': typeof TokensRoute
@@ -121,6 +129,7 @@ export interface FileRoutesById {
   '/logs': typeof LogsRoute
   '/models': typeof ModelsRoute
   '/overview': typeof OverviewRoute
+  '/plans': typeof PlansRoute
   '/pricing': typeof PricingRoute
   '/settings': typeof SettingsRoute
   '/tokens': typeof TokensRoute
@@ -137,6 +146,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/models'
     | '/overview'
+    | '/plans'
     | '/pricing'
     | '/settings'
     | '/tokens'
@@ -151,6 +161,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/models'
     | '/overview'
+    | '/plans'
     | '/pricing'
     | '/settings'
     | '/tokens'
@@ -165,6 +176,7 @@ export interface FileRouteTypes {
     | '/logs'
     | '/models'
     | '/overview'
+    | '/plans'
     | '/pricing'
     | '/settings'
     | '/tokens'
@@ -180,6 +192,7 @@ export interface RootRouteChildren {
   LogsRoute: typeof LogsRoute
   ModelsRoute: typeof ModelsRoute
   OverviewRoute: typeof OverviewRoute
+  PlansRoute: typeof PlansRoute
   PricingRoute: typeof PricingRoute
   SettingsRoute: typeof SettingsRoute
   TokensRoute: typeof TokensRoute
@@ -244,6 +257,13 @@ declare module '@tanstack/vue-router' {
       preLoaderRoute: typeof OverviewRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/plans': {
+      id: '/plans'
+      path: '/plans'
+      fullPath: '/plans'
+      preLoaderRoute: typeof PlansRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/pricing': {
       id: '/pricing'
       path: '/pricing'
@@ -284,6 +304,7 @@ const rootRouteChildren: RootRouteChildren = {
   LogsRoute: LogsRoute,
   ModelsRoute: ModelsRoute,
   OverviewRoute: OverviewRoute,
+  PlansRoute: PlansRoute,
   PricingRoute: PricingRoute,
   SettingsRoute: SettingsRoute,
   TokensRoute: TokensRoute,

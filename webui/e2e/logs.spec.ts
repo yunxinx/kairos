@@ -394,3 +394,35 @@ test.describe('request logs page', () => {
     await expect(page.getByTestId('logs-exact-model')).toContainText('e2e-exact-model');
   });
 });
+
+test('details show base price, discount, and charged amount; list filters by discount', async ({ page }) => {
+  seedRequestLogs([
+    {
+      created_at: Date.now(),
+      token_key: 'sk-e2e-discount',
+      token_name: 'Discount token',
+      model: 'e2e-discount-model',
+      channel: 'e2e-discount-channel',
+      status_code: 200,
+      base_cost_usd_micros: 1_000_000,
+      discount_bp: 8000,
+      cost_usd_micros: 800_000,
+    },
+  ]);
+
+  await page.goto('/logs');
+  await page.locator('#logs-search').fill('sk-e2e-discount');
+  const row = page.locator('[data-testid="log-row"][data-model="e2e-discount-model"]');
+  await expect(row).toBeVisible();
+
+  await row.getByTestId('log-expand').click();
+  await expect(page.getByTestId('log-base-cost')).toHaveText(usdLabel(1_000_000));
+  await expect(page.getByTestId('log-discount-rate')).toContainText('80%');
+  await expect(page.getByTestId('log-charged-cost')).toHaveText(usdLabel(800_000));
+  await page.keyboard.press('Escape');
+
+  await page.getByTestId('logs-discount-filter').click();
+  await page.locator('[data-testid="logs-discount-filter-option"][data-value="8000"]').click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('[data-testid="log-row"]')).toHaveCount(1);
+});

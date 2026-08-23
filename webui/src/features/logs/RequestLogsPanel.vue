@@ -5,7 +5,6 @@ import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import {
   PROTOCOLS,
-  roleAtLeast,
   type LogEntry,
   type LogQuery,
   type RequestLogSortBy,
@@ -35,6 +34,8 @@ import { useLogListControls } from '@/features/logs/useLogListControls';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
+import { formatDiscountBp } from '@/lib/format';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent } from '@/lib/window-anchor';
 
@@ -82,11 +83,8 @@ const { t } = useI18n();
 const { error, success } = useToast();
 const me = useCurrentUser();
 
-/** 补扣/豁免是计费操作，后端要求 admin+；普通用户不渲染入口。 */
-const canSettleLogs = computed(() => {
-  const role = me.value?.role;
-  return role !== undefined && roleAtLeast(role, 'admin');
-});
+/** 补扣/豁免是计费操作，要求生效能力 `settle_waive`；普通用户不渲染入口。 */
+const canSettleLogs = computed(() => hasCapability(me.value, 'settle_waive'));
 const queryClient = useQueryClient();
 
 const {
@@ -114,6 +112,7 @@ const {
 } = useWindowStack<RequestLogWindowPayload>();
 
 const appliedSettled = ref<string[]>([]);
+const appliedDiscountBp = ref<string[]>([]);
 const appliedProtocols = ref<string[]>([]);
 const appliedModel = ref<string | null>(null);
 const appliedChannel = ref<string | null>(null);
@@ -203,6 +202,20 @@ const protocolOptions = computed(() =>
   })),
 );
 
+const discountOptions = computed(() => {
+  const counts = new Map<number, number>();
+  for (const item of items.value) {
+    counts.set(item.discount_bp, (counts.get(item.discount_bp) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([bp, count]) => ({
+      value: String(bp),
+      label: formatDiscountBp(bp),
+      count,
+    }));
+});
+
 const refreshOptions = computed(() => [
   { value: '0', label: t('logs.autoRefreshOff') },
   { value: '5', label: t('logs.autoRefreshSeconds', { seconds: 5 }) },
@@ -225,6 +238,7 @@ const channelProtocolMap = computed((): Map<string, string> | null => {
 });
 
 watch(appliedSettled, resetResults);
+watch(appliedDiscountBp, resetResults);
 watch(appliedProtocols, resetResults);
 watch([appliedModel, appliedChannel, appliedTokenName], resetResults);
 
@@ -255,6 +269,9 @@ function buildQuery(): LogQuery {
   if (appliedSettled.value.length === 1) {
     query.settled = appliedSettled.value[0] === 'true';
   }
+  if (appliedDiscountBp.value.length === 1) {
+    query.discount_bp = Number(appliedDiscountBp.value[0]);
+  }
   if (appliedProtocols.value.length > 0) {
     query.inbound_protocol = appliedProtocols.value;
   }
@@ -277,6 +294,7 @@ const logsQuery = useQuery({
     appliedFrom,
     appliedTo,
     appliedSettled,
+    appliedDiscountBp,
     appliedProtocols,
     appliedModel,
     appliedChannel,
@@ -322,6 +340,7 @@ const paging = computed(() => pagination(total.value));
 
 function clearFilters() {
   appliedSettled.value = [];
+  appliedDiscountBp.value = [];
   appliedProtocols.value = [];
   appliedModel.value = null;
   appliedChannel.value = null;
@@ -413,6 +432,13 @@ function onFilterToken(tokenName: string) {
             :title="t('logs.settledFilter')"
             :options="settledOptions"
             test-id="logs-settled-filter"
+          />
+          <FacetedFilter
+            v-if="discountOptions.length > 0"
+            v-model="appliedDiscountBp"
+            :title="t('logs.discountFilter')"
+            :options="discountOptions"
+            test-id="logs-discount-filter"
           />
           <FacetedFilter
             v-model="appliedProtocols"

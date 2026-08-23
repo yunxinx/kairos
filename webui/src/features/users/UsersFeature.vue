@@ -39,7 +39,7 @@ import { useCurrentUser } from '@/lib/session';
 import { groupDisplayName } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
-type UserManageTab = 'profile' | 'recharge' | 'groups' | 'tokens';
+type UserManageTab = 'profile' | 'recharge' | 'plan' | 'tokens';
 
 type UserWindowPayload =
   | { kind: 'create' }
