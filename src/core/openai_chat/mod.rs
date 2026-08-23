@@ -1005,6 +1005,9 @@ pub struct StreamDecoder {
     /// 最近一次出现的 finish_reason：usage 独立末帧（无 finish_reason）复用，
     /// 避免 Finish 退化为 Other 并在下游编码时误落回 "stop"。
     last_finish_reason: Option<FinishReason>,
+    /// 是否已产出 `ResponseMetadata`：Chat Completions 每个 chunk 都重复携带
+    /// id/model，而该事件在 IR 中是「一次响应一次」的生命周期事件。
+    metadata_emitted: bool,
 }
 
 impl StreamDecoder {
@@ -1018,9 +1021,16 @@ impl StreamDecoder {
         let mut events = Vec::new();
         let mut is_output = false;
 
-        if let Some(id) = &wire.id
+        // 每条 chunk 都重复携带 id/model，但 `ResponseMetadata` 是一次响应只发
+        // 一次的生命周期事件：重复产出会让下游编码器把它当成新响应的开始，例如
+        // Responses 编码器据此下发 `response.created`，重复即等于宣告响应重开。
+        // 与 anthropic_messages（仅 message_start）、openai_responses（仅
+        // response.created）两个解码器的产出时机对齐。
+        if !self.metadata_emitted
+            && let Some(id) = &wire.id
             && let Some(model) = &wire.model
         {
+            self.metadata_emitted = true;
             events.push(StreamEvent::ResponseMetadata {
                 id: id.clone(),
                 model: model.clone(),
@@ -1218,7 +1228,7 @@ impl StreamEncoder {
                     self.text_open = false;
                 }
                 choice.insert("delta".into(), Value::Object(delta_obj));
-                vec![self.chunk_frame(choice)]
+                vec![Value::Object(self.build_chunk(choice))]
             }
             StreamEvent::TextEnd { .. } => Vec::new(),
             StreamEvent::ReasoningStart { .. } => {
@@ -1247,7 +1257,7 @@ impl StreamEncoder {
                 let mut choice = serde_json::Map::new();
                 choice.insert("index".into(), json!(0));
                 choice.insert("delta".into(), Value::Object(delta_obj));
-                vec![self.chunk_frame(choice)]
+                vec![Value::Object(self.build_chunk(choice))]
             }
             StreamEvent::ToolInputDelta { id, delta, .. } => {
                 if let Some(tool) = self.tool_calls.iter_mut().find(|t| t.id == *id) {
@@ -1269,7 +1279,7 @@ impl StreamEncoder {
                 let mut choice = serde_json::Map::new();
                 choice.insert("index".into(), json!(0));
                 choice.insert("delta".into(), Value::Object(delta_obj));
-                vec![self.chunk_frame(choice)]
+                vec![Value::Object(self.build_chunk(choice))]
             }
             StreamEvent::ToolInputEnd { .. } => Vec::new(),
             StreamEvent::ToolCall { .. } => Vec::new(),
@@ -1284,8 +1294,7 @@ impl StreamEncoder {
                     "finish_reason".into(),
                     json!(encode_finish_reason(finish_reason)),
                 );
-                let mut obj = serde_json::Map::new();
-                obj.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
+                let mut obj = self.build_chunk(choice);
                 obj.insert("usage".into(), encode_usage(usage));
                 // 流中丢弃过 reasoning：finish 帧显式 warning，供下游感知信息损失。
                 if self.saw_reasoning {
@@ -1302,8 +1311,15 @@ impl StreamEncoder {
         }
     }
 
-    /// 构造一个 `chat.completion.chunk` 帧，携带记录的响应 id/model。
-    fn chunk_frame(&self, choice: serde_json::Map<String, Value>) -> Value {
+    /// 构造一个 `chat.completion.chunk` 对象，携带记录的响应 id/model。
+    ///
+    /// 返回可继续追加顶层字段的对象而非 [`Value`]，供终止帧在同一信封上补
+    /// `usage`——每个 chunk（含终止帧）都必须带齐 `id`/`object`/`model`，
+    /// 下游按 id 关联响应、按 object 判定帧类型。
+    fn build_chunk(
+        &self,
+        choice: serde_json::Map<String, Value>,
+    ) -> serde_json::Map<String, Value> {
         let mut obj = serde_json::Map::new();
         obj.insert(
             "id".into(),
@@ -1318,7 +1334,7 @@ impl StreamEncoder {
         let model = self.inbound_model.as_deref().unwrap_or(&self.model);
         obj.insert("model".into(), json!(model));
         obj.insert("choices".into(), Value::Array(vec![Value::Object(choice)]));
-        Value::Object(obj)
+        obj
     }
 }
 
@@ -1551,6 +1567,34 @@ mod tests {
             }
             other => panic!("应产出 Finish 事件，实际 {other:?}"),
         }
+    }
+
+    /// 同一解码器连续处理多个 chunk：`ResponseMetadata` 只产出一次。
+    ///
+    /// Chat Completions 每个 chunk 都重复携带 id/model，但该事件在 IR 中是一次
+    /// 响应一次的生命周期事件。重复产出会被下游编码器当成新响应开始——Responses
+    /// 编码器据此下发 `response.created`，客户端收到第二帧就会丢弃已累积的内容。
+    #[test]
+    fn response_metadata_is_emitted_once_per_stream() {
+        let mut decoder = StreamDecoder::default();
+        let metadata_count = ["Hel", "lo", "!"]
+            .into_iter()
+            .flat_map(|delta| {
+                decoder
+                    .process(&json!({
+                        "id": "chatcmpl-9",
+                        "object": "chat.completion.chunk",
+                        "model": "gpt-4o",
+                        "choices": [{ "index": 0, "delta": { "content": delta } }]
+                    }))
+                    .events
+            })
+            .filter(|event| matches!(event, StreamEvent::ResponseMetadata { .. }))
+            .count();
+        assert_eq!(
+            metadata_count, 1,
+            "三个都带 id/model 的 chunk 只应产出一个 ResponseMetadata"
+        );
     }
 
     /// usage 独立末帧（`include_usage` 真实帧型：choices 为空、仅带 usage）仍产出
