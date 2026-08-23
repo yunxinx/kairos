@@ -766,3 +766,59 @@ async fn login_root_session(admin_base: &str) -> String {
         .expect("登录应返回会话令牌")
         .to_string()
 }
+
+// ---- 下游 SSE 响应解析 ----
+
+/// 下游客户端收到的一个 SSE 帧。
+///
+/// `event` 对 OpenAI 两套协议恒为 `None`（不写事件名），Anthropic Messages 与
+/// Responses 则靠它区分帧类型；两种形态共用一个类型，跨协议测试才能比较同一
+/// 组数据。序列化形状即快照形状。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownstreamFrame {
+    pub event: Option<String>,
+    pub data: Value,
+}
+
+/// 解析下游 SSE 响应体为帧序列，跳过空载荷与 `[DONE]` 哨兵。
+///
+/// 此前各测试二进制各持一份实现，形状还不一致（有的丢弃 `event:`）。收敛到夹具
+/// 后，帧序列本身可直接作为快照值，事件名与载荷的对应关系也不再丢失。
+pub async fn collect_sse_frames(resp: reqwest::Response) -> Vec<DownstreamFrame> {
+    use futures_util::StreamExt;
+
+    let mut frames = Vec::new();
+    let mut buffer = String::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("响应流应可读");
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = buffer.find("\n\n") {
+            let raw: String = buffer.drain(..end + 2).collect();
+            let mut event = None;
+            let mut data = None;
+            for line in raw.lines() {
+                if let Some(name) = line.strip_prefix("event:") {
+                    event = Some(name.trim().to_string());
+                } else if let Some(payload) = line.strip_prefix("data:") {
+                    let payload = payload.trim();
+                    if payload.is_empty() || payload == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                        data = Some(value);
+                    }
+                }
+            }
+            if let Some(data) = data {
+                frames.push(DownstreamFrame { event, data });
+            }
+        }
+    }
+    frames
+}
+
+/// 帧序列中所有 `data:` 载荷，供只关心载荷的断言使用。
+pub fn frame_payloads(frames: &[DownstreamFrame]) -> Vec<&Value> {
+    frames.iter().map(|frame| &frame.data).collect()
+}

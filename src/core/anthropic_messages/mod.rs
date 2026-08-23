@@ -1822,6 +1822,7 @@ pub fn encode_model_list(ids: &[String]) -> Value {
 mod tests {
     use super::*;
     use crate::core::stream::StreamAccumulator;
+    use crate::core::testing::frames_to_snapshot;
 
     /// 黄金样例请求 decode → encode 往返还原 wire。
     ///
@@ -2248,43 +2249,29 @@ mod tests {
         );
     }
 
-    /// 解析 SSE 帧的 `data:` 载荷为 JSON，供帧内容断言。
-    fn frame_json(frame: &SseFrame) -> Value {
-        serde_json::from_str(&frame.data).expect("帧载荷应为合法 JSON")
-    }
-
-    /// 流式 IR 事件编码为入站 Anthropic SSE 帧：带事件名，message_finish 收尾。
+    /// 流式 IR 事件编码为入站 Anthropic SSE 帧。
+    ///
+    /// 快照锁住整条帧序列：事件名、块索引、`content_block_start`/`delta`/`stop`
+    /// 的配对、以及 `message_delta` + `message_stop` 的两帧收尾。逐字段断言只能
+    /// 抽查其中几处，帧数量与顺序的回归会漏掉。
     #[test]
     fn stream_events_encode_to_anthropic_frames() {
         let mut encoder = StreamEncoder::default();
-        let start = encoder.message_start();
-        assert_eq!(start.event.as_deref(), Some("message_start"));
-        assert!(start.data.contains("msg_stream"));
-
-        let frames = encoder.encode(&StreamEvent::TextStart {
+        let mut frames = vec![encoder.message_start()];
+        frames.extend(encoder.encode(&StreamEvent::TextStart {
             id: "0".to_string(),
             provider_options: HashMap::new(),
-        });
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].event.as_deref(), Some("content_block_start"));
-        assert_eq!(frame_json(&frames[0])["content_block"]["type"], "text");
-
-        let frames = encoder.encode(&StreamEvent::TextDelta {
+        }));
+        frames.extend(encoder.encode(&StreamEvent::TextDelta {
             id: "0".to_string(),
             delta: "Hi".to_string(),
             provider_options: HashMap::new(),
-        });
-        assert_eq!(frames[0].event.as_deref(), Some("content_block_delta"));
-        assert_eq!(frame_json(&frames[0])["delta"]["type"], "text_delta");
-        assert_eq!(frame_json(&frames[0])["delta"]["text"], "Hi");
-
-        let frames = encoder.encode(&StreamEvent::TextEnd {
+        }));
+        frames.extend(encoder.encode(&StreamEvent::TextEnd {
             id: "0".to_string(),
             provider_options: HashMap::new(),
-        });
-        assert_eq!(frames[0].event.as_deref(), Some("content_block_stop"));
-
-        let frames = encoder.encode(&StreamEvent::Finish {
+        }));
+        frames.extend(encoder.encode(&StreamEvent::Finish {
             finish_reason: FinishReason {
                 unified: FinishReasonUnified::ToolCalls,
                 raw: Some("tool_use".to_string()),
@@ -2297,41 +2284,38 @@ mod tests {
                 raw: None,
             },
             provider_metadata: HashMap::new(),
-        });
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].event.as_deref(), Some("message_delta"));
-        assert_eq!(frame_json(&frames[0])["delta"]["stop_reason"], "tool_use");
-        assert_eq!(frame_json(&frames[0])["usage"]["output_tokens"], 2);
-        assert_eq!(frames[1].event.as_deref(), Some("message_stop"));
+        }));
+
+        insta::assert_json_snapshot!(frames_to_snapshot(&frames));
     }
 
     /// 流式 signature_delta 编码：附随进行中 thinking 块的增量事件。
+    ///
+    /// 快照覆盖两种增量的分帧结果——有内容无 signature 走 `thinking_delta`，
+    /// 零长增量仅携带 signature 走 `signature_delta`，两者都只应产出单帧。
     #[test]
     fn stream_encodes_signature_delta() {
         let mut encoder = StreamEncoder::default();
-        encoder.encode(&StreamEvent::ReasoningStart {
+        let mut frames = encoder.encode(&StreamEvent::ReasoningStart {
             id: "0".to_string(),
             provider_options: HashMap::new(),
         });
-        let frames = encoder.encode(&StreamEvent::ReasoningDelta {
+        frames.extend(encoder.encode(&StreamEvent::ReasoningDelta {
             id: "0".to_string(),
             delta: "先想".to_string(),
             provider_options: HashMap::new(),
-        });
-        // 内容增量 + 无 signature → 单帧 thinking_delta。
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frame_json(&frames[0])["delta"]["type"], "thinking_delta");
+        }));
+        frames.extend(
+            encoder.encode(&StreamEvent::ReasoningDelta {
+                id: "0".to_string(),
+                delta: String::new(),
+                provider_options: [("anthropic".to_string(), json!({ "signature": "sigX" }))]
+                    .into_iter()
+                    .collect(),
+            }),
+        );
 
-        let frames = encoder.encode(&StreamEvent::ReasoningDelta {
-            id: "0".to_string(),
-            delta: String::new(),
-            provider_options: [("anthropic".to_string(), json!({ "signature": "sigX" }))]
-                .into_iter()
-                .collect(),
-        });
-        assert_eq!(frames.len(), 1, "零长增量仅携带 signature");
-        assert_eq!(frame_json(&frames[0])["delta"]["type"], "signature_delta");
-        assert_eq!(frame_json(&frames[0])["delta"]["signature"], "sigX");
+        insta::assert_json_snapshot!(frames_to_snapshot(&frames));
     }
 
     /// 直通 usage 嗅探：顶层、message_start.message、message_delta 三种分布都提取。

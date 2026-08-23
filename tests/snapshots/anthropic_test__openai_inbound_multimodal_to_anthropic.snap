@@ -1,0 +1,29 @@
+---
+source: tests/anthropic_test.rs
+expression: "received[0][\"messages\"][0][\"content\"]"
+---
+[
+  {
+    "text": "What's in these images?",
+    "type": "text"
+  },
+  {
+    "source": {
+      "data": "iVBORw0KGgoAAAANSUhEUg==",
+      "media_type": "image/png",
+      "type": "base64"
+    },
+    "type": "image"
+  },
+  {
+    "text": "and",
+    "type": "text"
+  },
+  {
+    "source": {
+      "type": "url",
+      "url": "https://example.com/image.png"
+    },
+    "type": "image"
+  }
+]

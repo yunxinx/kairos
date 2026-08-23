@@ -1,0 +1,22 @@
+---
+source: tests/responses_test.rs
+expression: "received[0][\"input\"][0][\"content\"]"
+---
+[
+  {
+    "text": "What's in these images?",
+    "type": "input_text"
+  },
+  {
+    "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
+    "type": "input_image"
+  },
+  {
+    "text": "and",
+    "type": "input_text"
+  },
+  {
+    "image_url": "https://example.com/image.png",
+    "type": "input_image"
+  }
+]

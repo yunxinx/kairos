@@ -1,0 +1,25 @@
+---
+source: tests/anthropic_test.rs
+expression: "json!({\n    \"upstream_request_content\": received[0][\"messages\"][0][\"content\"],\n    \"downstream_warnings\": body[\"gateway\"][\"warnings\"],\n})"
+---
+{
+  "downstream_warnings": [
+    {
+      "details": "OpenAI Chat Completions 仅支持图片媒体，application/pdf 已丢弃",
+      "feature": "media",
+      "type": "unsupported"
+    }
+  ],
+  "upstream_request_content": [
+    {
+      "text": "What's in this?",
+      "type": "text"
+    },
+    {
+      "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+      },
+      "type": "image_url"
+    }
+  ]
+}

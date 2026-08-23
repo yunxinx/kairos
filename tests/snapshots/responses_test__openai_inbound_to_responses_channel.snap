@@ -1,0 +1,42 @@
+---
+source: tests/responses_test.rs
+expression: "json!({ \"downstream_response\": body, \"upstream_request\": received[0], })"
+---
+{
+  "downstream_response": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "logprobs": null,
+        "message": {
+          "content": "Hello!",
+          "role": "assistant"
+        }
+      }
+    ],
+    "id": "resp_01",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 2,
+      "prompt_tokens": 10,
+      "total_tokens": 12
+    }
+  },
+  "upstream_request": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "hi",
+            "type": "input_text"
+          }
+        ],
+        "role": "user",
+        "type": "message"
+      }
+    ],
+    "model": "gpt-4o"
+  }
+}

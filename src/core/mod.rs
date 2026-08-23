@@ -9,3 +9,6 @@ pub mod ir;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod stream;
+
+#[cfg(test)]
+pub(crate) mod testing;

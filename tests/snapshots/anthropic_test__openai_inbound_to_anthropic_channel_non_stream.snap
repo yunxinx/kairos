@@ -1,0 +1,47 @@
+---
+source: tests/anthropic_test.rs
+expression: "json!({ \"downstream_response\": body, \"upstream_request\": received[0], })"
+---
+{
+  "downstream_response": {
+    "choices": [
+      {
+        "finish_reason": "tool_calls",
+        "index": 0,
+        "logprobs": null,
+        "message": {
+          "content": "I'll check the weather.",
+          "role": "assistant",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"city\":\"San Francisco\"}",
+                "name": "get_weather"
+              },
+              "id": "toolu_01",
+              "type": "function"
+            }
+          ]
+        }
+      }
+    ],
+    "id": "msg_01x",
+    "model": "claude-sonnet",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 12,
+      "prompt_tokens": 25,
+      "total_tokens": 37
+    }
+  },
+  "upstream_request": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": "What is the weather in San Francisco?",
+        "role": "user"
+      }
+    ],
+    "model": "gpt-4o"
+  }
+}

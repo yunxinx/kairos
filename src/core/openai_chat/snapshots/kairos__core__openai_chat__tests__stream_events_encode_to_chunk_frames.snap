@@ -1,0 +1,42 @@
+---
+source: src/core/openai_chat/mod.rs
+expression: frames_to_snapshot(&frames)
+---
+[
+  {
+    "data": {
+      "choices": [
+        {
+          "delta": {
+            "content": "Hi",
+            "role": "assistant"
+          },
+          "index": 0
+        }
+      ],
+      "id": "chatcmpl-stream",
+      "model": "",
+      "object": "chat.completion.chunk"
+    },
+    "event": null
+  },
+  {
+    "data": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0
+        }
+      ],
+      "id": "chatcmpl-stream",
+      "model": "",
+      "object": "chat.completion.chunk",
+      "usage": {
+        "completion_tokens": 2,
+        "prompt_tokens": 3,
+        "total_tokens": 5
+      }
+    },
+    "event": null
+  }
+]

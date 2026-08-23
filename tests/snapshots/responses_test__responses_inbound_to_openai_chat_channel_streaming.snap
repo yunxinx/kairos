@@ -1,0 +1,82 @@
+---
+source: tests/responses_test.rs
+expression: frames
+---
+[
+  {
+    "event": "response.created",
+    "data": {
+      "response": {
+        "id": "chatcmpl-9",
+        "model": "gpt-4o",
+        "object": "response",
+        "status": "in_progress"
+      },
+      "type": "response.created"
+    }
+  },
+  {
+    "event": "response.output_item.added",
+    "data": {
+      "item": {
+        "id": "0",
+        "phase": "final_answer",
+        "type": "message"
+      },
+      "output_index": 0,
+      "type": "response.output_item.added"
+    }
+  },
+  {
+    "event": "response.content_part.added",
+    "data": {
+      "content_index": 0,
+      "item_id": "0",
+      "output_index": 0,
+      "part": {
+        "annotations": [],
+        "text": "",
+        "type": "output_text"
+      },
+      "type": "response.content_part.added"
+    }
+  },
+  {
+    "event": "response.output_text.delta",
+    "data": {
+      "content_index": 0,
+      "delta": "Hel",
+      "item_id": "0",
+      "output_index": 0,
+      "type": "response.output_text.delta"
+    }
+  },
+  {
+    "event": "response.output_text.delta",
+    "data": {
+      "content_index": 0,
+      "delta": "lo",
+      "item_id": "0",
+      "output_index": 0,
+      "type": "response.output_text.delta"
+    }
+  },
+  {
+    "event": "response.completed",
+    "data": {
+      "response": {
+        "id": "chatcmpl-9",
+        "model": "gpt-4o",
+        "object": "response",
+        "output": [],
+        "status": "completed",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 2,
+          "total_tokens": 12
+        }
+      },
+      "type": "response.completed"
+    }
+  }
+]

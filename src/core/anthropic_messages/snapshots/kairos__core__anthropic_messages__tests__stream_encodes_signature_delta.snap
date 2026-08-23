@@ -1,0 +1,40 @@
+---
+source: src/core/anthropic_messages/mod.rs
+expression: frames_to_snapshot(&frames)
+---
+[
+  {
+    "data": {
+      "content_block": {
+        "signature": "",
+        "thinking": "",
+        "type": "thinking"
+      },
+      "index": 0,
+      "type": "content_block_start"
+    },
+    "event": "content_block_start"
+  },
+  {
+    "data": {
+      "delta": {
+        "thinking": "先想",
+        "type": "thinking_delta"
+      },
+      "index": 0,
+      "type": "content_block_delta"
+    },
+    "event": "content_block_delta"
+  },
+  {
+    "data": {
+      "delta": {
+        "signature": "sigX",
+        "type": "signature_delta"
+      },
+      "index": 0,
+      "type": "content_block_delta"
+    },
+    "event": "content_block_delta"
+  }
+]

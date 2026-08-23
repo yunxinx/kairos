@@ -1375,6 +1375,7 @@ pub fn encode_model_list(ids: &[String]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::testing::{frame_payload, frames_to_snapshot};
 
     /// 黄金样例请求 decode → encode 往返还原 wire。
     #[test]
@@ -1710,34 +1711,23 @@ mod tests {
         assert!(sniff_chat_usage(&no_usage).is_none());
     }
 
-    /// 解析 SSE 帧的 `data:` 载荷为 JSON，供帧内容断言。
-    fn frame_json(frame: &SseFrame) -> Value {
-        assert_eq!(frame.event, None, "Chat Completions 帧不应带事件名");
-        serde_json::from_str(&frame.data).expect("帧载荷应为合法 JSON")
-    }
-
-    /// IR 流事件编码为入站 chunk 帧：首帧 text 带 role，finish 帧带 usage。
+    /// IR 流事件编码为入站 chunk 帧。
+    ///
+    /// 快照锁住整条帧序列：`text-start` 不产帧、首个 delta 补 `role`、finish 帧
+    /// 携带 usage，以及全程 `event` 恒为 `null`（Chat Completions 不写事件名）。
     #[test]
     fn stream_events_encode_to_chunk_frames() {
         let mut encoder = StreamEncoder::default();
-        let frames = encoder.encode(&StreamEvent::TextStart {
+        let mut frames = encoder.encode(&StreamEvent::TextStart {
             id: "0".to_string(),
             provider_options: HashMap::new(),
         });
-        assert!(frames.is_empty(), "text-start 不应产出帧");
-
-        let frames = encoder.encode(&StreamEvent::TextDelta {
+        frames.extend(encoder.encode(&StreamEvent::TextDelta {
             id: "0".to_string(),
             delta: "Hi".to_string(),
             provider_options: HashMap::new(),
-        });
-        assert_eq!(frames.len(), 1);
-        let chunk = frame_json(&frames[0]);
-        assert_eq!(chunk["object"], "chat.completion.chunk");
-        assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
-        assert_eq!(chunk["choices"][0]["delta"]["content"], "Hi");
-
-        let frames = encoder.encode(&StreamEvent::Finish {
+        }));
+        frames.extend(encoder.encode(&StreamEvent::Finish {
             finish_reason: FinishReason {
                 unified: FinishReasonUnified::Stop,
                 raw: Some("stop".to_string()),
@@ -1750,12 +1740,9 @@ mod tests {
                 raw: None,
             },
             provider_metadata: HashMap::new(),
-        });
-        assert_eq!(frames.len(), 1);
-        let chunk = frame_json(&frames[0]);
-        assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
-        assert_eq!(chunk["usage"]["completion_tokens"], 2);
-        assert_eq!(chunk["usage"]["prompt_tokens"], 3);
+        }));
+
+        insta::assert_json_snapshot!(frames_to_snapshot(&frames));
     }
 
     /// 目标协议不支持的媒体类型（非图片）出站时丢弃并记 warning。
@@ -1840,7 +1827,7 @@ mod tests {
             warnings: response.warnings.clone(),
         });
         assert_eq!(frames.len(), 1, "有 warning 时 stream-start 应产出一帧");
-        let chunk = frame_json(&frames[0]);
+        let chunk = frame_payload(&frames[0]);
         assert_eq!(chunk["gateway"]["warnings"][0]["feature"], "reasoning");
 
         // 无 warning 时 stream-start 不产出帧。

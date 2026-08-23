@@ -7,43 +7,9 @@
 
 mod common;
 
-use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
-use futures_util::StreamExt;
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior, collect_sse_frames};
 use kairos::config;
 use serde_json::{Value, json};
-
-/// 解析下游 SSE 响应体，返回所有 `data:` 帧的 JSON 值列表（含 `event:` 名）。
-async fn collect_sse_frames(resp: reqwest::Response) -> Vec<(Option<String>, Value)> {
-    let mut frames = Vec::new();
-    let mut buffer = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("响应流应可读");
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(end) = buffer.find("\n\n") {
-            let frame: String = buffer.drain(..end + 2).collect();
-            let mut event = None;
-            let mut data = None;
-            for line in frame.lines() {
-                if let Some(name) = line.strip_prefix("event:") {
-                    event = Some(name.trim().to_string());
-                } else if let Some(d) = line.strip_prefix("data:") {
-                    let d = d.trim();
-                    if d.is_empty() || d == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(d) {
-                        data = Some(value);
-                    }
-                }
-            }
-            if let Some(data) = data {
-                frames.push((event, data));
-            }
-        }
-    }
-    frames
-}
 
 /// 构造指向 mock 上游的 Responses 渠道 seed（其余沿用测试默认）。
 fn responses_channel_seed(base: &str) -> common::Seed {
@@ -128,20 +94,16 @@ async fn responses_inbound_to_openai_chat_channel() {
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 下游收到 Responses response 对象。
+    // 下游收到 Responses response 对象，出站请求经 IR 重编码为 openai chat 格式。
+    // Responses 的 response 对象字段远多于被逐条断言的那几个（usage 明细、
+    // annotations、status），整体快照才锁得住。
     let body: Value = resp.json().await.expect("响应应可解析");
-    assert_eq!(body["object"], "response");
-    assert_eq!(body["status"], "completed");
-    assert_eq!(body["output"][0]["type"], "message");
-    assert_eq!(body["output"][0]["role"], "assistant");
-    assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
-    assert_eq!(body["output"][0]["content"][0]["text"], "Hello!");
-
-    // 出站请求经 IR 重编码为 openai chat 格式。
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0]["model"], TEST_MODEL);
-    assert_eq!(received[0]["messages"][0]["content"], "hi");
+    insta::assert_json_snapshot!(json!({
+        "downstream_response": body,
+        "upstream_request": received[0],
+    }));
 
     // 日志 inbound_protocol 落 openai_responses。
     let protocol: String = sqlx::query_scalar("SELECT inbound_protocol FROM request_log")
@@ -213,17 +175,14 @@ async fn openai_inbound_to_responses_channel() {
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 下游收到 openai chat.completion。
+    // 下游收到 openai chat.completion，出站请求经 IR 重编码为 Responses 格式。
     let body: Value = resp.json().await.expect("响应应可解析");
-    assert_eq!(body["object"], "chat.completion");
-    assert_eq!(body["choices"][0]["message"]["content"], "Hello!");
-
-    // 出站请求经 IR 重编码为 Responses 格式。
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0]["model"], TEST_MODEL);
-    assert_eq!(received[0]["input"][0]["role"], "user");
-    assert_eq!(received[0]["input"][0]["content"][0]["text"], "hi");
+    insta::assert_json_snapshot!(json!({
+        "downstream_response": body,
+        "upstream_request": received[0],
+    }));
 }
 
 /// openai_chat 入站 → Responses 渠道：多模态跨协议映射（image_url → input_image）。
@@ -260,20 +219,11 @@ async fn openai_inbound_multimodal_to_responses() {
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
+    // 文本与两种 image 来源的混排：快照锁住 4 个 part 的顺序与 input_image
+    // 的字段形状（Responses 用扁平 image_url 字符串，不是 chat 的嵌套对象）。
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    let content = received[0]["input"][0]["content"].as_array().unwrap();
-    assert_eq!(content.len(), 4, "混排顺序应保留 4 个 part");
-    assert_eq!(content[0]["type"], "input_text");
-    assert_eq!(content[0]["text"], "What's in these images?");
-    assert_eq!(content[1]["type"], "input_image");
-    assert_eq!(
-        content[1]["image_url"],
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
-    );
-    assert_eq!(content[2]["type"], "input_text");
-    assert_eq!(content[3]["type"], "input_image");
-    assert_eq!(content[3]["image_url"], "https://example.com/image.png");
+    insta::assert_json_snapshot!(received[0]["input"][0]["content"]);
 }
 
 /// openai_chat 入站 → Responses 渠道：上游 Responses 返回 reasoning，跨协议族丢弃并记 warning。
@@ -406,7 +356,7 @@ async fn responses_passthrough_streaming_bills() {
     assert!(
         frames
             .iter()
-            .any(|(_, data)| data["type"] == "response.output_text.delta"),
+            .any(|f| f.data["type"] == "response.output_text.delta"),
         "直通应转发 Responses 事件帧"
     );
 
@@ -460,32 +410,18 @@ async fn responses_inbound_to_openai_chat_channel_streaming() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let frames = collect_sse_frames(resp).await;
-    // 下游逐帧收到 Responses 事件：首帧 response.created 携带真实 id（非占位），
-    // 随后 output_text.delta 累积文本。
-    assert_eq!(frames[0].1["type"], "response.created");
-    assert_eq!(frames[0].0.as_deref(), Some("response.created"));
+
+    // 关键回归：首帧 response.created 必须携带真实响应 id，而非编码器占位 id
+    // ——占位 id 会让下游把同一次响应认成两个。
     assert_eq!(
-        frames[0].1["response"]["id"], "chatcmpl-9",
+        frames[0].data["response"]["id"], "chatcmpl-9",
         "response.created 应携带真实响应 id，而非占位 id"
     );
-    let text: String = frames
-        .iter()
-        .filter(|(_, d)| d["type"] == "response.output_text.delta")
-        .filter_map(|(_, d)| d["delta"].as_str())
-        .collect();
-    assert_eq!(text, "Hello");
-    // 终止帧 response.completed 带 usage 与 finish_reason 语义。
-    let completed = frames
-        .iter()
-        .find(|(_, d)| d["type"] == "response.completed")
-        .expect("应有 response.completed 帧");
-    assert_eq!(completed.1["response"]["status"], "completed");
-    assert_eq!(completed.1["response"]["usage"]["output_tokens"], 2);
-    // 无 [DONE] 哨兵：Responses 以 response.completed 收尾。
-    assert!(
-        frames.iter().all(|(_, d)| d["type"] != "[DONE]"),
-        "Responses 流不应有 [DONE] 哨兵"
-    );
+
+    // 其余以整条事件序列的快照为准：事件名与 `type` 的对应、item 的
+    // added/delta/done 配对、[DONE] 哨兵的缺席（Responses 以 response.completed
+    // 收尾），都是抽查单帧覆盖不到的顺序契约。
+    insta::assert_json_snapshot!(frames);
 }
 
 /// Responses 入站 → openai_chat 渠道：流式 tool calling，下游 function_call 项被 `output_item.done` 收尾。
@@ -541,51 +477,38 @@ async fn responses_inbound_tool_call_stream_closes_function_call() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
     let frames = collect_sse_frames(resp).await;
-    // 下游应收到 function_call 的 output_item.added 与 arguments delta。
-    assert!(
-        frames
-            .iter()
-            .any(|(_, d)| d["type"] == "response.output_item.added"
-                && d["item"]["type"] == "function_call"),
-        "应有 function_call 的 output_item.added"
-    );
-    assert!(
-        frames
-            .iter()
-            .any(|(_, d)| d["type"] == "response.function_call_arguments.delta"),
-        "应有 function_call_arguments.delta"
-    );
-    // 关键回归：function_call 项必须被 output_item.done 收尾（携带完整 arguments）。
-    let done = frames
-        .iter()
-        .find(|(_, d)| {
-            d["type"] == "response.output_item.done" && d["item"]["type"] == "function_call"
-        })
-        .expect("function_call 项应被 output_item.done 收尾");
-    assert_eq!(done.1["item"]["call_id"], "call_1");
-    assert_eq!(done.1["item"]["name"], "get_weather");
-    assert_eq!(done.1["item"]["arguments"], r#"{"city":"SF"}"#);
-    // 终止帧 response.completed 在 done 之后。
+
+    // 整条事件序列快照：function_call 的 added / arguments.delta / done 三帧是否
+    // 齐备、arguments 是否跨帧累积完整，看序列本身即可，无需逐条存在性断言。
+    insta::assert_json_snapshot!(frames);
+
+    // 以下两条是本测试存在的理由，快照读不出「必须如此」的意图，保留具名断言。
+    // 其一：function_call 项必须在终止帧之前被 output_item.done 收尾。
     let done_idx = frames
         .iter()
-        .position(|(_, d)| {
-            d["type"] == "response.output_item.done" && d["item"]["type"] == "function_call"
+        .position(|f| {
+            f.data["type"] == "response.output_item.done"
+                && f.data["item"]["type"] == "function_call"
         })
         .expect("应有 done");
     let completed_idx = frames
         .iter()
-        .position(|(_, d)| d["type"] == "response.completed")
+        .position(|f| f.data["type"] == "response.completed")
         .expect("应有 completed");
     assert!(
         done_idx < completed_idx,
         "output_item.done 应在 response.completed 之前"
     );
-    // 每个 output item 独占一个 output_index（下游 SDK 按它索引进行中的项，
-    // 多 item 共用同一索引会互相覆盖）。
+    // 其二：每个 output item 独占一个 output_index（下游 SDK 按它索引进行中的
+    // 项，多 item 共用同一索引会互相覆盖）。
     let indexes: Vec<u64> = frames
         .iter()
-        .filter(|(_, d)| d["type"] == "response.output_item.added")
-        .map(|(_, d)| d["output_index"].as_u64().expect("output_index 应存在"))
+        .filter(|f| f.data["type"] == "response.output_item.added")
+        .map(|f| {
+            f.data["output_index"]
+                .as_u64()
+                .expect("output_index 应存在")
+        })
         .collect();
     assert!(indexes.len() >= 2, "应有文本与工具两个 output item");
     let unique: std::collections::HashSet<u64> = indexes.iter().copied().collect();
@@ -774,12 +697,12 @@ async fn responses_inbound_multimodal_to_openai_chat_streaming() {
     let frames = collect_sse_frames(resp).await;
     let text: String = frames
         .iter()
-        .filter(|(_, d)| d["type"] == "response.output_text.delta")
-        .filter_map(|(_, d)| d["delta"].as_str())
+        .filter(|f| f.data["type"] == "response.output_text.delta")
+        .filter_map(|f| f.data["delta"].as_str())
         .collect();
     assert_eq!(text, "ok");
     assert!(
-        frames.iter().all(|(_, d)| d.get("gateway").is_none()),
+        frames.iter().all(|f| f.data.get("gateway").is_none()),
         "图片可在 openai chat 表达，不应有 warning"
     );
 }

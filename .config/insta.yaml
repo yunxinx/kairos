@@ -1,0 +1,18 @@
+# insta 快照测试的工程级策略：在此一处声明，测试代码不再各自配置。
+#
+#  迭代期用 `cargo insta test --accept` 落盘，随后审阅
+# `.snap` 的 diff；验收期与 CI 用 `INSTA_UPDATE=no` 让未接受的差异直接阻断。
+
+behavior:
+  # 快照写入策略保持默认 auto：本地留 .snap.new（已 gitignore），CI 只失败不写盘。
+  # 显式接受一律走 `cargo insta test --accept`（环境变量优先级高于本文件）。
+  update: auto
+
+test:
+  # 孤儿快照检查不设为全局默认：它以「本次跑过的测试」为参照，过滤式运行
+  # （`cargo nextest run <filter>`，本项目的日常做法）会把没跑到的快照全判为
+  # 孤儿。该检查只在跑全量套件时显式开启：
+  #     cargo insta test --unreferenced=reject
+  unreferenced: ignore
+  # 不进入交互式 review
+  auto_review: false

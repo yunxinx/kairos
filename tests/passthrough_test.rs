@@ -9,37 +9,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior, collect_sse_frames};
 use futures_util::StreamExt;
 use kairos::config;
 use kairos::store::resources::Channel;
 use serde_json::{Value, json};
-
-/// 解析下游 SSE 响应体，返回所有 `data:` 帧的原始 JSON 值列表。
-async fn collect_sse_frames(resp: reqwest::Response) -> Vec<Value> {
-    let mut frames = Vec::new();
-    let mut buffer = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("响应流应可读");
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(end) = buffer.find("\n\n") {
-            let frame: String = buffer.drain(..end + 2).collect();
-            for line in frame.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        frames.push(value);
-                    }
-                }
-            }
-        }
-    }
-    frames
-}
 
 /// 发起非流式 Chat Completions 请求。
 async fn send_completion(base: &str) -> reqwest::Response {
@@ -157,11 +131,11 @@ async fn stream_passthrough_forwards_and_bills_usage() {
     let frames = collect_sse_frames(resp).await;
 
     // 直通：帧与上游原样一致（含原始 finish/usage 帧）。
-    assert_eq!(frames[0]["object"], "chat.completion.chunk");
-    assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hel");
-    assert_eq!(frames[1]["choices"][0]["delta"]["content"], "lo");
+    assert_eq!(frames[0].data["object"], "chat.completion.chunk");
+    assert_eq!(frames[0].data["choices"][0]["delta"]["content"], "Hel");
+    assert_eq!(frames[1].data["choices"][0]["delta"]["content"], "lo");
     let usage_frame = frames.last().expect("应有 usage 帧");
-    assert_eq!(usage_frame["usage"]["completion_tokens"], 100);
+    assert_eq!(usage_frame.data["usage"]["completion_tokens"], 100);
 
     // 流式直通唯一授权补丁：注入 stream_options.include_usage（usage 帧与计费的前提）。
     let received = gw.upstream.received();

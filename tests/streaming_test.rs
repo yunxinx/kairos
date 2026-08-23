@@ -6,35 +6,8 @@
 
 mod common;
 
-use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
-use futures_util::StreamExt;
-use serde_json::{Value, json};
-
-/// 解析下游 SSE 响应体，返回所有 `data:` 帧的 JSON 值列表。
-async fn collect_sse_frames(resp: reqwest::Response) -> Vec<Value> {
-    let mut frames = Vec::new();
-    let mut buffer = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("响应流应可读");
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(end) = buffer.find("\n\n") {
-            let frame: String = buffer.drain(..end + 2).collect();
-            for line in frame.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        frames.push(value);
-                    }
-                }
-            }
-        }
-    }
-    frames
-}
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior, collect_sse_frames};
+use serde_json::json;
 
 /// 发起流式 Chat Completions 请求。
 async fn send_stream(base: &str) -> reqwest::Response {
@@ -86,18 +59,18 @@ async fn streaming_text_delivers_chunks() {
     let frames = collect_sse_frames(resp).await;
 
     // 首帧携带 role，后续帧只带 content 增量。
-    assert_eq!(frames[0]["object"], "chat.completion.chunk");
-    assert_eq!(frames[0]["choices"][0]["delta"]["role"], "assistant");
-    assert_eq!(frames[0]["choices"][0]["delta"]["content"], "Hel");
-    assert_eq!(frames[1]["choices"][0]["delta"]["content"], "lo");
+    assert_eq!(frames[0].data["object"], "chat.completion.chunk");
+    assert_eq!(frames[0].data["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(frames[0].data["choices"][0]["delta"]["content"], "Hel");
+    assert_eq!(frames[1].data["choices"][0]["delta"]["content"], "lo");
     // 有 finish 帧（带 finish_reason）与独立 usage 帧。
     let finish = frames
         .iter()
-        .find(|f| f["choices"][0]["finish_reason"] == "stop")
+        .find(|f| f.data["choices"][0]["finish_reason"] == "stop")
         .expect("应有 finish 帧");
-    assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+    assert_eq!(finish.data["choices"][0]["finish_reason"], "stop");
     let usage_frame = frames.last().expect("应有 usage 帧");
-    assert_eq!(usage_frame["usage"]["completion_tokens"], 2);
+    assert_eq!(usage_frame.data["usage"]["completion_tokens"], 2);
 }
 
 /// 流式 tool-call：tool_input 跨帧累积，末帧带完整参数。
@@ -134,20 +107,20 @@ async fn streaming_tool_call_accumulates() {
 
     // 工具调用首帧带 id 与 name。
     assert_eq!(
-        frames[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
+        frames[0].data["choices"][0]["delta"]["tool_calls"][0]["id"],
         "call_1"
     );
     assert_eq!(
-        frames[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+        frames[0].data["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
         "get_weather"
     );
     // 增量帧只带 arguments。
     assert_eq!(
-        frames[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
+        frames[1].data["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"],
         r#"{"city":"SF"}"#
     );
     let last = frames.last().expect("应有 finish 帧");
-    assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(last.data["choices"][0]["finish_reason"], "tool_calls");
 }
 
 /// 流式 usage 计费：按实际 usage 四分量精确扣减并落日志。

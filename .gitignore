@@ -13,6 +13,9 @@
 # 运行时日志
 *.log
 
+# insta 待接受快照：只应存在于本地迭代期间，由 `cargo insta test --accept` 消化
+*.snap.new
+
 # 编辑器与工具
 .vscode/
 .idea/

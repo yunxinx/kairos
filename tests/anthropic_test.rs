@@ -7,36 +7,9 @@
 
 mod common;
 
-use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
-use futures_util::StreamExt;
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior, collect_sse_frames};
 use kairos::config;
 use serde_json::{Value, json};
-
-/// 解析下游 SSE 响应体，返回所有 `data:` 帧的 JSON 值列表。
-async fn collect_sse_frames(resp: reqwest::Response) -> Vec<Value> {
-    let mut frames = Vec::new();
-    let mut buffer = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("响应流应可读");
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(end) = buffer.find("\n\n") {
-            let frame: String = buffer.drain(..end + 2).collect();
-            for line in frame.lines() {
-                if let Some(data) = line.strip_prefix("data:") {
-                    let data = data.trim();
-                    if data.is_empty() || data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(data) {
-                        frames.push(value);
-                    }
-                }
-            }
-        }
-    }
-    frames
-}
 
 /// 构造指向 mock 上游的 Anthropic 渠道 seed（其余沿用测试默认）。
 fn anthropic_channel_seed(base: &str) -> common::Seed {
@@ -73,32 +46,17 @@ async fn openai_inbound_to_anthropic_channel_non_stream() {
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 下游收到 openai chat.completion，tool_use 映射为 tool_calls。
+    // 下游收到 openai chat.completion（tool_use → tool_calls），出站请求经 IR
+    // 重编码为 Anthropic 格式。两侧 wire 形状整体快照：逐字段断言只覆盖得到
+    // content/tool_calls/finish_reason，usage 换算、max_tokens 补默认、
+    // stop_reason 映射这些同样属于协议契约的部分会漏在断言之外。
     let body: Value = resp.json().await.expect("响应应可解析");
-    assert_eq!(body["object"], "chat.completion");
-    assert_eq!(
-        body["choices"][0]["message"]["content"],
-        "I'll check the weather."
-    );
-    assert_eq!(
-        body["choices"][0]["message"]["tool_calls"][0]["id"],
-        "toolu_01"
-    );
-    assert_eq!(
-        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
-        "get_weather"
-    );
-    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
-
-    // 出站请求经 IR 重编码为 Anthropic 格式（含 tool 往返）。
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1, "mock 上游应收一条请求");
-    assert_eq!(received[0]["model"], TEST_MODEL);
-    assert_eq!(received[0]["messages"][0]["role"], "user");
-    assert_eq!(
-        received[0]["messages"][0]["content"],
-        "What is the weather in San Francisco?"
-    );
+    insta::assert_json_snapshot!(json!({
+        "downstream_response": body,
+        "upstream_request": received[0],
+    }));
 
     // 计费：input 25 + output 12。
     // 费用 = 25*2.5/1M + 12*10/1M = 62 + 120 = 182 微元。
@@ -175,19 +133,14 @@ async fn anthropic_inbound_to_openai_channel() {
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 下游收到 Anthropic Messages 格式。
+    // 下游收到 Anthropic Messages 格式，出站请求经 IR 重编码为 openai chat 格式。
     let body: Value = resp.json().await.expect("响应应可解析");
-    assert_eq!(body["type"], "message");
-    assert_eq!(body["role"], "assistant");
-    assert_eq!(body["content"][0]["type"], "text");
-    assert_eq!(body["content"][0]["text"], "Hello!");
-    assert_eq!(body["stop_reason"], "end_turn");
-
-    // 出站请求经 IR 重编码为 openai chat 格式。
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0]["model"], TEST_MODEL);
-    assert_eq!(received[0]["messages"][0]["content"], "hi");
+    insta::assert_json_snapshot!(json!({
+        "downstream_response": body,
+        "upstream_request": received[0],
+    }));
 
     // 日志 inbound_protocol 落 anthropic_messages。
     let protocol: String = sqlx::query_scalar("SELECT inbound_protocol FROM request_log")
@@ -297,18 +250,22 @@ async fn openai_inbound_to_anthropic_channel_streaming() {
 
     let frames = collect_sse_frames(resp).await;
     // 下游逐帧收到 openai chat.completion.chunk，文本累积完整。
-    assert_eq!(frames[0]["object"], "chat.completion.chunk");
+    assert_eq!(frames[0].data["object"], "chat.completion.chunk");
     let text: String = frames
         .iter()
-        .map(|f| f["choices"][0]["delta"]["content"].as_str().unwrap_or(""))
+        .map(|f| {
+            f.data["choices"][0]["delta"]["content"]
+                .as_str()
+                .unwrap_or("")
+        })
         .collect();
     assert_eq!(text, "Hello");
     // finish 帧带 finish_reason 与 usage。
     let finish = frames
         .iter()
-        .find(|f| f["choices"][0]["finish_reason"] == "stop")
+        .find(|f| f.data["choices"][0]["finish_reason"] == "stop")
         .expect("应有 finish 帧");
-    assert_eq!(finish["usage"]["completion_tokens"], 2);
+    assert_eq!(finish.data["usage"]["completion_tokens"], 2);
 
     // 计费：input 10 + output 2 = 10*2.5/1M + 2*10/1M = 25 + 20 = 45 微元。
     let row: (i64,) =
@@ -362,7 +319,9 @@ async fn anthropic_passthrough_streaming_bills_split_usage() {
     // 消费完流，确保结算已落库；直通转发文本增量。
     let frames = collect_sse_frames(resp).await;
     assert!(
-        frames.iter().any(|f| f["type"] == "content_block_delta"),
+        frames
+            .iter()
+            .any(|f| f.data["type"] == "content_block_delta"),
         "直通应转发 Anthropic 事件帧"
     );
 
@@ -431,23 +390,16 @@ async fn anthropic_inbound_multimodal_to_openai_chat() {
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 出站请求：图片映射为 image_url（data URL），文档（非图片）在 chat 丢弃。
+    // 出站请求：图片映射为 image_url（data URL），文档（非图片）在 chat 丢弃；
+    // 下游响应带丢弃 warning。快照同时锁住保留部分的顺序与丢弃部分的缺席，
+    // 「文档没了」和「图片还在原位」是同一条断言的两面。
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    let content = received[0]["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[1]["type"], "image_url");
-    assert_eq!(
-        content[1]["image_url"]["url"],
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
-    );
-    // 文档被丢弃：chat 仅支持图片媒体。
-    assert_eq!(content.len(), 2, "文档媒体应在 chat 出站丢弃");
-
-    // 下游响应显式 warning：文档媒体丢弃。
     let body: Value = resp.json().await.expect("响应应可解析");
-    assert_eq!(body["gateway"]["warnings"][0]["type"], "unsupported");
-    assert_eq!(body["gateway"]["warnings"][0]["feature"], "media");
+    insta::assert_json_snapshot!(json!({
+        "upstream_request_content": received[0]["messages"][0]["content"],
+        "downstream_warnings": body["gateway"]["warnings"],
+    }));
 }
 
 /// Anthropic 入站 → Anthropic 渠道（同协议直通）：多模态字节级原样送达上游。
@@ -545,17 +497,19 @@ async fn anthropic_inbound_multimodal_to_openai_chat_streaming() {
     let frames = collect_sse_frames(resp).await;
     let text: String = frames
         .iter()
-        .filter(|f| f["type"] == "content_block_delta" && f["delta"]["type"] == "text_delta")
-        .filter_map(|f| f["delta"]["text"].as_str())
+        .filter(|f| {
+            f.data["type"] == "content_block_delta" && f.data["delta"]["type"] == "text_delta"
+        })
+        .filter_map(|f| f.data["delta"]["text"].as_str())
         .collect();
     assert_eq!(text, "ok");
     // 文档丢弃的 warning 随流首 ping 帧下发（Anthropic 无标准 warnings 通道）。
     let warning_frame = frames
         .iter()
-        .find(|f| f.get("warnings").is_some())
+        .find(|f| f.data.get("warnings").is_some())
         .expect("流首应有携带 warnings 的 ping 帧");
-    assert_eq!(warning_frame["warnings"][0]["type"], "unsupported");
-    assert_eq!(warning_frame["warnings"][0]["feature"], "media");
+    assert_eq!(warning_frame.data["warnings"][0]["type"], "unsupported");
+    assert_eq!(warning_frame.data["warnings"][0]["feature"], "media");
 }
 
 /// OpenAI chat 入站 → Anthropic 渠道：多模态跨协议映射（data URL ↔ base64 source）。
@@ -593,19 +547,9 @@ async fn openai_inbound_multimodal_to_anthropic() {
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
+    // 文本与两种 image source 的混排：快照锁住 4 个 block 的顺序与各自的
+    // source 形状（base64 三元组 / url 二元组）。
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    let content = received[0]["messages"][0]["content"].as_array().unwrap();
-    assert_eq!(content.len(), 4, "混排顺序应保留 4 个 block");
-    assert_eq!(content[0]["type"], "text");
-    assert_eq!(content[0]["text"], "What's in these images?");
-    assert_eq!(content[1]["type"], "image");
-    assert_eq!(content[1]["source"]["type"], "base64");
-    assert_eq!(content[1]["source"]["media_type"], "image/png");
-    assert_eq!(content[1]["source"]["data"], "iVBORw0KGgoAAAANSUhEUg==");
-    assert_eq!(content[2]["type"], "text");
-    assert_eq!(content[2]["text"], "and");
-    assert_eq!(content[3]["type"], "image");
-    assert_eq!(content[3]["source"]["type"], "url");
-    assert_eq!(content[3]["source"]["url"], "https://example.com/image.png");
+    insta::assert_json_snapshot!(received[0]["messages"][0]["content"]);
 }
