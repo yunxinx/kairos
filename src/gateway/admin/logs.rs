@@ -55,6 +55,11 @@ pub(super) struct LogEntry {
     output_price_usd_micros: i64,
     cache_read_price_usd_micros: i64,
     cache_write_price_usd_micros: i64,
+    /// 渠道原价（折扣前）。
+    base_cost_usd_micros: i64,
+    /// 万分比折扣率（10000 = 原价）。
+    discount_bp: i64,
+    /// 实收（折后），补扣/豁免按此列处理。
     cost_usd_micros: i64,
     /// 费用是否已完成所属用户钱包结算。
     settled: bool,
@@ -84,6 +89,8 @@ impl LogEntry {
             output_price_usd_micros: log.price.output_micros,
             cache_read_price_usd_micros: log.price.cache_read_micros,
             cache_write_price_usd_micros: log.price.cache_write_micros,
+            base_cost_usd_micros: log.base_cost_usd_micros,
+            discount_bp: log.discount_bp,
             cost_usd_micros: log.cost_usd_micros,
             settled: log.settled,
             request_body: log.request_body.map(|bytes| BASE64_STANDARD.encode(bytes)),

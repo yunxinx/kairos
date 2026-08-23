@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
+use crate::core::billing;
 use crate::store::StoreError;
 
 /// 内置 `standard` 档固定 id：新建普通用户的默认套餐。
@@ -88,9 +89,15 @@ pub(crate) async fn list_plans_for_snapshot(
             serde_json::from_str(&capabilities_json).map_err(|_| {
                 StoreError::InvalidResource(format!("套餐 {id} 的 capabilities_json 非法"))
             })?;
+        let discount_bp: i64 = row.try_get("discount_bp").map_err(StoreError::Query)?;
+        if !(billing::MIN_DISCOUNT_BP..=billing::MAX_DISCOUNT_BP).contains(&discount_bp) {
+            return Err(StoreError::InvalidResource(format!(
+                "套餐 {id} 的 discount_bp 超出合法范围: {discount_bp}"
+            )));
+        }
         out.push(PlanSnapshot {
             id,
-            discount_bp: row.try_get("discount_bp").map_err(StoreError::Query)?,
+            discount_bp,
             default_rpm: rpm_from_db(default_rpm)?,
             shared_rpm: rpm_from_db(shared_rpm)?,
             groups: groups_by_plan.remove(&id).unwrap_or_default(),

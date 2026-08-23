@@ -6,7 +6,8 @@ use bytes::Bytes;
 
 use crate::{
     config::Protocol,
-    core::{billing::PriceSnapshot, ir::Usage},
+    core::billing::{self, PriceSnapshot},
+    core::ir::Usage,
     store,
     store::resources::Token,
 };
@@ -16,13 +17,32 @@ use super::http::Deps;
 /// 一次请求的计费结果，供日志落库。
 ///
 /// 请求日志的 `settled` 由 [`log_request`] 按结算成败填写，调用方不必预置。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(super) struct Billing {
     pub(super) usage: Usage,
     pub(super) price: PriceSnapshot,
+    /// 渠道原价（折扣前），为零表示未产生计费/失败请求。
+    pub(super) base_cost_usd_micros: i64,
+    /// 本次使用的万分比折扣率（10000 = 原价）。
+    pub(super) discount_bp: i64,
+    /// 实收（折后），用于扣钱包、累计结算与日志。
     pub(super) cost_usd_micros: i64,
     pub(super) request_body: Option<Bytes>,
     pub(super) response_body: Option<Vec<u8>>,
+}
+
+impl Default for Billing {
+    fn default() -> Self {
+        Self {
+            usage: Usage::default(),
+            price: PriceSnapshot::default(),
+            base_cost_usd_micros: 0,
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            cost_usd_micros: 0,
+            request_body: None,
+            response_body: None,
+        }
+    }
 }
 
 /// 按独立的日志 body 上限截断落库字节，避免 full_body 把库撑爆。
@@ -104,6 +124,8 @@ pub(super) async fn log_request(
         cache_read_tokens: billing.usage.cache_read_tokens,
         cache_write_tokens: billing.usage.cache_write_tokens,
         price: billing.price,
+        base_cost_usd_micros: billing.base_cost_usd_micros,
+        discount_bp: billing.discount_bp,
         cost_usd_micros: billing.cost_usd_micros,
         settled: billing.cost_usd_micros <= 0,
         request_id: Some(request_id.to_string()),

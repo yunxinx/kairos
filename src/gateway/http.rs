@@ -556,6 +556,10 @@ async fn handle_request(
     };
 
     // 5. 计费准入：用户钱包与令牌累计上限须通过（单价按实际跳在出站时选用）。
+    //
+    // 折扣率在准入时从当前用户所挂套餐取出；免费档（bp=0）不要求余额为正，
+    // 粗估也按折后金额比对，避免被原价门槛挡住。
+    let discount_bp = snapshot.discount_bp_for_token(token);
     let mut conn = match deps.pool.acquire().await {
         Ok(conn) => conn,
         Err(err) => {
@@ -601,7 +605,7 @@ async fn handle_request(
             .await;
         }
     };
-    if balance.wallet.balance_usd_micros <= 0 {
+    if balance.wallet.balance_usd_micros <= 0 && discount_bp != 0 {
         let message = format!(
             "用户余额不足（当前 {:.2} USD）",
             balance.wallet.balance_usd_micros as f64 / 1_000_000.0
@@ -642,8 +646,8 @@ async fn handle_request(
         .await;
     }
     if let Some(max_tokens) = request.max_tokens.filter(|&n| n > 0) {
-        let estimate = estimate_admission_cost_micros(&hops, &snapshot, max_tokens);
-        if estimate > balance.wallet.balance_usd_micros {
+        let estimate = estimate_admission_cost_micros(&hops, &snapshot, discount_bp, max_tokens);
+        if discount_bp != 0 && estimate > balance.wallet.balance_usd_micros {
             let message = format!(
                 "用户余额不足以覆盖预估费用（预估 {:.2} USD，当前 {:.2} USD）",
                 estimate as f64 / 1_000_000.0,
@@ -808,10 +812,11 @@ fn billed_price(snapshot: &RuntimeSnapshot, record: &ChannelRecord, model: &str)
         .expect("准入已过滤无价格渠道")
 }
 
-/// 候选跳里最高的 output 单价 × `max_tokens`，挡住极端输出上限。
+/// 候选跳里最高的 output 单价 × `max_tokens`，再按折扣率折成实收，挡住极端输出上限。
 fn estimate_admission_cost_micros(
     hops: &[RouteHop],
     snapshot: &RuntimeSnapshot,
+    discount_bp: i64,
     max_tokens: u32,
 ) -> i64 {
     let mut max_output = 0i64;
@@ -821,7 +826,8 @@ fn estimate_admission_cost_micros(
             max_output = max_output.max(price.output_micros);
         }
     }
-    billing::estimate_max_output_cost_micros(max_tokens, max_output)
+    let base = billing::estimate_max_output_cost_micros(max_tokens, max_output);
+    billing::discounted_cost_micros(base, discount_bp)
 }
 
 /// 解析本次请求的出站跳序列。
@@ -1001,6 +1007,7 @@ async fn outbound_with_failover(
             let response_body = snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = request_id.to_string();
             Box::pin(async move {
+                let discount_bp = snapshot.discount_bp_for_token(token);
                 log_request(
                     deps,
                     token,
@@ -1010,6 +1017,7 @@ async fn outbound_with_failover(
                     status,
                     started,
                     Billing {
+                        discount_bp,
                         request_body,
                         response_body,
                         ..Default::default()
@@ -1084,6 +1092,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                     status,
                     ctx.started,
                     Billing {
+                        discount_bp: ctx.snapshot.discount_bp_for_token(ctx.token),
                         request_body,
                         response_body,
                         ..Default::default()
@@ -1288,7 +1297,9 @@ async fn passthrough_non_stream_completion(
         // 响应体原样透传（字节级一致），从 JSON 嗅探 usage 计费。
         let usage = protocol::sniff_usage(&parsed, channel.protocol).unwrap_or_default();
         let price = billed_price(ctx.snapshot, record, ctx.routed_model);
-        let cost = billing::cost_micros(&usage, &price);
+        let base_cost = billing::cost_micros(&usage, &price);
+        let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
+        let charged = billing::discounted_cost_micros(base_cost, discount_bp);
         log_request(
             ctx.deps,
             ctx.token,
@@ -1300,7 +1311,9 @@ async fn passthrough_non_stream_completion(
             Billing {
                 usage,
                 price,
-                cost_usd_micros: cost,
+                base_cost_usd_micros: base_cost,
+                discount_bp,
+                cost_usd_micros: charged,
                 request_body: ctx.request_body.clone(),
                 response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
             },
@@ -1494,7 +1507,9 @@ async fn pipe_passthrough_stream<S>(
         );
     }
     // 流结束：按嗅探累积的 usage 结算并落日志。
-    let cost = billing::cost_micros(&usage, &ctx.price);
+    let base_cost = billing::cost_micros(&usage, &ctx.price);
+    let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
+    let charged = billing::discounted_cost_micros(base_cost, discount_bp);
     log_request(
         &ctx.deps,
         &ctx.token,
@@ -1506,7 +1521,9 @@ async fn pipe_passthrough_stream<S>(
         Billing {
             usage,
             price: ctx.price,
-            cost_usd_micros: cost,
+            base_cost_usd_micros: base_cost,
+            discount_bp,
+            cost_usd_micros: charged,
             request_body: ctx.request_body.clone(),
             response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
@@ -1619,7 +1636,9 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                 // 请求侧转换的信息损失随响应回传，下游可感知而非莫名降级。
                 ir.warnings.extend(request_warnings);
                 let usage = &ir.usage;
-                let cost = billing::cost_micros(usage, &price);
+                let base_cost = billing::cost_micros(usage, &price);
+                let discount_bp = snapshot.discount_bp_for_token(token);
+                let charged = billing::discounted_cost_micros(base_cost, discount_bp);
                 let inbound = protocol::encode_response(&ir, inbound_protocol);
                 // full_body 记录实际返回下游的入站响应字节（重编码结果）；
                 // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
@@ -1637,7 +1656,9 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                     Billing {
                         usage: usage.clone(),
                         price,
-                        cost_usd_micros: cost,
+                        base_cost_usd_micros: base_cost,
+                        discount_bp,
+                        cost_usd_micros: charged,
                         request_body: ctx.request_body.clone(),
                         response_body: inbound_wire,
                     },
@@ -1994,7 +2015,9 @@ fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
 /// 结算流式请求费用并落日志。
 async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
     let usage = &response.usage;
-    let cost = billing::cost_micros(usage, &ctx.price);
+    let base_cost = billing::cost_micros(usage, &ctx.price);
+    let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
+    let charged = billing::discounted_cost_micros(base_cost, discount_bp);
     log_request(
         &ctx.deps,
         &ctx.token,
@@ -2006,7 +2029,9 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
         Billing {
             usage: response.usage.clone(),
             price: ctx.price,
-            cost_usd_micros: cost,
+            base_cost_usd_micros: base_cost,
+            discount_bp,
+            cost_usd_micros: charged,
             request_body: ctx.request_body.clone(),
             response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
         },
@@ -2209,6 +2234,7 @@ async fn error_response(
     let body = protocol::encode_error(status.as_u16(), message, inbound_protocol);
     if let (Some(token), Some(model)) = (token, model) {
         let response_wire = full_body.then(|| serde_json::to_vec(&body).unwrap_or_default());
+        let discount_bp = deps.snapshot.read().await.discount_bp_for_token(token);
         log_request(
             deps,
             token,
@@ -2220,6 +2246,8 @@ async fn error_response(
             Billing {
                 usage: Usage::default(),
                 price: PriceSnapshot::default(),
+                base_cost_usd_micros: 0,
+                discount_bp,
                 cost_usd_micros: 0,
                 request_body,
                 response_body: response_wire,

@@ -144,7 +144,13 @@ pub struct RequestLog {
     pub cache_write_tokens: u64,
     /// 计费时的四档价格快照（micro-USD / 1M tokens）。
     pub price: PriceSnapshot,
-    /// 本次费用（micro-USD）。
+    /// 渠道原价（micro-USD），不套用折扣。
+    pub base_cost_usd_micros: i64,
+    /// 本次使用的万分比折扣率（10000 = 原价）。
+    pub discount_bp: i64,
+    /// 本次实收（micro-USD，折后）。
+    ///
+    /// 补扣/豁免按此列入账；对账时由 `base_cost_usd_micros` 与 `discount_bp` 复核。
     pub cost_usd_micros: i64,
     /// 费用是否已完成所属用户钱包结算；结算失败时为 `false`，供对账补扣。
     pub settled: bool,
@@ -174,9 +180,10 @@ pub async fn insert_request_log_on(
          (created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
           channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
           cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+          cache_read_price_usd_micros, cache_write_price_usd_micros, \
+          base_cost_usd_micros, discount_bp, cost_usd_micros, \
           settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.created_at)
     .bind(&log.token_name)
@@ -196,6 +203,8 @@ pub async fn insert_request_log_on(
     .bind(log.price.output_micros)
     .bind(log.price.cache_read_micros)
     .bind(log.price.cache_write_micros)
+    .bind(log.base_cost_usd_micros)
+    .bind(log.discount_bp)
     .bind(log.cost_usd_micros)
     .bind(log.settled as i64)
     .bind(&log.request_id)
@@ -615,7 +624,8 @@ async fn query_request_logs_on(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, \
+         base_cost_usd_micros, discount_bp, cost_usd_micros, \
          settled FROM request_log",
     );
     push_request_log_filters(&mut qb, filter);
@@ -650,7 +660,8 @@ pub async fn get_request_log_on_conn(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, \
+         base_cost_usd_micros, discount_bp, cost_usd_micros, \
          settled, request_body, response_body FROM request_log WHERE id = ?",
     )
     .bind(id)
@@ -948,7 +959,12 @@ pub struct StatsSummary {
     pub success_count: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 实收（折后）合计。
     pub cost_usd_micros: i64,
+    /// 渠道原价合计（成本）。
+    pub base_cost_usd_micros: i64,
+    /// 毛利：实收 - 渠道原价（折后合计减原价合计）。
+    pub gross_profit_usd_micros: i64,
     /// 令牌数：全局视图为全部令牌，归属视图只数该用户自己的。
     pub token_count: u64,
     /// 出站渠道数。归属视图为 `None`：渠道是运营视角的数字，普通用户不该看到。
@@ -963,6 +979,8 @@ pub struct DailyBucket {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd_micros: i64,
+    pub base_cost_usd_micros: i64,
+    pub gross_profit_usd_micros: i64,
 }
 
 /// 按模型或按渠道的费用/请求分布。
@@ -971,6 +989,8 @@ pub struct CostShare {
     pub name: String,
     pub request_count: u64,
     pub cost_usd_micros: i64,
+    pub base_cost_usd_micros: i64,
+    pub gross_profit_usd_micros: i64,
 }
 
 /// 全量累计：不受 `/stats` 时间窗影响。
@@ -983,6 +1003,8 @@ pub struct CostShare {
 pub struct LifetimeStats {
     pub request_count: u64,
     pub cost_usd_micros: i64,
+    pub base_cost_usd_micros: i64,
+    pub gross_profit_usd_micros: i64,
     pub total_tokens: u64,
 }
 
@@ -1009,7 +1031,12 @@ pub async fn query_stats(
          COALESCE(SUM(input_tokens), 0) AS input_tokens, \
          COALESCE(SUM(output_tokens), 0) AS output_tokens, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-           AS cost_usd_micros \
+           AS cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+           AS base_cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
+           AS gross_profit_usd_micros \
          FROM request_log WHERE created_at >= ?{}",
         user_scope_clause(user_id)
     );
@@ -1063,6 +1090,12 @@ pub async fn query_stats(
         cost_usd_micros: summary_row
             .try_get("cost_usd_micros")
             .map_err(StoreError::Query)?,
+        base_cost_usd_micros: summary_row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        gross_profit_usd_micros: summary_row
+            .try_get("gross_profit_usd_micros")
+            .map_err(StoreError::Query)?,
         token_count,
         channel_count,
     };
@@ -1095,6 +1128,11 @@ pub async fn query_lifetime_stats(
         "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+           AS base_cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
+           AS gross_profit_usd_micros, \
          COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
            AS total_tokens \
          FROM request_log{}",
@@ -1109,6 +1147,12 @@ pub async fn query_lifetime_stats(
     Ok(LifetimeStats {
         request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
         cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        base_cost_usd_micros: row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        gross_profit_usd_micros: row
+            .try_get("gross_profit_usd_micros")
+            .map_err(StoreError::Query)?,
         total_tokens: as_count(row.try_get("total_tokens").map_err(StoreError::Query)?),
     })
 }
@@ -1121,6 +1165,12 @@ fn trend_bucket(row: &sqlx::sqlite::SqliteRow) -> Result<DailyBucket, StoreError
         input_tokens: as_count(row.try_get("input_tokens").map_err(StoreError::Query)?),
         output_tokens: as_count(row.try_get("output_tokens").map_err(StoreError::Query)?),
         cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        base_cost_usd_micros: row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        gross_profit_usd_micros: row
+            .try_get("gross_profit_usd_micros")
+            .map_err(StoreError::Query)?,
     })
 }
 
@@ -1140,7 +1190,9 @@ async fn query_hourly_buckets(
                 COALESCE(agg.request_count, 0) AS request_count, \
                 COALESCE(agg.input_tokens, 0) AS input_tokens, \
                 COALESCE(agg.output_tokens, 0) AS output_tokens, \
-                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros \
+                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros, \
+                COALESCE(agg.base_cost_usd_micros, 0) AS base_cost_usd_micros, \
+                COALESCE(agg.gross_profit_usd_micros, 0) AS gross_profit_usd_micros \
          FROM calendar \
          LEFT JOIN ( \
             SELECT strftime('%Y-%m-%dT%H:00:00Z', created_at / 1000, 'unixepoch') AS hour, \
@@ -1148,7 +1200,11 @@ async fn query_hourly_buckets(
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
+                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
             FROM request_log WHERE created_at >= ?{} \
             GROUP BY hour \
          ) agg ON agg.hour = strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) \
@@ -1184,7 +1240,9 @@ async fn query_daily_buckets(
                 COALESCE(agg.request_count, 0) AS request_count, \
                 COALESCE(agg.input_tokens, 0) AS input_tokens, \
                 COALESCE(agg.output_tokens, 0) AS output_tokens, \
-                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros \
+                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros, \
+                COALESCE(agg.base_cost_usd_micros, 0) AS base_cost_usd_micros, \
+                COALESCE(agg.gross_profit_usd_micros, 0) AS gross_profit_usd_micros \
          FROM calendar \
          LEFT JOIN ( \
             SELECT date(created_at / 1000, 'unixepoch') AS day, \
@@ -1192,7 +1250,11 @@ async fn query_daily_buckets(
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
+                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
             FROM request_log WHERE created_at >= ?{} \
             GROUP BY day \
          ) agg ON agg.day = calendar.day \
@@ -1231,7 +1293,12 @@ async fn query_cost_share(
     let sql = format!(
         "SELECT {column} AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-           AS cost_usd_micros \
+           AS cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+           AS base_cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
+           AS gross_profit_usd_micros \
          FROM request_log WHERE created_at >= ?{} \
          GROUP BY {column} \
          ORDER BY cost_usd_micros DESC, name ASC",
@@ -1249,6 +1316,12 @@ async fn query_cost_share(
             name: row.try_get("name").map_err(StoreError::Query)?,
             request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
             cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+            base_cost_usd_micros: row
+                .try_get("base_cost_usd_micros")
+                .map_err(StoreError::Query)?,
+            gross_profit_usd_micros: row
+                .try_get("gross_profit_usd_micros")
+                .map_err(StoreError::Query)?,
         });
     }
     Ok(shares)
@@ -1493,6 +1566,10 @@ fn map_request_log_row(
             .try_get("cache_write_tokens")
             .map_err(StoreError::Query)?,
         price,
+        base_cost_usd_micros: row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        discount_bp: row.try_get("discount_bp").map_err(StoreError::Query)?,
         cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
         settled: row
             .try_get::<i64, _>("settled")
@@ -2077,6 +2154,8 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: i as i64,
+                    base_cost_usd_micros: 0,
+                    discount_bp: 10_000,
                     settled: true,
                     request_id: None,
                     request_body: None,
@@ -2193,6 +2272,8 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: 0,
+                    base_cost_usd_micros: 0,
+                    discount_bp: 10_000,
                     settled: true,
                     request_id: None,
                     request_body: None,
@@ -2276,6 +2357,8 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: 0,
+                    base_cost_usd_micros: 0,
+                    discount_bp: 10_000,
                     settled: true,
                     request_id: None,
                     request_body: None,
@@ -2333,6 +2416,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 0,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2361,6 +2446,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 0,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2415,6 +2502,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 12,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2478,6 +2567,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2537,6 +2628,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 9_999,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: false,
                 request_id: None,
                 request_body: None,
@@ -2565,6 +2658,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 100,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2597,6 +2692,8 @@ mod tests {
             cache_write_tokens: 0,
             price: PriceSnapshot::default(),
             cost_usd_micros: 1,
+            base_cost_usd_micros: 0,
+            discount_bp: 10_000,
             settled,
             request_id: None,
             request_body: None,

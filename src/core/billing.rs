@@ -28,12 +28,33 @@ impl PriceSnapshot {
     }
 }
 
+/// 折扣率下限：0 表示免费档。
+pub const MIN_DISCOUNT_BP: i64 = 0;
+/// 折扣率上限：1_000_000 万分比 = 100 倍，防止误配成天文数字。
+pub const MAX_DISCOUNT_BP: i64 = 1_000_000;
+/// 原价折扣率：10000 万分比 = 100%。
+pub const DEFAULT_DISCOUNT_BP: i64 = 10_000;
+
 /// 计算 `usage` 对应的整数 micro-USD 费用：四分量 × 各自单价，整数微元截断。
+///
+/// 这是渠道原价，不套用套餐折扣；折扣在总额上再做一次整数乘除。
 pub fn cost_micros(usage: &Usage, price: &PriceSnapshot) -> i64 {
     component_cost(usage.input_tokens, price.input_micros)
         + component_cost(usage.output_tokens, price.output_micros)
         + component_cost(usage.cache_read_tokens, price.cache_read_micros)
         + component_cost(usage.cache_write_tokens, price.cache_write_micros)
+}
+
+/// 按万分比折扣把渠道原价换算为实收，只截断一次。
+///
+/// `discount_bp` 必须已在 [`MIN_DISCOUNT_BP`] 与 [`MAX_DISCOUNT_BP`] 之间；
+/// 库加载与写入侧负责校验，调用方直接使用。
+pub fn discounted_cost_micros(base_cost_usd_micros: i64, discount_bp: i64) -> i64 {
+    debug_assert!(
+        (MIN_DISCOUNT_BP..=MAX_DISCOUNT_BP).contains(&discount_bp),
+        "discount_bp 超出合法范围: {discount_bp}"
+    );
+    (base_cost_usd_micros as i128 * discount_bp as i128 / 10_000) as i64
 }
 
 /// 用 `max_tokens` 作为 output 用量的粗估费用，挡住极端输出上限。
@@ -139,6 +160,15 @@ mod tests {
         // 1M input → 0.15 USD = 150_000 微元。
         let u = usage(1_000_000, 0, 0, 0);
         assert_eq!(cost_micros(&u, &price), 150_000);
+    }
+
+    #[test]
+    fn discounted_cost_uses_single_integer_division() {
+        assert_eq!(discounted_cost_micros(4_250, 8_000), 3_400);
+        assert_eq!(discounted_cost_micros(4_250, 10_000), 4_250);
+        assert_eq!(discounted_cost_micros(4_250, 0), 0);
+        assert_eq!(discounted_cost_micros(1, 3_333), 0);
+        assert_eq!(discounted_cost_micros(999_999, 1_000_000), 99_999_900);
     }
 
     #[test]

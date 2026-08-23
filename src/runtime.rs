@@ -14,6 +14,7 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
+use crate::core::billing;
 use crate::store::StoreError;
 use crate::store::plans;
 pub use crate::store::plans::PlanCapabilities;
@@ -111,6 +112,20 @@ impl RuntimeSnapshot {
     /// 按渠道稳定 id + 可调用名取单价。
     pub fn price_for_channel(&self, channel_id: i64, model: &str) -> Option<&resources::Price> {
         self.prices.get(&channel_id)?.get(model)
+    }
+
+    /// 令牌所属用户当前套餐的折扣率（万分比）。
+    ///
+    /// root 不挂档，恒为原价；套餐缺失按原价处理（正常数据不会发生）。
+    pub fn discount_bp_for_token(&self, token: &resources::Token) -> i64 {
+        match self.users.get(&token.user_id).map(|user| user.plan) {
+            Some(PlanBinding::Unrestricted) | None => billing::DEFAULT_DISCOUNT_BP,
+            Some(PlanBinding::Plan(plan_id)) => self
+                .plans
+                .get(&plan_id)
+                .map(|plan| plan.discount_bp)
+                .unwrap_or(billing::DEFAULT_DISCOUNT_BP),
+        }
     }
 
     /// 令牌组是否仍可调用：组非空、用户启用、组存在；所挂套餐名单是唯一来源。
