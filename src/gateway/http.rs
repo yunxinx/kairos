@@ -40,7 +40,7 @@ use crate::{
     core::billing::PriceSnapshot,
     core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage},
     core::stream::{SseFrame, StreamAccumulator},
-    runtime::{RuntimeSnapshot, SnapshotHandle},
+    runtime::{PlanBinding, RuntimeSnapshot, SnapshotHandle},
     store,
     store::resources::{Channel, ChannelRecord, Token},
 };
@@ -2261,22 +2261,46 @@ async fn error_response(
 }
 
 /// 令牌生效 RPM：令牌桶上限 = 令牌 `rate_limit_rpm`（缺省跟随全局兜底，`0` 不限）；
-/// 所属用户配置了正数 RPM 时另开用户桶，跨该用户全部令牌共享（令牌写 `0` 也
-/// 压不过用户上限）。快照原子替换后，本函数每次调用重读两维上限，自动生效。
+/// 用户桶按「用户显式值 → 套餐默认值 → 系统兜底」取值，跨该用户全部令牌共享；
+/// 套餐桶上限 = 套餐 `shared_rpm` 的正数值，跨该档全部用户共享。用户/套餐字段的
+/// `0` 是显式不限该维度，不会继续回退。root 不挂套餐，只受令牌桶的系统兜底约束。
+/// 快照原子替换后，本函数每次调用重读三维上限，自动生效。
 fn token_rate_limited(
     deps: &Deps,
     token: &Token,
     snapshot: &RuntimeSnapshot,
 ) -> Result<(), Duration> {
     let token_limit = token.rate_limit_rpm.unwrap_or(snapshot.rate_limit_rpm);
-    let user_limit = snapshot
-        .users
-        .get(&token.user_id)
-        .and_then(|user| user.rate_limit_rpm)
-        .filter(|limit| *limit > 0)
-        .map(|limit| (token.user_id, limit));
+    let (user_limit, plan_limit) = match snapshot.users.get(&token.user_id) {
+        Some(user) => match user.plan {
+            PlanBinding::Unrestricted => (None, None),
+            PlanBinding::Plan(plan_id) => {
+                let plan = snapshot.plans.get(&plan_id);
+                let user_limit = match user.rate_limit_rpm {
+                    // 显式 0 与令牌 RPM 一样表示该维度不限速；它是已填写的值，
+                    // 因而不会因换档而改成套餐默认值。
+                    Some(limit) => limit,
+                    None => match plan.and_then(|plan| plan.default_rpm) {
+                        Some(limit) => limit,
+                        None => snapshot.rate_limit_rpm,
+                    },
+                };
+                let user_limit = if user_limit > 0 {
+                    Some((token.user_id, user_limit))
+                } else {
+                    None
+                };
+                let plan_limit = match plan.and_then(|plan| plan.shared_rpm) {
+                    Some(limit) if limit > 0 => Some((plan_id, limit)),
+                    _ => None,
+                };
+                (user_limit, plan_limit)
+            }
+        },
+        None => (None, None),
+    };
     deps.request_rate
-        .try_acquire(&token.token_key, token_limit, user_limit)
+        .try_acquire(&token.token_key, token_limit, user_limit, plan_limit)
 }
 
 /// 令牌 RPM 超限：429 + `Retry-After`。

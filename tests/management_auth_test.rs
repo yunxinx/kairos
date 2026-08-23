@@ -37,6 +37,71 @@ async fn bearer_json(
         .expect("管理请求应可达")
 }
 
+async fn create_user(gw: &TestGateway, email: &str, rate_limit_rpm: Option<u64>) -> i64 {
+    let response = bearer_json(
+        gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": email,
+            "display_name": email,
+            "password": "password1",
+            "role": "user",
+            "rate_limit_rpm": rate_limit_rpm
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response.json::<Value>().await.expect("用户响应应可解析")["id"]
+        .as_i64()
+        .expect("应有用户 id")
+}
+
+async fn login_user(gw: &TestGateway, email: &str) -> String {
+    let response = reqwest::Client::new()
+        .post(admin_url(gw, "/login"))
+        .json(&json!({ "email": email, "password": "password1" }))
+        .send()
+        .await
+        .expect("用户登录应可达");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json::<Value>().await.expect("登录响应应可解析")["token"]
+        .as_str()
+        .expect("应有会话令牌")
+        .to_string()
+}
+
+async fn create_user_token(gw: &TestGateway, session: &str, name: &str) -> String {
+    let response = bearer_json(
+        gw,
+        session,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({
+            "name": name,
+            "model_group": "default",
+            "rate_limit_rpm": 0,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response.json::<Value>().await.expect("令牌响应应可解析")["token_key"]
+        .as_str()
+        .expect("应有令牌 key")
+        .to_string()
+}
+
+async fn list_models(base_url: &str, token_key: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{base_url}/v1/models"))
+        .bearer_auth(token_key)
+        .send()
+        .await
+        .expect("模型列表请求应可达")
+}
+
 /// 播种后的 root 可用邮箱密码换会话；错密码失败；登出后会话失效。
 #[tokio::test]
 async fn seeded_root_can_login_and_logout() {
@@ -774,5 +839,67 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
         call(keys[1].clone()).await.status(),
         StatusCode::TOO_MANY_REQUESTS,
         "用户级 RPM 是名下所有令牌合计的硬性上限"
+    );
+}
+
+/// 用户未填 RPM 时跟随套餐默认值；套餐共享桶跨用户生效，且用户桶拒绝不偷占套餐额度。
+#[tokio::test]
+async fn plan_default_and_shared_rpm_apply_to_protocol_requests() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let default_user_email = "plan-default-rpm@example.com";
+    let explicit_user_email = "plan-explicit-rpm@example.com";
+    let cross_user_email = "plan-cross-user-rpm@example.com";
+    let _default_user_id = create_user(&gw, default_user_email, None).await;
+    let _explicit_user_id = create_user(&gw, explicit_user_email, Some(10)).await;
+    let _cross_user_id = create_user(&gw, cross_user_email, Some(10)).await;
+
+    let default_session = login_user(&gw, default_user_email).await;
+    let explicit_session = login_user(&gw, explicit_user_email).await;
+    let cross_session = login_user(&gw, cross_user_email).await;
+    let default_token_a = create_user_token(&gw, &default_session, "default-a").await;
+    let default_token_b = create_user_token(&gw, &default_session, "default-b").await;
+    let explicit_token_a = create_user_token(&gw, &explicit_session, "explicit-a").await;
+    let cross_user_token = create_user_token(&gw, &cross_session, "cross-user").await;
+
+    // 默认用户桶为 1，套餐共享桶为 3；系统兜底保持默认的 0。
+    sqlx::query("UPDATE plans SET default_rpm = 1, shared_rpm = 3 WHERE id = 1")
+        .execute(&gw.pool)
+        .await
+        .expect("应能设置测试套餐 RPM");
+    let protocol_base = gw.spawn_reloaded_protocol().await;
+
+    assert_eq!(
+        list_models(&protocol_base, &default_token_a).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_models(&protocol_base, &default_token_b).await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "用户未填值时应跟随套餐默认 RPM"
+    );
+
+    // 上一个用户级拒绝不能记入套餐桶，否则这里第二次请求会被共享桶提前拒绝。
+    assert_eq!(
+        list_models(&protocol_base, &explicit_token_a)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_models(&protocol_base, &explicit_token_a)
+            .await
+            .status(),
+        StatusCode::OK,
+        "用户显式 RPM 应覆盖套餐默认值"
+    );
+    let plan_limited = list_models(&protocol_base, &cross_user_token).await;
+    assert_eq!(
+        plan_limited.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "同档用户合计达到共享 RPM 后应返回 429"
+    );
+    assert!(
+        plan_limited.headers().get("retry-after").is_some(),
+        "套餐桶超限应带 Retry-After"
     );
 }
