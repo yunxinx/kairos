@@ -15,6 +15,8 @@ use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 
 use crate::store::StoreError;
+use crate::store::plans;
+pub use crate::store::plans::PlanCapabilities;
 use crate::store::resources::{
     self, SETTING_AUTH_THROTTLE_MAX_FAILURES, SETTING_AUTH_THROTTLE_WINDOW_SECS,
     SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_LOG_BODY_MAX_BYTES,
@@ -47,8 +49,10 @@ pub struct RuntimeSnapshot {
     pub model_groups: HashMap<String, resources::ModelGroup>,
     /// 统一模型，按可调用名索引（有序 failover）。
     pub unified_models: HashMap<String, resources::UnifiedModel>,
-    /// 管理用户：启停、角色与可用模型组（入站令牌准入）。
+    /// 管理用户：启停、角色与所挂套餐（入站令牌准入）。
     pub users: HashMap<i64, RuntimeUser>,
+    /// 套餐运行时投影，按套餐 id 索引（模型组名单与套餐级限速/折扣）。
+    pub plans: HashMap<i64, RuntimePlan>,
     /// 是否落完整请求/响应 body（来自 `full_body` 开关）。
     pub full_body: bool,
     /// 入站请求体大小上限（字节，来自 `max_request_bytes` 开关）。
@@ -75,12 +79,31 @@ pub struct RuntimeSnapshot {
     pub rate_limit_rpm: u64,
 }
 
-/// 快照里的管理用户：请求路径只读启停、角色、可用组与用户级限速。
+/// 用户与套餐的绑定：root 不挂档，用类型把「没有套餐」这个合法状态表达出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanBinding {
+    /// root：全部模型组可用，原价结算，只受系统兜底限速。
+    Unrestricted,
+    /// 普通用户/管理员所挂的套餐 id。
+    Plan(i64),
+}
+
+/// 套餐的运行时投影：请求路径只读折扣、限速默认值、共享 RPM 和模型组名单。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimePlan {
+    pub discount_bp: i64,
+    pub default_rpm: Option<u64>,
+    pub shared_rpm: Option<u64>,
+    pub groups: HashSet<String>,
+    pub capabilities: PlanCapabilities,
+}
+
+/// 快照里的管理用户：请求路径只读启停、角色、所挂套餐与用户级限速。
 #[derive(Debug, Clone)]
 pub struct RuntimeUser {
     pub role: ManagementRole,
     pub enabled: bool,
-    pub assigned_groups: HashSet<String>,
+    pub plan: PlanBinding,
     pub rate_limit_rpm: Option<u64>,
 }
 
@@ -90,9 +113,9 @@ impl RuntimeSnapshot {
         self.prices.get(&channel_id)?.get(model)
     }
 
-    /// 令牌组是否仍可调用：组非空、用户启用、组存在；普通用户还须在可用名单里。
+    /// 令牌组是否仍可调用：组非空、用户启用、组存在；所挂套餐名单是唯一来源。
     ///
-    /// root/admin 的令牌只要组还在即可。空组（删组后置空）一律不可调用。
+    /// root 走 `Unrestricted` 直通；空组（删组后置空）一律不可调用。
     pub fn token_group_assigned(&self, token: &resources::Token) -> bool {
         if token.model_group.is_empty() {
             return false;
@@ -106,10 +129,13 @@ impl RuntimeSnapshot {
         if !self.model_groups.contains_key(&token.model_group) {
             return false;
         }
-        if user.role.at_least(ManagementRole::Admin) {
-            return true;
+        match user.plan {
+            PlanBinding::Unrestricted => true,
+            PlanBinding::Plan(plan_id) => self
+                .plans
+                .get(&plan_id)
+                .is_some_and(|plan| plan.groups.contains(&token.model_group)),
         }
-        user.assigned_groups.contains(&token.model_group)
     }
 
     /// 认证失败计数窗口；库内为 0 时按 1 秒处理，避免 `Duration::from_secs(0)` 让窗口立刻过期。
@@ -162,6 +188,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
     let price_rows = resources::list_prices(pool).await?;
     let group_rows = resources::list_model_groups(pool).await?;
     let unified_rows = resources::list_unified_models(pool).await?;
+    let plan_rows = plans::list_plans_for_snapshot(pool).await?;
     let settings = resources::list_settings(pool).await?;
 
     let tokens = token_rows
@@ -184,24 +211,44 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         .map(|model| (model.id.clone(), model))
         .collect();
     // 只取请求路径要用的字段：头像不进快照（见 list_users_for_snapshot）。
+    let plans = plan_rows
+        .into_iter()
+        .map(|plan| {
+            (
+                plan.id,
+                RuntimePlan {
+                    discount_bp: plan.discount_bp,
+                    default_rpm: plan.default_rpm,
+                    shared_rpm: plan.shared_rpm,
+                    groups: plan.groups,
+                    capabilities: plan.capabilities,
+                },
+            )
+        })
+        .collect();
+
     let user_rows = users::list_users_for_snapshot(pool).await?;
-    let assigned_rows = users::list_all_assigned_groups(pool).await?;
     let mut users: HashMap<i64, RuntimeUser> = HashMap::new();
     for user in user_rows {
+        let plan = match user.plan_id {
+            Some(plan_id) => PlanBinding::Plan(plan_id),
+            None if user.id == resources::ROOT_USER_ID => PlanBinding::Unrestricted,
+            None => {
+                return Err(StoreError::InvalidResource(format!(
+                    "用户 {} 缺少套餐，只有 root 允许不挂档",
+                    user.id
+                )));
+            }
+        };
         users.insert(
             user.id,
             RuntimeUser {
                 role: user.role,
                 enabled: user.enabled,
-                assigned_groups: HashSet::new(),
+                plan,
                 rate_limit_rpm: user.rate_limit_rpm,
             },
         );
-    }
-    for (user_id, group) in assigned_rows {
-        if let Some(user) = users.get_mut(&user_id) {
-            user.assigned_groups.insert(group);
-        }
     }
 
     Ok(RuntimeSnapshot {
@@ -211,6 +258,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         model_groups,
         unified_models,
         users,
+        plans,
         full_body: load_full_body(&settings),
         max_request_bytes: load_max_request_bytes(&settings),
         max_response_bytes: load_u64(
@@ -327,10 +375,10 @@ mod tests {
             .get(&resources::ROOT_USER_ID)
             .expect("空库应有内置 root");
         assert!(root.enabled);
-        assert!(
-            root.assigned_groups
-                .contains(resources::DEFAULT_MODEL_GROUP)
-        );
+        assert_eq!(root.plan, PlanBinding::Unrestricted);
+        assert_eq!(snap.plans.len(), 2, "空库应有内置 standard/admin 两档");
+        assert!(snap.plans.contains_key(&1));
+        assert!(snap.plans.contains_key(&2));
         assert!(
             snap.model_groups
                 .contains_key(resources::DEFAULT_MODEL_GROUP)
@@ -467,5 +515,37 @@ mod tests {
         );
         assert!(snap.full_body, "开关应生效");
         assert_eq!(snap.max_request_bytes, 8_000_000);
+    }
+
+    /// 内置套餐进快照：standard 含 default，admin 名单为空；用户按 plan_id 绑档。
+    #[tokio::test]
+    async fn snapshot_loads_builtin_plans_and_user_bindings() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        sqlx::query(
+            "INSERT INTO users (email, display_name, role, enabled, created_at, plan_id) \
+             VALUES ('coder@example.com', 'Coder', 'user', 1, 0, 1)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("应能插入测试用户");
+        drop(conn);
+
+        let snap = load_snapshot(&pool).await.expect("应能加载快照");
+        let standard = snap.plans.get(&1).expect("应有 standard 档");
+        assert!(standard.groups.contains(resources::DEFAULT_MODEL_GROUP));
+        assert_eq!(standard.default_rpm, None);
+        assert_eq!(standard.shared_rpm, None);
+        let admin = snap.plans.get(&2).expect("应有 admin 档");
+        assert!(admin.groups.is_empty());
+        assert!(admin.capabilities.manage_users);
+        assert!(admin.capabilities.assign_plan);
+
+        let coder = snap
+            .users
+            .values()
+            .find(|user| user.role == ManagementRole::User)
+            .expect("应有普通用户");
+        assert_eq!(coder.plan, PlanBinding::Plan(1));
     }
 }

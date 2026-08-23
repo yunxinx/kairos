@@ -15,6 +15,7 @@ use sqlx::SqlitePool;
 use crate::gateway::logging;
 use crate::store;
 use crate::store::StoreError;
+use crate::store::plans;
 use crate::store::users::{self, ManagementRole, NewUser, UserRecord};
 
 use super::auth::ManagementIdentity;
@@ -47,7 +48,7 @@ pub(super) fn admin_routes() -> Router<AdminDeps> {
         .route("/users/{id}/balance", post(recharge_user))
         .route(
             "/users/{id}/model-groups",
-            get(get_user_model_groups).put(replace_user_model_groups),
+            get(get_user_plan_groups).put(replace_user_plan_groups),
         )
 }
 
@@ -209,9 +210,12 @@ async fn get_me(
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", identity.user_id())))?;
-    let assigned_groups = users::list_assigned_groups(&deps.pool, user.id)
-        .await
-        .map_err(AdminError::Store)?;
+    let assigned_groups = match user.plan_id {
+        Some(plan_id) => plans::list_plan_groups(&deps.pool, plan_id)
+            .await
+            .map_err(AdminError::Store)?,
+        None => Vec::new(),
+    };
     let wallet = store::get_user_wallet(&deps.pool, user.id)
         .await
         .map_err(AdminError::Store)?;
@@ -675,7 +679,7 @@ struct AssignedGroupsView {
     groups: Vec<String>,
 }
 
-async fn get_user_model_groups(
+async fn get_user_plan_groups(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
@@ -685,13 +689,16 @@ async fn get_user_model_groups(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    let groups = users::list_assigned_groups(&deps.pool, id)
+    let Some(plan_id) = target.plan_id else {
+        return Ok(Json(AssignedGroupsView { groups: Vec::new() }));
+    };
+    let groups = plans::list_plan_groups(&deps.pool, plan_id)
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(AssignedGroupsView { groups }))
 }
 
-async fn replace_user_model_groups(
+async fn replace_user_plan_groups(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
@@ -704,10 +711,15 @@ async fn replace_user_model_groups(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    let before = users::list_assigned_groups_on_conn(&mut tx, id)
+    let Some(plan_id) = target.plan_id else {
+        return Err(AdminError::InvalidBody(
+            "root 不挂套餐，不能调整模型组".to_string(),
+        ));
+    };
+    let before = plans::list_plan_groups_on_conn(&mut tx, plan_id)
         .await
         .map_err(AdminError::Store)?;
-    let groups = users::replace_assigned_groups(&mut tx, id, &body.groups)
+    let groups = plans::replace_plan_groups(&mut tx, plan_id, &body.groups)
         .await
         .map_err(map_user_store_err)?;
     if before != groups {
@@ -756,9 +768,12 @@ async fn user_admin_view(
     record: UserRecord,
     stats: Option<users::UserStatsRecord>,
 ) -> Result<UserAdminView, AdminError> {
-    let groups = users::list_assigned_groups(pool, record.id)
-        .await
-        .map_err(AdminError::Store)?;
+    let groups = match record.plan_id {
+        Some(plan_id) => plans::list_plan_groups(pool, plan_id)
+            .await
+            .map_err(AdminError::Store)?,
+        None => Vec::new(),
+    };
     let wallet = store::get_user_wallet(pool, record.id)
         .await
         .map_err(AdminError::Store)?;
@@ -805,12 +820,12 @@ async fn list_management_users(
     let wallets = store::list_user_wallets(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
-    let mut groups_by_user: HashMap<i64, Vec<String>> = HashMap::new();
-    for (user_id, group) in users::list_all_assigned_groups(&deps.pool)
+    let mut groups_by_plan: HashMap<i64, Vec<String>> = HashMap::new();
+    for (plan_id, group) in plans::list_all_plan_groups(&deps.pool)
         .await
         .map_err(AdminError::Store)?
     {
-        groups_by_user.entry(user_id).or_default().push(group);
+        groups_by_plan.entry(plan_id).or_default().push(group);
     }
     let views = records
         .into_iter()
@@ -820,7 +835,10 @@ async fn list_management_users(
                 .get(&record.id)
                 .copied()
                 .ok_or_else(|| AdminError::Store(StoreError::MissingWallet(record.id)))?;
-            let mut assigned_groups = groups_by_user.remove(&record.id).unwrap_or_default();
+            let mut assigned_groups = record
+                .plan_id
+                .and_then(|plan_id| groups_by_plan.remove(&plan_id))
+                .unwrap_or_default();
             assigned_groups.sort();
             Ok(UserAdminView {
                 id: record.id,

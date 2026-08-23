@@ -6,6 +6,7 @@
 //! `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
 pub mod catalog;
+pub mod plans;
 pub mod resources;
 mod system_log;
 pub mod users;
@@ -1563,12 +1564,24 @@ mod tests {
         .expect("应有用户钱包");
         assert_eq!(wallet, (0, 0));
 
-        let assigned: String =
-            sqlx::query_scalar("SELECT group_name FROM user_model_groups WHERE user_id = 1")
+        let root_plan: Option<i64> = sqlx::query_scalar("SELECT plan_id FROM users WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("应能读 root 套餐");
+        assert_eq!(root_plan, None, "root 不挂套餐");
+
+        let standard_group: String =
+            sqlx::query_scalar("SELECT group_name FROM plan_model_groups WHERE plan_id = 1")
                 .fetch_one(&pool)
                 .await
-                .expect("root 应有默认可用组");
-        assert_eq!(assigned, "default");
+                .expect("standard 应含 default 组");
+        assert_eq!(standard_group, "default");
+
+        let builtin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE builtin = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("应能数内置套餐");
+        assert_eq!(builtin_count, 2, "内置两档应已播种");
 
         let remaining_col: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('token_balance') \
@@ -1732,8 +1745,15 @@ mod tests {
                  VALUES ('not-a-number', 0, 0, 0)",
             ),
             (
-                "user_model_groups",
-                "INSERT INTO user_model_groups (user_id, group_name) VALUES ('not-a-number', 'default')",
+                "plans",
+                "INSERT INTO plans (id, internal_name, display_name, note, note_visible_to_admin, \
+                     discount_bp, default_rpm, shared_rpm, initial_grant_usd_micros, \
+                     capabilities_json, shared_with_admin, builtin, created_at) \
+                 VALUES ('not-a-number', 'x', 'X', '', 0, 10000, NULL, NULL, 0, '{}', 0, 0, 0)",
+            ),
+            (
+                "plan_model_groups",
+                "INSERT INTO plan_model_groups (plan_id, group_name) VALUES ('not-a-number', 'default')",
             ),
             (
                 "management_sessions",

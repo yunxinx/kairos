@@ -40,6 +40,11 @@ impl ManagementIdentity {
         self.user.id
     }
 
+    /// 当前用户所挂套餐；root 为 `None`。
+    pub(super) fn plan_id(&self) -> Option<i64> {
+        self.user.plan_id
+    }
+
     /// 审计事件的操作者。
     pub(super) fn actor(&self) -> store::Actor<'_> {
         store::Actor {

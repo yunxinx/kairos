@@ -10,6 +10,7 @@ use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::gateway::logging;
 use crate::store;
+use crate::store::plans;
 use crate::store::resources::{Token, TokenRecord};
 use crate::store::users::{self, ManagementRole};
 
@@ -216,7 +217,10 @@ async fn reject_invalid_group_binding(
     if identity.role().at_least(ManagementRole::Admin) {
         return Ok(());
     }
-    let assigned = users::list_assigned_groups_on_conn(conn, identity.user_id())
+    let Some(plan_id) = identity.plan_id() else {
+        return Err(AdminError::InvalidBody("用户未挂套餐".to_string()));
+    };
+    let assigned = plans::list_plan_groups_on_conn(conn, plan_id)
         .await
         .map_err(AdminError::Store)?;
     if assigned.iter().any(|name| name == group) {
