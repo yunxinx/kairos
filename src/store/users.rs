@@ -421,11 +421,40 @@ pub(crate) fn default_plan_id_for_role(role: ManagementRole) -> Option<i64> {
     }
 }
 
+/// 修改用户套餐绑定；调用方负责角色与授权范围校验。
+pub async fn set_user_plan(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    plan_id: i64,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE users SET plan_id = ? WHERE id = ? AND deleted_at IS NULL")
+        .bind(plan_id)
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::UserNotFound(user_id));
+    }
+    Ok(())
+}
+
 /// 创建用户：同步建零额钱包，并按角色挂到内置默认套餐。
 pub async fn insert_user(
     conn: &mut SqliteConnection,
     new_user: NewUser<'_>,
     now: i64,
+) -> Result<UserRecord, StoreError> {
+    let plan_id = default_plan_id_for_role(new_user.role);
+    insert_user_with_plan(conn, new_user, now, plan_id).await
+}
+
+/// 创建用户并挂到指定套餐；起步金与钱包在同一事务中一次性写入。
+pub async fn insert_user_with_plan(
+    conn: &mut SqliteConnection,
+    new_user: NewUser<'_>,
+    now: i64,
+    plan_id: Option<i64>,
 ) -> Result<UserRecord, StoreError> {
     let email = normalize_email(new_user.email);
     if email.is_empty() || !email.contains('@') {
@@ -443,7 +472,10 @@ pub async fn insert_user(
     }
     let password_hash = hash_password(new_user.password).await?;
     let rpm_val = rate_limit_rpm_to_db(new_user.rate_limit_rpm)?;
-    let plan_id = default_plan_id_for_role(new_user.role);
+    let initial_grant = match plan_id {
+        Some(plan_id) => crate::store::plans::initial_grant_on_conn(conn, plan_id).await?,
+        None => 0,
+    };
     let result = sqlx::query(
         "INSERT INTO users (email, display_name, password_hash, role, enabled, created_at, rate_limit_rpm, plan_id) \
          VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
@@ -461,9 +493,10 @@ pub async fn insert_user(
     let id = result.last_insert_rowid();
     sqlx::query(
         "INSERT INTO user_balance (user_id, balance_usd_micros, settled_usd_micros, created_at) \
-         VALUES (?, 0, 0, ?)",
+         VALUES (?, ?, 0, ?)",
     )
     .bind(id)
+    .bind(initial_grant)
     .bind(now)
     .execute(&mut *conn)
     .await

@@ -16,6 +16,42 @@ pub const STANDARD_PLAN_ID: i64 = 1;
 /// 内置 `admin` 档固定 id：新建管理员的默认套餐。
 pub const ADMIN_PLAN_ID: i64 = 2;
 
+/// 管理面套餐完整投影。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PlanRecord {
+    pub id: i64,
+    pub internal_name: String,
+    pub display_name: String,
+    pub note: String,
+    pub note_visible_to_admin: bool,
+    pub discount_bp: i64,
+    pub default_rpm: Option<u64>,
+    pub shared_rpm: Option<u64>,
+    pub initial_grant_usd_micros: i64,
+    pub capabilities: PlanCapabilities,
+    pub shared_with_admin: bool,
+    pub builtin: bool,
+    pub created_at: i64,
+    pub groups: Vec<String>,
+}
+
+/// 管理面套餐写入字段。
+#[derive(Debug, Clone)]
+pub struct PlanInput {
+    pub internal_name: String,
+    pub display_name: String,
+    pub note: String,
+    pub note_visible_to_admin: bool,
+    pub discount_bp: i64,
+    pub default_rpm: Option<u64>,
+    pub shared_rpm: Option<u64>,
+    pub initial_grant_usd_micros: i64,
+    pub capabilities: PlanCapabilities,
+    pub shared_with_admin: bool,
+    pub groups: Vec<String>,
+}
+
 /// 套餐管理面能力开关。
 ///
 /// 生效能力 = 套餐开关 ∩ 角色；本结构只描述套餐侧配置，不参与角色判断。
@@ -259,6 +295,197 @@ fn rpm_from_db(value: Option<i64>) -> Result<Option<u64>, StoreError> {
                 .map_err(|_| StoreError::InvalidResource("数据库中的 RPM 为负数".to_string()))
         })
         .transpose()
+}
+
+fn rpm_to_db(value: Option<u64>) -> Result<Option<i64>, StoreError> {
+    value
+        .map(|v| {
+            i64::try_from(v)
+                .map_err(|_| StoreError::InvalidResource("RPM 超出 SQLite 整数范围".to_string()))
+        })
+        .transpose()
+}
+
+fn bool_from_db(value: i64) -> bool {
+    value != 0
+}
+
+async fn map_plan_row(
+    conn: &mut SqliteConnection,
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<PlanRecord, StoreError> {
+    let id: i64 = row.try_get("id").map_err(StoreError::Query)?;
+    let raw: String = row
+        .try_get("capabilities_json")
+        .map_err(StoreError::Query)?;
+    Ok(PlanRecord {
+        id,
+        internal_name: row.try_get("internal_name").map_err(StoreError::Query)?,
+        display_name: row.try_get("display_name").map_err(StoreError::Query)?,
+        note: row.try_get("note").map_err(StoreError::Query)?,
+        note_visible_to_admin: bool_from_db(
+            row.try_get("note_visible_to_admin")
+                .map_err(StoreError::Query)?,
+        ),
+        discount_bp: row.try_get("discount_bp").map_err(StoreError::Query)?,
+        default_rpm: rpm_from_db(row.try_get("default_rpm").map_err(StoreError::Query)?)?,
+        shared_rpm: rpm_from_db(row.try_get("shared_rpm").map_err(StoreError::Query)?)?,
+        initial_grant_usd_micros: row
+            .try_get("initial_grant_usd_micros")
+            .map_err(StoreError::Query)?,
+        capabilities: parse_capabilities_json(id, &raw)?,
+        shared_with_admin: bool_from_db(
+            row.try_get("shared_with_admin")
+                .map_err(StoreError::Query)?,
+        ),
+        builtin: bool_from_db(row.try_get("builtin").map_err(StoreError::Query)?),
+        created_at: row.try_get("created_at").map_err(StoreError::Query)?,
+        groups: list_plan_groups_on_conn(conn, id).await?,
+    })
+}
+
+/// 读取全部套餐（按 id 排序）。
+pub async fn list_plans(pool: &SqlitePool) -> Result<Vec<PlanRecord>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    let rows = sqlx::query(
+        "SELECT id, internal_name, display_name, note, note_visible_to_admin, \
+        discount_bp, default_rpm, shared_rpm, initial_grant_usd_micros, capabilities_json, \
+        shared_with_admin, builtin, created_at FROM plans ORDER BY id",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        out.push(map_plan_row(&mut conn, row).await?);
+    }
+    Ok(out)
+}
+
+/// 按 id 读取套餐。
+pub async fn get_plan(pool: &SqlitePool, id: i64) -> Result<Option<PlanRecord>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    get_plan_on_conn(&mut conn, id).await
+}
+
+/// 在现有连接上按 id 读取套餐。
+pub async fn get_plan_on_conn(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> Result<Option<PlanRecord>, StoreError> {
+    let row = sqlx::query(
+        "SELECT id, internal_name, display_name, note, note_visible_to_admin, \
+        discount_bp, default_rpm, shared_rpm, initial_grant_usd_micros, capabilities_json, \
+        shared_with_admin, builtin, created_at FROM plans WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    match row {
+        Some(row) => Ok(Some(map_plan_row(conn, &row).await?)),
+        None => Ok(None),
+    }
+}
+
+/// 读取套餐起步金；调用方应在创建用户事务中使用。
+pub async fn initial_grant_on_conn(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> Result<i64, StoreError> {
+    sqlx::query_scalar("SELECT initial_grant_usd_micros FROM plans WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?
+        .ok_or_else(|| StoreError::InvalidResource(format!("套餐 {id} 不存在")))
+}
+
+/// 新建套餐，返回带数据库 id 的资源。
+pub async fn insert_plan(
+    conn: &mut SqliteConnection,
+    input: &PlanInput,
+    now: i64,
+) -> Result<PlanRecord, StoreError> {
+    validate_input(input)?;
+    let capabilities_json = serialize_capabilities_json(&input.capabilities)?;
+    let default_rpm = rpm_to_db(input.default_rpm)?;
+    let shared_rpm = rpm_to_db(input.shared_rpm)?;
+    let result = sqlx::query(
+        "INSERT INTO plans (internal_name, display_name, note, note_visible_to_admin, \
+         discount_bp, default_rpm, shared_rpm, initial_grant_usd_micros, capabilities_json, \
+         shared_with_admin, builtin, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+    )
+    .bind(&input.internal_name)
+    .bind(&input.display_name)
+    .bind(&input.note)
+    .bind(input.note_visible_to_admin)
+    .bind(input.discount_bp)
+    .bind(default_rpm)
+    .bind(shared_rpm)
+    .bind(input.initial_grant_usd_micros)
+    .bind(capabilities_json)
+    .bind(input.shared_with_admin)
+    .bind(now)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    let id = result.last_insert_rowid();
+    replace_plan_groups(conn, id, &input.groups).await?;
+    get_plan_on_conn(conn, id)
+        .await?
+        .ok_or_else(|| StoreError::InvalidResource(format!("套餐 {id} 创建后不可读")))
+}
+
+/// 整体更新套餐（id 与 builtin 身份不变）。
+pub async fn update_plan(
+    conn: &mut SqliteConnection,
+    id: i64,
+    input: &PlanInput,
+) -> Result<PlanRecord, StoreError> {
+    validate_input(input)?;
+    let capabilities_json = serialize_capabilities_json(&input.capabilities)?;
+    let result = sqlx::query(
+        "UPDATE plans SET internal_name = ?, display_name = ?, note = ?, note_visible_to_admin = ?, \
+         discount_bp = ?, default_rpm = ?, shared_rpm = ?, initial_grant_usd_micros = ?, \
+         capabilities_json = ?, shared_with_admin = ? WHERE id = ?",
+    )
+    .bind(&input.internal_name)
+    .bind(&input.display_name)
+    .bind(&input.note)
+    .bind(input.note_visible_to_admin)
+    .bind(input.discount_bp)
+    .bind(rpm_to_db(input.default_rpm)?)
+    .bind(rpm_to_db(input.shared_rpm)?)
+    .bind(input.initial_grant_usd_micros)
+    .bind(capabilities_json)
+    .bind(input.shared_with_admin)
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::InvalidResource(format!("套餐 {id} 不存在")));
+    }
+    replace_plan_groups(conn, id, &input.groups).await?;
+    get_plan_on_conn(conn, id)
+        .await?
+        .ok_or_else(|| StoreError::InvalidResource(format!("套餐 {id} 更新后不可读")))
+}
+
+fn validate_input(input: &PlanInput) -> Result<(), StoreError> {
+    if input.internal_name.trim().is_empty() || input.display_name.trim().is_empty() {
+        return Err(StoreError::InvalidResource("套餐名称不能为空".to_string()));
+    }
+    if !(billing::MIN_DISCOUNT_BP..=billing::MAX_DISCOUNT_BP).contains(&input.discount_bp) {
+        return Err(StoreError::InvalidResource(
+            "discount_bp 超出合法范围".to_string(),
+        ));
+    }
+    if input.initial_grant_usd_micros < 0 {
+        return Err(StoreError::InvalidResource("起步金不能为负数".to_string()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

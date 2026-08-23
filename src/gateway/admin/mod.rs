@@ -19,6 +19,7 @@ mod catalog;
 mod channels;
 mod logs;
 mod models;
+mod plans;
 mod probes;
 mod settings;
 mod stats;
@@ -96,6 +97,7 @@ pub fn router(
         .merge(channels::routes())
         .merge(probes::routes())
         .merge(settings::routes())
+        .merge(plans::root_routes())
         .merge(users::root_routes())
         .merge(logs::root_routes())
         .route_layer(middleware::from_fn(auth::require_root));
@@ -105,6 +107,7 @@ pub fn router(
         .merge(users::admin_routes())
         .merge(billing::routes())
         .merge(logs::admin_routes())
+        .merge(plans::admin_routes())
         .route_layer(middleware::from_fn(auth::require_admin));
     // 此层等于「所有登录用户可见」。在这里新增端点前必须先回答：它是否要按归属
     // 收窄？需要收窄的（日志、统计）由处理器用 `owner_scope` 注入 user_id；

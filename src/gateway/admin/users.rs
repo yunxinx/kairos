@@ -7,7 +7,7 @@ use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, Path, Request, State},
     http::StatusCode,
-    routing::{get, post, put},
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -46,12 +46,10 @@ pub(super) fn admin_routes() -> Router<AdminDeps> {
         )
         .route("/users/{id}/tokens", get(tokens::list_user_tokens))
         .route("/users/{id}/balance", post(recharge_user))
-        .route("/users/{id}/model-groups", get(get_user_plan_groups))
 }
 
-/// 过渡期的套餐名单写接口：改套餐配方仍是 root 独占，06 号票移除整个端点。
 pub(super) fn root_routes() -> Router<AdminDeps> {
-    Router::new().route("/users/{id}/model-groups", put(replace_user_plan_groups))
+    Router::new()
 }
 
 pub(super) fn signed_in_routes() -> Router<AdminDeps> {
@@ -72,7 +70,7 @@ struct LoginBody {
 }
 
 #[derive(Debug, Serialize)]
-struct UserView {
+pub(super) struct UserView {
     id: i64,
     email: String,
     display_name: String,
@@ -80,10 +78,11 @@ struct UserView {
     enabled: bool,
     avatar: Option<String>,
     rate_limit_rpm: Option<u64>,
+    plan_id: Option<i64>,
 }
 
 impl UserView {
-    fn from_record(record: UserRecord) -> Self {
+    pub(super) fn from_record(record: UserRecord) -> Self {
         Self {
             id: record.id,
             email: record.email,
@@ -92,6 +91,7 @@ impl UserView {
             enabled: record.enabled,
             avatar: record.avatar,
             rate_limit_rpm: record.rate_limit_rpm,
+            plan_id: record.plan_id,
         }
     }
 }
@@ -199,6 +199,9 @@ struct MeView {
     enabled: bool,
     avatar: Option<String>,
     rate_limit_rpm: Option<u64>,
+    plan_id: Option<i64>,
+    plan_display_name: Option<String>,
+    discount_bp: i64,
     assigned_groups: Vec<String>,
     balance_usd_micros: i64,
     settled_usd_micros: i64,
@@ -212,12 +215,16 @@ async fn get_me(
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", identity.user_id())))?;
-    let assigned_groups = match user.plan_id {
-        Some(plan_id) => plans::list_plan_groups(&deps.pool, plan_id)
+    let plan = match user.plan_id {
+        Some(plan_id) => plans::get_plan(&deps.pool, plan_id)
             .await
             .map_err(AdminError::Store)?,
-        None => Vec::new(),
+        None => None,
     };
+    let assigned_groups = plan
+        .as_ref()
+        .map(|plan| plan.groups.clone())
+        .unwrap_or_default();
     let wallet = store::get_user_wallet(&deps.pool, user.id)
         .await
         .map_err(AdminError::Store)?;
@@ -229,6 +236,9 @@ async fn get_me(
         enabled: user.enabled,
         avatar: user.avatar,
         rate_limit_rpm: user.rate_limit_rpm,
+        plan_id: user.plan_id,
+        plan_display_name: plan.as_ref().map(|plan| plan.display_name.clone()),
+        discount_bp: plan.as_ref().map_or(10_000, |plan| plan.discount_bp),
         assigned_groups,
         balance_usd_micros: wallet.balance_usd_micros,
         settled_usd_micros: wallet.settled_usd_micros,
@@ -366,6 +376,8 @@ struct UserCreate {
     role: ManagementRole,
     #[serde(default)]
     rate_limit_rpm: Option<u64>,
+    #[serde(default)]
+    plan_id: Option<i64>,
 }
 
 async fn create_user(
@@ -383,7 +395,19 @@ async fn create_user(
     }
     let now = logging::unix_millis();
     let mut tx = begin_write(&deps).await?;
-    let user = users::insert_user(
+    let selected_plan = create
+        .plan_id
+        .or_else(|| users::default_plan_id_for_role(create.role));
+    let selected_plan = selected_plan
+        .ok_or_else(|| AdminError::InvalidBody("root 不能作为新建用户角色".to_string()))?;
+    let plan = plans::get_plan_on_conn(&mut tx, selected_plan)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::InvalidBody(format!("套餐 {selected_plan} 不存在")))?;
+    if identity.role() == ManagementRole::Admin && !plan.shared_with_admin {
+        return Err(AdminError::Forbidden);
+    }
+    let user = users::insert_user_with_plan(
         &mut tx,
         NewUser {
             email: &create.email,
@@ -393,6 +417,7 @@ async fn create_user(
             rate_limit_rpm: create.rate_limit_rpm,
         },
         now,
+        Some(selected_plan),
     )
     .await
     .map_err(map_user_store_err)?;
@@ -405,6 +430,20 @@ async fn create_user(
             user.id,
             user.email,
             user.role.as_str()
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "billing",
+        &format!(
+            "新建用户 {} ({}) 按套餐 {} 入账起步金 {} USD",
+            user.id,
+            user.email,
+            plan.display_name,
+            format_usd_micros(plan.initial_grant_usd_micros)
         ),
     )
     .await
@@ -673,79 +712,6 @@ async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AssignedGroupsBody {
-    groups: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AssignedGroupsView {
-    groups: Vec<String>,
-}
-
-async fn get_user_plan_groups(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(id): Path<i64>,
-) -> Result<Json<AssignedGroupsView>, AdminError> {
-    identity.require_capability(ManagementCapability::ViewOwnPlanGroups)?;
-    let target = users::get_user(&deps.pool, id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
-    reject_user_management(&identity, &target, None)?;
-    let groups = visible_plan_groups(&deps.pool, &identity, target.plan_id).await?;
-    Ok(Json(AssignedGroupsView { groups }))
-}
-
-async fn replace_user_plan_groups(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(id): Path<i64>,
-    body: Result<Json<AssignedGroupsBody>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<AssignedGroupsView>, AdminError> {
-    identity.require_capability(ManagementCapability::AssignPlan)?;
-    let body = body.map_err(AdminError::bad_body)?.0;
-    let mut tx = begin_write(&deps).await?;
-    let target = users::get_user_on_conn(&mut tx, id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
-    reject_user_management(&identity, &target, None)?;
-    let Some(plan_id) = target.plan_id else {
-        return Err(AdminError::InvalidBody(
-            "root 不挂套餐，不能调整模型组".to_string(),
-        ));
-    };
-    let before = plans::list_plan_groups_on_conn(&mut tx, plan_id)
-        .await
-        .map_err(AdminError::Store)?;
-    let groups = plans::replace_plan_groups(&mut tx, plan_id, &body.groups)
-        .await
-        .map_err(map_user_store_err)?;
-    if before != groups {
-        // 撤组会让已绑该组的令牌立即失效（ADR-0010），值得留痕。
-        store::record_audit(
-            &mut tx,
-            identity.actor(),
-            "users",
-            &format!(
-                "调整用户 {} ({}) 可用模型组：[{}] → [{}]",
-                id,
-                target.email,
-                before.join(", "),
-                groups.join(", ")
-            ),
-        )
-        .await
-        .map_err(AdminError::Store)?;
-    }
-    tx.commit().await.map_err(db_err)?;
-    reload_and_swap(&deps).await?;
-    Ok(Json(AssignedGroupsView { groups }))
-}
-
 #[derive(Debug, Serialize)]
 struct UserAdminView {
     id: i64,
@@ -756,6 +722,9 @@ struct UserAdminView {
     // 不带 avatar：运营列表与详情都不渲染头像，而它可能是 MB 级 base64 data URL，
     // 逐个用户带上等于给 /users 平白挂几 MB。自己的头像走 /me。
     rate_limit_rpm: Option<u64>,
+    plan_id: Option<i64>,
+    plan_display_name: Option<String>,
+    discount_bp: i64,
     assigned_groups: Vec<String>,
     balance_usd_micros: i64,
     settled_usd_micros: i64,
@@ -771,6 +740,12 @@ async fn user_admin_view(
     record: UserRecord,
     stats: Option<users::UserStatsRecord>,
 ) -> Result<UserAdminView, AdminError> {
+    let plan = match record.plan_id {
+        Some(plan_id) => plans::get_plan(pool, plan_id)
+            .await
+            .map_err(AdminError::Store)?,
+        None => None,
+    };
     let groups = visible_plan_groups(pool, identity, record.plan_id).await?;
     let wallet = store::get_user_wallet(pool, record.id)
         .await
@@ -788,6 +763,9 @@ async fn user_admin_view(
         role: record.role,
         enabled: record.enabled,
         rate_limit_rpm: record.rate_limit_rpm,
+        plan_id: record.plan_id,
+        plan_display_name: plan.as_ref().map(|plan| plan.display_name.clone()),
+        discount_bp: plan.as_ref().map_or(10_000, |plan| plan.discount_bp),
         assigned_groups: groups,
         balance_usd_micros: wallet.balance_usd_micros,
         settled_usd_micros: wallet.settled_usd_micros,
@@ -826,6 +804,12 @@ async fn list_management_users(
     {
         groups_by_plan.entry(plan_id).or_default().push(group);
     }
+    let plan_meta: HashMap<i64, (String, i64)> = plans::list_plans(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?
+        .into_iter()
+        .map(|plan| (plan.id, (plan.display_name, plan.discount_bp)))
+        .collect();
     let visible_groups = if identity.role() == ManagementRole::Root
         || identity.has_capability(ManagementCapability::ViewOtherGroups)
     {
@@ -857,6 +841,10 @@ async fn list_management_users(
                 assigned_groups.retain(|group| visible_groups.contains(group));
             }
             assigned_groups.sort();
+            let (plan_display_name, discount_bp) = record
+                .plan_id
+                .and_then(|plan_id| plan_meta.get(&plan_id).cloned())
+                .map_or((None, 10_000), |(name, discount)| (Some(name), discount));
             Ok(UserAdminView {
                 id: record.id,
                 email: record.email,
@@ -864,6 +852,9 @@ async fn list_management_users(
                 role: record.role,
                 enabled: record.enabled,
                 rate_limit_rpm: record.rate_limit_rpm,
+                plan_id: record.plan_id,
+                plan_display_name,
+                discount_bp,
                 assigned_groups,
                 balance_usd_micros: wallet.balance_usd_micros,
                 settled_usd_micros: wallet.settled_usd_micros,
