@@ -115,7 +115,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let seeded_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
     let (user_id, user_token) = create_role(&gw, "user@example.com", "user").await;
-    let (_admin_id, admin_token) = create_role(&gw, "admin@example.com", "admin").await;
+    let (admin_id, admin_token) = create_role(&gw, "admin@example.com", "admin").await;
 
     let created = json_req(
         &gw,
@@ -143,6 +143,17 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         .collect();
     assert_eq!(user_keys, vec![mine_key.as_str()]);
     assert!(!user_keys.contains(&TEST_TOKEN_KEY));
+
+    // admin 档默认名单为空；令牌候选也必须先由套餐名单授予。
+    let assigned = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/users/{admin_id}/model-groups"),
+        json!({ "groups": ["default"] }),
+    )
+    .await;
+    assert_eq!(assigned.status(), StatusCode::OK);
 
     let admin_creates = json_req(
         &gw,

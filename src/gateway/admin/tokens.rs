@@ -198,10 +198,10 @@ fn token_key_charset_ok(key: &str) -> bool {
         .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
 }
 
-/// 事务内校验令牌可绑定的组：组必须存在；普通用户的组还必须在本人可用名单里。
+/// 事务内校验令牌可绑定的组：组必须存在；非 root 的组还必须在所挂套餐名单里。
 ///
 /// 授权依据与写入须同一写事务（`mod.rs` 的 `BEGIN IMMEDIATE` 原则）：先读快照
-/// 再开事务的间隙里，组可能刚被删除或刚从该用户名单撤下。admin+ 不受名单约束。
+/// 再开事务的间隙里，组可能刚被删除或刚从该套餐名单撤下。
 async fn reject_invalid_group_binding(
     conn: &mut SqliteConnection,
     identity: &ManagementIdentity,
@@ -214,11 +214,11 @@ async fn reject_invalid_group_binding(
     {
         return Err(AdminError::NotFound(format!("模型组 {group} 不存在")));
     }
-    if identity.role().at_least(ManagementRole::Admin) {
-        return Ok(());
-    }
-    let Some(plan_id) = identity.plan_id() else {
-        return Err(AdminError::InvalidBody("用户未挂套餐".to_string()));
+    let plan_id = match (identity.role(), identity.plan_id()) {
+        // root 不挂套餐，等价于运行时的 `PlanBinding::Unrestricted`。
+        (ManagementRole::Root, None) => return Ok(()),
+        (_, Some(plan_id)) => plan_id,
+        (_, None) => return Err(AdminError::InvalidBody("用户未挂套餐".to_string())),
     };
     let assigned = plans::list_plan_groups_on_conn(conn, plan_id)
         .await
