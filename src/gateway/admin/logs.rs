@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store;
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::tokens::mask_token_key;
 use super::{AdminDeps, AdminError, parse_comma_list};
 
@@ -132,6 +132,7 @@ pub(super) async fn query_logs(
     Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<LogQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<LogPage>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
@@ -168,6 +169,7 @@ pub(super) async fn get_log(
     Extension(identity): Extension<ManagementIdentity>,
     Path(raw): Path<String>,
 ) -> Result<Json<LogEntry>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let id = parse_log_id(&raw)?;
     let log = store::get_request_log(&deps.pool, id)
         .await
@@ -316,8 +318,10 @@ pub(super) struct SystemLogPage {
 /// 分页查询系统日志；该端点已经由路由层限制为 admin+。
 pub(super) async fn query_system_logs(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<SystemLogQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<SystemLogPage>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewLogsStats)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;

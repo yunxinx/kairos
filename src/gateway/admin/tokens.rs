@@ -14,7 +14,7 @@ use crate::store::plans;
 use crate::store::resources::{Token, TokenRecord};
 use crate::store::users::{self, ManagementRole};
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::{AdminDeps, AdminError, begin_write, db_err, reload_and_swap};
 
 pub(super) fn routes() -> Router<AdminDeps> {
@@ -85,6 +85,7 @@ pub(super) async fn list_user_tokens(
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<TokenView>>, AdminError> {
+    identity.require_capability(ManagementCapability::ToggleUserTokens)?;
     let target = users::get_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
@@ -264,6 +265,7 @@ async fn reject_token_toggle_on_conn(
     if existing.token.user_id == identity.user_id() {
         return Ok(());
     }
+    identity.require_capability(ManagementCapability::ToggleUserTokens)?;
     if !identity.role().at_least(ManagementRole::Admin) {
         return Err(AdminError::Forbidden);
     }

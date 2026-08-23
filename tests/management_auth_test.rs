@@ -903,3 +903,146 @@ async fn plan_default_and_shared_rpm_apply_to_protocol_requests() {
         "套餐桶超限应带 Retry-After"
     );
 }
+
+/// 套餐能力按请求从库解析：开关只能收窄 admin，不能突破 root-only 路由或角色层级。
+#[tokio::test]
+async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let created = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "capability-admin@example.com",
+            "display_name": "能力管理员",
+            "password": "password1",
+            "role": "admin"
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let admin_id = created.json::<Value>().await.expect("管理员应可解析")["id"]
+        .as_i64()
+        .expect("应有管理员 id");
+    let admin_token = login_user(&gw, "capability-admin@example.com").await;
+
+    // 内置 admin 档默认开启六项能力；同一会话不需要重新登录。
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/logs").await.status(),
+        StatusCode::OK
+    );
+
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind("{}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能关闭能力");
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::FORBIDDEN,
+        "关闭能力后已有会话也应立即失效"
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/logs").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/stats").await.status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 只打开改价时，admin 能做该项，但不会被顺带授予用户运营或模型组查看。
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind("{\"edit_prices\":true}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能打开改价");
+    let prices = bearer_get(&gw, &admin_token, "/prices").await;
+    assert_eq!(prices.status(), StatusCode::OK);
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/model-groups")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let prices_body: Value = prices.json().await.expect("价格列表应可解析");
+    let price = prices_body[0].clone();
+    let channel_id = price["channel_id"].as_i64().expect("应有渠道 id");
+    let model = price["model"].as_str().expect("应有模型名");
+    let changed_price = bearer_json(
+        &gw,
+        &admin_token,
+        reqwest::Method::PUT,
+        &format!("/prices/{channel_id}/{model}"),
+        json!({
+            "channel_id": channel_id,
+            "model": model,
+            "input_micros": price["input_micros"].as_i64().expect("input"),
+            "output_micros": price["output_micros"].as_i64().expect("output"),
+            "cache_read_micros": price["cache_read_micros"],
+            "cache_write_micros": price["cache_write_micros"]
+        }),
+    )
+    .await;
+    assert_eq!(changed_price.status(), StatusCode::OK);
+
+    // 即使把所有套餐开关打开，admin 仍不能碰 root-only 资源或管理 root/admin。
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind(
+            "{\"manage_users\":true,\"assign_plan\":true,\"view_logs_stats\":true,\
+             \"settle_waive\":true,\"toggle_user_tokens\":true,\"view_own_plan_groups\":true,\
+             \"view_other_groups\":true,\"edit_prices\":true,\"edit_model_groups\":true,\
+             \"edit_unified_models\":true,\"edit_price_catalog\":true}",
+        )
+        .execute(&gw.pool)
+        .await
+        .expect("应能打开全部开关");
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/channels").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/settings").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, &format!("/users/{admin_id}"))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "能力开关不能让 admin 读取 admin 账号"
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::PUT,
+            &format!("/users/{admin_id}/model-groups"),
+            json!({ "groups": [] }),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN,
+        "套餐目录写入仍应由 root-only 路由守住"
+    );
+    assert_eq!(
+        bearer_get(&gw, &gw.session, "/channels").await.status(),
+        StatusCode::OK,
+        "root 不受套餐开关约束"
+    );
+    assert_eq!(
+        bearer_get(&gw, &gw.session, "/settings").await.status(),
+        StatusCode::OK
+    );
+}

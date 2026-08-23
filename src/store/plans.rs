@@ -36,6 +36,41 @@ pub struct PlanCapabilities {
     pub edit_price_catalog: bool,
 }
 
+/// 从套餐行的 JSON 字段解析能力开关。
+pub(crate) fn parse_capabilities_json(
+    plan_id: i64,
+    raw: &str,
+) -> Result<PlanCapabilities, StoreError> {
+    serde_json::from_str(raw).map_err(|_| {
+        StoreError::InvalidResource(format!("套餐 {plan_id} 的 capabilities_json 非法"))
+    })
+}
+
+/// 把能力开关编码成套餐行的 JSON 字段，供管理写路径复用。
+pub fn serialize_capabilities_json(capabilities: &PlanCapabilities) -> Result<String, StoreError> {
+    serde_json::to_string(capabilities)
+        .map_err(|err| StoreError::InvalidResource(format!("套餐能力序列化失败: {err}")))
+}
+
+/// 按 id 读取一档套餐的能力开关。
+pub(crate) async fn load_plan_capabilities(
+    pool: &SqlitePool,
+    plan_id: i64,
+) -> Result<PlanCapabilities, StoreError> {
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT capabilities_json FROM plans WHERE id = ?")
+            .bind(plan_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(StoreError::Query)?;
+    let Some(raw) = raw else {
+        return Err(StoreError::InvalidResource(format!(
+            "套餐 {plan_id} 不存在"
+        )));
+    };
+    parse_capabilities_json(plan_id, &raw)
+}
+
 /// 快照加载用的套餐投影；不携带备注、内部名、分享与创建时间等管理面字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PlanSnapshot {
@@ -85,10 +120,7 @@ pub(crate) async fn list_plans_for_snapshot(
         let capabilities_json: String = row
             .try_get("capabilities_json")
             .map_err(StoreError::Query)?;
-        let capabilities: PlanCapabilities =
-            serde_json::from_str(&capabilities_json).map_err(|_| {
-                StoreError::InvalidResource(format!("套餐 {id} 的 capabilities_json 非法"))
-            })?;
+        let capabilities = parse_capabilities_json(id, &capabilities_json)?;
         let discount_bp: i64 = row.try_get("discount_bp").map_err(StoreError::Query)?;
         if !(billing::MIN_DISCOUNT_BP..=billing::MAX_DISCOUNT_BP).contains(&discount_bp) {
             return Err(StoreError::InvalidResource(format!(
@@ -227,4 +259,40 @@ fn rpm_from_db(value: Option<i64>) -> Result<Option<u64>, StoreError> {
                 .map_err(|_| StoreError::InvalidResource("数据库中的 RPM 为负数".to_string()))
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_json_defaults_new_fields_to_off() {
+        let capabilities =
+            parse_capabilities_json(7, "{\"manage_users\":true}").expect("缺省字段应能解析");
+        assert!(capabilities.manage_users);
+        assert!(!capabilities.assign_plan);
+        assert!(!capabilities.edit_price_catalog);
+    }
+
+    #[test]
+    fn capability_json_roundtrips_all_named_switches() {
+        let capabilities = PlanCapabilities {
+            manage_users: true,
+            assign_plan: true,
+            view_logs_stats: true,
+            settle_waive: true,
+            toggle_user_tokens: true,
+            view_own_plan_groups: true,
+            view_other_groups: true,
+            edit_prices: true,
+            edit_model_groups: true,
+            edit_unified_models: true,
+            edit_price_catalog: true,
+        };
+        let raw = serialize_capabilities_json(&capabilities).expect("能力应能编码");
+        assert_eq!(
+            parse_capabilities_json(7, &raw).expect("编码结果应能回读"),
+            capabilities
+        );
+    }
 }

@@ -4,17 +4,19 @@ use std::collections::HashSet;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{get, put},
 };
 use serde::Serialize;
 
+use crate::store::plans;
 use crate::store::resources::{
     Channel, ChannelRecord, GroupModel, ModelGroup, Price, UnifiedMember, UnifiedModel,
     channel_lists_callable,
 };
 
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::{AdminDeps, AdminError, db_err, reload_and_swap};
 
 pub(super) fn routes() -> Router<AdminDeps> {
@@ -45,7 +47,11 @@ pub(super) fn routes() -> Router<AdminDeps> {
 // --- 价格 ---
 
 /// 列出全部价格（按渠道 id、模型名排序，保证确定性）。
-async fn list_prices(State(deps): State<AdminDeps>) -> Result<Json<Vec<Price>>, AdminError> {
+async fn list_prices(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<Json<Vec<Price>>, AdminError> {
+    identity.require_capability(ManagementCapability::EditPrices)?;
     let snapshot = deps.snapshot.read().await;
     let mut prices: Vec<Price> = snapshot
         .prices
@@ -64,8 +70,10 @@ async fn list_prices(State(deps): State<AdminDeps>) -> Result<Json<Vec<Price>>, 
 /// 新建价格：同一渠道同一模型已存在则冲突（409），否则写库 + 换快照 + 返回新价格。
 async fn create_price(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<Price>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<Price>), AdminError> {
+    identity.require_capability(ManagementCapability::EditPrices)?;
     let price = body.map_err(AdminError::bad_body)?;
     validate_price(&price)?;
     {
@@ -95,9 +103,11 @@ async fn create_price(
 /// 整体替换价格（路径 `channel_id`/`model` 权威）：写库 + 换快照 + 返回新价格。
 async fn update_price(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path((channel_id, model)): Path<(i64, String)>,
     body: Result<Json<Price>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Price>, AdminError> {
+    identity.require_capability(ManagementCapability::EditPrices)?;
     let mut price = body.map_err(AdminError::bad_body)?;
     price.channel_id = channel_id;
     price.model = model;
@@ -120,8 +130,10 @@ async fn update_price(
 /// 删除价格：不存在则 404，否则删除并返回被删价格。
 async fn delete_price(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path((channel_id, model)): Path<(i64, String)>,
 ) -> Result<Json<Price>, AdminError> {
+    identity.require_capability(ManagementCapability::EditPrices)?;
     let deleted = read_price(&deps, channel_id, &model).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::delete_price(&mut tx, channel_id, &model)
@@ -137,9 +149,30 @@ async fn delete_price(
 /// 列出全部模型组（按 `name` 排序，保证确定性）。
 async fn list_model_groups(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<ModelGroup>>, AdminError> {
-    let snapshot = deps.snapshot.read().await;
-    let mut groups: Vec<ModelGroup> = snapshot.model_groups.values().cloned().collect();
+    if identity.role() == crate::store::users::ManagementRole::Admin
+        && !identity.has_capability(ManagementCapability::ViewOwnPlanGroups)
+        && !identity.has_capability(ManagementCapability::ViewOtherGroups)
+    {
+        return Err(AdminError::Forbidden);
+    }
+    let mut groups: Vec<ModelGroup> = {
+        let snapshot = deps.snapshot.read().await;
+        snapshot.model_groups.values().cloned().collect()
+    };
+    if identity.role() == crate::store::users::ManagementRole::Admin
+        && !identity.has_capability(ManagementCapability::ViewOtherGroups)
+    {
+        let Some(plan_id) = identity.plan_id() else {
+            return Err(AdminError::Forbidden);
+        };
+        let assigned = plans::list_plan_groups(&deps.pool, plan_id)
+            .await
+            .map_err(AdminError::Store)?;
+        let assigned: HashSet<String> = assigned.into_iter().collect();
+        groups.retain(|group| assigned.contains(&group.name));
+    }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(groups))
 }
@@ -147,8 +180,10 @@ async fn list_model_groups(
 /// 新建模型组：同名已存在则冲突（409），否则写库 + 换快照 + 返回新组。
 async fn create_model_group(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<ModelGroup>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<ModelGroup>), AdminError> {
+    identity.require_capability(ManagementCapability::EditModelGroups)?;
     let mut group = body.map_err(AdminError::bad_body)?;
     {
         let snapshot = deps.snapshot.read().await;
@@ -173,9 +208,11 @@ async fn create_model_group(
 /// 整体替换模型组（按路径 `name`，路径权威）：写库 + 换快照 + 返回新组。
 async fn update_model_group(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(name): Path<String>,
     body: Result<Json<ModelGroup>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<ModelGroup>, AdminError> {
+    identity.require_capability(ManagementCapability::EditModelGroups)?;
     let mut group = body.map_err(AdminError::bad_body)?;
     group.name = name;
     {
@@ -201,8 +238,10 @@ async fn update_model_group(
 /// 删除模型组：内置 `default` 拒绝；令牌组由外键置空失效，渠道默认组改回 `default`。
 async fn delete_model_group(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(name): Path<String>,
 ) -> Result<Json<ModelGroup>, AdminError> {
+    identity.require_capability(ManagementCapability::EditModelGroups)?;
     if name == crate::store::resources::DEFAULT_MODEL_GROUP {
         return Err(AdminError::Conflict("内置组 default 不能删除".to_string()));
     }
@@ -226,7 +265,9 @@ async fn delete_model_group(
 /// 读视图带 `available`：渠道已删/停用/不再登记该名时为 false，写契约不含此字段。
 async fn list_unified_models(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<UnifiedModelView>>, AdminError> {
+    identity.require_capability(ManagementCapability::EditUnifiedModels)?;
     let snapshot = deps.snapshot.read().await;
     let mut models: Vec<UnifiedModelView> = snapshot
         .unified_models
@@ -240,8 +281,10 @@ async fn list_unified_models(
 /// 新建统一模型：同 ID 已存在则冲突（409），否则写库 + 换快照 + 返回新资源。
 async fn create_unified_model(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<UnifiedModel>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<UnifiedModel>), AdminError> {
+    identity.require_capability(ManagementCapability::EditUnifiedModels)?;
     let mut model = body.map_err(AdminError::bad_body)?;
     {
         let snapshot = deps.snapshot.read().await;
@@ -273,9 +316,11 @@ async fn create_unified_model(
 /// 整体替换统一模型（按路径 `id`，路径权威）：写库 + 换快照 + 返回新资源。
 async fn update_unified_model(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<String>,
     body: Result<Json<UnifiedModel>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UnifiedModel>, AdminError> {
+    identity.require_capability(ManagementCapability::EditUnifiedModels)?;
     let mut model = body.map_err(AdminError::bad_body)?;
     model.id = id;
     {
@@ -308,8 +353,10 @@ async fn update_unified_model(
 /// 删除统一模型：不存在则 404，否则删除并返回被删资源。
 async fn delete_unified_model(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<String>,
 ) -> Result<Json<UnifiedModel>, AdminError> {
+    identity.require_capability(ManagementCapability::EditUnifiedModels)?;
     let deleted = read_unified_model(&deps, &id).await?;
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::delete_unified_model(&mut tx, &id)

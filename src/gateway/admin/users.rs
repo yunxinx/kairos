@@ -1,13 +1,13 @@
 //! 管理用户与会话端点：登录、自助账户、用户运营、钱包和模型组分配。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, Path, Request, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -18,7 +18,7 @@ use crate::store::StoreError;
 use crate::store::plans;
 use crate::store::users::{self, ManagementRole, NewUser, UserRecord};
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::tokens;
 use super::{
     AdminDeps, AdminError, bearer_from_headers, begin_write, db_err, format_usd_micros,
@@ -46,10 +46,12 @@ pub(super) fn admin_routes() -> Router<AdminDeps> {
         )
         .route("/users/{id}/tokens", get(tokens::list_user_tokens))
         .route("/users/{id}/balance", post(recharge_user))
-        .route(
-            "/users/{id}/model-groups",
-            get(get_user_plan_groups).put(replace_user_plan_groups),
-        )
+        .route("/users/{id}/model-groups", get(get_user_plan_groups))
+}
+
+/// 过渡期的套餐名单写接口：改套餐配方仍是 root 独占，06 号票移除整个端点。
+pub(super) fn root_routes() -> Router<AdminDeps> {
+    Router::new().route("/users/{id}/model-groups", put(replace_user_plan_groups))
 }
 
 pub(super) fn signed_in_routes() -> Router<AdminDeps> {
@@ -371,6 +373,7 @@ async fn create_user(
     Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<UserCreate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<UserView>), AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let create = body.map_err(AdminError::bad_body)?.0;
     match (identity.role(), create.role) {
         // root 全局唯一：创建接口不接受 root，内置账号是唯一来源。
@@ -468,6 +471,7 @@ async fn update_user(
     headers: axum::http::HeaderMap,
     body: Result<Json<UserUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UserView>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let update = body.map_err(AdminError::bad_body)?.0;
     let mut tx = begin_write(&deps).await?;
     let target = users::get_user_on_conn(&mut tx, id)
@@ -643,6 +647,7 @@ async fn delete_user(
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let mut tx = begin_write(&deps).await?;
     let target = users::get_user_on_conn(&mut tx, id)
         .await
@@ -684,17 +689,13 @@ async fn get_user_plan_groups(
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
 ) -> Result<Json<AssignedGroupsView>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewOwnPlanGroups)?;
     let target = users::get_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    let Some(plan_id) = target.plan_id else {
-        return Ok(Json(AssignedGroupsView { groups: Vec::new() }));
-    };
-    let groups = plans::list_plan_groups(&deps.pool, plan_id)
-        .await
-        .map_err(AdminError::Store)?;
+    let groups = visible_plan_groups(&deps.pool, &identity, target.plan_id).await?;
     Ok(Json(AssignedGroupsView { groups }))
 }
 
@@ -704,6 +705,7 @@ async fn replace_user_plan_groups(
     Path(id): Path<i64>,
     body: Result<Json<AssignedGroupsBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<AssignedGroupsView>, AdminError> {
+    identity.require_capability(ManagementCapability::AssignPlan)?;
     let body = body.map_err(AdminError::bad_body)?.0;
     let mut tx = begin_write(&deps).await?;
     let target = users::get_user_on_conn(&mut tx, id)
@@ -765,15 +767,11 @@ struct UserAdminView {
 
 async fn user_admin_view(
     pool: &SqlitePool,
+    identity: &ManagementIdentity,
     record: UserRecord,
     stats: Option<users::UserStatsRecord>,
 ) -> Result<UserAdminView, AdminError> {
-    let groups = match record.plan_id {
-        Some(plan_id) => plans::list_plan_groups(pool, plan_id)
-            .await
-            .map_err(AdminError::Store)?,
-        None => Vec::new(),
-    };
+    let groups = visible_plan_groups(pool, identity, record.plan_id).await?;
     let wallet = store::get_user_wallet(pool, record.id)
         .await
         .map_err(AdminError::Store)?;
@@ -808,6 +806,7 @@ async fn list_management_users(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<UserAdminView>>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let mut records = users::list_users(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -827,6 +826,21 @@ async fn list_management_users(
     {
         groups_by_plan.entry(plan_id).or_default().push(group);
     }
+    let visible_groups = if identity.role() == ManagementRole::Root
+        || identity.has_capability(ManagementCapability::ViewOtherGroups)
+    {
+        None
+    } else if identity.has_capability(ManagementCapability::ViewOwnPlanGroups) {
+        let own_plan_groups = match identity.plan_id() {
+            Some(plan_id) => plans::list_plan_groups(&deps.pool, plan_id)
+                .await
+                .map_err(AdminError::Store)?,
+            None => Vec::new(),
+        };
+        Some(own_plan_groups.into_iter().collect::<HashSet<String>>())
+    } else {
+        Some(HashSet::new())
+    };
     let views = records
         .into_iter()
         .map(|record| -> Result<UserAdminView, AdminError> {
@@ -837,8 +851,11 @@ async fn list_management_users(
                 .ok_or_else(|| AdminError::Store(StoreError::MissingWallet(record.id)))?;
             let mut assigned_groups = record
                 .plan_id
-                .and_then(|plan_id| groups_by_plan.remove(&plan_id))
+                .and_then(|plan_id| groups_by_plan.get(&plan_id).cloned())
                 .unwrap_or_default();
+            if let Some(visible_groups) = &visible_groups {
+                assigned_groups.retain(|group| visible_groups.contains(group));
+            }
             assigned_groups.sort();
             Ok(UserAdminView {
                 id: record.id,
@@ -865,12 +882,15 @@ async fn get_management_user(
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
 ) -> Result<Json<UserAdminView>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let target = users::get_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    user_admin_view(&deps.pool, target, None).await.map(Json)
+    user_admin_view(&deps.pool, &identity, target, None)
+        .await
+        .map(Json)
 }
 
 async fn recharge_user(
@@ -879,6 +899,7 @@ async fn recharge_user(
     Path(id): Path<i64>,
     body: Result<Json<BalanceAdjustment>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UserAdminView>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let delta = body.map_err(AdminError::bad_body)?.0.delta_usd_micros;
     let mut tx = begin_write(&deps).await?;
     // 归档用户的钱包仍须可对账：补扣路径（结算/豁免）已允许 root 触碰归档账户，
@@ -925,5 +946,43 @@ async fn recharge_user(
         .map_err(AdminError::Store)?;
     }
     tx.commit().await.map_err(db_err)?;
-    user_admin_view(&deps.pool, target, None).await.map(Json)
+    user_admin_view(&deps.pool, &identity, target, None)
+        .await
+        .map(Json)
+}
+
+/// 按当前管理员的模型组可见能力裁剪目标用户的套餐名单。
+async fn visible_plan_groups(
+    pool: &SqlitePool,
+    identity: &ManagementIdentity,
+    target_plan_id: Option<i64>,
+) -> Result<Vec<String>, AdminError> {
+    let Some(target_plan_id) = target_plan_id else {
+        return Ok(Vec::new());
+    };
+    let groups = plans::list_plan_groups(pool, target_plan_id)
+        .await
+        .map_err(AdminError::Store)?;
+    if identity.role() == ManagementRole::Root
+        || identity.has_capability(ManagementCapability::ViewOtherGroups)
+    {
+        return Ok(groups);
+    }
+    if !identity.has_capability(ManagementCapability::ViewOwnPlanGroups) {
+        return Ok(Vec::new());
+    }
+    let Some(own_plan_id) = identity.plan_id() else {
+        return Ok(Vec::new());
+    };
+    if own_plan_id == target_plan_id {
+        return Ok(groups);
+    }
+    let own_groups = plans::list_plan_groups(pool, own_plan_id)
+        .await
+        .map_err(AdminError::Store)?;
+    let own_groups: HashSet<String> = own_groups.into_iter().collect();
+    Ok(groups
+        .into_iter()
+        .filter(|group| own_groups.contains(group))
+        .collect())
 }

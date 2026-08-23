@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store;
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::{AdminDeps, AdminError};
 
 pub(super) fn routes() -> Router<AdminDeps> {
@@ -94,6 +94,7 @@ async fn get_stats(
     Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<StatsQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<StatsView>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
@@ -173,6 +174,7 @@ async fn get_lifetime_stats(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<LifetimeStatsView>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let stats = store::query_lifetime_stats(&deps.pool, identity.owner_scope())
         .await
         .map_err(AdminError::Store)?;

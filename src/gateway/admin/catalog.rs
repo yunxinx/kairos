@@ -1,7 +1,7 @@
 //! 价格目录缓存管理。
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Query, State},
     routing::{get, post},
 };
@@ -11,6 +11,7 @@ use crate::catalog;
 use crate::gateway::logging;
 use crate::store::catalog::{CatalogMeta, CatalogModel, CatalogView};
 
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::{AdminDeps, AdminError, db_err, parse_comma_list};
 
 pub(super) fn routes() -> Router<AdminDeps> {
@@ -41,8 +42,10 @@ struct CatalogQuery {
 /// 读价格目录缓存；可按 `q` / `provider_id` 过滤。
 async fn get_catalog(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<CatalogQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<CatalogView>, AdminError> {
+    identity.require_capability(ManagementCapability::EditPriceCatalog)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
@@ -59,7 +62,11 @@ async fn get_catalog(
 }
 
 /// 读目录元数据：上次同步时刻与提供方列表，不返回模型行。
-async fn get_catalog_meta(State(deps): State<AdminDeps>) -> Result<Json<CatalogMeta>, AdminError> {
+async fn get_catalog_meta(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<Json<CatalogMeta>, AdminError> {
+    identity.require_capability(ManagementCapability::EditPriceCatalog)?;
     let meta = crate::store::catalog::load_catalog_meta(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -69,8 +76,10 @@ async fn get_catalog_meta(State(deps): State<AdminDeps>) -> Result<Json<CatalogM
 /// 整表替换价格目录缓存（供导入与测试播种）；同步时刻记为现在。
 async fn put_catalog(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<CatalogPut>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<CatalogView>, AdminError> {
+    identity.require_capability(ManagementCapability::EditPriceCatalog)?;
     let Json(CatalogPut { models }) = body.map_err(AdminError::bad_body)?;
     let synced_at = logging::unix_millis();
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
@@ -88,7 +97,11 @@ async fn put_catalog(
 }
 
 /// 从 models.dev 拉取并替换价格目录缓存。
-async fn sync_catalog(State(deps): State<AdminDeps>) -> Result<Json<CatalogView>, AdminError> {
+async fn sync_catalog(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<Json<CatalogView>, AdminError> {
+    identity.require_capability(ManagementCapability::EditPriceCatalog)?;
     let view =
         catalog::fetch_and_replace(&deps.pool, &deps.client, catalog::MODELS_DEV_CATALOG_URL)
             .await

@@ -96,6 +96,7 @@ pub fn router(
         .merge(channels::routes())
         .merge(probes::routes())
         .merge(settings::routes())
+        .merge(users::root_routes())
         .merge(logs::root_routes())
         .route_layer(middleware::from_fn(auth::require_root));
     let admin_plus = Router::new()

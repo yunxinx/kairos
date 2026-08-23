@@ -553,8 +553,18 @@ mod tests {
         assert_eq!(standard.shared_rpm, None);
         let admin = snap.plans.get(&2).expect("应有 admin 档");
         assert!(admin.groups.is_empty());
-        assert!(admin.capabilities.manage_users);
-        assert!(admin.capabilities.assign_plan);
+        assert_eq!(
+            admin.capabilities,
+            PlanCapabilities {
+                manage_users: true,
+                assign_plan: true,
+                view_logs_stats: true,
+                settle_waive: true,
+                toggle_user_tokens: true,
+                view_own_plan_groups: true,
+                ..PlanCapabilities::default()
+            }
+        );
 
         let coder = snap
             .users
