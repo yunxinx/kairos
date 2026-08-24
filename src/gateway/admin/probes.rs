@@ -15,7 +15,7 @@ use crate::config::Protocol;
 use crate::core::ir::{ChatRequest, ContentPart, Message, Role};
 use crate::gateway::http::{OutboundAuth, upstream_error_message};
 use crate::gateway::protocol;
-use crate::store::resources::Channel;
+use crate::store::resources::{Channel, StoredChannelKey, select_channel_key};
 
 use super::channels::{parse_channel_id, read_channel_record, reject_non_http_url};
 use super::{AdminDeps, AdminError};
@@ -88,10 +88,13 @@ async fn test_channel(
     }
     let id = parse_channel_id(raw_id)?;
     let record = read_channel_record(&deps, id).await?;
-    let channel = record.channel;
+    let channel = &record.channel;
     reject_non_http_url(&channel.base_url)?;
-    let model = resolve_probe_model(&channel, requested).ok_or_else(|| {
+    let model = resolve_probe_model(channel, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("模型 {requested} 不在渠道 {id} 的清单中"))
+    })?;
+    let key = select_channel_key(&record.keys, requested).ok_or_else(|| {
+        AdminError::InvalidBody(format!("渠道 {id} 没有可用于模型 {requested} 的启用密钥"))
     })?;
     let request = minimal_probe_request(&model);
     let mut warnings = Vec::new();
@@ -107,7 +110,7 @@ async fn test_channel(
         .client
         .post(&upstream_url)
         .timeout(Duration::from_millis(channel.timeout_ms))
-        .apply_outbound_auth(&channel)
+        .apply_outbound_auth(channel.protocol, key)
         .json(&outbound)
         .send()
         .await;
@@ -240,29 +243,27 @@ async fn list_upstream_models(
     if draft.timeout_ms < 1 {
         return Err(AdminError::InvalidBody("timeout_ms 不能小于 1".to_string()));
     }
-    // 借临时 Channel 复用 OutboundAuth；与出站认证无关的字段取不影响认证的缺省值。
-    let channel = Channel {
-        name: String::new(),
-        protocol: draft.protocol,
-        base_url: draft.base_url,
+    let key = StoredChannelKey {
+        id: 0,
+        channel_id: 0,
+        name: "draft".to_string(),
         api_key: draft.api_key,
-        models: Vec::new(),
-        model_aliases: HashMap::new(),
-        timeout_ms: draft.timeout_ms,
-        max_retries: 0,
+        weight: 1,
         enabled: true,
-        model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+        models: None,
+        blocked_models: None,
+        created_at: 0,
     };
     let url = format!(
         "{}{}",
-        channel.base_url.trim_end_matches('/'),
+        draft.base_url.trim_end_matches('/'),
         UPSTREAM_MODELS_PATH
     );
     let send = deps
         .client
         .get(&url)
-        .timeout(Duration::from_millis(channel.timeout_ms))
-        .apply_outbound_auth(&channel)
+        .timeout(Duration::from_millis(draft.timeout_ms))
+        .apply_outbound_auth(draft.protocol, &key)
         .send()
         .await;
     let response = match send {

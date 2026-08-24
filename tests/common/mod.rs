@@ -72,6 +72,7 @@ impl UpstreamBehavior {
 #[derive(Debug, Default)]
 pub struct ReceivedLog {
     pub requests: Vec<Value>,
+    pub api_keys: Vec<Option<String>>,
     pub anthropic_versions: Vec<Option<String>>,
     pub anthropic_betas: Vec<Option<String>>,
     pub openai_organizations: Vec<Option<String>>,
@@ -154,6 +155,15 @@ impl MockUpstream {
             .clone()
     }
 
+    /// 拷贝收到的出站认证头，用于验证密钥选择。
+    pub fn received_api_keys(&self) -> Vec<Option<String>> {
+        self.received
+            .lock()
+            .expect("received 锁不应被污染")
+            .api_keys
+            .clone()
+    }
+
     /// 拷贝收到的 `anthropic-version` 头（缺省为 `None`）。
     pub fn received_anthropic_versions(&self) -> Vec<Option<String>> {
         self.received
@@ -223,8 +233,20 @@ async fn capture_outbound_headers(
         .get("openai-project")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let api_key = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::to_string);
     {
         let mut log = received.lock().expect("received 锁不应被污染");
+        log.api_keys.push(api_key);
         log.anthropic_versions.push(version);
         log.anthropic_betas.push(beta);
         log.openai_organizations.push(organization);
@@ -377,7 +399,14 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             name: "test-channel".to_string(),
             protocol: config::Protocol::OpenAiChat,
             base_url: upstream_base.to_string(),
-            api_key: "sk-upstream".to_string(),
+            keys: vec![kairos::store::resources::ChannelKey {
+                name: "default".to_string(),
+                api_key: "sk-upstream".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }],
             models: vec![TEST_MODEL.to_string()],
             model_aliases: [("fast".to_string(), "gpt-4o-mini".to_string())]
                 .into_iter()

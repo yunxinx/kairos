@@ -269,8 +269,21 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
     }
     reject_non_http_url(&channel.base_url)?;
-    if channel.api_key.trim().is_empty() {
-        return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
+    if channel.keys.is_empty() {
+        return Err(AdminError::InvalidBody("keys 不能为空".to_string()));
+    }
+    for key in &channel.keys {
+        if key.name.trim().is_empty() {
+            return Err(AdminError::InvalidBody("密钥 name 不能为空".to_string()));
+        }
+        if key.api_key.trim().is_empty() {
+            return Err(AdminError::InvalidBody("密钥 api_key 不能为空".to_string()));
+        }
+        if key.weight < 0 {
+            return Err(AdminError::InvalidBody(
+                "密钥 weight 不能小于 0".to_string(),
+            ));
+        }
     }
     Ok(())
 }

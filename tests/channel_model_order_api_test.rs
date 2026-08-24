@@ -40,7 +40,7 @@ fn channel_body(name: &str, base_url: String, models: Value) -> Value {
         "name": name,
         "protocol": "openai_chat",
         "base_url": base_url,
-        "api_key": "sk-upstream",
+        "keys": [{"name": "default", "api_key": "sk-upstream", "weight": 1, "enabled": true, "models": null, "blocked_models": null}],
         "models": models,
         "model_aliases": {},
         "timeout_ms": 1000,

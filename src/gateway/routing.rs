@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::store::resources::{Channel, ChannelModelOrder, ChannelRecord};
+use crate::store::resources::{Channel, ChannelModelOrder, ChannelRecord, StoredChannelKey};
 
 /// 一次路由的结果：按 failover 顺序排列的候选渠道。
 ///
@@ -16,6 +16,15 @@ use crate::store::resources::{Channel, ChannelModelOrder, ChannelRecord};
 pub struct Route {
     /// 按尝试顺序排列的候选渠道记录（含稳定 id，克隆自配置）。
     pub channels: Vec<ChannelRecord>,
+    /// 已在准入阶段为每个候选渠道选定的密钥；同渠道重试复用该结果。
+    pub selected_keys: HashMap<i64, StoredChannelKey>,
+}
+
+impl Route {
+    /// 取该渠道本次请求已选定的密钥。
+    pub fn selected_key(&self, channel_id: i64) -> Option<&StoredChannelKey> {
+        self.selected_keys.get(&channel_id)
+    }
 }
 
 /// 该渠道对入站模型名应发给上游的出站名：命中本渠道别名表则用 value，否则原样。
@@ -111,6 +120,7 @@ pub fn route(
             .into_iter()
             .map(|(record, _)| record.clone())
             .collect(),
+        selected_keys: HashMap::new(),
     })
 }
 
@@ -123,7 +133,14 @@ mod tests {
             name: name.to_string(),
             protocol: crate::config::Protocol::OpenAiChat,
             base_url: "http://localhost".to_string(),
-            api_key: "k".to_string(),
+            keys: vec![crate::store::resources::ChannelKey {
+                name: "default".to_string(),
+                api_key: "k".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }],
             models: models.iter().map(|s| s.to_string()).collect(),
             model_aliases: Default::default(),
             timeout_ms: 1000,
@@ -135,7 +152,11 @@ mod tests {
 
     /// 测试用记录包装：id 仅作身份占位，路由不依赖其取值。
     fn record(id: i64, channel: Channel) -> ChannelRecord {
-        ChannelRecord { id, channel }
+        ChannelRecord {
+            id,
+            channel,
+            keys: Vec::new(),
+        }
     }
 
     /// 显式顺序在前，未写顺序的候选随后按渠道 id 升序兜底。

@@ -135,6 +135,8 @@ pub struct RequestLog {
     /// 存量行或尚未出站的失败请求为 `None`。
     pub outbound_model: Option<String>,
     pub channel: String,
+    /// 本次出站使用的密钥身份（名称或 id），绝不保存密钥明文。
+    pub channel_key: Option<String>,
     pub status_code: i64,
     pub latency_ms: i64,
     /// usage 四分量。
@@ -178,12 +180,12 @@ pub async fn insert_request_log_on(
     let result = sqlx::query(
         "INSERT INTO request_log \
          (created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+          channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
           cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
           cache_read_price_usd_micros, cache_write_price_usd_micros, \
           base_cost_usd_micros, discount_bp, cost_usd_micros, \
           settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.created_at)
     .bind(&log.token_name)
@@ -193,6 +195,7 @@ pub async fn insert_request_log_on(
     .bind(&log.model)
     .bind(&log.outbound_model)
     .bind(&log.channel)
+    .bind(&log.channel_key)
     .bind(log.status_code)
     .bind(log.latency_ms)
     .bind(log.input_tokens as i64)
@@ -624,7 +627,7 @@ async fn query_request_logs_on(
 ) -> Result<Vec<RequestLog>, StoreError> {
     let mut qb = sqlx::QueryBuilder::new(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-         channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
@@ -660,7 +663,7 @@ pub async fn get_request_log_on_conn(
 ) -> Result<Option<RequestLog>, StoreError> {
     let row = sqlx::query(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-         channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
@@ -1561,6 +1564,7 @@ fn map_request_log_row(
         model: row.try_get("model").map_err(StoreError::Query)?,
         outbound_model: row.try_get("outbound_model").map_err(StoreError::Query)?,
         channel: row.try_get("channel").map_err(StoreError::Query)?,
+        channel_key: row.try_get("channel_key").map_err(StoreError::Query)?,
         status_code: row.try_get("status_code").map_err(StoreError::Query)?,
         latency_ms: row.try_get("latency_ms").map_err(StoreError::Query)?,
         input_tokens: row.try_get("input_tokens").map_err(StoreError::Query)?,
@@ -1788,7 +1792,14 @@ mod tests {
                 name: "strict-price".to_string(),
                 protocol: crate::config::Protocol::OpenAiChat,
                 base_url: "http://127.0.0.1:9".to_string(),
-                api_key: "sk".to_string(),
+                keys: vec![resources::ChannelKey {
+                    name: "default".to_string(),
+                    api_key: "sk".to_string(),
+                    weight: 1,
+                    enabled: true,
+                    models: None,
+                    blocked_models: None,
+                }],
                 models: vec![],
                 model_aliases: std::collections::HashMap::new(),
                 timeout_ms: 1000,
@@ -1849,9 +1860,14 @@ mod tests {
             ),
             (
                 "channels",
-                "INSERT INTO channels (name, protocol, base_url, api_key, models_json, \
+                "INSERT INTO channels (name, protocol, base_url, models_json, \
                      model_aliases_json, timeout_ms, max_retries) \
-                 VALUES ('c', 'openai_chat', 'u', 'k', '[]', '{}', 'not-a-number', 1)",
+                 VALUES ('c', 'openai_chat', 'u', '[]', '{}', 'not-a-number', 1)",
+            ),
+            (
+                "channel_keys",
+                "INSERT INTO channel_keys (channel_id, name, api_key, weight, enabled, created_at) \
+                 VALUES (?, 'k', 'secret', 'not-a-number', 1, 0)",
             ),
             (
                 "settings",
@@ -1872,7 +1888,11 @@ mod tests {
             ),
         ];
         for (table, sql) in probes {
-            let result = sqlx::query(sql).execute(&pool).await;
+            let result = if table == "channel_keys" {
+                sqlx::query(sql).bind(channel_id).execute(&pool).await
+            } else {
+                sqlx::query(sql).execute(&pool).await
+            };
             assert!(
                 result.is_err(),
                 "{table} 应仍是 STRICT 表，错类型写入须被拒"
@@ -2161,6 +2181,7 @@ mod tests {
                     inbound_protocol: "openai_chat".to_string(),
                     model: model.to_string(),
                     outbound_model: None,
+                    channel_key: None,
                     channel: "c1".to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -2279,6 +2300,7 @@ mod tests {
                     inbound_protocol: "openai_chat".to_string(),
                     model: (*model).to_string(),
                     outbound_model: None,
+                    channel_key: None,
                     channel: (*channel).to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -2364,6 +2386,7 @@ mod tests {
                     inbound_protocol: "openai_chat".to_string(),
                     model: (*model).to_string(),
                     outbound_model: None,
+                    channel_key: None,
                     channel: (*channel).to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -2423,6 +2446,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "cached".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2453,6 +2477,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "heavy".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2509,6 +2534,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2574,6 +2600,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "fast".to_string(),
                 outbound_model: Some("gpt-4o-mini".to_string()),
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2635,6 +2662,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2665,6 +2693,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2699,6 +2728,7 @@ mod tests {
             inbound_protocol: "openai_chat".to_string(),
             model: "m".to_string(),
             outbound_model: None,
+            channel_key: None,
             channel: "c".to_string(),
             status_code: 200,
             latency_ms: 1,

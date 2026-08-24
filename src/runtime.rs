@@ -200,7 +200,7 @@ pub type SnapshotHandle = Arc<RwLock<Arc<RuntimeSnapshot>>>;
 /// 四类资源分别读取：渠道/令牌/价格直接装载，运行时开关经 `load_settings` 解析
 /// 出日志、网关保护与目录同步等设置（缺省用默认值）。
 pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreError> {
-    let channels = resources::list_channel_records(pool).await?;
+    let channels = resources::list_channel_records_with_keys(pool).await?;
     let channel_model_order = resources::list_channel_model_orders(pool).await?;
     let token_rows = resources::list_tokens(pool).await?;
     let price_rows = resources::list_prices(pool).await?;
@@ -446,7 +446,14 @@ mod tests {
                 name: "c1".to_string(),
                 protocol: Protocol::OpenAiChat,
                 base_url: "https://api.example.com/v1".to_string(),
-                api_key: "k".to_string(),
+                keys: vec![resources::ChannelKey {
+                    name: "default".to_string(),
+                    api_key: "k".to_string(),
+                    weight: 1,
+                    enabled: true,
+                    models: None,
+                    blocked_models: None,
+                }],
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
                 timeout_ms: 1000,

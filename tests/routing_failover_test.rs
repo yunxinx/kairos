@@ -46,7 +46,14 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             name: "ch-0".to_string(),
             protocol: config::Protocol::OpenAiChat,
             base_url: bases[0].clone(),
-            api_key: "sk-0".to_string(),
+            keys: vec![kairos::store::resources::ChannelKey {
+                name: "default".to_string(),
+                api_key: "sk-0".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }],
             models: vec![TEST_MODEL.to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
@@ -58,7 +65,14 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             name: "ch-1".to_string(),
             protocol: config::Protocol::OpenAiChat,
             base_url: bases[1].clone(),
-            api_key: "sk-1".to_string(),
+            keys: vec![kairos::store::resources::ChannelKey {
+                name: "default".to_string(),
+                api_key: "sk-1".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }],
             models: vec![TEST_MODEL.to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
@@ -77,7 +91,14 @@ fn three_channel_seed(bases: &[String]) -> common::Seed {
         name: "ch-2".to_string(),
         protocol: config::Protocol::OpenAiChat,
         base_url: bases[2].clone(),
-        api_key: "sk-2".to_string(),
+        keys: vec![kairos::store::resources::ChannelKey {
+            name: "default".to_string(),
+            api_key: "sk-2".to_string(),
+            weight: 1,
+            enabled: true,
+            models: None,
+            blocked_models: None,
+        }],
         models: vec![TEST_MODEL.to_string()],
         model_aliases: Default::default(),
         timeout_ms: 1000,
@@ -109,6 +130,42 @@ async fn retryable_429_fails_over_to_next_channel() {
     // 两个渠道都被请求过（首渠道失败一次，次渠道成功一次）。
     assert_eq!(ups[0].received().len(), 1, "首渠道应收一次请求");
     assert_eq!(ups[1].received().len(), 1, "次渠道应收一次请求");
+}
+
+/// 渠道内启用密钥按模型名单筛选，并把选中的密钥用于出站认证。
+#[tokio::test]
+async fn channel_key_model_filter_selects_usable_auth_key() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels[0].keys = vec![
+            kairos::store::resources::ChannelKey {
+                name: "blocked".to_string(),
+                api_key: "sk-blocked".to_string(),
+                weight: 100,
+                enabled: true,
+                models: Some(vec!["other".to_string()]),
+                blocked_models: None,
+            },
+            kairos::store::resources::ChannelKey {
+                name: "usable".to_string(),
+                api_key: "sk-usable".to_string(),
+                weight: 1,
+                enabled: true,
+                models: Some(vec![TEST_MODEL.to_string()]),
+                blocked_models: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let response = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        ups[0].received_api_keys(),
+        vec![Some("Bearer sk-usable".to_string())]
+    );
 }
 
 /// 顺序表先给全部候选排序；模型组钉渠道随后只做稳定过滤，不能让未钉渠道

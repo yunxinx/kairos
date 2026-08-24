@@ -42,7 +42,7 @@ use crate::{
     core::stream::{SseFrame, StreamAccumulator},
     runtime::{PlanBinding, RuntimeSnapshot, SnapshotHandle},
     store,
-    store::resources::{Channel, ChannelRecord, Token},
+    store::resources::{Channel, ChannelRecord, StoredChannelKey, Token},
 };
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
@@ -767,10 +767,14 @@ fn hop_for_member(
     {
         return Err(HopDeny::NoPrice);
     }
+    let key = crate::store::resources::select_channel_key(&record.keys, &member.model)
+        .ok_or(HopDeny::NoRoute)?
+        .clone();
     Ok(RouteHop {
         routed_model: member.model.clone(),
         route: routing::Route {
             channels: vec![record.clone()],
+            selected_keys: std::collections::HashMap::from([(record.id, key)]),
         },
     })
 }
@@ -793,11 +797,26 @@ fn hop_for_callable(
             return Err(HopDeny::NoRoute);
         }
     }
-    route
+    let had_price = route
         .channels
-        .retain(|record| snapshot.price_for_channel(record.id, model).is_some());
+        .iter()
+        .any(|record| snapshot.price_for_channel(record.id, model).is_some());
+    route.channels.retain(|record| {
+        if snapshot.price_for_channel(record.id, model).is_none() {
+            return false;
+        }
+        let Some(key) = crate::store::resources::select_channel_key(&record.keys, model) else {
+            return false;
+        };
+        route.selected_keys.insert(record.id, key.clone());
+        true
+    });
     if route.channels.is_empty() {
-        return Err(HopDeny::NoPrice);
+        return Err(if had_price {
+            HopDeny::NoRoute
+        } else {
+            HopDeny::NoPrice
+        });
     }
     Ok(RouteHop {
         routed_model: model.to_string(),
@@ -993,10 +1012,13 @@ async fn outbound_with_failover(
                     inbound_headers,
                     request_id,
                 };
+                let key = route
+                    .selected_key(record.id)
+                    .expect("准入已为每个渠道选出密钥");
                 if request.stream {
-                    stream_completion(&mut ctx, &record.channel).await
+                    stream_completion(&mut ctx, &record.channel, key).await
                 } else {
-                    non_stream_completion(&mut ctx, &record.channel).await
+                    non_stream_completion(&mut ctx, &record.channel, key).await
                 }
             })
         },
@@ -1004,6 +1026,12 @@ async fn outbound_with_failover(
             let outbound_model =
                 outbound_model_for_channel_name(route, channel, routed_model).map(str::to_string);
             let channel = channel.to_string();
+            let channel_key = route
+                .channels
+                .iter()
+                .find(|record| record.channel.name == channel)
+                .and_then(|record| route.selected_key(record.id))
+                .map(|key| key.name.clone());
             let request_body = request_body_for_log.clone();
             let response_body = snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = request_id.to_string();
@@ -1015,6 +1043,7 @@ async fn outbound_with_failover(
                     &request.model,
                     outbound_model.as_deref(),
                     &channel,
+                    channel_key.as_deref(),
                     status,
                     started,
                     Billing {
@@ -1070,9 +1099,11 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             let record = record.clone();
             Box::pin(async move {
                 if ctx.request.stream {
-                    passthrough_stream_completion(ctx, &record).await
+                    let key = route.selected_key(record.id).expect("直通路由已选密钥");
+                    passthrough_stream_completion(ctx, &record, key).await
                 } else {
-                    passthrough_non_stream_completion(ctx, &record).await
+                    let key = route.selected_key(record.id).expect("直通路由已选密钥");
+                    passthrough_non_stream_completion(ctx, &record, key).await
                 }
             })
         },
@@ -1080,6 +1111,12 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             let outbound_model = outbound_model_for_channel_name(route, channel, ctx.routed_model)
                 .map(str::to_string);
             let channel = channel.to_string();
+            let channel_key = route
+                .channels
+                .iter()
+                .find(|record| record.channel.name == channel)
+                .and_then(|record| route.selected_key(record.id))
+                .map(|key| key.name.clone());
             let request_body = ctx.request_body.clone();
             let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = ctx.request_id.to_string();
@@ -1090,6 +1127,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                     &ctx.request.model,
                     outbound_model.as_deref(),
                     &channel,
+                    channel_key.as_deref(),
                     status,
                     ctx.started,
                     Billing {
@@ -1118,6 +1156,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
 async fn passthrough_stream_completion(
     ctx: &PassthroughCtx<'_>,
     record: &ChannelRecord,
+    key: &StoredChannelKey,
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, true, channel.protocol);
@@ -1128,7 +1167,7 @@ async fn passthrough_stream_completion(
         ctx.deps
             .client
             .post(&upstream_url)
-            .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
+            .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
             .header("content-type", "application/json")
             .body(outbound)
@@ -1194,6 +1233,7 @@ async fn passthrough_stream_completion(
         request: ctx.request.clone(),
         routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
+        channel_key_name: key.name.clone(),
         status_code,
         started: ctx.started,
         price: billed_price(ctx.snapshot, record, ctx.routed_model),
@@ -1227,6 +1267,7 @@ async fn passthrough_stream_completion(
 async fn passthrough_non_stream_completion(
     ctx: &PassthroughCtx<'_>,
     record: &ChannelRecord,
+    key: &StoredChannelKey,
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, false, channel.protocol);
@@ -1237,7 +1278,7 @@ async fn passthrough_non_stream_completion(
         ctx.deps
             .client
             .post(&upstream_url)
-            .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
+            .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
             .header("content-type", "application/json")
             .body(outbound)
@@ -1307,6 +1348,7 @@ async fn passthrough_non_stream_completion(
             &ctx.request.model,
             outbound_model_for_log(channel, ctx.routed_model),
             &channel.name,
+            Some(&key.name),
             status_code,
             ctx.started,
             Billing {
@@ -1387,6 +1429,7 @@ struct PassthroughStreamTask {
     request: ChatRequest,
     routed_model: String,
     channel: Channel,
+    channel_key_name: String,
     status_code: u16,
     started: i64,
     price: PriceSnapshot,
@@ -1517,6 +1560,7 @@ async fn pipe_passthrough_stream<S>(
         &ctx.request.model,
         outbound_model_for_log(&ctx.channel, &ctx.routed_model),
         &ctx.channel.name,
+        Some(&ctx.channel_key_name),
         ctx.status_code,
         ctx.started,
         Billing {
@@ -1565,7 +1609,11 @@ async fn send_passthrough_chunk(
 ///
 /// 按渠道协议编码出站请求、调用上游、解码响应为 IR，再重编码为入站协议返回。
 /// 成功且 usage 非零才结算；失败或零输出不扣费。
-async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
+async fn non_stream_completion(
+    ctx: &mut CallCtx<'_>,
+    channel: &Channel,
+    key: &StoredChannelKey,
+) -> Outbound {
     let deps = ctx.deps;
     let snapshot = ctx.snapshot;
     let request = ctx.request;
@@ -1592,7 +1640,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
         .client
         .post(&upstream_url)
         .timeout(Duration::from_millis(channel.timeout_ms))
-        .apply_outbound_auth(channel)
+        .apply_outbound_auth(channel.protocol, key)
         .apply_feature_headers(ctx.inbound_headers)
         .json(&outbound_value)
         .send()
@@ -1652,6 +1700,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                     &request.model,
                     Some(outbound_model),
                     &channel.name,
+                    Some(&key.name),
                     status_code,
                     started,
                     Billing {
@@ -1701,7 +1750,11 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
 /// 按渠道协议编码出站请求（强制流式，OpenAI 另注入 `stream_options.include_usage`
 /// 供计费），逐 SSE 帧解码为 IR 流事件，累积为 `ChatResponse` 以取 usage 计费，
 /// 同时重编码为入站协议 SSE 帧流回下游。流结束后按累积 usage 结算并落日志。
-async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
+async fn stream_completion(
+    ctx: &mut CallCtx<'_>,
+    channel: &Channel,
+    key: &StoredChannelKey,
+) -> Outbound {
     let deps = ctx.deps;
     let request = ctx.request;
     let token = ctx.token;
@@ -1735,7 +1788,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         Duration::from_millis(channel.timeout_ms),
         deps.client
             .post(&upstream_url)
-            .apply_outbound_auth(channel)
+            .apply_outbound_auth(channel.protocol, key)
             .apply_feature_headers(ctx.inbound_headers)
             .json(&outbound)
             .send(),
@@ -1805,6 +1858,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         request: request.clone(),
         routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
+        channel_key_name: key.name.clone(),
         inbound_model: (request.model != outbound_model).then(|| request.model.clone()),
         request_warnings,
         status_code,
@@ -1832,6 +1886,7 @@ struct StreamTask {
     request: ChatRequest,
     routed_model: String,
     channel: Channel,
+    channel_key_name: String,
     /// 别名命中时入站模型名（用于重写响应模型名）；`None` 表示不覆盖。
     inbound_model: Option<String>,
     /// 请求侧转换的信息损失，以 `stream-start` 事件在流首下发。
@@ -2025,6 +2080,7 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
         &ctx.request.model,
         outbound_model_for_log(&ctx.channel, &ctx.routed_model),
         &ctx.channel.name,
+        Some(&ctx.channel_key_name),
         ctx.status_code,
         ctx.started,
         Billing {
@@ -2163,28 +2219,30 @@ const FORWARDED_FEATURE_HEADERS: &[&str] =
 /// OpenAI 用 `Authorization: Bearer`；Anthropic 用 `x-api-key` 并带
 /// `anthropic-version`。直通路径转发下游版本头，避免强行降级；IR / 探测仍钉默认。
 pub(super) trait OutboundAuth {
-    fn apply_outbound_auth(self, channel: &Channel) -> Self;
+    fn apply_outbound_auth(self, protocol: Protocol, key: &StoredChannelKey) -> Self;
     fn apply_outbound_auth_with_version(
         self,
-        channel: &Channel,
+        protocol: Protocol,
+        key: &StoredChannelKey,
         inbound_version: Option<&HeaderValue>,
     ) -> Self;
     fn apply_feature_headers(self, inbound: &HeaderMap) -> Self;
 }
 
 impl OutboundAuth for reqwest::RequestBuilder {
-    fn apply_outbound_auth(self, channel: &Channel) -> Self {
-        self.apply_outbound_auth_with_version(channel, None)
+    fn apply_outbound_auth(self, protocol: Protocol, key: &StoredChannelKey) -> Self {
+        self.apply_outbound_auth_with_version(protocol, key, None)
     }
 
     fn apply_outbound_auth_with_version(
         self,
-        channel: &Channel,
+        protocol: Protocol,
+        key: &StoredChannelKey,
         inbound_version: Option<&HeaderValue>,
     ) -> Self {
-        match channel.protocol {
-            Protocol::OpenAiChat | Protocol::OpenAiResponses => self.bearer_auth(&channel.api_key),
-            Protocol::AnthropicMessages => self.header("x-api-key", &channel.api_key).header(
+        match protocol {
+            Protocol::OpenAiChat | Protocol::OpenAiResponses => self.bearer_auth(&key.api_key),
+            Protocol::AnthropicMessages => self.header("x-api-key", &key.api_key).header(
                 "anthropic-version",
                 inbound_version
                     .cloned()
@@ -2242,6 +2300,7 @@ async fn error_response(
             model,
             None,
             "",
+            None,
             status.as_u16(),
             started,
             Billing {

@@ -44,7 +44,14 @@ fn channel_body(name: &str, base_url: String, models: Value) -> Value {
         "name": name,
         "protocol": "openai_chat",
         "base_url": base_url,
-        "api_key": "sk-upstream",
+        "keys": [{
+            "name": "default",
+            "api_key": "sk-upstream",
+            "weight": 1,
+            "enabled": true,
+            "models": null,
+            "blocked_models": null
+        }],
         "models": models,
         "model_aliases": {},
         "timeout_ms": 1000,
@@ -1189,7 +1196,7 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
         .await
         .expect("渠道列表应可解析");
     let mut conflict = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
-    conflict["api_key"] = json!("sk-other");
+    conflict["keys"][0]["api_key"] = json!("sk-other");
     conflict["timeout_ms"] = json!(1);
     conflict["max_retries"] = json!(9);
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", conflict).await;
@@ -2186,6 +2193,7 @@ async fn logs_redact_long_token_keys() {
             inbound_protocol: "openai_chat".to_string(),
             model: "m".to_string(),
             outbound_model: None,
+            channel_key: None,
             channel: "c".to_string(),
             status_code: 200,
             latency_ms: 1,
@@ -2242,6 +2250,7 @@ async fn logs_redact_long_token_keys() {
             inbound_protocol: "openai_chat".to_string(),
             model: "m".to_string(),
             outbound_model: None,
+            channel_key: None,
             channel: "c".to_string(),
             status_code: 200,
             latency_ms: 1,
@@ -2291,6 +2300,7 @@ async fn logs_mask_multibyte_token_keys_without_panic() {
             inbound_protocol: "openai_chat".to_string(),
             model: "m".to_string(),
             outbound_model: None,
+            channel_key: None,
             channel: "c".to_string(),
             status_code: 200,
             latency_ms: 1,
@@ -2343,6 +2353,8 @@ async fn logs_filter_settled_and_report_unsettled_total() {
         inbound_protocol: "openai_chat".to_string(),
         model: "m".to_string(),
         outbound_model: None,
+        channel_key: None,
+
         channel: "c".to_string(),
         status_code: 200,
         latency_ms: 1,
@@ -2411,6 +2423,8 @@ async fn unsettled_log_can_be_settled_or_waived() {
         inbound_protocol: "openai_chat".to_string(),
         model: "m".to_string(),
         outbound_model: None,
+        channel_key: None,
+
         channel: "c".to_string(),
         status_code: 200,
         latency_ms: 1,
@@ -2555,6 +2569,8 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
         inbound_protocol: "openai_chat".to_string(),
         model: "m".to_string(),
         outbound_model: None,
+        channel_key: None,
+
         channel: "c".to_string(),
         status_code: 200,
         latency_ms: 1,
@@ -2827,6 +2843,7 @@ async fn seed_log(pool: &sqlx::SqlitePool, log: SeededLog) {
             inbound_protocol: "openai_chat".to_string(),
             model: log.model.to_string(),
             outbound_model: None,
+            channel_key: None,
             channel: log.channel.to_string(),
             status_code: log.status_code,
             latency_ms: 10,
@@ -2869,6 +2886,7 @@ async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
         SeededLog {
             created_at: today_start + 1,
             model: TEST_MODEL,
+
             channel: "test-channel",
             status_code: 200,
             input_tokens: 10,
@@ -2882,6 +2900,7 @@ async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
         SeededLog {
             created_at: today_start + 2,
             model: TEST_MODEL,
+
             channel: "test-channel",
             status_code: 200,
             input_tokens: 20,
@@ -2896,6 +2915,7 @@ async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
         SeededLog {
             created_at: today_start + 3,
             model: TEST_MODEL,
+
             channel: "test-channel",
             status_code: 500,
             input_tokens: 0,
@@ -2910,6 +2930,7 @@ async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
         SeededLog {
             created_at: yesterday + 1,
             model: "gpt-4o-mini",
+
             channel: "other-channel",
             status_code: 200,
             input_tokens: 5,
@@ -2924,6 +2945,7 @@ async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
         SeededLog {
             created_at: eight_days_ago + 1,
             model: TEST_MODEL,
+
             channel: "test-channel",
             status_code: 200,
             input_tokens: 1,
@@ -3156,6 +3178,50 @@ async fn channel_probe_success_skips_billing_and_logging() {
         .await
         .expect("应能统计日志");
     assert_eq!(logs_before, logs_after, "探测不应落 request_log");
+}
+
+/// 渠道探测同样按模型筛选密钥，并使用适用密钥发起请求。
+#[tokio::test]
+async fn channel_probe_uses_model_eligible_key() {
+    let mut gw = TestGateway::start_with_admin(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].keys = vec![
+            kairos::store::resources::ChannelKey {
+                name: "blocked".to_string(),
+                api_key: "sk-blocked".to_string(),
+                weight: 100,
+                enabled: true,
+                models: Some(vec!["other".to_string()]),
+                blocked_models: None,
+            },
+            kairos::store::resources::ChannelKey {
+                name: "usable".to_string(),
+                api_key: "sk-probe".to_string(),
+                weight: 1,
+                enabled: true,
+                models: Some(vec![TEST_MODEL.to_string()]),
+                blocked_models: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    let channel_id = channel_id_by_name(&gw, "test-channel").await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(json!({"ok": true})));
+
+    let response = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        &format!("/channels/{channel_id}/test"),
+        json!({"model": TEST_MODEL}),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        gw.upstream.received_api_keys(),
+        vec![Some("Bearer sk-probe".to_string())]
+    );
 }
 
 /// 渠道探测失败（上游 4xx）：可达但带状态码与错误摘要；仍不落日志。
