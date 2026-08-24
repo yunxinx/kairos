@@ -104,6 +104,8 @@ const protocolOptions = computed(() =>
 );
 
 interface EditorKey {
+  /** 编辑会话内稳定身份；不能用数组下标作为 Vue key。 */
+  editorId: string;
   name: string;
   api_key: string;
   /** 权重输入草稿；保存时按无符号整数解析，空值按 1 处理。 */
@@ -115,6 +117,13 @@ interface EditorKey {
   blocked_models: string;
 }
 
+let nextEditorKeyId = 0;
+
+function newEditorKeyId(): string {
+  nextEditorKeyId += 1;
+  return `editor-key-${nextEditorKeyId}`;
+}
+
 function parseCommaList(value: string): string[] {
   return value
     .split(',')
@@ -124,6 +133,7 @@ function parseCommaList(value: string): string[] {
 
 function keyToEditor(key: ChannelKey): EditorKey {
   return {
+    editorId: newEditorKeyId(),
     name: key.name,
     api_key: key.api_key,
     weight: String(key.weight),
@@ -161,6 +171,7 @@ function sameEditorKey(left: EditorKey, right: EditorKey): boolean {
 
 function emptyEditorKey(): EditorKey {
   return {
+    editorId: newEditorKeyId(),
     name: '',
     api_key: '',
     weight: '1',
@@ -446,6 +457,15 @@ function handleSave() {
     }
     return;
   }
+  const seenKeyNames = new Set<string>();
+  for (const [index, key] of editorKeys.value.entries()) {
+    const name = key.name.trim();
+    if (seenKeyNames.has(name)) {
+      showFieldError(`keyName${index}`, t('channel.keyNameDuplicate'));
+      return;
+    }
+    seenKeyNames.add(name);
+  }
   const timeoutMs = parseOptionalUint(editorTimeoutMs.value);
   const maxRetries = parseOptionalUint(editorMaxRetries.value);
   if (timeoutMs === null || maxRetries === null) {
@@ -602,7 +622,7 @@ function handleSave() {
               </legend>
               <div
                 v-for="(key, index) in editorKeys"
-                :key="index"
+                :key="key.editorId"
                 class="border-seed mb-3 rounded-md border p-3 last:mb-0"
                 data-testid="channel-key-row"
                 :data-key-index="index"

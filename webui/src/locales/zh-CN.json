@@ -381,6 +381,7 @@
     "removeKey": "移除密钥 {name}",
     "keyLabel": "密钥 {n}",
     "keyName": "名称",
+    "keyNameDuplicate": "同一渠道内的密钥名称必须唯一",
     "keyWeight": "权重",
     "keyModels": "模型白名单",
     "keyModelsGuide": "可选。该密钥允许服务的模型 ID，英文逗号分隔。",

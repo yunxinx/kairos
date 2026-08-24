@@ -656,7 +656,24 @@ async fn handle_request(
         .await;
     }
     if let Some(max_tokens) = request.max_tokens.filter(|&n| n > 0) {
-        let estimate = estimate_admission_cost_micros(&hops, &snapshot, discount_bp, max_tokens);
+        let estimate =
+            match estimate_admission_cost_micros(&hops, &snapshot, discount_bp, max_tokens) {
+                Ok(estimate) => estimate,
+                Err(err) => {
+                    return billing_error_response(
+                        &deps,
+                        full_body,
+                        token,
+                        &request.model,
+                        started,
+                        err,
+                        inbound_protocol,
+                        request_body_for_log,
+                        &request_id,
+                    )
+                    .await;
+                }
+            };
         if discount_bp != 0 && estimate > balance.wallet.balance_usd_micros {
             let message = format!(
                 "用户余额不足以覆盖预估费用（预估 {:.2} USD，当前 {:.2} USD）",
@@ -852,15 +869,18 @@ fn estimate_admission_cost_micros(
     snapshot: &RuntimeSnapshot,
     discount_bp: i64,
     max_tokens: u32,
-) -> i64 {
+) -> Result<i64, billing::BillingError> {
     let mut max_output = 0i64;
     for hop in hops {
         for record in &hop.route.channels {
             let price = billed_price(snapshot, record, &hop.routed_model);
+            if price.output_micros < 0 {
+                return Err(billing::BillingError::NegativePrice);
+            }
             max_output = max_output.max(price.output_micros);
         }
     }
-    let base = billing::estimate_max_output_cost_micros(max_tokens, max_output);
+    let base = billing::estimate_max_output_cost_micros(max_tokens, max_output)?;
     billing::discounted_cost_micros(base, discount_bp)
 }
 
@@ -1370,9 +1390,29 @@ async fn passthrough_non_stream_completion(
         // 响应体原样透传（字节级一致），从 JSON 嗅探 usage 计费。
         let usage = protocol::sniff_usage(&parsed, channel.protocol).unwrap_or_default();
         let price = billed_price(ctx.snapshot, record, ctx.routed_model);
-        let base_cost = billing::cost_micros(&usage, &price);
         let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
-        let charged = billing::discounted_cost_micros(base_cost, discount_bp);
+        let billing = match Billing::try_calculated(
+            usage,
+            price,
+            discount_bp,
+            ctx.request_body.clone(),
+            ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
+        ) {
+            Ok(billing) => billing,
+            Err(err) => {
+                store::record_system_error(
+                    &ctx.deps.pool,
+                    "billing",
+                    &format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                )
+                .await;
+                return Outbound::Fatal {
+                    channel: channel.name.clone(),
+                    status: 500,
+                    message: "费用超出支持范围，未完成结算".to_string(),
+                };
+            }
+        };
         log_request(
             ctx.deps,
             ctx.token,
@@ -1382,15 +1422,7 @@ async fn passthrough_non_stream_completion(
             Some(&key.name),
             status_code,
             ctx.started,
-            Billing {
-                usage,
-                price,
-                base_cost_usd_micros: base_cost,
-                discount_bp,
-                cost_usd_micros: charged,
-                request_body: ctx.request_body.clone(),
-                response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
-            },
+            billing,
             ctx.inbound_protocol,
             ctx.request_id,
         )
@@ -1582,9 +1614,7 @@ async fn pipe_passthrough_stream<S>(
         );
     }
     // 流结束：按嗅探累积的 usage 结算并落日志。
-    let base_cost = billing::cost_micros(&usage, &ctx.price);
     let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
-    let charged = billing::discounted_cost_micros(base_cost, discount_bp);
     log_request(
         &ctx.deps,
         &ctx.token,
@@ -1594,15 +1624,13 @@ async fn pipe_passthrough_stream<S>(
         Some(&ctx.channel_key_name),
         ctx.status_code,
         ctx.started,
-        Billing {
+        Billing::calculated(
             usage,
-            price: ctx.price,
-            base_cost_usd_micros: base_cost,
+            ctx.price,
             discount_bp,
-            cost_usd_micros: charged,
-            request_body: ctx.request_body.clone(),
-            response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
-        },
+            ctx.request_body.clone(),
+            ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
+        ),
         ctx.protocol,
         &ctx.request_id,
     )
@@ -1716,15 +1744,35 @@ async fn non_stream_completion(
                 // 请求侧转换的信息损失随响应回传，下游可感知而非莫名降级。
                 ir.warnings.extend(request_warnings);
                 let usage = &ir.usage;
-                let base_cost = billing::cost_micros(usage, &price);
                 let discount_bp = snapshot.discount_bp_for_token(token);
-                let charged = billing::discounted_cost_micros(base_cost, discount_bp);
                 let inbound = protocol::encode_response(&ir, inbound_protocol);
                 // full_body 记录实际返回下游的入站响应字节（重编码结果）；
                 // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
                 let inbound_wire = snapshot
                     .full_body
                     .then(|| serde_json::to_vec(&inbound).unwrap_or_default());
+                let billing = match Billing::try_calculated(
+                    usage.clone(),
+                    price,
+                    discount_bp,
+                    ctx.request_body.clone(),
+                    inbound_wire,
+                ) {
+                    Ok(billing) => billing,
+                    Err(err) => {
+                        store::record_system_error(
+                            &deps.pool,
+                            "billing",
+                            &format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                        )
+                        .await;
+                        return Outbound::Fatal {
+                            channel: channel.name.clone(),
+                            status: 500,
+                            message: "费用超出支持范围，未完成结算".to_string(),
+                        };
+                    }
+                };
                 log_request(
                     deps,
                     token,
@@ -1734,15 +1782,7 @@ async fn non_stream_completion(
                     Some(&key.name),
                     status_code,
                     started,
-                    Billing {
-                        usage: usage.clone(),
-                        price,
-                        base_cost_usd_micros: base_cost,
-                        discount_bp,
-                        cost_usd_micros: charged,
-                        request_body: ctx.request_body.clone(),
-                        response_body: inbound_wire,
-                    },
+                    billing,
                     inbound_protocol,
                     ctx.request_id,
                 )
@@ -2101,10 +2141,7 @@ fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
 
 /// 结算流式请求费用并落日志。
 async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
-    let usage = &response.usage;
-    let base_cost = billing::cost_micros(usage, &ctx.price);
     let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
-    let charged = billing::discounted_cost_micros(base_cost, discount_bp);
     log_request(
         &ctx.deps,
         &ctx.token,
@@ -2114,15 +2151,13 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
         Some(&ctx.channel_key_name),
         ctx.status_code,
         ctx.started,
-        Billing {
-            usage: response.usage.clone(),
-            price: ctx.price,
-            base_cost_usd_micros: base_cost,
+        Billing::calculated(
+            response.usage.clone(),
+            ctx.price,
             discount_bp,
-            cost_usd_micros: charged,
-            request_body: ctx.request_body.clone(),
-            response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
-        },
+            ctx.request_body.clone(),
+            ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
+        ),
         ctx.inbound_protocol,
         &ctx.request_id,
     )
@@ -2272,8 +2307,10 @@ impl OutboundAuth for reqwest::RequestBuilder {
         inbound_version: Option<&HeaderValue>,
     ) -> Self {
         match protocol {
-            Protocol::OpenAiChat | Protocol::OpenAiResponses => self.bearer_auth(&key.api_key),
-            Protocol::AnthropicMessages => self.header("x-api-key", &key.api_key).header(
+            Protocol::OpenAiChat | Protocol::OpenAiResponses => {
+                self.bearer_auth(key.expose_api_key())
+            }
+            Protocol::AnthropicMessages => self.header("x-api-key", key.expose_api_key()).header(
                 "anthropic-version",
                 inbound_version
                     .cloned()
@@ -2340,6 +2377,7 @@ async fn error_response(
                 base_cost_usd_micros: 0,
                 discount_bp,
                 cost_usd_micros: 0,
+                calculation_error: None,
                 request_body,
                 response_body: response_wire,
             },
@@ -2444,6 +2482,40 @@ async fn db_error_response(
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         &message,
+        deps,
+        full_body,
+        Some(token),
+        Some(model),
+        started,
+        inbound_protocol,
+        request_body,
+        request_id,
+    )
+    .await
+}
+
+/// 准入费用不可表示：拒绝出站、写系统错误，并按 500 记录本次请求。
+#[allow(clippy::too_many_arguments)]
+async fn billing_error_response(
+    deps: &Deps,
+    full_body: bool,
+    token: &Token,
+    model: &str,
+    started: i64,
+    err: billing::BillingError,
+    inbound_protocol: Protocol,
+    request_body: Option<Bytes>,
+    request_id: &str,
+) -> Response {
+    store::record_system_error(
+        &deps.pool,
+        "billing",
+        &format!("准入费用计算失败，已拒绝出站: {err}"),
+    )
+    .await;
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "费用超出支持范围，未发起上游请求",
         deps,
         full_body,
         Some(token),

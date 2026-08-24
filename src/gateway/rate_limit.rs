@@ -12,7 +12,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::store::resources::{StoredChannelKey, channel_key_supports_model};
+use crate::store::channel_keys::{
+    StoredChannelKey, eligible_channel_keys, select_weighted_channel_key,
+};
 
 const STICKY_TTL: Duration = Duration::from_secs(60 * 60);
 
@@ -48,10 +50,7 @@ impl SessionStickyCache {
         session: u64,
         keys: &[StoredChannelKey],
     ) -> Option<StoredChannelKey> {
-        let candidates: Vec<&StoredChannelKey> = keys
-            .iter()
-            .filter(|key| key.enabled && channel_key_supports_model(key, model))
-            .collect();
+        let candidates = eligible_channel_keys(keys, model);
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         prune_sticky_expired(&mut map, now);
@@ -77,7 +76,7 @@ impl SessionStickyCache {
             map.remove(&cache_key);
         }
 
-        let selected = select_weighted(&candidates).clone();
+        let selected = select_weighted_channel_key(&candidates)?.clone();
         map.insert(
             cache_key,
             StickyEntry {
@@ -91,22 +90,6 @@ impl SessionStickyCache {
 
 fn prune_sticky_expired(map: &mut HashMap<StickyKey, StickyEntry>, now: Instant) {
     map.retain(|_, entry| entry.expires_at > now);
-}
-
-fn select_weighted<'a>(candidates: &[&'a StoredChannelKey]) -> &'a StoredChannelKey {
-    let total: u128 = candidates.iter().map(|key| key.weight.max(0) as u128).sum();
-    if total == 0 {
-        return candidates[rand::random_range(0..candidates.len())];
-    }
-    let mut point = rand::random_range(0..total);
-    for key in candidates {
-        let weight = key.weight.max(0) as u128;
-        if point < weight {
-            return key;
-        }
-        point -= weight;
-    }
-    candidates[0]
 }
 
 /// 滑动窗口长度：RPM 按自然分钟计数。
@@ -233,17 +216,17 @@ mod tests {
     use crate::store::resources::StoredChannelKey;
 
     fn key(id: i64, weight: i64, enabled: bool) -> StoredChannelKey {
-        StoredChannelKey {
+        StoredChannelKey::new(
             id,
-            channel_id: 7,
-            name: format!("key-{id}"),
-            api_key: format!("secret-{id}"),
+            7,
+            format!("key-{id}"),
+            format!("secret-{id}"),
             weight,
             enabled,
-            models: None,
-            blocked_models: None,
-            created_at: 0,
-        }
+            None,
+            None,
+            0,
+        )
     }
 
     #[test]

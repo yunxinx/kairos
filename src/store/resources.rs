@@ -12,6 +12,9 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::config::Protocol;
 use crate::store::StoreError;
+pub use crate::store::channel_keys::{
+    ChannelKey, StoredChannelKey, channel_key_supports_model, select_channel_key,
+};
 
 /// 内置模型组名：未指定分组的令牌与未放入其他组的可调用名落在此组。
 pub const DEFAULT_MODEL_GROUP: &str = "default";
@@ -51,44 +54,6 @@ pub struct Channel {
     /// 添加可调用名时并入的模型组；[`DEFAULT_MODEL_GROUP`] 表示不自动入组。
     #[serde(default = "default_model_group")]
     pub model_group: String,
-}
-
-/// 渠道上的一把上游密钥。密钥明文只在运行时内存中存在，日志只记录 `id`/`name`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ChannelKey {
-    pub name: String,
-    pub api_key: String,
-    #[serde(default = "default_channel_key_weight")]
-    pub weight: i64,
-    #[serde(default = "default_channel_key_enabled")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub models: Option<Vec<String>>,
-    #[serde(default)]
-    pub blocked_models: Option<Vec<String>>,
-}
-
-/// 已持久化的渠道密钥：含库生成身份，供运行时选取和记录。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredChannelKey {
-    pub id: i64,
-    pub channel_id: i64,
-    pub name: String,
-    pub api_key: String,
-    pub weight: i64,
-    pub enabled: bool,
-    pub models: Option<Vec<String>>,
-    pub blocked_models: Option<Vec<String>>,
-    pub created_at: i64,
-}
-
-fn default_channel_key_weight() -> i64 {
-    1
-}
-
-fn default_channel_key_enabled() -> bool {
-    true
 }
 
 /// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
@@ -584,7 +549,7 @@ pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord
     for row in rows {
         channels.push(map_channel_record(&row)?);
     }
-    attach_channel_keys(channels, list_channel_keys(pool).await?)
+    attach_channel_keys(channels, list_channel_keys(pool).await?, true)
 }
 
 /// 在调用方已经开启的事务里读出全部渠道记录。
@@ -618,23 +583,22 @@ pub async fn list_channel_records_on_conn(
             let blocked_json: Option<String> = row
                 .try_get("blocked_models_json")
                 .map_err(StoreError::Query)?;
-            Ok(StoredChannelKey {
-                id: row.try_get("id").map_err(StoreError::Query)?,
-                channel_id: row.try_get("channel_id").map_err(StoreError::Query)?,
-                name: row.try_get("name").map_err(StoreError::Query)?,
-                api_key: row.try_get("api_key").map_err(StoreError::Query)?,
-                weight: row.try_get("weight").map_err(StoreError::Query)?,
-                enabled: row
-                    .try_get::<i64, _>("enabled")
+            Ok(StoredChannelKey::new(
+                row.try_get("id").map_err(StoreError::Query)?,
+                row.try_get("channel_id").map_err(StoreError::Query)?,
+                row.try_get("name").map_err(StoreError::Query)?,
+                row.try_get("api_key").map_err(StoreError::Query)?,
+                row.try_get("weight").map_err(StoreError::Query)?,
+                row.try_get::<i64, _>("enabled")
                     .map_err(StoreError::Query)?
                     != 0,
-                models: parse_optional_models(models_json)?,
-                blocked_models: parse_optional_models(blocked_json)?,
-                created_at: row.try_get("created_at").map_err(StoreError::Query)?,
-            })
+                parse_optional_models(models_json)?,
+                parse_optional_models(blocked_json)?,
+                row.try_get("created_at").map_err(StoreError::Query)?,
+            ))
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
-    attach_channel_keys(channels, keys)
+    attach_channel_keys(channels, keys, true)
 }
 
 const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, models_json, \
@@ -691,52 +655,56 @@ pub async fn list_channel_keys(pool: &SqlitePool) -> Result<Vec<StoredChannelKey
             let blocked_json: Option<String> = row
                 .try_get("blocked_models_json")
                 .map_err(StoreError::Query)?;
-            Ok(StoredChannelKey {
-                id: row.try_get("id").map_err(StoreError::Query)?,
-                channel_id: row.try_get("channel_id").map_err(StoreError::Query)?,
-                name: row.try_get("name").map_err(StoreError::Query)?,
-                api_key: row.try_get("api_key").map_err(StoreError::Query)?,
-                weight: row.try_get("weight").map_err(StoreError::Query)?,
-                enabled: row
-                    .try_get::<i64, _>("enabled")
+            Ok(StoredChannelKey::new(
+                row.try_get("id").map_err(StoreError::Query)?,
+                row.try_get("channel_id").map_err(StoreError::Query)?,
+                row.try_get("name").map_err(StoreError::Query)?,
+                row.try_get("api_key").map_err(StoreError::Query)?,
+                row.try_get("weight").map_err(StoreError::Query)?,
+                row.try_get::<i64, _>("enabled")
                     .map_err(StoreError::Query)?
                     != 0,
-                models: parse_optional_models(models_json)?,
-                blocked_models: parse_optional_models(blocked_json)?,
-                created_at: row.try_get("created_at").map_err(StoreError::Query)?,
-            })
+                parse_optional_models(models_json)?,
+                parse_optional_models(blocked_json)?,
+                row.try_get("created_at").map_err(StoreError::Query)?,
+            ))
         })
         .collect()
-}
-
-/// 将渠道密钥附加到渠道记录，供运行时路由使用。
-pub async fn list_channel_records_with_keys(
-    pool: &SqlitePool,
-) -> Result<Vec<ChannelRecord>, StoreError> {
-    list_channel_records(pool).await
 }
 
 fn attach_channel_keys(
     mut records: Vec<ChannelRecord>,
     keys: Vec<StoredChannelKey>,
+    include_wire: bool,
 ) -> Result<Vec<ChannelRecord>, StoreError> {
     for key in keys {
         if let Some(record) = records
             .iter_mut()
             .find(|record| record.id == key.channel_id)
         {
-            record.channel.keys.push(ChannelKey {
-                name: key.name.clone(),
-                api_key: key.api_key.clone(),
-                weight: key.weight,
-                enabled: key.enabled,
-                models: key.models.clone(),
-                blocked_models: key.blocked_models.clone(),
-            });
+            if include_wire {
+                record.channel.keys.push(key.to_wire());
+            }
             record.keys.push(key);
         }
     }
     Ok(records)
+}
+
+/// 运行时快照读取渠道时剥离 wire 明文，避免同一密钥在 `Channel` DTO 与受保护
+/// `StoredChannelKey` 中保留两份；管理面仍从 `ChannelRecord.keys` 按需构造 wire。
+pub async fn list_channel_records_without_secrets(
+    pool: &SqlitePool,
+) -> Result<Vec<ChannelRecord>, StoreError> {
+    let rows = sqlx::query(CHANNEL_RECORD_SELECT)
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    let mut channels = Vec::with_capacity(rows.len());
+    for row in rows {
+        channels.push(map_channel_record(&row)?);
+    }
+    attach_channel_keys(channels, list_channel_keys(pool).await?, false)
 }
 
 fn parse_optional_models(value: Option<String>) -> Result<Option<Vec<String>>, StoreError> {
@@ -746,49 +714,6 @@ fn parse_optional_models(value: Option<String>) -> Result<Option<Vec<String>>, S
                 .map_err(|_| StoreError::InvalidResource("渠道密钥模型名单非法".to_string()))
         })
         .transpose()
-}
-
-/// 判断密钥是否允许该模型。
-pub fn channel_key_supports_model(key: &StoredChannelKey, model: &str) -> bool {
-    let allowed = key
-        .models
-        .as_ref()
-        .is_none_or(|models| models.iter().any(|item| item == model));
-    let blocked = key
-        .blocked_models
-        .as_ref()
-        .is_some_and(|models| models.iter().any(|item| item == model));
-    allowed && !blocked
-}
-
-/// 按权重随机选取一把密钥。权重全为零时退化为等概率。
-pub fn select_channel_key<'a>(
-    keys: &'a [StoredChannelKey],
-    model: &str,
-) -> Option<&'a StoredChannelKey> {
-    let candidates: Vec<&StoredChannelKey> = keys
-        .iter()
-        .filter(|key| key.enabled && channel_key_supports_model(key, model))
-        .collect();
-    if candidates.is_empty() {
-        return None;
-    }
-    if candidates.len() == 1 {
-        return Some(candidates[0]);
-    }
-    let total: u128 = candidates.iter().map(|key| key.weight.max(0) as u128).sum();
-    if total == 0 {
-        return Some(candidates[rand::random_range(0..candidates.len())]);
-    }
-    let mut point = rand::random_range(0..total);
-    for key in candidates {
-        let weight = key.weight.max(0) as u128;
-        if point < weight {
-            return Some(key);
-        }
-        point -= weight;
-    }
-    None
 }
 
 /// 读出所有显式同名渠道顺序行，按可调用名、位置、渠道 id 保证稳定顺序。
@@ -1668,18 +1593,17 @@ mod tests {
         models: Option<Vec<&str>>,
         blocked_models: Option<Vec<&str>>,
     ) -> StoredChannelKey {
-        StoredChannelKey {
+        StoredChannelKey::new(
             id,
             channel_id,
-            name: name.to_string(),
-            api_key: format!("secret-{id}"),
+            name.to_string(),
+            format!("secret-{id}"),
             weight,
             enabled,
-            models: models.map(|items| items.into_iter().map(str::to_string).collect()),
-            blocked_models: blocked_models
-                .map(|items| items.into_iter().map(str::to_string).collect()),
-            created_at: 0,
-        }
+            models.map(|items| items.into_iter().map(str::to_string).collect()),
+            blocked_models.map(|items| items.into_iter().map(str::to_string).collect()),
+            0,
+        )
     }
 
     /// 高权重密钥在大量独立选取中显著更常出现。

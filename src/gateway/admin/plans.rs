@@ -176,7 +176,11 @@ async fn create_plan(
     let plan = plans::get_plan(&deps.pool, plan.id)
         .await
         .map_err(AdminError::Store)?
-        .expect("提交后的套餐应存在");
+        .ok_or_else(|| {
+            AdminError::Store(store::StoreError::InvalidResource(
+                "套餐提交后不可读".to_string(),
+            ))
+        })?;
     Ok((StatusCode::CREATED, Json(PlanView::from_record(plan, true))))
 }
 
@@ -209,7 +213,11 @@ async fn update_plan(
     let plan = plans::get_plan(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
-        .expect("提交后的套餐应存在");
+        .ok_or_else(|| {
+            AdminError::Store(store::StoreError::InvalidResource(format!(
+                "套餐 {id} 提交后不可读"
+            )))
+        })?;
     Ok(Json(PlanView::from_record(plan, true)))
 }
 

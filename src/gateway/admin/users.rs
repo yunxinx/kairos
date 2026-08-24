@@ -404,6 +404,12 @@ async fn create_user(
 ) -> Result<(StatusCode, Json<UserView>), AdminError> {
     identity.require_capability(ManagementCapability::ManageUsers)?;
     let create = body.map_err(AdminError::bad_body)?.0;
+    if create
+        .plan_id
+        .is_some_and(|plan_id| Some(plan_id) != users::default_plan_id_for_role(create.role))
+    {
+        identity.require_capability(ManagementCapability::AssignPlan)?;
+    }
     match (identity.role(), create.role) {
         // root 全局唯一：创建接口不接受 root，内置账号是唯一来源。
         (_, ManagementRole::Root) => return Err(AdminError::Forbidden),

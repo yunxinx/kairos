@@ -200,7 +200,7 @@ pub type SnapshotHandle = Arc<RwLock<Arc<RuntimeSnapshot>>>;
 /// 四类资源分别读取：渠道/令牌/价格直接装载，运行时开关经 `load_settings` 解析
 /// 出日志、网关保护与目录同步等设置（缺省用默认值）。
 pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreError> {
-    let channels = resources::list_channel_records_with_keys(pool).await?;
+    let channels = resources::list_channel_records_without_secrets(pool).await?;
     let channel_model_order = resources::list_channel_model_orders(pool).await?;
     let token_rows = resources::list_tokens(pool).await?;
     let price_rows = resources::list_prices(pool).await?;

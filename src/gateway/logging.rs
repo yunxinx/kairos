@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use crate::{
     config::Protocol,
-    core::billing::{self, PriceSnapshot},
+    core::billing::{self, BillingError, PriceSnapshot},
     core::ir::Usage,
     store,
     store::resources::Token,
@@ -27,6 +27,8 @@ pub(super) struct Billing {
     pub(super) discount_bp: i64,
     /// 实收（折后），用于扣钱包、累计结算与日志。
     pub(super) cost_usd_micros: i64,
+    /// 费用不可表示时保留错误；该请求只能写成未结算，禁止用零费用掩盖。
+    pub(super) calculation_error: Option<BillingError>,
     pub(super) request_body: Option<Bytes>,
     pub(super) response_body: Option<Vec<u8>>,
 }
@@ -39,8 +41,61 @@ impl Default for Billing {
             base_cost_usd_micros: 0,
             discount_bp: billing::DEFAULT_DISCOUNT_BP,
             cost_usd_micros: 0,
+            calculation_error: None,
             request_body: None,
             response_body: None,
+        }
+    }
+}
+
+impl Billing {
+    /// 从 usage 与价格受检构造计费结果；失败时保留原始 usage/价格并标记未结算。
+    pub(super) fn try_calculated(
+        usage: Usage,
+        price: PriceSnapshot,
+        discount_bp: i64,
+        request_body: Option<Bytes>,
+        response_body: Option<Vec<u8>>,
+    ) -> Result<Self, BillingError> {
+        let charge = billing::charge_micros(&usage, &price, discount_bp)?;
+        Ok(Self {
+            usage,
+            price,
+            base_cost_usd_micros: charge.base_cost_usd_micros,
+            discount_bp,
+            cost_usd_micros: charge.cost_usd_micros,
+            calculation_error: None,
+            request_body,
+            response_body,
+        })
+    }
+
+    /// 从 usage 与价格受检构造计费结果；失败时保留原始 usage/价格并标记未结算。
+    pub(super) fn calculated(
+        usage: Usage,
+        price: PriceSnapshot,
+        discount_bp: i64,
+        request_body: Option<Bytes>,
+        response_body: Option<Vec<u8>>,
+    ) -> Self {
+        match Self::try_calculated(
+            usage.clone(),
+            price,
+            discount_bp,
+            request_body.clone(),
+            response_body.clone(),
+        ) {
+            Ok(billing) => billing,
+            Err(err) => Self {
+                usage,
+                price,
+                base_cost_usd_micros: 0,
+                discount_bp,
+                cost_usd_micros: 0,
+                calculation_error: Some(err),
+                request_body,
+                response_body,
+            },
         }
     }
 }
@@ -129,11 +184,23 @@ pub(super) async fn log_request(
         base_cost_usd_micros: billing.base_cost_usd_micros,
         discount_bp: billing.discount_bp,
         cost_usd_micros: billing.cost_usd_micros,
-        settled: billing.cost_usd_micros <= 0,
+        settled: billing.calculation_error.is_none() && billing.cost_usd_micros == 0,
         request_id: Some(request_id.to_string()),
         request_body: clip_logged_body(billing.request_body.map(|bytes| bytes.to_vec()), max_bytes),
         response_body: clip_logged_body(billing.response_body, max_bytes),
     };
+
+    if let Some(err) = billing.calculation_error {
+        log.settled = false;
+        write_unsettled_request_log(
+            deps,
+            log,
+            "billing",
+            &format!("费用计算失败，未执行结算: {err}"),
+        )
+        .await;
+        return;
+    }
 
     let mut tx = match deps.pool.begin().await {
         Ok(tx) => tx,

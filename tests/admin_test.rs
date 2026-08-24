@@ -1208,6 +1208,20 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
         .expect("渠道列表应可解析");
     assert_eq!(before, after, "冲突写不应改变库与快照");
 
+    // 同一渠道内密钥名（按保存时 trim 后）必须唯一，避免日志无法辨识实际凭据。
+    let mut duplicate_keys = channel_body(
+        "duplicate-key-names",
+        gw.upstream.base_url(),
+        json!([TEST_MODEL]),
+    );
+    duplicate_keys["keys"] = json!([
+        { "name": "primary", "api_key": "sk-a", "weight": 1, "enabled": true },
+        { "name": " primary ", "api_key": "sk-b", "weight": 1, "enabled": true }
+    ]);
+    let duplicate_response =
+        admin_json(&gw, reqwest::Method::POST, "/channels", duplicate_keys).await;
+    assert_eq!(duplicate_response.status(), reqwest::StatusCode::CONFLICT);
+
     // 删除不存在的资源 → 404。
     let resp = client
         .delete(format!("{admin}/tokens/does-not-exist"))

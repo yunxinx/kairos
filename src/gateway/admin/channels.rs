@@ -37,7 +37,8 @@ struct ChannelView {
 }
 
 impl ChannelView {
-    fn from_record(record: ChannelRecord) -> Self {
+    fn from_record(mut record: ChannelRecord) -> Self {
+        record.channel.keys = record.keys.iter().map(|key| key.to_wire()).collect();
         ChannelView {
             id: record.id,
             channel: record.channel,
@@ -237,6 +238,9 @@ fn normalize_channel_group(channel: &mut Channel) {
     if channel.model_group.is_empty() {
         channel.model_group = crate::store::resources::DEFAULT_MODEL_GROUP.to_string();
     }
+    for key in &mut channel.keys {
+        key.name = key.name.trim().to_string();
+    }
 }
 
 /// 把本次新加入渠道的可调用名钉进渠道默认组；`default` 不入组。
@@ -272,6 +276,7 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     if channel.keys.is_empty() {
         return Err(AdminError::InvalidBody("keys 不能为空".to_string()));
     }
+    let mut key_names = HashSet::with_capacity(channel.keys.len());
     for key in &channel.keys {
         if key.name.trim().is_empty() {
             return Err(AdminError::InvalidBody("密钥 name 不能为空".to_string()));
@@ -283,6 +288,12 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
             return Err(AdminError::InvalidBody(
                 "密钥 weight 不能小于 0".to_string(),
             ));
+        }
+        if !key_names.insert(key.name.as_str()) {
+            return Err(AdminError::Conflict(format!(
+                "渠道内密钥名称 {} 重复",
+                key.name
+            )));
         }
     }
     Ok(())

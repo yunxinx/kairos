@@ -938,6 +938,44 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         StatusCode::OK
     );
 
+    // 创建用户时显式挂载非默认套餐也属于套餐分配，不能只凭 ManageUsers 绕过 AssignPlan。
+    let custom_plan = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/plans",
+        json!({
+            "internal_name": "explicit-assignment-check",
+            "display_name": "显式分配校验",
+            "shared_with_admin": true
+        }),
+    )
+    .await;
+    assert_eq!(custom_plan.status(), StatusCode::CREATED);
+    let custom_plan_id = custom_plan.json::<Value>().await.expect("套餐应可解析")["id"]
+        .as_i64()
+        .expect("套餐应有 id");
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind("{\"manage_users\":true}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能只打开用户管理能力");
+    let explicit_assignment = bearer_json(
+        &gw,
+        &admin_token,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "explicit-assignment-check@example.com",
+            "display_name": "显式分配校验",
+            "password": "password1",
+            "role": "user",
+            "plan_id": custom_plan_id
+        }),
+    )
+    .await;
+    assert_eq!(explicit_assignment.status(), StatusCode::FORBIDDEN);
+
     sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
         .bind("{}")
         .execute(&gw.pool)

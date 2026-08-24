@@ -381,6 +381,7 @@
     "removeKey": "Remove key {name}",
     "keyLabel": "Key {n}",
     "keyName": "Name",
+    "keyNameDuplicate": "Key names must be unique within a channel.",
     "keyWeight": "Weight",
     "keyModels": "Model allow list",
     "keyModelsGuide": "Optional. Comma-separated model IDs this key may serve.",

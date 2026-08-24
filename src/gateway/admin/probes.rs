@@ -243,17 +243,17 @@ async fn list_upstream_models(
     if draft.timeout_ms < 1 {
         return Err(AdminError::InvalidBody("timeout_ms 不能小于 1".to_string()));
     }
-    let key = StoredChannelKey {
-        id: 0,
-        channel_id: 0,
-        name: "draft".to_string(),
-        api_key: draft.api_key,
-        weight: 1,
-        enabled: true,
-        models: None,
-        blocked_models: None,
-        created_at: 0,
-    };
+    let key = StoredChannelKey::new(
+        0,
+        0,
+        "draft".to_string(),
+        draft.api_key,
+        1,
+        true,
+        None,
+        None,
+        0,
+    );
     let url = format!(
         "{}{}",
         draft.base_url.trim_end_matches('/'),

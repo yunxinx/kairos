@@ -6,6 +6,7 @@
 //! `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
 pub mod catalog;
+pub mod channel_keys;
 pub mod plans;
 pub mod resources;
 mod system_log;
