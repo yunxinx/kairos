@@ -11,7 +11,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { channelWriteBody, type Channel, type ChannelView, type Protocol } from '@/api/types';
+import {
+  channelWriteBody,
+  type Channel,
+  type ChannelKey,
+  type ChannelView,
+  type Protocol,
+} from '@/api/types';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
@@ -80,7 +86,6 @@ const uid = useId();
 const nameInputId = `channel-editor-name-${uid}`;
 const protocolInputId = `channel-editor-protocol-${uid}`;
 const baseUrlInputId = `channel-editor-base-url-${uid}`;
-const apiKeyInputId = `channel-editor-api-key-${uid}`;
 const timeoutMsInputId = `channel-editor-timeout-ms-${uid}`;
 const maxRetriesInputId = `channel-editor-max-retries-${uid}`;
 const enabledInputId = `channel-editor-enabled-${uid}`;
@@ -98,11 +103,81 @@ const protocolOptions = computed(() =>
   })),
 );
 
+interface EditorKey {
+  name: string;
+  api_key: string;
+  /** 权重输入草稿；保存时按无符号整数解析，空值按 1 处理。 */
+  weight: string;
+  enabled: boolean;
+  /** 逗号分隔的模型白名单草稿。 */
+  models: string;
+  /** 逗号分隔的模型黑名单草稿。 */
+  blocked_models: string;
+}
+
+function parseCommaList(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item !== '');
+}
+
+function keyToEditor(key: ChannelKey): EditorKey {
+  return {
+    name: key.name,
+    api_key: key.api_key,
+    weight: String(key.weight),
+    enabled: key.enabled,
+    models: (key.models ?? []).join(', '),
+    blocked_models: (key.blocked_models ?? []).join(', '),
+  };
+}
+
+function editorToKey(editor: EditorKey): ChannelKey {
+  const weight = parseOptionalUint(editor.weight);
+  const models = parseCommaList(editor.models);
+  const blockedModels = parseCommaList(editor.blocked_models);
+  return {
+    name: editor.name.trim(),
+    api_key: editor.api_key.trim(),
+    weight: weight ?? 1,
+    enabled: editor.enabled,
+    models: models.length > 0 ? models : null,
+    blocked_models: blockedModels.length > 0 ? blockedModels : null,
+  };
+}
+
+function sameEditorKey(left: EditorKey, right: EditorKey): boolean {
+  return (
+    left.name.trim() === right.name.trim() &&
+    left.api_key === right.api_key &&
+    left.weight.trim() === right.weight.trim() &&
+    left.enabled === right.enabled &&
+    parseCommaList(left.models).join('\0') === parseCommaList(right.models).join('\0') &&
+    parseCommaList(left.blocked_models).join('\0') ===
+      parseCommaList(right.blocked_models).join('\0')
+  );
+}
+
+function emptyEditorKey(): EditorKey {
+  return {
+    name: '',
+    api_key: '',
+    weight: '1',
+    enabled: true,
+    models: '',
+    blocked_models: '',
+  };
+}
+
+const initialKeys =
+  props.initial && props.initial.keys.length > 0
+    ? props.initial.keys.map(keyToEditor)
+    : [{ ...emptyEditorKey(), name: 'default' }];
 const initialValues = {
   name: props.initial?.name ?? '',
   protocol: props.initial?.protocol ?? 'openai_chat',
   baseUrl: props.initial?.base_url ?? '',
-  apiKey: props.initial?.api_key ?? '',
   models: props.initial ? [...props.initial.models] : ([] as string[]),
   aliases: props.initial ? { ...props.initial.model_aliases } : ({} as Record<string, string>),
   timeoutMs: String(props.initial?.timeout_ms ?? '30000'),
@@ -114,7 +189,9 @@ const initialValues = {
 const editorName = ref(initialValues.name);
 const editorProtocol = ref<Protocol>(initialValues.protocol);
 const editorBaseUrl = ref(initialValues.baseUrl);
-const editorApiKey = ref(initialValues.apiKey);
+const editorKeys = ref<EditorKey[]>(
+  initialKeys.length > 0 ? initialKeys.map((key) => ({ ...key })) : [emptyEditorKey()],
+);
 const editorModels = ref<string[]>(initialValues.models);
 /** 别名映射草稿（别名 → 主模型名）：仅在同步表格中编辑。 */
 const editorAliasesMap = ref<Record<string, string>>(initialValues.aliases);
@@ -130,7 +207,10 @@ const dirty = computed(
     editorName.value !== initialValues.name ||
     editorProtocol.value !== initialValues.protocol ||
     editorBaseUrl.value !== initialValues.baseUrl ||
-    editorApiKey.value !== initialValues.apiKey ||
+    editorKeys.value.length !== initialKeys.length ||
+    editorKeys.value.some(
+      (key, index) => !sameEditorKey(key, initialKeys[index] ?? emptyEditorKey()),
+    ) ||
     !sameModelSet(editorModels.value, initialValues.models) ||
     !sameAliasMap(editorAliasesMap.value, initialValues.aliases) ||
     editorTimeoutMs.value !== initialValues.timeoutMs ||
@@ -269,6 +349,17 @@ function clearAddModelDraft() {
   addModelDraft.value = '';
 }
 
+// --- 密钥列表 ---
+
+function addKey() {
+  editorKeys.value = [...editorKeys.value, emptyEditorKey()];
+}
+
+function removeKey(index: number) {
+  if (editorKeys.value.length <= 1) return;
+  editorKeys.value = editorKeys.value.filter((_, itemIndex) => itemIndex !== index);
+}
+
 // --- chip 点击复制模型名 ---
 
 function copyModel(model: string) {
@@ -286,10 +377,13 @@ interface FloatingWindowControls {
 const floatingWindow = useTemplateRef<FloatingWindowControls>('floatingWindow');
 const editorView = ref<EditorView>('form');
 
-/** 出站三要素缺一即无法拉取上游模型。 */
-const canSync = computed(
-  () => editorBaseUrl.value.trim() !== '' && editorApiKey.value.trim() !== '',
+/** 上游模型同步使用第一把非空密钥；同步视图只关心能否取到上游列表。 */
+const syncApiKey = computed(
+  () => editorKeys.value.find((key) => key.api_key.trim() !== '')?.api_key ?? '',
 );
+
+/** 出站三要素缺一即无法拉取上游模型。 */
+const canSync = computed(() => editorBaseUrl.value.trim() !== '' && syncApiKey.value.trim() !== '');
 
 /** 草稿超时解析结果；非法传 null，由同步视图兜底缺省值。 */
 const syncTimeoutMs = computed(() => parseOptionalUint(editorTimeoutMs.value));
@@ -327,7 +421,6 @@ function handleSave() {
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
     { name: 'baseUrl', value: editorBaseUrl.value, rules: [{ kind: 'required' }] },
-    { name: 'apiKey', value: editorApiKey.value, rules: [{ kind: 'required' }] },
     {
       name: 'timeoutMs',
       value: editorTimeoutMs.value,
@@ -339,6 +432,13 @@ function handleSave() {
       rules: [{ kind: 'required' }, { kind: 'uint' }],
     },
   ];
+  editorKeys.value.forEach((key, index) => {
+    specs.push({ name: `keyName${index}`, value: key.name, rules: [{ kind: 'required' }] });
+    specs.push({ name: `keyApi${index}`, value: key.api_key, rules: [{ kind: 'required' }] });
+    if (key.weight.trim() !== '' && parseOptionalUint(key.weight) === null) {
+      specs.push({ name: `keyWeight${index}`, value: key.weight, rules: [{ kind: 'uint' }] });
+    }
+  });
   if (!validate(specs, t)) {
     const failedField = activeError.value?.field;
     if (failedField && ADVANCED_FIELDS.has(failedField)) {
@@ -351,6 +451,7 @@ function handleSave() {
   if (timeoutMs === null || maxRetries === null) {
     return;
   }
+  const keys = editorKeys.value.map(editorToKey);
   const models = [...editorModels.value].sort(compareModels);
   const modelAliases = { ...editorAliasesMap.value };
   if (props.initial === null) {
@@ -358,11 +459,9 @@ function handleSave() {
       name: editorName.value.trim(),
       protocol: editorProtocol.value,
       base_url: editorBaseUrl.value.trim(),
-      api_key: editorApiKey.value,
+      keys,
       models,
       model_aliases: modelAliases,
-      priority: 0,
-      weight: 1,
       timeout_ms: timeoutMs,
       max_retries: maxRetries,
       enabled: editorEnabled.value,
@@ -371,7 +470,7 @@ function handleSave() {
     return;
   }
   // 编辑以列表中最新定义为基底整体替换写：开窗期间行内改过的字段
-  // （如优先级/权重）不会被开窗时刻的旧快照覆盖。
+  // 不会被开窗时刻的旧快照覆盖。
   const latest = queryClient
     .getQueryData<ChannelView[]>(['channels'])
     ?.find((item) => item.id === props.initial?.id);
@@ -384,7 +483,7 @@ function handleSave() {
     name: editorName.value.trim(),
     protocol: editorProtocol.value,
     base_url: editorBaseUrl.value.trim(),
-    api_key: editorApiKey.value,
+    keys,
     models,
     model_aliases: modelAliases,
     timeout_ms: timeoutMs,
@@ -479,35 +578,162 @@ function handleSave() {
                 />
               </template>
             </FormField>
-            <FormField
-              field-name="apiKey"
-              :label="t('channel.apiKey')"
-              :input-id="apiKeyInputId"
-              :error="fieldError('apiKey')"
-            >
-              <template #default="{ hintId, invalid }">
-                <FormTextInput
-                  v-if="initial === null"
-                  :id="apiKeyInputId"
-                  v-model="editorApiKey"
-                  type="text"
-                  autocomplete="off"
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('apiKey')"
-                />
-                <FormPasswordInput
-                  v-else
-                  :id="apiKeyInputId"
-                  v-model="editorApiKey"
-                  autocomplete="off"
-                  mask-while-hidden
-                  :invalid="invalid"
-                  :hint-id="hintId"
-                  v-on="fieldInputHandlers('apiKey')"
-                />
-              </template>
-            </FormField>
+            <fieldset class="border-seed rounded-md border p-3" data-testid="channel-keys-fieldset">
+              <legend
+                class="text-fg-muted flex w-full items-center gap-1.5 px-1 text-xs font-medium"
+              >
+                {{ t('channel.keysTitle') }}
+                <span
+                  class="badge badge-neutral font-mono"
+                  data-testid="channel-key-count"
+                  :aria-label="t('channel.keysTitle')"
+                >
+                  {{ editorKeys.length }}
+                </span>
+                <span class="legend-rule" aria-hidden="true" />
+                <button
+                  type="button"
+                  class="legend-btn"
+                  data-testid="channel-add-key"
+                  @click="addKey"
+                >
+                  {{ t('channel.addKey') }}
+                </button>
+              </legend>
+              <div
+                v-for="(key, index) in editorKeys"
+                :key="index"
+                class="border-seed mb-3 rounded-md border p-3 last:mb-0"
+                data-testid="channel-key-row"
+                :data-key-index="index"
+              >
+                <div class="mb-2 flex items-center justify-between gap-2">
+                  <span class="text-fg-muted text-xs font-medium">
+                    {{ t('channel.keyLabel', { n: index + 1 }) }}
+                  </span>
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon"
+                    :disabled="editorKeys.length <= 1"
+                    data-testid="channel-key-remove"
+                    :aria-label="t('channel.removeKey', { name: key.name || index + 1 })"
+                    @click="removeKey(index)"
+                  >
+                    <UiIcon name="close" :size="14" />
+                  </button>
+                </div>
+                <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <FormField
+                    :field-name="`keyName${index}`"
+                    :label="t('channel.keyName')"
+                    :input-id="`${uid}-channel-editor-key-name-${index}`"
+                    :error="fieldError(`keyName${index}`)"
+                  >
+                    <template #default="{ hintId, invalid }">
+                      <FormTextInput
+                        :id="`${uid}-channel-editor-key-name-${index}`"
+                        v-model="key.name"
+                        type="text"
+                        autocomplete="off"
+                        :invalid="invalid"
+                        :hint-id="hintId"
+                        data-testid="channel-key-name"
+                        v-on="fieldInputHandlers(`keyName${index}`)"
+                      />
+                    </template>
+                  </FormField>
+                  <FormField
+                    :field-name="`keyApi${index}`"
+                    :label="t('channel.apiKey')"
+                    :input-id="`${uid}-channel-editor-key-apikey-${index}`"
+                    :error="fieldError(`keyApi${index}`)"
+                  >
+                    <template #default="{ hintId, invalid }">
+                      <FormTextInput
+                        v-if="initial === null"
+                        :id="`${uid}-channel-editor-key-apikey-${index}`"
+                        v-model="key.api_key"
+                        type="text"
+                        autocomplete="off"
+                        :invalid="invalid"
+                        :hint-id="hintId"
+                        data-testid="channel-key-api"
+                        v-on="fieldInputHandlers(`keyApi${index}`)"
+                      />
+                      <FormPasswordInput
+                        v-else
+                        :id="`${uid}-channel-editor-key-apikey-${index}`"
+                        v-model="key.api_key"
+                        autocomplete="off"
+                        mask-while-hidden
+                        :invalid="invalid"
+                        :hint-id="hintId"
+                        data-testid="channel-key-api"
+                        v-on="fieldInputHandlers(`keyApi${index}`)"
+                      />
+                    </template>
+                  </FormField>
+                  <FormField
+                    :field-name="`keyWeight${index}`"
+                    :label="t('channel.keyWeight')"
+                    :input-id="`${uid}-channel-editor-key-weight-${index}`"
+                    :error="fieldError(`keyWeight${index}`)"
+                  >
+                    <template #default="{ hintId, invalid }">
+                      <FormTextInput
+                        :id="`${uid}-channel-editor-key-weight-${index}`"
+                        v-model="key.weight"
+                        type="text"
+                        inputmode="numeric"
+                        :invalid="invalid"
+                        :hint-id="hintId"
+                        data-testid="channel-key-weight"
+                        v-on="fieldInputHandlers(`keyWeight${index}`)"
+                      />
+                    </template>
+                  </FormField>
+                  <FormField
+                    :field-name="`keyEnabled${index}`"
+                    :label="t('channel.enabled')"
+                    :input-id="`${uid}-channel-editor-key-enabled-${index}`"
+                  >
+                    <FormSwitch
+                      :id="`${uid}-channel-editor-key-enabled-${index}`"
+                      v-model="key.enabled"
+                      data-testid="channel-key-enabled"
+                    />
+                  </FormField>
+                  <FormField
+                    :field-name="`keyModels${index}`"
+                    :label="t('channel.keyModels')"
+                    :input-id="`${uid}-channel-editor-key-models-${index}`"
+                    :guide="t('channel.keyModelsGuide')"
+                  >
+                    <FormTextInput
+                      :id="`${uid}-channel-editor-key-models-${index}`"
+                      v-model="key.models"
+                      type="text"
+                      :placeholder="t('channel.keyModelsPlaceholder')"
+                      data-testid="channel-key-models"
+                    />
+                  </FormField>
+                  <FormField
+                    :field-name="`keyBlocked${index}`"
+                    :label="t('channel.keyBlockedModels')"
+                    :input-id="`${uid}-channel-editor-key-blocked-${index}`"
+                    :guide="t('channel.keyBlockedModelsGuide')"
+                  >
+                    <FormTextInput
+                      :id="`${uid}-channel-editor-key-blocked-${index}`"
+                      v-model="key.blocked_models"
+                      type="text"
+                      :placeholder="t('channel.keyBlockedModelsPlaceholder')"
+                      data-testid="channel-key-blocked-models"
+                    />
+                  </FormField>
+                </div>
+              </div>
+            </fieldset>
             <FormField
               field-name="modelGroup"
               :label="t('channel.modelGroup')"
@@ -718,7 +944,7 @@ function handleSave() {
       :aliases="editorAliasesMap"
       :protocol="editorProtocol"
       :base-url="editorBaseUrl.trim()"
-      :api-key="editorApiKey"
+      :api-key="syncApiKey"
       :timeout-ms="syncTimeoutMs"
       :stack-order="stackOrder"
       @back="handleSyncBack"

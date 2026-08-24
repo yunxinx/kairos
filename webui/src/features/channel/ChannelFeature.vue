@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { channelWriteBody, type Channel, type ChannelView } from '@/api/types';
+import { channelWriteBody, type ChannelView } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ProtocolBadge from '@/components/ui/ProtocolBadge.vue';
@@ -12,7 +12,6 @@ import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
-import NumberStepper from '@/components/ui/NumberStepper.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
@@ -180,24 +179,6 @@ const togglingId = computed(() =>
   toggleMutation.isPending.value ? (toggleMutation.variables.value?.id ?? null) : null,
 );
 
-// 优先级/权重行内编辑：整体替换写（PUT 携带完整定义），成功后重取列表。
-type ChannelFieldPatch = Partial<Pick<Channel, 'priority' | 'weight'>>;
-
-const fieldMutation = useMutation({
-  mutationFn: ({ channel, patch }: { channel: ChannelView; patch: ChannelFieldPatch }) =>
-    apiClient.updateChannel(channel.id, { ...channelWriteBody(channel), ...patch }),
-  onSuccess: async () => {
-    await invalidateChannels();
-  },
-  onError: (err) => {
-    error(extractApiError(err).message);
-  },
-});
-
-const savingId = computed(() =>
-  fieldMutation.isPending.value ? (fieldMutation.variables.value?.channel.id ?? null) : null,
-);
-
 function openCreate(event: Event) {
   openWindow(anchorFromEvent(event), { kind: 'editor', channel: null });
 }
@@ -319,14 +300,12 @@ function openProbe(channel: ChannelView) {
             <TableHead class="min-w-44">{{ t('channel.name') }}</TableHead>
             <TableHead>{{ t('channel.requestProtocol') }}</TableHead>
             <TableHead>{{ t('channel.models') }}</TableHead>
-            <TableHead align="center" class="w-28 pr-1">{{ t('channel.priority') }}</TableHead>
-            <TableHead align="center" class="w-28 pl-1">{{ t('channel.weight') }}</TableHead>
             <TableHead align="center">{{ t('channel.status') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="8" />
+          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="6" />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"
@@ -348,30 +327,6 @@ function openProbe(channel: ChannelView) {
                 <OverflowChips
                   :items="channelModelChips.get(channel.id) ?? []"
                   chip-test-id="channel-models-chip"
-                />
-              </TableCell>
-              <TableCell align="center" class="pr-1">
-                <NumberStepper
-                  v-model="channel.priority"
-                  data-testid="channel-priority-stepper"
-                  :min="0"
-                  :disabled="savingId === channel.id"
-                  :label="t('channel.priority')"
-                  @update:model-value="
-                    (value) => fieldMutation.mutate({ channel, patch: { priority: value } })
-                  "
-                />
-              </TableCell>
-              <TableCell align="center" class="pl-1">
-                <NumberStepper
-                  v-model="channel.weight"
-                  data-testid="channel-weight-stepper"
-                  :min="1"
-                  :disabled="savingId === channel.id"
-                  :label="t('channel.weight')"
-                  @update:model-value="
-                    (value) => fieldMutation.mutate({ channel, patch: { weight: value } })
-                  "
                 />
               </TableCell>
               <TableCell align="center">
@@ -424,7 +379,7 @@ function openProbe(channel: ChannelView) {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="8" class="h-24 whitespace-normal">
+              <TableCell :colspan="6" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}

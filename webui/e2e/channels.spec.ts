@@ -50,7 +50,8 @@ test.describe('channel resource page', () => {
       await expect(page.getByTestId('channel-sync-models')).toBeDisabled();
       await page.locator('[id^="channel-editor-name"]').fill('ok-channel');
       await page.locator('[id^="channel-editor-base-url"]').fill(okUpstream.baseUrl);
-      await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
+      await page.locator('[data-testid="channel-key-name"]').fill('default');
+      await page.locator('[data-testid="channel-key-api"]').fill('sk-upstream');
 
       // 同步视图进入后不自动请求：先为空，点「同步模型」才拉取上游模型。
       await page.getByTestId('channel-sync-models').click();
@@ -119,16 +120,9 @@ test.describe('channel resource page', () => {
       // 品牌图标以 mask 渲染：mask-image 为空会退化成纯色块。
       await expect(okRow.locator('.brand-icon')).toHaveCSS('mask-image', /url\(|image/);
 
-      // 优先级/权重行内步进：新建缺省 0/1，步进后持久化；权重触底时减号禁用。
-      const priorityStepper = okRow.getByTestId('channel-priority-stepper');
-      await expect(priorityStepper.locator('input')).toHaveValue('0');
-      await priorityStepper.hover();
-      await priorityStepper.getByRole('button', { name: 'Increase' }).click();
-      await expect(priorityStepper.locator('input')).toHaveValue('1');
-      const weightStepper = okRow.getByTestId('channel-weight-stepper');
-      await expect(weightStepper.locator('input')).toHaveValue('1');
-      await weightStepper.hover();
-      await expect(weightStepper.getByRole('button', { name: 'Decrease' })).toBeDisabled();
+      // 渠道列表不再有优先级/权重行内步进列。
+      await expect(page.getByTestId('channel-priority-stepper')).toHaveCount(0);
+      await expect(page.getByTestId('channel-weight-stepper')).toHaveCount(0);
 
       await page.getByTestId('channels-search').fill('ok-channel');
       await expect(okRow).toBeVisible();
@@ -270,7 +264,8 @@ test.describe('channel resource page', () => {
       // 同步错误以独立浮窗展示：进入不自动请求，点「同步模型」触发；3s 自动消失、悬浮暂停。
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-base-url"]').fill(errUpstream.baseUrl);
-      await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
+      await page.locator('[data-testid="channel-key-name"]').fill('default');
+      await page.locator('[data-testid="channel-key-api"]').fill('sk-upstream');
       await page.getByTestId('channel-sync-models').click();
       await page.getByTestId('channel-sync-run').click();
       const syncError = page.getByTestId('channel-sync-error');
@@ -287,7 +282,8 @@ test.describe('channel resource page', () => {
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-name"]').fill('fail-channel');
       await page.locator('[id^="channel-editor-base-url"]').fill(failUpstream.baseUrl);
-      await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
+      await page.locator('[data-testid="channel-key-name"]').fill('default');
+      await page.locator('[data-testid="channel-key-api"]').fill('sk-upstream');
       await page.getByTestId('channel-sync-models').click();
       await page.getByTestId('channel-sync-run').click();
       await page
@@ -378,7 +374,8 @@ test.describe('channel manual model add', () => {
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-name"]').fill(channelName);
       await page.locator('[id^="channel-editor-base-url"]').fill(upstream.baseUrl);
-      await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
+      await page.locator('[data-testid="channel-key-name"]').fill('default');
+      await page.locator('[data-testid="channel-key-api"]').fill('sk-upstream');
 
       await expect(page.getByTestId('channel-add-model')).toBeVisible();
       await expect(page.getByTestId('channel-add-model')).toHaveText('Add');
@@ -536,7 +533,8 @@ test.describe('channel alias occupancy', () => {
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-name"]').fill(channelName);
       await page.locator('[id^="channel-editor-base-url"]').fill(upstream.baseUrl);
-      await page.locator('[id^="channel-editor-api-key"]').fill('sk-upstream');
+      await page.locator('[data-testid="channel-key-name"]').fill('default');
+      await page.locator('[data-testid="channel-key-api"]').fill('sk-upstream');
       await page.getByTestId('channel-sync-models').click();
       await page.getByTestId('channel-sync-run').click();
 
@@ -649,6 +647,107 @@ test.describe('channel editor model overflow', () => {
     await expect(form.getByTestId('channel-model-chip')).toHaveCount(9);
   });
 
+  test('edits multiple upstream keys with weights, enable state, and model lists', async ({
+    page,
+  }) => {
+    const channelName = 'multi-key-channel';
+    await page.goto('/channels');
+    await page.getByTestId('create-channel').click();
+    await page.locator('[id^="channel-editor-name"]').fill(channelName);
+    await page.locator('[id^="channel-editor-base-url"]').fill('http://127.0.0.1:9');
+
+    const firstRow = page.getByTestId('channel-key-row').nth(0);
+    await firstRow.getByTestId('channel-key-name').fill('primary');
+    await firstRow.getByTestId('channel-key-api').fill('sk-primary');
+    await firstRow.getByTestId('channel-key-weight').fill('3');
+
+    await page.getByTestId('channel-add-key').click();
+    const secondRow = page.getByTestId('channel-key-row').nth(1);
+    await secondRow.getByTestId('channel-key-name').fill('secondary');
+    await secondRow.getByTestId('channel-key-api').fill('sk-secondary');
+    await secondRow.getByTestId('channel-key-weight').fill('2');
+    await secondRow.getByTestId('channel-key-enabled').click();
+    await secondRow.getByTestId('channel-key-models').fill('gpt-4o-mini');
+    await secondRow.getByTestId('channel-key-blocked-models').fill('gpt-4o');
+    await page.getByTestId('channel-save').click();
+
+    const channelRow = page.locator(
+      `[data-testid="channel-row"][data-channel-name="${channelName}"]`,
+    );
+    await expect(channelRow).toBeVisible();
+
+    const listed = await page.request.get('/api/channels', {
+      headers: await e2eRootHeaders(page.request),
+    });
+    const channels = (await listed.json()) as Array<{
+      name: string;
+      keys: Array<{
+        name: string;
+        api_key: string;
+        weight: number;
+        enabled: boolean;
+        models: string[] | null;
+        blocked_models: string[] | null;
+      }>;
+    }>;
+    const saved = channels.find((item) => item.name === channelName);
+    expect(saved?.keys).toHaveLength(2);
+    expect(saved?.keys[0]).toMatchObject({
+      name: 'primary',
+      api_key: 'sk-primary',
+      weight: 3,
+      enabled: true,
+    });
+    expect(saved?.keys[1]).toMatchObject({
+      name: 'secondary',
+      api_key: 'sk-secondary',
+      weight: 2,
+      enabled: false,
+      models: ['gpt-4o-mini'],
+      blocked_models: ['gpt-4o'],
+    });
+
+    await channelRow.getByTestId('channel-edit').click();
+    await expect(page.getByTestId('channel-key-row')).toHaveCount(2);
+    await expect(
+      page.getByTestId('channel-key-row').nth(0).getByTestId('channel-key-name'),
+    ).toHaveValue('primary');
+    await expect(
+      page.getByTestId('channel-key-row').nth(0).getByTestId('channel-key-weight'),
+    ).toHaveValue('3');
+    await expect(
+      page.getByTestId('channel-key-row').nth(1).getByTestId('channel-key-name'),
+    ).toHaveValue('secondary');
+    await expect(
+      page.getByTestId('channel-key-row').nth(1).getByTestId('channel-key-weight'),
+    ).toHaveValue('2');
+    await expect(
+      page.getByTestId('channel-key-row').nth(1).getByTestId('channel-key-models'),
+    ).toHaveValue('gpt-4o-mini');
+    await expect(
+      page.getByTestId('channel-key-row').nth(1).getByTestId('channel-key-blocked-models'),
+    ).toHaveValue('gpt-4o');
+    await expect(
+      page.getByTestId('channel-key-row').nth(1).getByTestId('channel-key-enabled'),
+    ).not.toBeChecked();
+
+    await page.getByTestId('channel-key-row').nth(1).getByTestId('channel-key-remove').click();
+    await expect(page.getByTestId('channel-key-row')).toHaveCount(1);
+    await page.getByTestId('channel-save').click();
+    await expect(page.getByTestId('channel-form')).toHaveCount(0);
+
+    const afterDelete = await page.request.get('/api/channels', {
+      headers: await e2eRootHeaders(page.request),
+    });
+    const afterChannels = (await afterDelete.json()) as Array<{
+      name: string;
+      keys: Array<{ name: string }>;
+    }>;
+    const afterSaved = afterChannels.find((item) => item.name === channelName);
+    expect(afterSaved?.keys).toHaveLength(1);
+    expect(afterSaved?.keys[0].name).toBe('primary');
+  });
+
   test('create form shows api key in plaintext; edit masks until unlocked', async ({ page }) => {
     const longKey = `sk-${'a'.repeat(40)}`;
     await seedChannel(page, {
@@ -659,7 +758,7 @@ test.describe('channel editor model overflow', () => {
 
     await page.goto('/channels');
     await page.getByTestId('create-channel').click();
-    await expect(page.locator('[id^="channel-editor-api-key"]')).toHaveAttribute('type', 'text');
+    await expect(page.getByTestId('channel-key-api')).toHaveAttribute('type', 'text');
     await page.getByRole('button', { name: /cancel|取消/i }).click();
 
     await page.getByTestId('channels-search').fill('mask-key-channel');
@@ -668,7 +767,7 @@ test.describe('channel editor model overflow', () => {
       `${longKey.slice(0, 8)}******${longKey.slice(-8)}`,
     );
     await page.getByTestId('secret-reveal').click();
-    await expect(page.locator('[id^="channel-editor-api-key"]')).toHaveValue(longKey);
-    await expect(page.locator('[id^="channel-editor-api-key"]')).toHaveAttribute('type', 'text');
+    await expect(page.getByTestId('channel-key-api')).toHaveValue(longKey);
+    await expect(page.getByTestId('channel-key-api')).toHaveAttribute('type', 'text');
   });
 });

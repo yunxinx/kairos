@@ -118,7 +118,8 @@
     "increment": "增加",
     "decrement": "减少",
     "yes": "是",
-    "no": "否"
+    "no": "否",
+    "saving": "保存中..."
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -373,7 +374,20 @@
     "deleteTitle": "删除渠道",
     "deleteMessage": "确定删除渠道「{name}」？删除后不可恢复。",
     "bulkDeleteTitle": "删除渠道",
-    "bulkDeleteMessage": "确定删除选中的 {count} 条渠道？删除后不可恢复。"
+    "bulkDeleteMessage": "确定删除选中的 {count} 条渠道？删除后不可恢复。",
+    "keyCount": "密钥",
+    "keysTitle": "上游密钥",
+    "addKey": "添加密钥",
+    "removeKey": "移除密钥 {name}",
+    "keyLabel": "密钥 {n}",
+    "keyName": "名称",
+    "keyWeight": "权重",
+    "keyModels": "模型白名单",
+    "keyModelsGuide": "可选。该密钥允许服务的模型 ID，英文逗号分隔。",
+    "keyModelsPlaceholder": "例如：gpt-4o, claude-sonnet-4",
+    "keyBlockedModels": "模型黑名单",
+    "keyBlockedModelsGuide": "可选。该密钥禁止服务的模型 ID，英文逗号分隔。",
+    "keyBlockedModelsPlaceholder": "例如：expensive-model"
   },
   "pricing": {
     "createEntry": "添加价格",
@@ -496,7 +510,12 @@
     "visibleEmpty": "该组当前列表为空。",
     "visibleOrder": "请求路由",
     "visibleHidden": "已从列表隐藏",
-    "visibleUnbound": "default（未绑定）"
+    "visibleUnbound": "default（未绑定）",
+    "tabOrder": "同名渠道顺序",
+    "orderChannels": "路由顺序",
+    "orderSave": "保存顺序",
+    "orderDragHandle": "拖拽调整渠道顺序",
+    "orderEmpty": "还没有同时出现在至少两条渠道上的可调用名。"
   },
   "settings": {
     "sections": "设置分类",

@@ -7,6 +7,7 @@ import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import GroupsTab from '@/features/models/GroupsTab.vue';
 import InventoryTab from '@/features/models/InventoryTab.vue';
+import OrderTab from '@/features/models/OrderTab.vue';
 import UnifiedTab from '@/features/models/UnifiedTab.vue';
 import VisibleTab from '@/features/models/VisibleTab.vue';
 
@@ -29,11 +30,12 @@ const canGroups = computed(() => {
     hasCapability(me.value, 'view_other_groups')
   );
 });
+const canOrder = computed(() => me.value?.role === 'root');
+
 const canVisible = computed(() => {
   if (me.value?.role === 'root') return true;
   return (
-    hasCapability(me.value, 'view_own_plan_groups') ||
-    hasCapability(me.value, 'view_other_groups')
+    hasCapability(me.value, 'view_own_plan_groups') || hasCapability(me.value, 'view_other_groups')
   );
 });
 
@@ -59,13 +61,36 @@ const defaultTab = computed(() => {
           >
             {{ t('models.tabInventory') }}
           </TabsTrigger>
-          <TabsTrigger v-if="canUnified" value="unified" class="page-tab-switch-btn" data-testid="models-tab-unified">
+          <TabsTrigger
+            v-if="canUnified"
+            value="unified"
+            class="page-tab-switch-btn"
+            data-testid="models-tab-unified"
+          >
             {{ t('models.tabUnified') }}
           </TabsTrigger>
-          <TabsTrigger v-if="canGroups" value="groups" class="page-tab-switch-btn" data-testid="models-tab-groups">
+          <TabsTrigger
+            v-if="canGroups"
+            value="groups"
+            class="page-tab-switch-btn"
+            data-testid="models-tab-groups"
+          >
             {{ t('models.tabGroups') }}
           </TabsTrigger>
-          <TabsTrigger v-if="canVisible" value="visible" class="page-tab-switch-btn" data-testid="models-tab-visible">
+          <TabsTrigger
+            v-if="canOrder"
+            value="order"
+            class="page-tab-switch-btn"
+            data-testid="models-tab-order"
+          >
+            {{ t('models.tabOrder') }}
+          </TabsTrigger>
+          <TabsTrigger
+            v-if="canVisible"
+            value="visible"
+            class="page-tab-switch-btn"
+            data-testid="models-tab-visible"
+          >
             {{ t('models.tabVisible') }}
           </TabsTrigger>
         </TabsList>
@@ -79,6 +104,9 @@ const defaultTab = computed(() => {
     </TabsContent>
     <TabsContent v-if="canGroups" value="groups">
       <GroupsTab />
+    </TabsContent>
+    <TabsContent v-if="canOrder" value="order">
+      <OrderTab />
     </TabsContent>
     <TabsContent v-if="canVisible" value="visible">
       <VisibleTab />

@@ -68,17 +68,30 @@ export interface Channel {
   name: string;
   protocol: Protocol;
   base_url: string;
-  api_key: string;
+  /** 该上游端点可用的多把账号密钥。 */
+  keys: ChannelKey[];
   models: string[];
   model_aliases: Record<string, string>;
-  priority: number;
-  weight: number;
   timeout_ms: number;
   max_retries: number;
   /** 是否启用：禁用的渠道不参与路由与失败切换。 */
   enabled: boolean;
   /** 保存时把新加入的可调用名并入该组；`default` 表示不自动入组。 */
   model_group: string;
+}
+
+/** 渠道上的一把上游密钥；模型白/黑名单为可选的逗号名单。 */
+export interface ChannelKey {
+  name: string;
+  api_key: string;
+  /** 加权随机权重；全部为 0 时退化为等概率。 */
+  weight: number;
+  /** 是否启用：禁用的密钥不参与选取。 */
+  enabled: boolean;
+  /** 模型白名单；`null`/缺省表示不限。 */
+  models?: string[] | null;
+  /** 模型黑名单；`null`/缺省表示不限。 */
+  blocked_models?: string[] | null;
 }
 
 /** 渠道读响应：库生成的稳定身份 + 写契约字段。 */
@@ -92,16 +105,20 @@ export function channelWriteBody(view: ChannelView): Channel {
     name: view.name,
     protocol: view.protocol,
     base_url: view.base_url,
-    api_key: view.api_key,
+    keys: view.keys.map((key) => ({ ...key })),
     models: view.models,
     model_aliases: view.model_aliases,
-    priority: view.priority,
-    weight: view.weight,
     timeout_ms: view.timeout_ms,
     max_retries: view.max_retries,
     enabled: view.enabled,
     model_group: view.model_group,
   };
+}
+
+/** 同名渠道顺序表里的一行：某个可调用名在多条渠道上的完整尝试顺序。 */
+export interface ChannelModelOrder {
+  model: string;
+  channel_ids: number[];
 }
 
 /** 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）。 */

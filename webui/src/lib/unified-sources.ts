@@ -1,4 +1,4 @@
-import type { ChannelView, UnifiedMember } from '@/api/types';
+import type { ChannelModelOrder, ChannelView, UnifiedMember } from '@/api/types';
 
 export function unifiedMemberKey(member: Pick<UnifiedMember, 'channel_id' | 'model'>): string {
   return `${member.channel_id}:${member.model}`;
@@ -57,16 +57,24 @@ export function memberSourceKind(
 }
 
 /**
- * 可调用名的渠道路由预览：priority 升序、同级 weight 降序（高权重更常排前）、再按渠道名。
- * 与运行时加权随机不同，这里给出稳定的偏好顺序；禁用渠道仍列出。
+ * 可调用名的渠道路由预览：同名顺序表升序，未显式排序的候选按渠道 id 兜底。
+ * 与运行时选路一致，这里给出稳定顺序；禁用渠道仍列出。
  */
-export function callableRouteMembers(model: string, channels: ChannelView[]): UnifiedMember[] {
+export function callableRouteMembers(
+  model: string,
+  channels: ChannelView[],
+  orders: ChannelModelOrder[] = [],
+): UnifiedMember[] {
+  const order = orders.find((entry) => entry.model === model);
+  const positions = new Map<number, number>();
+  order?.channel_ids.forEach((channelId, index) => positions.set(channelId, index));
   return channels
     .filter((channel) => channelListsCallable(channel, model))
     .sort((left, right) => {
-      if (left.priority !== right.priority) return left.priority - right.priority;
-      if (left.weight !== right.weight) return right.weight - left.weight;
-      return left.name.localeCompare(right.name);
+      const leftPosition = positions.get(left.id) ?? Number.MAX_SAFE_INTEGER;
+      const rightPosition = positions.get(right.id) ?? Number.MAX_SAFE_INTEGER;
+      if (leftPosition !== rightPosition) return leftPosition - rightPosition;
+      return left.id - right.id;
     })
     .map((channel) => ({
       channel_id: channel.id,

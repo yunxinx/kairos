@@ -45,6 +45,10 @@ const pricesQuery = useQuery({
   queryKey: ['prices'],
   queryFn: () => apiClient.listPrices(),
 });
+const ordersQuery = useQuery({
+  queryKey: ['channel-model-orders'],
+  queryFn: () => apiClient.listChannelModelOrders(),
+});
 
 const groupOptions = computed(() => {
   const groups = groupsQuery.data.value ?? [];
@@ -76,7 +80,9 @@ const sections = computed(() => {
           return {
             id,
             unified,
-            callableRoute: unified ? [] : callableRouteMembers(id, channels.value),
+            callableRoute: unified
+              ? []
+              : callableRouteMembers(id, channels.value, ordersQuery.data.value ?? []),
           };
         });
       return {
@@ -102,7 +108,8 @@ const showTableSkeleton = computed(
     (groupsQuery.isPending.value && !groupsQuery.data.value) ||
     (unifiedQuery.isPending.value && !unifiedQuery.data.value) ||
     (channelsQuery.isPending.value && !channelsQuery.data.value) ||
-    (pricesQuery.isPending.value && !pricesQuery.data.value),
+    (pricesQuery.isPending.value && !pricesQuery.data.value) ||
+    (ordersQuery.isPending.value && !ordersQuery.data.value),
 );
 
 const loadError = computed(
@@ -110,14 +117,16 @@ const loadError = computed(
     groupsQuery.isError.value ||
     unifiedQuery.isError.value ||
     channelsQuery.isError.value ||
-    pricesQuery.isError.value,
+    pricesQuery.isError.value ||
+    ordersQuery.isError.value,
 );
 
 function loadErrorMessage(): string {
   if (groupsQuery.isError.value) return extractApiError(groupsQuery.error.value).message;
   if (unifiedQuery.isError.value) return extractApiError(unifiedQuery.error.value).message;
   if (channelsQuery.isError.value) return extractApiError(channelsQuery.error.value).message;
-  return extractApiError(pricesQuery.error.value).message;
+  if (pricesQuery.isError.value) return extractApiError(pricesQuery.error.value).message;
+  return extractApiError(ordersQuery.error.value).message;
 }
 
 function refetchAll() {
@@ -125,6 +134,7 @@ function refetchAll() {
   void unifiedQuery.refetch();
   void channelsQuery.refetch();
   void pricesQuery.refetch();
+  void ordersQuery.refetch();
 }
 </script>
 

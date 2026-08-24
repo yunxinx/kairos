@@ -118,7 +118,8 @@
     "increment": "Increase",
     "decrement": "Decrease",
     "yes": "Yes",
-    "no": "No"
+    "no": "No",
+    "saving": "Saving..."
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -373,7 +374,20 @@
     "deleteTitle": "Delete channel",
     "deleteMessage": "Delete channel \"{name}\"? This cannot be undone.",
     "bulkDeleteTitle": "Delete channels",
-    "bulkDeleteMessage": "Delete {count} selected channels? This cannot be undone."
+    "bulkDeleteMessage": "Delete {count} selected channels? This cannot be undone.",
+    "keyCount": "Keys",
+    "keysTitle": "Upstream keys",
+    "addKey": "Add key",
+    "removeKey": "Remove key {name}",
+    "keyLabel": "Key {n}",
+    "keyName": "Name",
+    "keyWeight": "Weight",
+    "keyModels": "Model allow list",
+    "keyModelsGuide": "Optional. Comma-separated model IDs this key may serve.",
+    "keyModelsPlaceholder": "e.g. gpt-4o, claude-sonnet-4",
+    "keyBlockedModels": "Model block list",
+    "keyBlockedModelsGuide": "Optional. Comma-separated model IDs this key must never serve.",
+    "keyBlockedModelsPlaceholder": "e.g. expensive-model"
   },
   "pricing": {
     "createEntry": "Add price",
@@ -496,7 +510,12 @@
     "visibleEmpty": "This group currently lists no models.",
     "visibleOrder": "Request routing",
     "visibleHidden": "Hidden from list",
-    "visibleUnbound": "default (unbound)"
+    "visibleUnbound": "default (unbound)",
+    "tabOrder": "Channel order",
+    "orderChannels": "Routing order",
+    "orderSave": "Save order",
+    "orderDragHandle": "Drag to reorder channels",
+    "orderEmpty": "No callable name is currently served by two or more channels."
   },
   "settings": {
     "sections": "Settings sections",

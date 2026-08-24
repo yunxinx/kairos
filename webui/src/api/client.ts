@@ -3,6 +3,7 @@ import { ApiClientError, type ApiErrorBody } from '@/api/types';
 import type {
   BalanceAdjustment,
   Channel,
+  ChannelModelOrder,
   ChannelProbeResult,
   ChannelView,
   LogQuery,
@@ -271,6 +272,17 @@ export const apiClient = {
 
   deleteUnifiedModel(id: string): Promise<UnifiedModel> {
     return apiFetch(`/unified-models/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  },
+
+  listChannelModelOrders(): Promise<ChannelModelOrder[]> {
+    return apiFetch('/channel-model-orders');
+  },
+
+  replaceChannelModelOrder(model: string, channelIds: number[]): Promise<ChannelModelOrder> {
+    return apiFetch(`/channel-model-orders/${encodeURIComponent(model)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ model, channel_ids: channelIds }),
+    });
   },
 
   getSettings(): Promise<Settings> {
