@@ -168,6 +168,110 @@ async fn channel_key_model_filter_selects_usable_auth_key() {
     );
 }
 
+/// 同一会话的首试、429 重试与后续请求均复用同一把渠道密钥。
+#[tokio::test]
+async fn session_stickiness_keeps_key_across_retry_and_requests() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels[0].max_retries = 1;
+        seed.channels[0].keys = vec![
+            kairos::store::resources::ChannelKey {
+                name: "a".to_string(),
+                api_key: "sk-a".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+            kairos::store::resources::ChannelKey {
+                name: "b".to_string(),
+                api_key: "sk-b".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Status429);
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let client = reqwest::Client::new();
+    let request = || {
+        client
+            .post(format!("{}/v1/chat/completions", gw.base_url()))
+            .bearer_auth(TEST_TOKEN_KEY)
+            .header("x-kairos-session-id", "session-1")
+            .json(&json!({
+                "model": TEST_MODEL,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+    };
+    assert_eq!(request().send().await.expect("首请求应成功").status(), 200);
+    assert_eq!(
+        request().send().await.expect("后续请求应成功").status(),
+        200
+    );
+
+    let keys = ups[0].received_api_keys();
+    assert_eq!(keys.len(), 3, "首试、429 重试与后续请求都应到达上游");
+    assert!(keys.iter().all(|key| key == &keys[0]));
+}
+
+/// 不带会话头时，IR 前缀相同的请求也复用同一把密钥。
+#[tokio::test]
+async fn session_prefix_stickiness_without_header() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels[0].keys = vec![
+            kairos::store::resources::ChannelKey {
+                name: "a".to_string(),
+                api_key: "sk-a".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+            kairos::store::resources::ChannelKey {
+                name: "b".to_string(),
+                api_key: "sk-b".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{}/v1/chat/completions", gw.base_url()))
+            .bearer_auth(TEST_TOKEN_KEY)
+            .json(&json!({
+                "model": TEST_MODEL,
+                "messages": [
+                    { "role": "system", "content": "be precise" },
+                    { "role": "user", "content": "hello" }
+                ]
+            }))
+            .send()
+            .await
+            .expect("请求应成功");
+        assert_eq!(response.status(), 200);
+    }
+    let keys = ups[0].received_api_keys();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], keys[1]);
+}
+
 /// 顺序表先给全部候选排序；模型组钉渠道随后只做稳定过滤，不能让未钉渠道
 /// 的排位改变剩余候选的相对次序。
 #[tokio::test]

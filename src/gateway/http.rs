@@ -38,7 +38,7 @@ use crate::{
     config::Protocol,
     core::billing,
     core::billing::PriceSnapshot,
-    core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage},
+    core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage, prefix_hash},
     core::stream::{SseFrame, StreamAccumulator},
     runtime::{PlanBinding, RuntimeSnapshot, SnapshotHandle},
     store,
@@ -47,7 +47,7 @@ use crate::{
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
 use super::logging::{Billing, log_request, new_request_id, unix_millis};
-use super::rate_limit::RequestRateLimiter;
+use super::rate_limit::{RequestRateLimiter, SessionStickyCache};
 use super::sse::{
     OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
     take_frame,
@@ -64,6 +64,7 @@ pub struct Deps {
     pub(super) snapshot: SnapshotHandle,
     pub(super) auth_throttle: AuthThrottle,
     pub(super) request_rate: RequestRateLimiter,
+    pub(super) sticky: SessionStickyCache,
 }
 
 /// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
@@ -81,6 +82,7 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         snapshot,
         auth_throttle: AuthThrottle::new(),
         request_rate: RequestRateLimiter::new(),
+        sticky: SessionStickyCache::new(),
     };
 
     // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
@@ -536,7 +538,15 @@ async fn handle_request(
     }
 
     // 4. 准入：解析出站跳（普通模型一条；统一模型按成员顺序，只收已定价可路由的）。
-    let hops = match resolve_route_hops(&snapshot, &request.model, &token.model_group) {
+    // IR 已解码，此处才能稳定计算无头请求的前缀亲和标识。
+    let session = request_session(&headers, &request);
+    let hops = match resolve_route_hops(
+        &snapshot,
+        &request.model,
+        &token.model_group,
+        &deps.sticky,
+        session,
+    ) {
         Ok(hops) => hops,
         Err((status, message)) => {
             return error_response(
@@ -748,6 +758,8 @@ enum HopDeny {
 fn hop_for_member(
     snapshot: &RuntimeSnapshot,
     member: &crate::store::resources::UnifiedMember,
+    sticky: &SessionStickyCache,
+    session: u64,
 ) -> Result<RouteHop, HopDeny> {
     let Some(record) = snapshot
         .channels
@@ -767,9 +779,9 @@ fn hop_for_member(
     {
         return Err(HopDeny::NoPrice);
     }
-    let key = crate::store::resources::select_channel_key(&record.keys, &member.model)
-        .ok_or(HopDeny::NoRoute)?
-        .clone();
+    let key = sticky
+        .select(record.id, &member.model, session, &record.keys)
+        .ok_or(HopDeny::NoRoute)?;
     Ok(RouteHop {
         routed_model: member.model.clone(),
         route: routing::Route {
@@ -786,6 +798,8 @@ fn hop_for_callable(
     snapshot: &RuntimeSnapshot,
     model: &str,
     group_name: &str,
+    sticky: &SessionStickyCache,
+    session: u64,
 ) -> Result<RouteHop, HopDeny> {
     let mut route = routing::route(&snapshot.channels, &snapshot.channel_model_order, model)
         .ok_or(HopDeny::NoRoute)?;
@@ -805,7 +819,7 @@ fn hop_for_callable(
         if snapshot.price_for_channel(record.id, model).is_none() {
             return false;
         }
-        let Some(key) = crate::store::resources::select_channel_key(&record.keys, model) else {
+        let Some(key) = sticky.select(record.id, model, session, &record.keys) else {
             return false;
         };
         route.selected_keys.insert(record.id, key.clone());
@@ -858,12 +872,14 @@ fn resolve_route_hops(
     snapshot: &RuntimeSnapshot,
     model: &str,
     group_name: &str,
+    sticky: &SessionStickyCache,
+    session: u64,
 ) -> Result<Vec<RouteHop>, (StatusCode, String)> {
     if let Some(unified) = snapshot.unified_models.get(model) {
         let mut hops = Vec::new();
         let mut reasons = Vec::new();
         for member in &unified.models {
-            match hop_for_member(snapshot, member) {
+            match hop_for_member(snapshot, member, sticky, session) {
                 Ok(hop) => hops.push(hop),
                 Err(HopDeny::NoRoute) => {
                     reasons.push(format!("成员 {member} 没有可用渠道"));
@@ -886,7 +902,7 @@ fn resolve_route_hops(
         }
         return Ok(hops);
     }
-    match hop_for_callable(snapshot, model, group_name) {
+    match hop_for_callable(snapshot, model, group_name, sticky, session) {
         Ok(hop) => Ok(vec![hop]),
         Err(HopDeny::NoRoute) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -897,6 +913,21 @@ fn resolve_route_hops(
             format!("模型 {model} 未配置价格，无法计费"),
         )),
     }
+}
+
+/// 取请求级会话标识：显式头优先，缺失时使用解码后 IR 的稳定前缀哈希。
+fn request_session(headers: &HeaderMap, request: &ChatRequest) -> u64 {
+    headers
+        .get("x-kairos-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hasher::write(&mut hasher, value.as_bytes());
+            std::hash::Hasher::finish(&hasher)
+        })
+        .unwrap_or_else(|| prefix_hash(request))
 }
 
 /// 单次出站调用的请求侧上下文：入站请求、认证令牌与计费/日志所需的

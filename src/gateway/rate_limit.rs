@@ -12,6 +12,103 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::store::resources::{StoredChannelKey, channel_key_supports_model};
+
+const STICKY_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct StickyKey {
+    pub(super) channel_id: i64,
+    pub(super) model: String,
+    pub(super) session: u64,
+}
+
+struct StickyEntry {
+    key_id: i64,
+    expires_at: Instant,
+}
+
+/// 进程内会话粘性缓存；密钥选择与校验在同一把锁内完成，避免并发首次请求分叉。
+#[derive(Clone)]
+pub(super) struct SessionStickyCache {
+    inner: Arc<Mutex<HashMap<StickyKey, StickyEntry>>>,
+}
+
+impl SessionStickyCache {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(super) fn select(
+        &self,
+        channel_id: i64,
+        model: &str,
+        session: u64,
+        keys: &[StoredChannelKey],
+    ) -> Option<StoredChannelKey> {
+        let candidates: Vec<&StoredChannelKey> = keys
+            .iter()
+            .filter(|key| key.enabled && channel_key_supports_model(key, model))
+            .collect();
+        let now = Instant::now();
+        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        prune_sticky_expired(&mut map, now);
+        let cache_key = StickyKey {
+            channel_id,
+            model: model.to_string(),
+            session,
+        };
+        if candidates.is_empty() {
+            map.remove(&cache_key);
+            return None;
+        }
+        if candidates.len() == 1 {
+            // 单密钥渠道不使用粘性；清掉旧的多密钥缓存，避免恢复后错误复用。
+            map.remove(&cache_key);
+            return Some(candidates[0].clone());
+        }
+
+        if let Some(entry) = map.get(&cache_key) {
+            if let Some(key) = candidates.iter().find(|key| key.id == entry.key_id) {
+                return Some((*key).clone());
+            }
+            map.remove(&cache_key);
+        }
+
+        let selected = select_weighted(&candidates).clone();
+        map.insert(
+            cache_key,
+            StickyEntry {
+                key_id: selected.id,
+                expires_at: now.checked_add(STICKY_TTL).unwrap_or(now),
+            },
+        );
+        Some(selected)
+    }
+}
+
+fn prune_sticky_expired(map: &mut HashMap<StickyKey, StickyEntry>, now: Instant) {
+    map.retain(|_, entry| entry.expires_at > now);
+}
+
+fn select_weighted<'a>(candidates: &[&'a StoredChannelKey]) -> &'a StoredChannelKey {
+    let total: u128 = candidates.iter().map(|key| key.weight.max(0) as u128).sum();
+    if total == 0 {
+        return candidates[rand::random_range(0..candidates.len())];
+    }
+    let mut point = rand::random_range(0..total);
+    for key in candidates {
+        let weight = key.weight.max(0) as u128;
+        if point < weight {
+            return key;
+        }
+        point -= weight;
+    }
+    candidates[0]
+}
+
 /// 滑动窗口长度：RPM 按自然分钟计数。
 const WINDOW: Duration = Duration::from_secs(60);
 
@@ -130,7 +227,24 @@ fn prune_expired(map: &mut HashMap<RateKey, VecDeque<Instant>>, now: Instant) {
 
 #[cfg(test)]
 mod tests {
-    use super::RequestRateLimiter;
+    use std::time::{Duration, Instant};
+
+    use super::{RequestRateLimiter, SessionStickyCache, StickyEntry, StickyKey};
+    use crate::store::resources::StoredChannelKey;
+
+    fn key(id: i64, weight: i64, enabled: bool) -> StoredChannelKey {
+        StoredChannelKey {
+            id,
+            channel_id: 7,
+            name: format!("key-{id}"),
+            api_key: format!("secret-{id}"),
+            weight,
+            enabled,
+            models: None,
+            blocked_models: None,
+            created_at: 0,
+        }
+    }
 
     #[test]
     fn blocks_after_limit_from_same_token() {
@@ -223,5 +337,80 @@ mod tests {
         // 套餐已满；第三个用户的令牌桶和用户桶仍应保持空闲。
         assert!(limiter.try_acquire("sk-d", 10, Some((9, 1)), plan).is_err());
         assert!(limiter.try_acquire("sk-d", 10, Some((9, 1)), None).is_ok());
+    }
+
+    #[test]
+    fn sticky_selection_reuses_key_for_same_channel_model_session() {
+        let cache = SessionStickyCache::new();
+        let keys = [key(1, 1, true), key(2, 1, true)];
+        let first = cache.select(7, "model", 42, &keys).expect("应选出密钥");
+        let second = cache.select(7, "model", 42, &keys).expect("应复用密钥");
+        assert_eq!(first.id, second.id);
+    }
+
+    #[test]
+    fn sticky_selection_is_scoped_by_channel_and_model() {
+        let cache = SessionStickyCache::new();
+        let keys = [key(1, 1, true), key(2, 1, true)];
+        let other_keys = [key(3, 1, true), key(4, 1, true)];
+        let first = cache.select(7, "model-a", 42, &keys).expect("应选出密钥");
+        let other_channel = cache
+            .select(8, "model-a", 42, &other_keys)
+            .expect("应选出密钥");
+        let other_model = cache
+            .select(7, "model-b", 42, &other_keys)
+            .expect("应选出密钥");
+        assert_eq!(cache.select(7, "model-a", 42, &keys).unwrap().id, first.id);
+        assert!(other_channel.id == 3 || other_channel.id == 4);
+        assert!(other_model.id == 3 || other_model.id == 4);
+    }
+
+    #[test]
+    fn disabled_cached_key_is_removed_and_reselected() {
+        let cache = SessionStickyCache::new();
+        let keys = [key(1, 1, true), key(2, 1, true)];
+        let first = cache.select(7, "model", 42, &keys).expect("应选出密钥");
+        let disabled = [
+            key(first.id, first.weight, false),
+            key(if first.id == 1 { 2 } else { 1 }, 1, true),
+        ];
+        let selected = cache.select(7, "model", 42, &disabled).expect("应重选");
+        assert_ne!(selected.id, first.id);
+    }
+
+    #[test]
+    fn collapsing_to_one_key_drops_old_sticky_entry() {
+        let cache = SessionStickyCache::new();
+        let keys = [key(1, 1, true), key(2, 1, true)];
+        let first = cache.select(7, "model", 42, &keys).expect("应选出密钥");
+        let remaining_id = if first.id == 1 { 2 } else { 1 };
+        let remaining = [key(remaining_id, 1, true)];
+        assert_eq!(
+            cache.select(7, "model", 42, &remaining).unwrap().id,
+            remaining_id
+        );
+        assert!(cache.inner.lock().expect("缓存锁不应被污染").is_empty());
+        let restored = cache.select(7, "model", 42, &keys).expect("应重新随机选取");
+        assert!(restored.id == 1 || restored.id == 2);
+    }
+
+    #[test]
+    fn expired_entry_is_pruned_before_reselection() {
+        let cache = SessionStickyCache::new();
+        let cache_key = StickyKey {
+            channel_id: 7,
+            model: "model".to_string(),
+            session: 42,
+        };
+        cache.inner.lock().expect("缓存锁不应被污染").insert(
+            cache_key,
+            StickyEntry {
+                key_id: 1,
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        let keys = [key(1, 0, true), key(2, 100, true)];
+        let selected = cache.select(7, "model", 42, &keys).expect("应重选");
+        assert_eq!(selected.id, 2);
     }
 }
