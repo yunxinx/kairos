@@ -1,6 +1,6 @@
 //! 定价、模型组与统一模型管理。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Json, Router,
@@ -8,19 +8,20 @@ use axum::{
     http::StatusCode,
     routing::{get, put},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::store::plans;
 use crate::store::resources::{
     Channel, ChannelRecord, GroupModel, ModelGroup, Price, UnifiedMember, UnifiedModel,
     channel_lists_callable,
 };
+use crate::store::{self, plans};
 
 use super::auth::{ManagementCapability, ManagementIdentity};
-use super::{AdminDeps, AdminError, db_err, reload_and_swap};
+use super::{AdminDeps, AdminError, begin_write, db_err, reload_and_swap};
 
 pub(super) fn routes() -> Router<AdminDeps> {
     Router::new()
+        .route("/channel-model-orders", get(list_channel_model_orders))
         .route("/prices", get(list_prices).post(create_price))
         .route(
             "/prices/{channel_id}/{model}",
@@ -42,6 +43,190 @@ pub(super) fn routes() -> Router<AdminDeps> {
             "/unified-models/{id}",
             put(update_unified_model).delete(delete_unified_model),
         )
+}
+
+/// 只有 root 可写的同名渠道顺序表。
+pub(super) fn order_routes() -> Router<AdminDeps> {
+    Router::new().route(
+        "/channel-model-orders/{model}",
+        put(replace_channel_model_order),
+    )
+}
+
+// --- 同名渠道顺序 ---
+
+/// 同一可调用名在多个渠道上的完整尝试顺序。
+///
+/// `channel_ids` 是写入契约；读取时也复用这一形状，使拖拽结果可以直接作为
+/// 下一次整体替换的请求体。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelModelOrderView {
+    model: String,
+    channel_ids: Vec<i64>,
+}
+
+/// 列出至少由两条渠道登记的可调用名及其当前顺序。
+///
+/// 禁用渠道仍是配置候选，因此在顺序表里保留；缺少显式行时使用渠道 id 的默认顺序。
+async fn list_channel_model_orders(
+    State(deps): State<AdminDeps>,
+) -> Result<Json<Vec<ChannelModelOrderView>>, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    Ok(Json(channel_model_order_views(&snapshot)))
+}
+
+/// 整体替换路径中可调用名的顺序。写事务先重读候选，防止在读快照到提交之间渠道
+/// 定义改变而把不再登记该名的渠道写入顺序表。
+async fn replace_channel_model_order(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(model): Path<String>,
+    body: Result<Json<ChannelModelOrderView>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<ChannelModelOrderView>, AdminError> {
+    let mut requested = body.map_err(AdminError::bad_body)?.0;
+    requested.model = model;
+    let mut tx = begin_write(&deps).await?;
+    let channels = crate::store::resources::list_channel_records_on_conn(&mut tx)
+        .await
+        .map_err(AdminError::Store)?;
+    let candidates = channel_candidates(&channels, &requested.model);
+    validate_channel_model_order(&requested, &candidates)?;
+    crate::store::resources::replace_channel_model_order(
+        &mut tx,
+        &requested.model,
+        &requested.channel_ids,
+    )
+    .await
+    .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "channel_model_orders",
+        &format!(
+            "调整可调用名 {} 的渠道顺序：{}",
+            requested.model,
+            requested
+                .channel_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" → ")
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    let snapshot = deps.snapshot.read().await;
+    channel_model_order_view(&snapshot, &requested.model)
+        .map(Json)
+        .ok_or_else(|| AdminError::NotFound(format!("可调用名 {} 不再有多个渠道", requested.model)))
+}
+
+/// 将快照中的登记关系投影为管理面顺序资源，按可调用名排序。
+fn channel_model_order_views(
+    snapshot: &crate::runtime::RuntimeSnapshot,
+) -> Vec<ChannelModelOrderView> {
+    let mut candidates_by_model: HashMap<String, Vec<i64>> = HashMap::new();
+    for record in &snapshot.channels {
+        for model in crate::store::resources::channel_callable_names(&record.channel) {
+            candidates_by_model
+                .entry(model)
+                .or_default()
+                .push(record.id);
+        }
+    }
+
+    let mut views: Vec<ChannelModelOrderView> = candidates_by_model
+        .into_iter()
+        .filter_map(|(model, candidates)| {
+            (candidates.len() >= 2).then(|| ChannelModelOrderView {
+                channel_ids: ordered_channel_ids(snapshot, &model, &candidates),
+                model,
+            })
+        })
+        .collect();
+    views.sort_by(|left, right| left.model.cmp(&right.model));
+    views
+}
+
+/// 从一个快照读取某个可调用名的顺序资源；单渠道名字不属于该资源集合。
+fn channel_model_order_view(
+    snapshot: &crate::runtime::RuntimeSnapshot,
+    model: &str,
+) -> Option<ChannelModelOrderView> {
+    let candidates = channel_candidates(&snapshot.channels, model);
+    (candidates.len() >= 2).then(|| ChannelModelOrderView {
+        model: model.to_string(),
+        channel_ids: ordered_channel_ids(snapshot, model, &candidates),
+    })
+}
+
+/// 按路由同一规则排列：显式位置在前，未显式的候选再按渠道 id。
+fn ordered_channel_ids(
+    snapshot: &crate::runtime::RuntimeSnapshot,
+    model: &str,
+    candidates: &[i64],
+) -> Vec<i64> {
+    let positions: HashMap<i64, i64> = snapshot
+        .channel_model_order
+        .iter()
+        .filter(|entry| entry.model == model)
+        .map(|entry| (entry.channel_id, entry.position))
+        .collect();
+    let mut ids = candidates.to_vec();
+    ids.sort_unstable_by_key(|id| match positions.get(id) {
+        Some(position) => (0, *position, *id),
+        None => (1, 0, *id),
+    });
+    ids
+}
+
+/// 该可调用名在所有渠道的登记候选，按稳定 id 排序。
+fn channel_candidates(records: &[ChannelRecord], model: &str) -> Vec<i64> {
+    let mut candidates: Vec<i64> = records
+        .iter()
+        .filter(|record| channel_lists_callable(&record.channel, model))
+        .map(|record| record.id)
+        .collect();
+    candidates.sort_unstable();
+    candidates
+}
+
+/// 替换必须恰好给出该名的候选集合一次；否则会悄悄漏掉渠道或留存重复位置。
+fn validate_channel_model_order(
+    requested: &ChannelModelOrderView,
+    candidates: &[i64],
+) -> Result<(), AdminError> {
+    if candidates.len() < 2 {
+        return Err(AdminError::NotFound(format!(
+            "可调用名 {} 没有至少两条候选渠道",
+            requested.model
+        )));
+    }
+    let candidate_ids: HashSet<i64> = candidates.iter().copied().collect();
+    let mut seen = HashSet::new();
+    for channel_id in &requested.channel_ids {
+        if !candidate_ids.contains(channel_id) {
+            return Err(AdminError::InvalidBody(format!(
+                "渠道 {channel_id} 未登记可调用名 {}",
+                requested.model
+            )));
+        }
+        if !seen.insert(*channel_id) {
+            return Err(AdminError::InvalidBody(format!(
+                "渠道 {channel_id} 在顺序中重复",
+            )));
+        }
+    }
+    if seen.len() != candidate_ids.len() {
+        return Err(AdminError::InvalidBody(format!(
+            "可调用名 {} 的顺序必须包含全部候选渠道",
+            requested.model
+        )));
+    }
+    Ok(())
 }
 
 // --- 价格 ---

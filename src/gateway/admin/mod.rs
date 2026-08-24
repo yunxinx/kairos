@@ -95,6 +95,7 @@ pub fn router(
     };
     let root_only = Router::new()
         .merge(channels::routes())
+        .merge(models::order_routes())
         .merge(probes::routes())
         .merge(settings::routes())
         .merge(plans::root_routes())

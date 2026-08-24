@@ -535,13 +535,10 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
 
 /// 读出全部渠道记录（含库生成的 `id`）。
 pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT id, name, protocol, base_url, api_key, models_json, model_aliases_json, \
-         timeout_ms, max_retries, enabled, model_group FROM channels",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(StoreError::Query)?;
+    let rows = sqlx::query(CHANNEL_RECORD_SELECT)
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
 
     let mut channels = Vec::with_capacity(rows.len());
     for row in rows {
@@ -549,6 +546,28 @@ pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord
     }
     Ok(channels)
 }
+
+/// 在调用方已经开启的事务里读出全部渠道记录。
+///
+/// 管理写路径用它把「校验目前的登记候选」与后续替换保持在同一个写事务中，
+/// 避免快照读取和实际提交之间出现渠道定义竞争。
+pub async fn list_channel_records_on_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ChannelRecord>, StoreError> {
+    let rows = sqlx::query(CHANNEL_RECORD_SELECT)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+
+    let mut channels = Vec::with_capacity(rows.len());
+    for row in rows {
+        channels.push(map_channel_record(&row)?);
+    }
+    Ok(channels)
+}
+
+const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, api_key, models_json, \
+    model_aliases_json, timeout_ms, max_retries, enabled, model_group FROM channels";
 
 /// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
@@ -605,6 +624,38 @@ pub async fn list_channel_model_orders(
             })
         })
         .collect()
+}
+
+/// 整体替换一个可调用名的渠道顺序。
+///
+/// 调用方应在同一写事务中校验渠道集合；这里只负责按给定顺序重写行，
+/// 位置从零开始。中途任一条 INSERT 失败都会由外层事务回滚。
+pub async fn replace_channel_model_order(
+    conn: &mut SqliteConnection,
+    model: &str,
+    channel_ids: &[i64],
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM channel_model_order WHERE model = ?")
+        .bind(model)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+
+    for (position, channel_id) in channel_ids.iter().copied().enumerate() {
+        let position = i64::try_from(position).map_err(|_| {
+            StoreError::InvalidResource("渠道顺序位置超出数据库整数范围".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO channel_model_order (model, channel_id, position) VALUES (?, ?, ?)",
+        )
+        .bind(model)
+        .bind(channel_id)
+        .bind(position)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    }
+    Ok(())
 }
 
 /// 新增一个渠道，返回库生成的 `id`。
