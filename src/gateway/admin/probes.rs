@@ -248,8 +248,6 @@ async fn list_upstream_models(
         api_key: draft.api_key,
         models: Vec::new(),
         model_aliases: HashMap::new(),
-        priority: 0,
-        weight: 1,
         timeout_ms: draft.timeout_ms,
         max_retries: 0,
         enabled: true,

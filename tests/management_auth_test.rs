@@ -1028,8 +1028,12 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
             &gw,
             &admin_token,
             reqwest::Method::PUT,
-            &format!("/users/{admin_id}/model-groups"),
-            json!({ "groups": [] }),
+            "/plans/2",
+            json!({
+                "internal_name": "admin",
+                "display_name": "admin",
+                "groups": []
+            }),
         )
         .await
         .status(),

@@ -145,12 +145,29 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     assert!(!user_keys.contains(&TEST_TOKEN_KEY));
 
     // admin 档默认名单为空；令牌候选也必须先由套餐名单授予。
+    let plan = json_req(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/plans",
+        json!({
+            "internal_name": "admin-token",
+            "display_name": "admin-token",
+            "groups": ["default"],
+            "capabilities": { "toggle_user_tokens": true }
+        }),
+    )
+    .await;
+    assert_eq!(plan.status(), StatusCode::CREATED);
+    let plan_id = plan.json::<Value>().await.expect("套餐应可解析")["id"]
+        .as_i64()
+        .expect("套餐应有 id");
     let assigned = json_req(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
-        &format!("/users/{admin_id}/model-groups"),
-        json!({ "groups": ["default"] }),
+        &format!("/users/{admin_id}/plan"),
+        json!({ "plan_id": plan_id }),
     )
     .await;
     assert_eq!(assigned.status(), StatusCode::OK);

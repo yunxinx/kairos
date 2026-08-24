@@ -42,6 +42,8 @@ pub use crate::store::resources::{
 pub struct RuntimeSnapshot {
     /// 渠道（路由候选，含库生成 id），按 store 返回顺序。
     pub channels: Vec<resources::ChannelRecord>,
+    /// 同名可调用名的显式渠道尝试顺序；缺少行的候选由路由按渠道 id 兜底。
+    pub channel_model_order: Vec<resources::ChannelModelOrder>,
     /// 令牌定义，按 `token_key` 索引（认证查找）。
     pub tokens: HashMap<String, resources::Token>,
     /// 价格表，外层按渠道稳定 id、内层按可调用名索引（计费准入）。
@@ -199,6 +201,7 @@ pub type SnapshotHandle = Arc<RwLock<Arc<RuntimeSnapshot>>>;
 /// 出日志、网关保护与目录同步等设置（缺省用默认值）。
 pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreError> {
     let channels = resources::list_channel_records(pool).await?;
+    let channel_model_order = resources::list_channel_model_orders(pool).await?;
     let token_rows = resources::list_tokens(pool).await?;
     let price_rows = resources::list_prices(pool).await?;
     let group_rows = resources::list_model_groups(pool).await?;
@@ -268,6 +271,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
 
     Ok(RuntimeSnapshot {
         channels,
+        channel_model_order,
         tokens,
         prices,
         model_groups,
@@ -445,8 +449,6 @@ mod tests {
                 api_key: "k".to_string(),
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
-                priority: 1,
-                weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,
@@ -483,6 +485,13 @@ mod tests {
         )
         .await
         .expect("应能写价格");
+        sqlx::query(
+            "INSERT INTO channel_model_order (model, channel_id, position) VALUES ('gpt-4o', ?, 4)",
+        )
+        .bind(channel_id)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写顺序行");
         resources::upsert_unified_model(
             &mut conn,
             &resources::UnifiedModel {
@@ -511,6 +520,14 @@ mod tests {
         let snap = load_snapshot(&pool).await.expect("应能加载快照");
         assert_eq!(snap.channels.len(), 1);
         assert_eq!(snap.channels[0].channel.name, "c1");
+        assert_eq!(
+            snap.channel_model_order,
+            vec![resources::ChannelModelOrder {
+                model: "gpt-4o".to_string(),
+                channel_id,
+                position: 4,
+            }]
+        );
         assert!(snap.tokens.contains_key("sk-a"));
         assert_eq!(
             snap.tokens["sk-a"].model_group,

@@ -43,8 +43,6 @@ pub struct Channel {
     pub api_key: String,
     pub models: Vec<String>,
     pub model_aliases: HashMap<String, String>,
-    pub priority: u32,
-    pub weight: u32,
     pub timeout_ms: u64,
     pub max_retries: u32,
     /// 是否启用：禁用的渠道不参与路由候选与失败切换。
@@ -62,6 +60,16 @@ pub struct ChannelRecord {
     /// 库生成的稳定身份；管理 API 以此定位渠道，改名不改变 id。
     pub id: i64,
     pub channel: Channel,
+}
+
+/// 某一可调用名的显式渠道尝试顺序。
+///
+/// 缺少行的渠道不从这里筛掉，而是在路由时排到全部显式行之后，按渠道 id 兜底。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelOrder {
+    pub model: String,
+    pub channel_id: i64,
+    pub position: i64,
 }
 
 /// 令牌：下游调用凭证。钱包在所属用户上；本行只保留定义与累计结算上限。
@@ -529,7 +537,7 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
 pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord>, StoreError> {
     let rows = sqlx::query(
         "SELECT id, name, protocol, base_url, api_key, models_json, model_aliases_json, \
-         priority, weight, timeout_ms, max_retries, enabled, model_group FROM channels",
+         timeout_ms, max_retries, enabled, model_group FROM channels",
     )
     .fetch_all(pool)
     .await
@@ -564,8 +572,6 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
         channel: Channel {
             base_url: row.try_get("base_url").map_err(StoreError::Query)?,
             api_key: row.try_get("api_key").map_err(StoreError::Query)?,
-            priority: row.try_get("priority").map_err(StoreError::Query)?,
-            weight: row.try_get("weight").map_err(StoreError::Query)?,
             timeout_ms: row.try_get("timeout_ms").map_err(StoreError::Query)?,
             max_retries: row.try_get("max_retries").map_err(StoreError::Query)?,
             enabled: enabled != 0,
@@ -576,6 +582,29 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             model_group: row.try_get("model_group").map_err(StoreError::Query)?,
         },
     })
+}
+
+/// 读出所有显式同名渠道顺序行，按可调用名、位置、渠道 id 保证稳定顺序。
+pub async fn list_channel_model_orders(
+    pool: &SqlitePool,
+) -> Result<Vec<ChannelModelOrder>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT model, channel_id, position FROM channel_model_order \
+         ORDER BY model ASC, position ASC, channel_id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    rows.iter()
+        .map(|row| {
+            Ok(ChannelModelOrder {
+                model: row.try_get("model").map_err(StoreError::Query)?,
+                channel_id: row.try_get("channel_id").map_err(StoreError::Query)?,
+                position: row.try_get("position").map_err(StoreError::Query)?,
+            })
+        })
+        .collect()
 }
 
 /// 新增一个渠道，返回库生成的 `id`。
@@ -592,8 +621,8 @@ pub async fn insert_channel(
     let result = sqlx::query(
         "INSERT INTO channels \
          (name, protocol, base_url, api_key, models_json, model_aliases_json, \
-          priority, weight, timeout_ms, max_retries, enabled, model_group) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          timeout_ms, max_retries, enabled, model_group) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -601,8 +630,6 @@ pub async fn insert_channel(
     .bind(&channel.api_key)
     .bind(&models_json)
     .bind(&aliases_json)
-    .bind(channel.priority)
-    .bind(channel.weight)
     .bind(channel.timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
@@ -627,7 +654,7 @@ pub async fn update_channel(
         "UPDATE channels SET \
            name = ?, protocol = ?, base_url = ?, api_key = ?, \
            models_json = ?, model_aliases_json = ?, \
-           priority = ?, weight = ?, timeout_ms = ?, max_retries = ?, enabled = ?, \
+           timeout_ms = ?, max_retries = ?, enabled = ?, \
            model_group = ? \
          WHERE id = ?",
     )
@@ -637,8 +664,6 @@ pub async fn update_channel(
     .bind(&channel.api_key)
     .bind(&models_json)
     .bind(&aliases_json)
-    .bind(channel.priority)
-    .bind(channel.weight)
     .bind(channel.timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
@@ -1245,13 +1270,75 @@ mod tests {
             api_key: "sk-x".to_string(),
             models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
             model_aliases: aliases,
-            priority: 1,
-            weight: 2,
             timeout_ms: 120_000,
             max_retries: 2,
             enabled: true,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
         }
+    }
+
+    /// 显式顺序行按位置读回；渠道删掉时仅级联摘掉该渠道，剩下一条时仍保留。
+    #[tokio::test]
+    async fn channel_model_order_retains_single_channel_and_cascades_deleted_channel() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let mut first = sample_channel();
+        first.name = "first".to_string();
+        let first_id = insert_channel(&mut conn, &first)
+            .await
+            .expect("应能写首渠道");
+        let mut second = sample_channel();
+        second.name = "second".to_string();
+        let second_id = insert_channel(&mut conn, &second)
+            .await
+            .expect("应能写次渠道");
+
+        sqlx::query(
+            "INSERT INTO channel_model_order (model, channel_id, position) VALUES \
+             ('gpt-4o', ?, 8), ('gpt-4o', ?, 3)",
+        )
+        .bind(first_id)
+        .bind(second_id)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写顺序行");
+        drop(conn);
+
+        assert_eq!(
+            list_channel_model_orders(&pool)
+                .await
+                .expect("应能读顺序行"),
+            vec![
+                ChannelModelOrder {
+                    model: "gpt-4o".to_string(),
+                    channel_id: second_id,
+                    position: 3,
+                },
+                ChannelModelOrder {
+                    model: "gpt-4o".to_string(),
+                    channel_id: first_id,
+                    position: 8,
+                },
+            ]
+        );
+
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        delete_channel(&mut conn, first_id)
+            .await
+            .expect("应能删渠道");
+        drop(conn);
+
+        assert_eq!(
+            list_channel_model_orders(&pool)
+                .await
+                .expect("应能读剩余顺序行"),
+            vec![ChannelModelOrder {
+                model: "gpt-4o".to_string(),
+                channel_id: second_id,
+                position: 3,
+            }],
+            "同名只剩一条渠道时顺序行仍须保留"
+        );
     }
 
     /// 新建渠道时全部可调用名算新增；更新只算相对上一版新出现的名字。
@@ -1870,8 +1957,6 @@ mod tests {
                 api_key: "sk".to_string(),
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
-                priority: 0,
-                weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,

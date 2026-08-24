@@ -1791,8 +1791,6 @@ mod tests {
                 api_key: "sk".to_string(),
                 models: vec![],
                 model_aliases: std::collections::HashMap::new(),
-                priority: 0,
-                weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,
@@ -1852,8 +1850,8 @@ mod tests {
             (
                 "channels",
                 "INSERT INTO channels (name, protocol, base_url, api_key, models_json, \
-                     model_aliases_json, priority, weight, timeout_ms, max_retries) \
-                 VALUES ('c', 'openai_chat', 'u', 'k', '[]', '{}', 'not-a-number', 1, 1000, 1)",
+                     model_aliases_json, timeout_ms, max_retries) \
+                 VALUES ('c', 'openai_chat', 'u', 'k', '[]', '{}', 'not-a-number', 1)",
             ),
             (
                 "settings",
@@ -1901,6 +1899,18 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(result.is_err(), "INTEGER 列写 REAL 应被 STRICT 拒绝");
+
+        assert!(
+            sqlx::query(
+                "INSERT INTO channel_model_order (model, channel_id, position) \
+                 VALUES ('m', ?, 'not-a-number')",
+            )
+            .bind(channel_id)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "channel_model_order 应仍是 STRICT 表，错类型写入须被拒"
+        );
     }
 
     /// token_balance 外键：无归属令牌的余额行被拒绝；删除令牌级联清理余额行，

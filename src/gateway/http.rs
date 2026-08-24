@@ -783,7 +783,8 @@ fn hop_for_callable(
     model: &str,
     group_name: &str,
 ) -> Result<RouteHop, HopDeny> {
-    let mut route = routing::route(&snapshot.channels, model).ok_or(HopDeny::NoRoute)?;
+    let mut route = routing::route(&snapshot.channels, &snapshot.channel_model_order, model)
+        .ok_or(HopDeny::NoRoute)?;
     if let Some(group) = snapshot.model_groups.get(group_name)
         && let Some(pinned) = store::resources::pinned_channel_ids(group, model)
     {

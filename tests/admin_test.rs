@@ -47,8 +47,6 @@ fn channel_body(name: &str, base_url: String, models: Value) -> Value {
         "api_key": "sk-upstream",
         "models": models,
         "model_aliases": {},
-        "priority": 1,
-        "weight": 1,
         "timeout_ms": 1000,
         "max_retries": 0,
         "enabled": true
@@ -583,8 +581,7 @@ async fn same_model_prices_are_per_channel() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
     let left_id = channel_id_by_name(&gw, "test-channel").await;
 
-    let mut right = channel_body("other-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
-    right["priority"] = json!(2);
+    let right = channel_body("other-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", right).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建渠道");
@@ -886,12 +883,11 @@ async fn unpriced_sibling_is_skipped_not_503() {
         .expect("应可删除播种价格");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    let mut sibling = channel_body(
+    let sibling = channel_body(
         "priced-sibling",
         gw.upstream.base_url(),
         json!([TEST_MODEL]),
     );
-    sibling["priority"] = json!(2);
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", sibling).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建渠道");
@@ -1175,10 +1171,15 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    // 渠道权重为 0 → 400：权重是加权随机除数，API 直写也须被拒。
-    let mut zero_weight = channel_body("zero-weight", gw.upstream.base_url(), json!([TEST_MODEL]));
-    zero_weight["weight"] = json!(0);
-    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", zero_weight).await;
+    // 旧的优先级/权重字段不再属于写契约，deny_unknown_fields 必须直接拒绝。
+    let mut legacy_routing = channel_body(
+        "legacy-routing",
+        gw.upstream.base_url(),
+        json!([TEST_MODEL]),
+    );
+    legacy_routing["priority"] = json!(1);
+    legacy_routing["weight"] = json!(1);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", legacy_routing).await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 重复新建 → 409，且不覆盖原资源（令牌 key 系统生成、创建不会冲突，以渠道为例）。
@@ -1189,8 +1190,6 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
         .expect("渠道列表应可解析");
     let mut conflict = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
     conflict["api_key"] = json!("sk-other");
-    conflict["priority"] = json!(9);
-    conflict["weight"] = json!(9);
     conflict["timeout_ms"] = json!(1);
     conflict["max_retries"] = json!(9);
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", conflict).await;

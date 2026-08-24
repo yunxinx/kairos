@@ -242,20 +242,29 @@ test.describe('overview page', () => {
 
     await expect(page.getByTestId('overview-trend-chart').locator('canvas')).toBeVisible();
 
-    const expectedGpt = stats.by_model.find((share) => share.model === 'e2e-ov-gpt');
-    expect(expectedGpt).toBeDefined();
-    const gptShare = page.locator('[data-testid="overview-model-share"][data-model="e2e-ov-gpt"]');
-    await expect(gptShare).toHaveAttribute(
-      'data-request-count',
-      String(expectedGpt?.request_count),
-    );
-    await expect(gptShare).toHaveAttribute(
-      'data-cost-usd-micros',
-      String(expectedGpt?.cost_usd_micros),
-    );
-    await expect(
-      page.locator('[data-testid="overview-model-share"][data-model="e2e-ov-mini"]'),
-    ).toBeVisible();
+    const expectedModelShares = [...stats.by_model]
+      .sort(
+        (left, right) =>
+          right.cost_usd_micros - left.cost_usd_micros ||
+          right.request_count - left.request_count,
+      )
+      .slice(0, 5);
+    const modelShares = page.getByTestId('overview-model-share');
+    await expect(modelShares).toHaveCount(expectedModelShares.length);
+    for (const share of expectedModelShares) {
+      const modelShare = page.locator(
+        `[data-testid="overview-model-share"][data-model="${share.model}"]`,
+      );
+      await expect(modelShare).toBeVisible();
+      await expect(modelShare).toHaveAttribute(
+        'data-request-count',
+        String(share.request_count),
+      );
+      await expect(modelShare).toHaveAttribute(
+        'data-cost-usd-micros',
+        String(share.cost_usd_micros),
+      );
+    }
 
     await page.getByTestId('overview-share-tab-channel').click();
     const expectedPrimary = stats.by_channel.find((share) => share.channel === 'e2e-ov-primary');

@@ -382,8 +382,6 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             model_aliases: [("fast".to_string(), "gpt-4o-mini".to_string())]
                 .into_iter()
                 .collect(),
-            priority: 1,
-            weight: 1,
             timeout_ms: 1000,
             max_retries: 0,
             enabled: true,

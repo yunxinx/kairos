@@ -272,9 +272,6 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     if channel.api_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
     }
-    if channel.weight < 1 {
-        return Err(AdminError::InvalidBody("weight 不能小于 1".to_string()));
-    }
     Ok(())
 }
 

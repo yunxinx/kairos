@@ -88,7 +88,48 @@ async fn first_channel_id(gw: &TestGateway) -> i64 {
         .expect("应有 id")
 }
 
-/// 新建用户带 `default`；名单撤组后请求失败且不能新建/改绑，勾回后原绑定恢复。
+async fn create_plan(gw: &TestGateway, internal_name: &str, groups: &[&str]) -> i64 {
+    let response = admin_json(
+        gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/plans",
+        json!({
+            "internal_name": internal_name,
+            "display_name": internal_name,
+            "groups": groups,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response.json::<Value>().await.expect("套餐应可解析")["id"]
+        .as_i64()
+        .expect("套餐应有 id")
+}
+
+async fn replace_plan_groups(
+    gw: &TestGateway,
+    plan_id: i64,
+    internal_name: &str,
+    groups: &[&str],
+) -> Value {
+    let response = admin_json(
+        gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/plans/{plan_id}"),
+        json!({
+            "internal_name": internal_name,
+            "display_name": internal_name,
+            "groups": groups,
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json().await.expect("套餐应可解析")
+}
+
+/// 新建用户带 `standard` 档；套餐名单撤组后请求失败且不能新建/改绑，勾回后原绑定恢复。
 #[tokio::test]
 async fn plan_groups_gate_create_rebind_requests_and_recover() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
@@ -108,11 +149,13 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
     assert_eq!(created.status(), StatusCode::CREATED);
     let user: Value = created.json().await.expect("用户应可解析");
     let user_id = user["id"].as_i64().expect("应有 id");
-
-    let listed = admin_get(&gw, &gw.session, &format!("/users/{user_id}/model-groups")).await;
-    assert_eq!(listed.status(), StatusCode::OK);
-    let groups: Value = listed.json().await.expect("可用组应可解析");
-    assert_eq!(groups["groups"], json!(["default"]));
+    assert_eq!(user["plan_id"], 1, "普通用户默认挂 standard 档");
+    let standard: Value = admin_get(&gw, &gw.session, "/plans/1")
+        .await
+        .json()
+        .await
+        .expect("standard 档应可解析");
+    assert_eq!(standard["groups"], json!(["default"]));
 
     admin_json(
         &gw,
@@ -126,17 +169,20 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
     )
     .await;
 
-    let replaced = admin_json(
+    let plan_id = create_plan(&gw, "coder", &["coding"]).await;
+    let assigned = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": ["coding"] }),
+        &format!("/users/{user_id}/plan"),
+        json!({ "plan_id": plan_id }),
     )
     .await;
-    assert_eq!(replaced.status(), StatusCode::OK);
-    let after: Value = replaced.json().await.expect("替换应可解析");
-    assert_eq!(after["groups"], json!(["coding"]));
+    assert_eq!(assigned.status(), StatusCode::OK);
+    assert_eq!(
+        assigned.json::<Value>().await.expect("换档响应应可解析")["plan_id"],
+        plan_id
+    );
 
     let session = login(&gw, "coder@example.com", "password1").await;
     let token_resp = admin_json(
@@ -165,15 +211,8 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
     let ok = chat(&gw, &key, TEST_MODEL).await;
     assert_eq!(ok.status(), StatusCode::OK);
 
-    let withdrawn = admin_json(
-        &gw,
-        &gw.session,
-        reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": ["default"] }),
-    )
-    .await;
-    assert_eq!(withdrawn.status(), StatusCode::OK);
+    let withdrawn = replace_plan_groups(&gw, plan_id, "coder", &[]).await;
+    assert_eq!(withdrawn["groups"], json!([]));
 
     let denied = chat(&gw, &key, TEST_MODEL).await;
     assert_eq!(
@@ -224,15 +263,8 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
     );
 
     // 名单恢复只改套餐，不改令牌行；原绑定应自动恢复。
-    let restored = admin_json(
-        &gw,
-        &gw.session,
-        reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": ["coding"] }),
-    )
-    .await;
-    assert_eq!(restored.status(), StatusCode::OK);
+    let restored = replace_plan_groups(&gw, plan_id, "coder", &["coding"]).await;
+    assert_eq!(restored["groups"], json!(["coding"]));
 
     let user_tokens = admin_get(&gw, &gw.session, &format!("/users/{user_id}/tokens")).await;
     assert_eq!(user_tokens.status(), StatusCode::OK);
@@ -296,12 +328,13 @@ async fn admin_tokens_follow_plan_group_allowlist() {
     .await;
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
+    let plan_id = create_plan(&gw, "operator", &["coding"]).await;
     let assigned = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": ["coding"] }),
+        &format!("/users/{user_id}/plan"),
+        json!({ "plan_id": plan_id }),
     )
     .await;
     assert_eq!(assigned.status(), StatusCode::OK);
@@ -328,15 +361,8 @@ async fn admin_tokens_follow_plan_group_allowlist() {
     )
     .await;
 
-    let withdrawn = admin_json(
-        &gw,
-        &gw.session,
-        reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": [] }),
-    )
-    .await;
-    assert_eq!(withdrawn.status(), StatusCode::OK);
+    let withdrawn = replace_plan_groups(&gw, plan_id, "operator", &[]).await;
+    assert_eq!(withdrawn["groups"], json!([]));
 
     let denied = chat(&gw, &key, TEST_MODEL).await;
     assert_eq!(denied.status(), StatusCode::NOT_FOUND);
@@ -362,15 +388,8 @@ async fn admin_tokens_follow_plan_group_allowlist() {
     .await;
     assert_eq!(rebind.status(), StatusCode::BAD_REQUEST);
 
-    let restored = admin_json(
-        &gw,
-        &gw.session,
-        reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": ["coding"] }),
-    )
-    .await;
-    assert_eq!(restored.status(), StatusCode::OK);
+    let restored = replace_plan_groups(&gw, plan_id, "operator", &["coding"]).await;
+    assert_eq!(restored["groups"], json!(["coding"]));
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(completion_body()));
     let recovered = chat(&gw, &key, TEST_MODEL).await;
@@ -392,6 +411,7 @@ async fn delete_group_clears_assignments_and_root_can_use_any_group() {
         }),
     )
     .await;
+    let plan_id = create_plan(&gw, "coder", &["default", "coding"]).await;
     let created = admin_json(
         &gw,
         &gw.session,
@@ -401,21 +421,12 @@ async fn delete_group_clears_assignments_and_root_can_use_any_group() {
             "email": "coder@example.com",
             "display_name": "编码",
             "password": "password1",
-            "role": "user"
+            "role": "user",
+            "plan_id": plan_id
         }),
     )
     .await;
-    let user_id = created.json::<Value>().await.expect("用户应可解析")["id"]
-        .as_i64()
-        .expect("应有 id");
-    admin_json(
-        &gw,
-        &gw.session,
-        reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": ["default", "coding"] }),
-    )
-    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
 
     let root_token = admin_json(
         &gw,
@@ -439,7 +450,10 @@ async fn delete_group_clears_assignments_and_root_can_use_any_group() {
         .expect("删组应可达");
     assert_eq!(deleted.status(), StatusCode::OK);
 
-    let listed = admin_get(&gw, &gw.session, &format!("/users/{user_id}/model-groups")).await;
-    let groups: Value = listed.json().await.expect("可用组应可解析");
-    assert_eq!(groups["groups"], json!(["default"]));
+    let plan: Value = admin_get(&gw, &gw.session, &format!("/plans/{plan_id}"))
+        .await
+        .json()
+        .await
+        .expect("套餐应可解析");
+    assert_eq!(plan["groups"], json!(["default"]));
 }
