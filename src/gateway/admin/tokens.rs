@@ -1,9 +1,9 @@
-//! 令牌管理：所有者编辑完整定义，启停则走独立的窄接口。
+//! 令牌管理：属性、启停与余额分别走窄接口。
 
 use axum::{
     Extension, Json, Router,
     extract::{Path, State},
-    routing::{get, put},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -11,17 +11,27 @@ use sqlx::{SqliteConnection, SqlitePool};
 use crate::gateway::logging;
 use crate::store;
 use crate::store::plans;
-use crate::store::resources::{Token, TokenRecord};
+use crate::store::resources::{Token, TokenAttributes, TokenRecord};
 use crate::store::users::{self, ManagementRole};
 
 use super::auth::{ManagementCapability, ManagementIdentity};
-use super::{AdminDeps, AdminError, begin_write, db_err, reload_and_swap};
+use super::{
+    AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, begin_write, db_err, reload_and_swap,
+    validate_bulk_targets,
+};
 
 pub(super) fn routes() -> Router<AdminDeps> {
     Router::new()
-        .route("/tokens", get(list_tokens).post(create_token))
+        .route(
+            "/tokens",
+            get(list_tokens).post(create_token).delete(delete_tokens),
+        )
         .route("/tokens/{id}", put(update_token).delete(delete_token))
         .route("/tokens/{id}/enabled", put(set_token_enabled))
+        .route(
+            "/tokens/{id}/balance-adjustments",
+            post(super::token_balance::adjust_token_balance),
+        )
 }
 
 /// 令牌读响应 wire 契约：定义字段 + 生命周期元数据 + 该令牌累计结算。
@@ -37,11 +47,15 @@ pub(super) struct TokenView {
     pub(super) created_at: i64,
     pub(super) last_used_at: Option<i64>,
     pub(super) settled_usd_micros: i64,
+    /// 可用余额；`None` 表示无限额。
+    pub(super) balance_usd_micros: Option<i64>,
 }
 
 impl TokenView {
-    fn from_record(record: TokenRecord, settled_usd_micros: i64) -> Self {
-        Self {
+    fn from_record(record: TokenRecord, settled_usd_micros: i64) -> Result<Self, AdminError> {
+        let balance_usd_micros =
+            available_balance(record.token.limit_usd_micros, settled_usd_micros)?;
+        Ok(Self {
             id: record.id,
             token_key: record.token.token_key,
             name: record.token.name,
@@ -52,22 +66,41 @@ impl TokenView {
             created_at: record.created_at,
             last_used_at: record.last_used_at,
             settled_usd_micros,
-        }
+            balance_usd_micros,
+        })
     }
 
-    fn from_record_masked(record: TokenRecord, settled_usd_micros: i64) -> Self {
+    fn from_record_masked(
+        record: TokenRecord,
+        settled_usd_micros: i64,
+    ) -> Result<Self, AdminError> {
         let masked = mask_token_key(&record.token.token_key);
-        let mut view = Self::from_record(record, settled_usd_micros);
+        let mut view = Self::from_record(record, settled_usd_micros)?;
         view.token_key = masked;
-        view
+        Ok(view)
     }
+}
+
+pub(super) fn available_balance(
+    limit_usd_micros: Option<i64>,
+    settled_usd_micros: i64,
+) -> Result<Option<i64>, AdminError> {
+    limit_usd_micros
+        .map(|limit| {
+            limit.checked_sub(settled_usd_micros).ok_or_else(|| {
+                AdminError::Store(store::StoreError::InvalidResource(
+                    "令牌余额超出整数范围".to_string(),
+                ))
+            })
+        })
+        .transpose()
 }
 
 async fn token_view(pool: &SqlitePool, record: TokenRecord) -> Result<TokenView, AdminError> {
     let settled = store::get_token_settled(pool, &record.token.token_key)
         .await
         .map_err(AdminError::Store)?;
-    Ok(TokenView::from_record(record, settled))
+    TokenView::from_record(record, settled)
 }
 
 async fn token_view_masked(
@@ -77,7 +110,7 @@ async fn token_view_masked(
     let settled = store::get_token_settled(pool, &record.token.token_key)
         .await
         .map_err(AdminError::Store)?;
-    Ok(TokenView::from_record_masked(record, settled))
+    TokenView::from_record_masked(record, settled)
 }
 
 pub(super) async fn list_user_tokens(
@@ -97,15 +130,14 @@ pub(super) async fn list_user_tokens(
     let settled = store::list_token_settled_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
-    Ok(Json(
-        records
-            .into_iter()
-            .map(|record| {
-                let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
-                TokenView::from_record_masked(record, amount)
-            })
-            .collect(),
-    ))
+    let views = records
+        .into_iter()
+        .map(|record| {
+            let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
+            TokenView::from_record_masked(record, amount)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(views))
 }
 
 pub(super) async fn list_tokens(
@@ -118,15 +150,14 @@ pub(super) async fn list_tokens(
     let settled = store::list_token_settled_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
-    Ok(Json(
-        records
-            .into_iter()
-            .map(|record| {
-                let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
-                TokenView::from_record(record, amount)
-            })
-            .collect(),
-    ))
+    let views = records
+        .into_iter()
+        .map(|record| {
+            let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
+            TokenView::from_record(record, amount)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(views))
 }
 
 /// 按库生成的 id 读回一条令牌记录；不存在返回 `NotFound`。
@@ -149,7 +180,7 @@ async fn read_token_record_by_key(
 }
 
 /// 解析路径中的令牌 id；非整数不标识任何令牌，按不存在处理（404）。
-fn parse_token_id(raw: &str) -> Result<i64, AdminError> {
+pub(super) fn parse_token_id(raw: &str) -> Result<i64, AdminError> {
     raw.parse::<i64>()
         .map_err(|_| AdminError::NotFound(format!("令牌 {raw} 不存在")))
 }
@@ -175,6 +206,23 @@ fn validate_token(token: &Token) -> Result<(), AdminError> {
         ));
     }
     if token.model_group.trim().is_empty() {
+        return Err(AdminError::InvalidBody("model_group 不能为空".to_string()));
+    }
+    Ok(())
+}
+
+fn validate_token_attributes(attributes: &TokenAttributes) -> Result<(), AdminError> {
+    if attributes.name.trim().is_empty() {
+        return Err(AdminError::InvalidBody("name 不能为空".to_string()));
+    }
+    if let Some(rpm) = attributes.rate_limit_rpm
+        && i64::try_from(rpm).is_err()
+    {
+        return Err(AdminError::InvalidBody(
+            "rate_limit_rpm 超出范围".to_string(),
+        ));
+    }
+    if attributes.model_group.trim().is_empty() {
         return Err(AdminError::InvalidBody("model_group 不能为空".to_string()));
     }
     Ok(())
@@ -245,7 +293,7 @@ pub(super) fn mask_token_key(key: &str) -> String {
 }
 
 /// 完整定义与删除只属于令牌所有者。
-fn reject_cross_owner_mutation(
+pub(super) fn reject_cross_owner_mutation(
     identity: &ManagementIdentity,
     existing: &TokenRecord,
 ) -> Result<(), AdminError> {
@@ -289,7 +337,19 @@ pub(super) struct TokenEnabledUpdate {
 #[serde(deny_unknown_fields)]
 pub(super) struct TokenCreate {
     name: String,
-    limit_usd_micros: Option<i64>,
+    /// 新令牌的初始可用余额；`None` 表示无限额。
+    balance_usd_micros: Option<i64>,
+    #[serde(default)]
+    rate_limit_rpm: Option<u64>,
+    enabled: bool,
+    #[serde(default = "crate::store::resources::default_model_group")]
+    model_group: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TokenUpdate {
+    name: String,
     #[serde(default)]
     rate_limit_rpm: Option<u64>,
     enabled: bool,
@@ -323,7 +383,8 @@ pub(super) async fn create_token(
             }
         },
         name: create.name,
-        limit_usd_micros: create.limit_usd_micros,
+        // 新令牌尚无累计结算，因此初始余额与累计上限数值相同。
+        limit_usd_micros: create.balance_usd_micros,
         rate_limit_rpm: create.rate_limit_rpm,
         enabled: create.enabled,
         model_group: create.model_group.trim().to_string(),
@@ -333,7 +394,7 @@ pub(super) async fn create_token(
     let now = logging::unix_millis();
     let mut tx = begin_write(&deps).await?;
     reject_invalid_group_binding(&mut tx, &identity, &token.model_group).await?;
-    crate::store::resources::upsert_token(&mut tx, &token, now)
+    crate::store::resources::insert_token(&mut tx, &token, now)
         .await
         .map_err(AdminError::Store)?;
     crate::store::initialize_token_settlement(&mut tx, &token.token_key, 0, now)
@@ -352,22 +413,25 @@ pub(super) async fn update_token(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
     Path(raw_id): Path<String>,
-    body: Result<Json<Token>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<TokenUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<TokenView>, AdminError> {
     let id = parse_token_id(&raw_id)?;
-    let mut token = body.map_err(AdminError::bad_body)?.0;
+    let update = body.map_err(AdminError::bad_body)?.0;
+    let attributes = TokenAttributes {
+        name: update.name,
+        rate_limit_rpm: update.rate_limit_rpm,
+        enabled: update.enabled,
+        model_group: update.model_group.trim().to_string(),
+    };
     let mut tx = begin_write(&deps).await?;
     let existing = store::resources::get_token_record_on_conn(&mut tx, id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
     reject_cross_owner_mutation(&identity, &existing)?;
-    token.token_key = existing.token.token_key.clone();
-    token.user_id = existing.token.user_id;
-    token.model_group = token.model_group.trim().to_string();
-    validate_token(&token)?;
-    reject_invalid_group_binding(&mut tx, &identity, &token.model_group).await?;
-    crate::store::resources::upsert_token(&mut tx, &token, logging::unix_millis())
+    validate_token_attributes(&attributes)?;
+    reject_invalid_group_binding(&mut tx, &identity, &attributes.model_group).await?;
+    crate::store::resources::update_token_attributes(&mut tx, id, &attributes)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
@@ -441,6 +505,9 @@ pub(super) async fn delete_token(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
     reject_cross_owner_mutation(&identity, &deleted)?;
+    let settled = store::get_token_settled_on_conn(&mut tx, &deleted.token.token_key)
+        .await
+        .map_err(AdminError::Store)?;
     store::delete_token_balance(&mut tx, &deleted.token.token_key)
         .await
         .map_err(AdminError::Store)?;
@@ -449,7 +516,36 @@ pub(super) async fn delete_token(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    token_view(&deps.pool, deleted).await.map(Json)
+    TokenView::from_record(deleted, settled).map(Json)
+}
+
+async fn delete_tokens(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<BulkDeleteBody<i64>>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<BulkDeleteResult<i64>>, AdminError> {
+    let targets = validate_bulk_targets(body.map_err(AdminError::bad_body)?.0.targets)?;
+    let mut tx = begin_write(&deps).await?;
+    let mut records = Vec::with_capacity(targets.len());
+    for id in &targets {
+        let record = store::resources::get_token_record_on_conn(&mut tx, *id)
+            .await
+            .map_err(AdminError::Store)?
+            .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
+        reject_cross_owner_mutation(&identity, &record)?;
+        records.push(record);
+    }
+    for record in &records {
+        store::delete_token_balance(&mut tx, &record.token.token_key)
+            .await
+            .map_err(AdminError::Store)?;
+        store::resources::delete_token(&mut tx, record.id)
+            .await
+            .map_err(AdminError::Store)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(BulkDeleteResult::new(targets)))
 }
 
 #[cfg(test)]

@@ -340,7 +340,7 @@ const bulkDelete = useBulkDelete<number>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['users'],
-  deleteOne: (userId) => apiClient.deleteUser(userId),
+  deleteMany: (userIds) => apiClient.deleteUsers(userIds),
 });
 
 function openCreate(event: Event) {

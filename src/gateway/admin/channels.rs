@@ -8,23 +8,83 @@ use axum::{
     http::StatusCode,
     routing::{get, put},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::gateway::{logging, routing};
 use crate::store;
 use crate::store::resources::{Channel, ChannelRecord};
 
 use super::auth::ManagementIdentity;
-use super::models::{reject_unhidden_unified_collision, reject_unknown_group};
-use super::{AdminDeps, AdminError, db_err, reload_and_swap};
+use super::models::reject_unhidden_unified_collision;
+use super::{
+    AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, begin_write, db_err, reload_and_swap,
+    validate_bulk_targets,
+};
 
 pub(super) fn routes() -> Router<AdminDeps> {
     Router::new()
-        .route("/channels", get(list_channels).post(create_channel))
+        .route(
+            "/channels",
+            get(list_channels)
+                .post(create_channel)
+                .delete(delete_channels),
+        )
         .route("/channels/{id}", put(update_channel).delete(delete_channel))
 }
 
+/// 渠道名录：admin+ 只读的最小投影，不含密钥与上游地址。
+///
+/// 模型页要判断「某个已登记名挂在哪条渠道、那条渠道还在不在」。没有这个端点时
+/// admin 调 `GET /channels` 拿 403，前端渠道表为空，于是把「不知道」渲染成了
+/// 「渠道已失效」——所有组员都误标红。投影只回渲染判断真正需要的字段：
+/// 出站地址与密钥仍是 root-only 的运营机密。
+pub(super) fn summary_routes() -> Router<AdminDeps> {
+    Router::new().route("/channels/summary", get(list_channel_summaries))
+}
+
+pub(super) fn model_routes() -> Router<AdminDeps> {
+    Router::new().route(
+        "/channel-models",
+        axum::routing::delete(delete_channel_models),
+    )
+}
+
 // --- 渠道 ---
+
+/// 渠道名录条目：身份 + 名称 + 协议 + 启用态 + 可调用名。
+///
+/// 带上 `protocol` 是因为日志页要标出「入站 ⇄ 出站」的协议转换，那张映射表按
+/// 渠道名查协议；缺它则 admin 的日志详情永远显示「出站未知」。
+#[derive(Debug, Serialize)]
+struct ChannelSummaryView {
+    id: i64,
+    name: String,
+    protocol: crate::config::Protocol,
+    enabled: bool,
+    models: Vec<String>,
+    model_aliases: std::collections::HashMap<String, String>,
+}
+
+/// 列出全部渠道名录。路由层已限制为 admin+；响应只含模型视图所需的安全字段。
+async fn list_channel_summaries(
+    State(deps): State<AdminDeps>,
+) -> Result<Json<Vec<ChannelSummaryView>>, AdminError> {
+    let snapshot = deps.snapshot.read().await;
+    Ok(Json(
+        snapshot
+            .channels
+            .iter()
+            .map(|record| ChannelSummaryView {
+                id: record.id,
+                name: record.channel.name.clone(),
+                protocol: record.channel.protocol,
+                enabled: record.channel.enabled,
+                models: record.channel.models.clone(),
+                model_aliases: record.channel.model_aliases.clone(),
+            })
+            .collect(),
+    ))
+}
 
 /// 渠道读视图：库生成的稳定身份 + 定义字段（同级展开序列化）。
 ///
@@ -76,30 +136,32 @@ async fn create_channel(
     let mut channel = body.map_err(AdminError::bad_body)?;
     normalize_channel_group(&mut channel);
     validate_channel(&channel)?;
-    reject_unknown_group(&deps, &channel.model_group).await?;
+    let mut tx = begin_write(&deps).await?;
+    reject_unknown_group_on_conn(&mut tx, &channel.model_group).await?;
+    let channels = crate::store::resources::list_channel_records_on_conn(&mut tx)
+        .await
+        .map_err(AdminError::Store)?;
+    let unified_models = crate::store::resources::list_unified_models_on_conn(&mut tx)
+        .await
+        .map_err(AdminError::Store)?;
+    if channels
+        .iter()
+        .any(|record| record.channel.name == channel.name)
     {
-        let snapshot = deps.snapshot.read().await;
-        if snapshot
-            .channels
-            .iter()
-            .any(|record| record.channel.name == channel.name)
-        {
-            return Err(AdminError::Conflict(format!(
-                "渠道 {} 已存在",
-                channel.name
-            )));
-        }
-        reject_alias_occupancy(&channel)?;
-        reject_alias_conflict(&snapshot.channels, &channel, None)?;
-        reject_unhidden_unified_collision(
-            &snapshot.channels,
-            Some(&channel),
-            None,
-            snapshot.unified_models.values(),
-            None,
-        )?;
+        return Err(AdminError::Conflict(format!(
+            "渠道 {} 已存在",
+            channel.name
+        )));
     }
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    reject_alias_occupancy(&channel)?;
+    reject_alias_conflict(&channels, &channel, None)?;
+    reject_unhidden_unified_collision(
+        &channels,
+        Some(&channel),
+        None,
+        unified_models.iter(),
+        None,
+    )?;
     let id = crate::store::resources::insert_channel(&mut tx, &channel)
         .await
         .map_err(AdminError::Store)?;
@@ -137,37 +199,38 @@ async fn update_channel(
     let mut channel = body.map_err(AdminError::bad_body)?;
     normalize_channel_group(&mut channel);
     validate_channel(&channel)?;
-    reject_unknown_group(&deps, &channel.model_group).await?;
-    let previous = {
-        let snapshot = deps.snapshot.read().await;
-        let current = snapshot
-            .channels
+    let mut tx = begin_write(&deps).await?;
+    reject_unknown_group_on_conn(&mut tx, &channel.model_group).await?;
+    let channels = crate::store::resources::list_channel_records_on_conn(&mut tx)
+        .await
+        .map_err(AdminError::Store)?;
+    let unified_models = crate::store::resources::list_unified_models_on_conn(&mut tx)
+        .await
+        .map_err(AdminError::Store)?;
+    let current = channels
+        .iter()
+        .find(|record| record.id == id)
+        .ok_or_else(|| AdminError::NotFound(format!("渠道 {id} 不存在")))?;
+    if channel.name != current.channel.name
+        && channels
             .iter()
-            .find(|record| record.id == id)
-            .ok_or_else(|| AdminError::NotFound(format!("渠道 {id} 不存在")))?;
-        if channel.name != current.channel.name
-            && snapshot
-                .channels
-                .iter()
-                .any(|record| record.channel.name == channel.name)
-        {
-            return Err(AdminError::Conflict(format!(
-                "渠道 {} 已存在",
-                channel.name
-            )));
-        }
-        reject_alias_occupancy(&channel)?;
-        reject_alias_conflict(&snapshot.channels, &channel, Some(id))?;
-        reject_unhidden_unified_collision(
-            &snapshot.channels,
-            Some(&channel),
-            Some(id),
-            snapshot.unified_models.values(),
-            None,
-        )?;
-        current.channel.clone()
-    };
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+            .any(|record| record.channel.name == channel.name)
+    {
+        return Err(AdminError::Conflict(format!(
+            "渠道 {} 已存在",
+            channel.name
+        )));
+    }
+    reject_alias_occupancy(&channel)?;
+    reject_alias_conflict(&channels, &channel, Some(id))?;
+    reject_unhidden_unified_collision(
+        &channels,
+        Some(&channel),
+        Some(id),
+        unified_models.iter(),
+        None,
+    )?;
+    let previous = current.channel.clone();
     crate::store::resources::update_channel(&mut tx, id, &channel)
         .await
         .map_err(AdminError::Store)?;
@@ -196,6 +259,22 @@ async fn update_channel(
     Ok(Json(ChannelView::from_record(updated)))
 }
 
+/// 在持有写事务时确认渠道默认组仍存在，避免先读快照后提交的竞态。
+async fn reject_unknown_group_on_conn(
+    conn: &mut sqlx::SqliteConnection,
+    group: &str,
+) -> Result<(), AdminError> {
+    if crate::store::resources::get_model_group(conn, group)
+        .await
+        .map_err(AdminError::Store)?
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err(AdminError::NotFound(format!("模型组 {group} 不存在")))
+    }
+}
+
 /// 删除渠道（按路径 `id`）：不存在则 404，否则删除并返回被删渠道视图。
 async fn delete_channel(
     State(deps): State<AdminDeps>,
@@ -219,6 +298,120 @@ async fn delete_channel(
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(ChannelView::from_record(deleted)))
+}
+
+async fn delete_channels(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<BulkDeleteBody<i64>>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<BulkDeleteResult<i64>>, AdminError> {
+    let targets = validate_bulk_targets(body.map_err(AdminError::bad_body)?.0.targets)?;
+    let mut tx = begin_write(&deps).await?;
+    let records = crate::store::resources::list_channel_records_on_conn(&mut tx)
+        .await
+        .map_err(AdminError::Store)?;
+    for id in &targets {
+        if !records.iter().any(|record| record.id == *id) {
+            return Err(AdminError::NotFound(format!("渠道 {id} 不存在")));
+        }
+    }
+    for id in &targets {
+        crate::store::resources::delete_channel(&mut tx, *id)
+            .await
+            .map_err(AdminError::Store)?;
+    }
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "channels",
+        &format!("批量删除 {} 条渠道", targets.len()),
+    )
+    .await
+    .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(BulkDeleteResult::new(targets)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelModelTarget {
+    channel_id: i64,
+    model: String,
+}
+
+async fn delete_channel_models(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<BulkDeleteBody<ChannelModelTarget>>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<BulkDeleteResult<ChannelModelTarget>>, AdminError> {
+    let targets = validate_bulk_targets(body.map_err(AdminError::bad_body)?.0.targets)?;
+    let mut tx = begin_write(&deps).await?;
+    let mut records = crate::store::resources::list_channel_records_on_conn(&mut tx)
+        .await
+        .map_err(AdminError::Store)?;
+
+    for target in &targets {
+        let record = records
+            .iter()
+            .find(|record| record.id == target.channel_id)
+            .ok_or_else(|| AdminError::NotFound(format!("渠道 {} 不存在", target.channel_id)))?;
+        if !record
+            .channel
+            .models
+            .iter()
+            .any(|model| model == &target.model)
+        {
+            return Err(AdminError::NotFound(format!(
+                "渠道 {} 的清单模型 {} 不存在",
+                target.channel_id, target.model
+            )));
+        }
+    }
+
+    for record in &mut records {
+        let mut drop = HashSet::new();
+        for target in targets
+            .iter()
+            .filter(|target| target.channel_id == record.id)
+        {
+            drop.insert(target.model.clone());
+            for (alias, canonical) in &record.channel.model_aliases {
+                if canonical == &target.model {
+                    drop.insert(alias.clone());
+                }
+            }
+        }
+        if drop.is_empty() {
+            continue;
+        }
+        record.channel.models.retain(|model| !drop.contains(model));
+        record
+            .channel
+            .model_aliases
+            .retain(|alias, canonical| !drop.contains(alias) && !drop.contains(canonical));
+        crate::store::resources::update_channel(&mut tx, record.id, &record.channel)
+            .await
+            .map_err(AdminError::Store)?;
+        crate::store::resources::retain_channel_prices(
+            &mut tx,
+            record.id,
+            &crate::store::resources::channel_callable_names(&record.channel),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "channels",
+        &format!("批量移除 {} 条渠道模型清单项", targets.len()),
+    )
+    .await
+    .map_err(AdminError::Store)?;
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(BulkDeleteResult::new(targets)))
 }
 pub(super) async fn read_channel_record(
     deps: &AdminDeps,

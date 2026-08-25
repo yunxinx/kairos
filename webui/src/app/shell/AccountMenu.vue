@@ -68,12 +68,13 @@ function handleToggleTheme() {
 }
 
 async function handleLogout() {
+  const revoke = apiClient.logout();
+  clearAdminKey();
   try {
-    await apiClient.logout();
+    await revoke;
   } catch {
     // 会话可能已失效；本地清凭据即可。
   }
-  clearAdminKey();
   await navigate({ to: '/login' });
 }
 </script>

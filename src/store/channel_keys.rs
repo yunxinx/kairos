@@ -133,13 +133,24 @@ pub fn channel_key_supports_model(key: &StoredChannelKey, model: &str) -> bool {
     allowed && !blocked
 }
 
+fn is_eligible_channel_key(key: &StoredChannelKey, model: &str) -> bool {
+    key.enabled && channel_key_supports_model(key, model)
+}
+
+/// 渠道是否至少有一把启用且允许指定模型的密钥。
+///
+/// 只做确定性判断，不执行加权随机选择，也不改变会话粘性缓存。
+pub fn channel_has_eligible_key(keys: &[StoredChannelKey], model: &str) -> bool {
+    keys.iter().any(|key| is_eligible_channel_key(key, model))
+}
+
 /// 返回启用且允许指定模型的密钥，保留存储顺序。
 pub fn eligible_channel_keys<'a>(
     keys: &'a [StoredChannelKey],
     model: &str,
 ) -> Vec<&'a StoredChannelKey> {
     keys.iter()
-        .filter(|key| key.enabled && channel_key_supports_model(key, model))
+        .filter(|key| is_eligible_channel_key(key, model))
         .collect()
 }
 
@@ -238,5 +249,21 @@ mod tests {
         let debug = format!("{key:?}");
         assert!(!debug.contains("secret-1"));
         assert!(debug.contains("REDACTED"));
+    }
+
+    #[test]
+    fn eligible_key_presence_matches_candidate_filter() {
+        let mut disabled = stored_key(1, 1, false);
+        disabled.models = Some(vec!["model-a".to_string()]);
+        let mut blocked = stored_key(2, 1, true);
+        blocked.blocked_models = Some(vec!["model-a".to_string()]);
+        let allowed = stored_key(3, 1, true);
+
+        let keys = [disabled, blocked, allowed];
+        assert!(channel_has_eligible_key(&keys, "model-a"));
+        assert_eq!(
+            channel_has_eligible_key(&keys, "model-a"),
+            !eligible_channel_keys(&keys, "model-a").is_empty()
+        );
     }
 }

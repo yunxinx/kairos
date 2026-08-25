@@ -1,4 +1,4 @@
-import { channelWriteBody, type Channel, type ChannelView, type Price } from '@/api/types';
+import { type ChannelSummary, type Price } from '@/api/types';
 
 /** 别名列上的关联名及其来源渠道。 */
 export interface AliasMapping {
@@ -48,13 +48,13 @@ function addRelated(list: AliasMapping[], alias: string, channelName: string) {
  *   主模型本身不成行（路由也不按 alias value 匹配）。
  * 同一可调用名在不同渠道上各成一行，单价按 (渠道, 模型) 取。
  */
-export function buildInventory(channels: ChannelView[], prices: Price[]): InventoryRow[] {
+export function buildInventory(channels: ChannelSummary[], prices: Price[]): InventoryRow[] {
   const byKey = new Map<string, InventoryRow>();
   const priceByKey = new Map(
     prices.map((price) => [channelModelKey(price.channel_id, price.model), price]),
   );
 
-  function rowOf(channel: ChannelView, name: string): InventoryRow {
+  function rowOf(channel: ChannelSummary, name: string): InventoryRow {
     const key = channelModelKey(channel.id, name);
     const existing = byKey.get(key);
     if (existing) return existing;
@@ -141,39 +141,6 @@ export function aliasChips(row: InventoryRow, channelName?: string | null): Alia
     chips.push({ name: item.alias, canonical: true });
   }
   return chips;
-}
-
-/**
- * 从指定渠道删除该行时，要从该渠道 `models` 拿掉的清单名：
- * 行名 + 折叠进本行的别名 key。不含出站主模型（它不在本渠道清单里）。
- * 行已按单一来源渠道成行，别名列无需再按渠道名过滤。
- */
-export function listedNamesOnChannel(row: InventoryRow): string[] {
-  return [row.name, ...row.aliases.map((item) => item.alias)];
-}
-
-/** 从渠道写契约里拿掉指定名字（主模型与别名 key/value）。 */
-export function stripNamesFromChannel(channel: ChannelView, drop: Set<string>): Channel {
-  const models = channel.models.filter((name) => !drop.has(name));
-  const model_aliases = Object.fromEntries(
-    Object.entries(channel.model_aliases).filter(
-      ([alias, canonical]) => !drop.has(alias) && !drop.has(canonical),
-    ),
-  );
-  return {
-    ...channelWriteBody(channel),
-    models,
-    model_aliases,
-  };
-}
-
-/** 渠道清单或别名是否因 `stripNamesFromChannel` 发生变化。 */
-export function channelChangedByStrip(channel: ChannelView, next: Channel): boolean {
-  if (channel.models.length !== next.models.length) return true;
-  if (Object.keys(channel.model_aliases).length !== Object.keys(next.model_aliases).length) {
-    return true;
-  }
-  return channel.models.some((name, index) => name !== next.models[index]);
 }
 
 /** 按渠道分段：每一行只属于其来源渠道。 */

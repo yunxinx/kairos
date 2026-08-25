@@ -27,6 +27,7 @@ import { useLogListControls } from '@/features/logs/useLogListControls';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { formatUnixMillis } from '@/lib/format';
+import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent } from '@/lib/window-anchor';
 
 type SystemLogWindowPayload = {
@@ -44,11 +45,20 @@ const SYSTEM_LOG_COLUMNS: ColumnVisibilitySpec<SystemLogColumnId>[] = [
   { id: 'actions', locked: true },
 ];
 
-const SYSTEM_LOG_HIDEABLE: SystemLogColumnId[] = ['level', 'target', 'actor', 'message'];
-
 const LEVELS = ['error', 'warn', 'info'] as const;
 
 const { t, locale } = useI18n();
+const me = useCurrentUser();
+
+/**
+ * 普通用户只能看到自己的审计行（后端按身份钉死 actor 维），操作者列恒为自己、
+ * 筛选也无从可选，故整列与漏斗都不渲染。
+ */
+const showActor = computed(() => me.value !== null && me.value.role !== 'user');
+
+const SYSTEM_LOG_HIDEABLE = computed<SystemLogColumnId[]>(() =>
+  showActor.value ? ['level', 'target', 'actor', 'message'] : ['level', 'target', 'message'],
+);
 const {
   draftKeyword,
   appliedKeyword,
@@ -84,7 +94,12 @@ const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
   SYSTEM_LOG_COLUMNS,
 );
 
-const columnMenuItems = computed(() => menuItems(SYSTEM_LOG_HIDEABLE));
+const columnMenuItems = computed(() => menuItems(SYSTEM_LOG_HIDEABLE.value));
+
+/** 操作者列按角色隐藏，不进 localStorage；空行 colspan 要把它扣掉。 */
+const effectiveColumnCount = computed(
+  () => columnCount.value - (!showActor.value && visible.value.actor ? 1 : 0),
+);
 
 const sortDir = ref<SortDir>('desc');
 
@@ -331,14 +346,16 @@ function levelBadgeClass(level: string): string {
           </TableHead>
           <TableHead v-if="visible.level" class="w-24">{{ t('logs.level') }}</TableHead>
           <TableHead v-if="visible.target" class="w-56">{{ t('logs.target') }}</TableHead>
-          <TableHead v-if="visible.actor" class="w-48">{{ t('logs.actor') }}</TableHead>
+          <TableHead v-if="showActor && visible.actor" class="w-48">{{
+            t('logs.actor')
+          }}</TableHead>
           <TableHead v-if="visible.message">{{ t('logs.message') }}</TableHead>
           <TableHead align="center">{{ t('common.actions') }}</TableHead>
         </TableRow>
       </TableHeader>
 
       <TableBody>
-        <TableRowsSkeleton v-if="showTableSkeleton" :columns="columnCount" />
+        <TableRowsSkeleton v-if="showTableSkeleton" :columns="effectiveColumnCount" />
         <template v-else>
           <TableRow
             v-for="entry in items"
@@ -380,7 +397,7 @@ function levelBadgeClass(level: string): string {
             </TableCell>
             <!-- 运维事件由系统自身产生，没有操作者；审计事件才有。 -->
             <TableCell
-              v-if="visible.actor"
+              v-if="showActor && visible.actor"
               truncate
               class="font-mono text-xs"
               data-testid="system-log-actor"
@@ -422,7 +439,7 @@ function levelBadgeClass(level: string): string {
           </TableRow>
 
           <TableRow v-if="items.length === 0">
-            <TableCell :colspan="columnCount" class="h-24 whitespace-normal">
+            <TableCell :colspan="effectiveColumnCount" class="h-24 whitespace-normal">
               <EmptyState data-testid="system-logs-empty" :title="t('common.emptyList')" />
             </TableCell>
           </TableRow>

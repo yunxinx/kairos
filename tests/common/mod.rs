@@ -469,7 +469,7 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         inserted.push((id, channel));
     }
     for token in &seed.tokens {
-        resources::upsert_token(
+        resources::insert_token(
             &mut conn,
             &Token {
                 token_key: token.token_key.clone(),

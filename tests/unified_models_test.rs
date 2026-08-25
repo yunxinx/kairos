@@ -306,7 +306,7 @@ async fn token_group_and_unified_id_may_share_the_same_string() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "coding", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "coding", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     assert_eq!(token.status(), reqwest::StatusCode::CREATED);

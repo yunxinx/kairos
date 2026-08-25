@@ -82,12 +82,28 @@ const roleOptions = computed(() => {
 
 const canAssignPlan = computed(() => hasCapability(me.value, 'assign_plan'));
 
+function defaultPlanForRole(selectedRole: ManagementRole): string {
+  if (selectedRole === 'root') return '';
+  const audience = selectedRole === 'admin' ? 'admin' : 'user';
+  const plan = (plansQuery.data.value ?? []).find(
+    (candidate) => candidate.audience === audience && candidate.is_default,
+  );
+  return plan ? String(plan.id) : '';
+}
+
 const planOptions = computed(() => {
-  const options = (plansQuery.data.value ?? []).map((plan) => ({
-    value: String(plan.id),
-    label: plan.display_name,
-  }));
-  if (initialPlanId && !options.some((option) => option.value === initialPlanId)) {
+  const audience = role.value === 'admin' ? 'admin' : 'user';
+  const options = (plansQuery.data.value ?? [])
+    .filter((plan) => plan.audience === audience)
+    .map((plan) => ({
+      value: String(plan.id),
+      label: plan.display_name,
+    }));
+  if (
+    role.value === initialRole &&
+    initialPlanId &&
+    !options.some((option) => option.value === initialPlanId)
+  ) {
     options.push({
       value: initialPlanId,
       label: props.user.plan_display_name || initialPlanId,
@@ -95,6 +111,15 @@ const planOptions = computed(() => {
   }
   return options;
 });
+
+watch(
+  [role, plansQuery.data],
+  ([selectedRole]) => {
+    selectedPlanId.value =
+      selectedRole === initialRole ? initialPlanId : defaultPlanForRole(selectedRole);
+  },
+  { immediate: true },
+);
 
 /** 仅 ASCII 小写：与服务端 normalize_email（to_ascii_lowercase）同一算法，
  * 避免 Unicode 大写（如 Á）导致前端判「已变化」而服务端 normalize 后判「未变」。 */
@@ -124,6 +149,7 @@ const saveMutation = useMutation({
       enabled?: boolean;
       password?: string;
       rate_limit_rpm?: number | null;
+      plan_id?: number;
     } = {
       display_name: displayName.value.trim(),
       enabled: enabled.value,
@@ -139,14 +165,15 @@ const saveMutation = useMutation({
     if (password.value) {
       body.password = password.value;
     }
-    const updated = await apiClient.updateUser(props.user.id, body);
     if (
       canAssignPlan.value &&
       selectedPlanId.value &&
+      role.value === initialRole &&
       selectedPlanId.value !== initialPlanId
     ) {
-      await apiClient.assignUserPlan(props.user.id, Number(selectedPlanId.value));
+      body.plan_id = Number(selectedPlanId.value);
     }
+    const updated = await apiClient.updateUser(props.user.id, body);
     return updated;
   },
   onSuccess: async () => {
@@ -305,6 +332,7 @@ function handleSave() {
           :id="planId"
           v-model="selectedPlanId"
           :options="planOptions"
+          :disabled="role !== initialRole"
           data-testid="user-editor-plan"
         />
       </FormField>

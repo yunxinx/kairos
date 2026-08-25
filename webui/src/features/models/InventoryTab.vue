@@ -25,25 +25,25 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { type BulkDeletePayload } from '@/composables/useBulkDelete';
+import { invalidateChannelCaches, useChannelDirectory } from '@/composables/useChannelDirectory';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
 import CatalogFillWindow from '@/features/models/CatalogFillWindow.vue';
 import PriceEditorWindow from '@/features/models/PriceEditorWindow.vue';
+import { hasCapability } from '@/lib/capabilities';
 import { formatUsdAmount } from '@/lib/format';
 import {
   aliasChips,
   buildInventory,
-  channelChangedByStrip,
   inventoryRowKey,
-  listedNamesOnChannel,
   sectionInventory,
   sortInventory,
-  stripNamesFromChannel,
   type AliasChip,
   type InventoryRow,
   type InventorySection,
 } from '@/lib/inventory';
+import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type InventoryDeleteTarget = { name: string; channelId: number; channelName: string };
@@ -58,12 +58,20 @@ type InventoryWindowPayload =
 const { t } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
+const me = useCurrentUser();
+const canEditPrices = computed(() => hasCapability(me.value, 'edit_prices'));
+const canEditCatalog = computed(() => hasCapability(me.value, 'edit_price_catalog'));
 
 const searchText = ref('');
 const statusFilter = ref<string[]>([]);
 const selectedChannels = ref<string[]>([]);
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
-const tableColumnCount = 8;
+const canRewriteChannels = computed(() => me.value?.role === 'root');
+const canSelectRows = computed(() => canEditCatalog.value || canRewriteChannels.value);
+const hasActions = computed(() => canEditPrices.value || canRewriteChannels.value);
+const tableColumnCount = computed(
+  () => 6 + (canSelectRows.value ? 1 : 0) + (hasActions.value ? 1 : 0),
+);
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
   const anchor = pendingAnchor.value;
@@ -82,15 +90,17 @@ const {
 
 const deleteErrors = ref<Record<number, string>>({});
 
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
+const { query: channelsQuery, channels } = useChannelDirectory();
 const pricesQuery = useQuery({
   queryKey: ['prices'],
   queryFn: () => apiClient.listPrices(),
 });
 
+/**
+ * 清单行删除要整体改写渠道定义（`PUT /channels/{id}`），那是 root-only 的写路径。
+ * 因此只有 root 才拉完整定义，也只有 root 才渲染删除入口；带 `edit_prices` 的
+ * admin 仍能改价，但不给它一个注定 403 的按钮。
+ */
 const loadError = computed(() => channelsQuery.isError.value || pricesQuery.isError.value);
 const showTableSkeleton = computed(
   () =>
@@ -98,9 +108,7 @@ const showTableSkeleton = computed(
     (pricesQuery.isPending.value && !pricesQuery.data.value),
 );
 
-const inventory = computed(() =>
-  buildInventory(channelsQuery.data.value ?? [], pricesQuery.data.value ?? []),
-);
+const inventory = computed(() => buildInventory(channels.value, pricesQuery.data.value ?? []));
 
 const filteredRows = computed(() => {
   const q = searchText.value.trim().toLowerCase();
@@ -193,30 +201,9 @@ const selectedRows = computed(() =>
 );
 
 async function removeInventoryTargets(targets: InventoryDeleteTarget[]) {
-  const channels = channelsQuery.data.value ?? [];
-  const rowByKey = new Map(inventory.value.map((row) => [inventoryRowKey(row), row]));
-  const dropByChannelId = new Map<number, Set<string>>();
-  for (const target of targets) {
-    const row = rowByKey.get(inventoryRowKey({ channelId: target.channelId, name: target.name }));
-    if (!row) continue;
-    let drop = dropByChannelId.get(target.channelId);
-    if (!drop) {
-      drop = new Set();
-      dropByChannelId.set(target.channelId, drop);
-    }
-    for (const name of listedNamesOnChannel(row)) {
-      drop.add(name);
-    }
-  }
-
-  for (const channel of channels) {
-    const drop = dropByChannelId.get(channel.id);
-    if (!drop) continue;
-    const next = stripNamesFromChannel(channel, drop);
-    if (channelChangedByStrip(channel, next)) {
-      await apiClient.updateChannel(channel.id, next);
-    }
-  }
+  await apiClient.deleteChannelModels(
+    targets.map((target) => ({ channel_id: target.channelId, model: target.name })),
+  );
 }
 
 const deleteMutation = useMutation({
@@ -232,7 +219,7 @@ const deleteMutation = useMutation({
       }
     }
     selection.setMany([...keys], false);
-    await queryClient.invalidateQueries({ queryKey: ['channels'] });
+    await invalidateChannelCaches(queryClient);
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
   },
   onError: (err, targets) => {
@@ -389,18 +376,18 @@ function loadErrorMessage(): string {
         </template>
         <!-- 复选框/价格/操作定宽；模型和别名不设宽，均分剩余，避免价格列吞掉身份列。 -->
         <colgroup>
-          <col class="w-10" />
+          <col v-if="canSelectRows" class="w-10" />
           <col />
           <col />
           <col class="w-28" />
           <col class="w-28" />
           <col class="w-28" />
           <col class="w-28" />
-          <col class="w-24" />
+          <col v-if="hasActions" class="w-24" />
         </colgroup>
         <TableHeader>
           <TableRow>
-            <TableHead class="w-10">
+            <TableHead v-if="canSelectRows" class="w-10">
               <div class="flex items-center justify-center">
                 <Checkbox
                   v-model="allVisibleSelected"
@@ -416,13 +403,15 @@ function loadErrorMessage(): string {
             <TableHead>{{ t('pricing.outputUsd') }}</TableHead>
             <TableHead>{{ t('pricing.cacheReadUsd') }}</TableHead>
             <TableHead>{{ t('pricing.cacheWriteUsd') }}</TableHead>
-            <TableHead align="center" class="w-24">{{ t('common.actions') }}</TableHead>
+            <TableHead v-if="hasActions" align="center" class="w-24">
+              {{ t('common.actions') }}
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           <TableRowsSkeleton
             v-if="showTableSkeleton"
-            has-select-column
+            :has-select-column="canSelectRows"
             :columns="tableColumnCount"
           />
           <template v-else>
@@ -448,6 +437,7 @@ function loadErrorMessage(): string {
                 :data-state="selection.isSelected(inventoryRowKey(row)) ? 'selected' : undefined"
               >
                 <SelectCell
+                  v-if="canSelectRows"
                   :checked="selection.isSelected(inventoryRowKey(row))"
                   test-id="inventory-select"
                   @toggle="selection.toggle(inventoryRowKey(row))"
@@ -479,9 +469,10 @@ function loadErrorMessage(): string {
                 <TableCell class="font-mono" data-testid="price-cache-write">
                   {{ row.price ? formatOptionalAmount(row.price.cache_write_micros) : '—' }}
                 </TableCell>
-                <TableCell align="center">
+                <TableCell v-if="hasActions" align="center">
                   <span class="inline-flex items-center justify-center gap-1">
                     <button
+                      v-if="canEditPrices"
                       type="button"
                       class="btn btn-ghost btn-icon"
                       data-testid="pricing-edit-entry"
@@ -492,7 +483,7 @@ function loadErrorMessage(): string {
                     >
                       <UiIcon name="pencil" :size="16" />
                     </button>
-                    <DataTableRowActions>
+                    <DataTableRowActions v-if="canRewriteChannels">
                       <DataTableMenuItem
                         danger
                         data-testid="inventory-delete"
@@ -515,11 +506,13 @@ function loadErrorMessage(): string {
         </TableBody>
       </DataTable>
       <DataTableBulkBar
+        v-if="canSelectRows"
         :count="selection.count.value"
         data-testid="inventory-bulk-bar"
         @clear="selection.clear"
       >
         <button
+          v-if="canEditCatalog"
           type="button"
           class="btn bulk-bar__action"
           data-testid="inventory-bulk-catalog"
@@ -528,8 +521,13 @@ function loadErrorMessage(): string {
         >
           {{ t('models.catalogFill') }}
         </button>
-        <span class="bulk-bar__divider" aria-hidden="true" />
+        <span
+          v-if="canEditCatalog && canRewriteChannels"
+          class="bulk-bar__divider"
+          aria-hidden="true"
+        />
         <button
+          v-if="canRewriteChannels"
           type="button"
           class="btn btn-danger-filled bulk-bar__delete"
           data-testid="inventory-bulk-delete"
@@ -553,6 +551,7 @@ function loadErrorMessage(): string {
         :cascade="index"
         :attention="win.attention"
         :topmost="win.id === topmostId"
+        :can-fill-from-catalog="canEditCatalog"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
         @dirty-change="(dirty) => setDirty(win.id, dirty)"

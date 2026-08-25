@@ -5,6 +5,7 @@
 //! （`token_balance`，只保存令牌累计结算）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats` 与
 //! `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
+pub mod balance_operations;
 pub mod catalog;
 pub mod channel_keys;
 pub mod plans;
@@ -534,6 +535,19 @@ pub async fn get_token_settled(pool: &SqlitePool, token_key: &str) -> Result<i64
     sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
         .bind(token_key)
         .fetch_optional(pool)
+        .await
+        .map_err(StoreError::Query)
+        .map(|amount: Option<i64>| amount.unwrap_or(0))
+}
+
+/// 在调用方事务内读取单令牌累计结算额；无结算行视为 0。
+pub async fn get_token_settled_on_conn(
+    conn: &mut SqliteConnection,
+    token_key: &str,
+) -> Result<i64, StoreError> {
+    sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
+        .bind(token_key)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(StoreError::Query)
         .map(|amount: Option<i64>| amount.unwrap_or(0))

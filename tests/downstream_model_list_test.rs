@@ -167,7 +167,7 @@ async fn list_models_follows_token_group_on_all_protocols() {
         "/tokens",
         json!({
             "name": "coder",
-            "limit_usd_micros": null,
+            "balance_usd_micros": null,
             "enabled": true,
             "model_group": "coding"
         }),
@@ -242,7 +242,7 @@ async fn hide_drops_collected_members_but_keeps_them_callable() {
         "/tokens",
         json!({
             "name": "packer",
-            "limit_usd_micros": null,
+            "balance_usd_micros": null,
             "enabled": true,
             "model_group": "pack"
         }),
@@ -253,8 +253,8 @@ async fn hide_drops_collected_members_but_keeps_them_callable() {
     let topped = admin_json(
         &gw,
         reqwest::Method::POST,
-        "/users/1/balance",
-        json!({ "delta_usd_micros": 5_000_000 }),
+        "/users/1/balance-adjustments",
+        json!({ "operation_id": "downstream-balance-1", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(topped.status(), reqwest::StatusCode::OK);

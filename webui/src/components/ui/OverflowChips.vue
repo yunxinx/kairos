@@ -57,10 +57,14 @@ function chipTooltip(chip: OverflowChip): string {
 <template>
   <span v-if="chips.length === 0" class="text-fg-muted">{{ t('common.emptyCell') }}</span>
   <span v-else class="inline-flex max-w-full items-center gap-1">
+    <!--
+      名称可收缩、状态标不可：`truncate` 的 `nowrap` 会把 flex 项的自动最小尺寸
+      顶成整段文字宽，名称于是不肯让位，把「已停用」挤到下一行。
+    -->
     <span v-for="chip in visible" :key="chip.name" class="inline-flex min-w-0 items-center gap-1">
       <Tooltip :text="chipTooltip(chip)">
         <span
-          class="badge max-w-[9rem] truncate"
+          class="badge max-w-[9rem] min-w-0 shrink truncate"
           :class="chipClass(chip)"
           :data-testid="chipTestId"
           :data-model="chip.name"
@@ -71,7 +75,7 @@ function chipTooltip(chip: OverflowChip): string {
       </Tooltip>
       <span
         v-if="chip.aside"
-        class="badge badge-danger"
+        class="badge badge-danger shrink-0 whitespace-nowrap"
         data-testid="member-source-status"
         :data-kind="chip.asideKind"
       >
@@ -101,7 +105,7 @@ function chipTooltip(chip: OverflowChip): string {
               <span class="inline-flex max-w-full items-center gap-1">
                 <Tooltip :text="chipTooltip(chip)">
                   <span
-                    class="badge max-w-full min-w-0 truncate"
+                    class="badge max-w-full min-w-0 shrink truncate"
                     :class="chipClass(chip)"
                     :data-testid="chipTestId"
                     :data-model="chip.name"
@@ -112,7 +116,7 @@ function chipTooltip(chip: OverflowChip): string {
                 </Tooltip>
                 <span
                   v-if="chip.aside"
-                  class="badge badge-danger"
+                  class="badge badge-danger shrink-0 whitespace-nowrap"
                   data-testid="member-source-status"
                   :data-kind="chip.asideKind"
                 >

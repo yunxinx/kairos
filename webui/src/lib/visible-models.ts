@@ -1,5 +1,5 @@
 import type {
-  ChannelView,
+  ChannelSummary,
   ManagementRole,
   ModelGroup,
   UnifiedMember,
@@ -70,7 +70,7 @@ export function assignedGroupOptions(
 }
 
 /** 渠道已登记的可调用名：各渠道 `models` ∪ 别名 key（含禁用渠道）。 */
-export function registeredCallableNames(channels: ChannelView[]): Set<string> {
+export function registeredCallableNames(channels: ChannelSummary[]): Set<string> {
   const names = new Set<string>();
   for (const channel of channels) {
     for (const model of channel.models) names.add(model);
@@ -116,7 +116,7 @@ export interface VisiblePreview {
 export function previewVisibleModels(
   groups: ModelGroup[],
   unifiedModels: UnifiedModel[],
-  channels: ChannelView[],
+  channels: ChannelSummary[],
   groupName: string,
 ): VisiblePreview {
   const names = registeredCallableNames(channels);
@@ -168,7 +168,7 @@ export interface VisibleSection {
 export function previewVisibleSections(
   groups: ModelGroup[],
   unifiedModels: UnifiedModel[],
-  channels: ChannelView[],
+  channels: ChannelSummary[],
   selectedGroupNames: string[],
 ): VisibleSection[] {
   const selected = new Set(selectedGroupNames);

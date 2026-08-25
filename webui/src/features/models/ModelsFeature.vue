@@ -3,10 +3,10 @@ import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { TabsContent, TabsIndicator, TabsList, TabsRoot, TabsTrigger } from 'reka-ui';
 import PageHeader from '@/app/layout/PageHeader.vue';
-import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import GroupsTab from '@/features/models/GroupsTab.vue';
 import InventoryTab from '@/features/models/InventoryTab.vue';
+import MyModelsPanel from '@/features/models/MyModelsPanel.vue';
 import OrderTab from '@/features/models/OrderTab.vue';
 import UnifiedTab from '@/features/models/UnifiedTab.vue';
 import VisibleTab from '@/features/models/VisibleTab.vue';
@@ -14,47 +14,24 @@ import VisibleTab from '@/features/models/VisibleTab.vue';
 const { t } = useI18n();
 const me = useCurrentUser();
 
-const canInventory = computed(() => {
-  if (me.value?.role === 'root') return true;
-  return hasCapability(me.value, 'edit_prices') || hasCapability(me.value, 'edit_price_catalog');
-});
-const canUnified = computed(() => {
-  if (me.value?.role === 'root') return true;
-  return hasCapability(me.value, 'edit_unified_models');
-});
-const canGroups = computed(() => {
-  if (me.value?.role === 'root') return true;
-  return (
-    hasCapability(me.value, 'edit_model_groups') ||
-    hasCapability(me.value, 'view_own_plan_groups') ||
-    hasCapability(me.value, 'view_other_groups')
-  );
-});
-const canOrder = computed(() => me.value?.role === 'root');
+// 普通用户走另一条渲染路径：整页只有「我能用哪些模型」这一张只读表，不出标签页。
+// 不把它做成第六个标签页——那会暗示还有别的标签页存在但被藏了。
+const isPlainUser = computed(() => me.value?.role === 'user');
 
-const canVisible = computed(() => {
-  if (me.value?.role === 'root') return true;
-  return (
-    hasCapability(me.value, 'view_own_plan_groups') || hasCapability(me.value, 'view_other_groups')
-  );
-});
-
-const defaultTab = computed(() => {
-  if (canInventory.value) return 'inventory';
-  if (canUnified.value) return 'unified';
-  if (canGroups.value) return 'groups';
-  return 'visible';
-});
+const defaultTab = 'inventory';
 </script>
 
 <template>
-  <TabsRoot :default-value="defaultTab" class="flex flex-col">
+  <div v-if="isPlainUser" class="flex flex-col">
+    <PageHeader :title="t('nav.models')" />
+    <MyModelsPanel />
+  </div>
+  <TabsRoot v-else :default-value="defaultTab" class="flex flex-col">
     <PageHeader>
       <template #leading>
         <TabsList class="page-tab-switch" :aria-label="t('models.tabsLabel')">
           <TabsIndicator class="page-tab-switch-knob" />
           <TabsTrigger
-            v-if="canInventory"
             value="inventory"
             class="page-tab-switch-btn"
             data-testid="models-tab-inventory"
@@ -62,7 +39,6 @@ const defaultTab = computed(() => {
             {{ t('models.tabInventory') }}
           </TabsTrigger>
           <TabsTrigger
-            v-if="canUnified"
             value="unified"
             class="page-tab-switch-btn"
             data-testid="models-tab-unified"
@@ -70,7 +46,6 @@ const defaultTab = computed(() => {
             {{ t('models.tabUnified') }}
           </TabsTrigger>
           <TabsTrigger
-            v-if="canGroups"
             value="groups"
             class="page-tab-switch-btn"
             data-testid="models-tab-groups"
@@ -78,7 +53,6 @@ const defaultTab = computed(() => {
             {{ t('models.tabGroups') }}
           </TabsTrigger>
           <TabsTrigger
-            v-if="canOrder"
             value="order"
             class="page-tab-switch-btn"
             data-testid="models-tab-order"
@@ -86,7 +60,6 @@ const defaultTab = computed(() => {
             {{ t('models.tabOrder') }}
           </TabsTrigger>
           <TabsTrigger
-            v-if="canVisible"
             value="visible"
             class="page-tab-switch-btn"
             data-testid="models-tab-visible"
@@ -96,19 +69,19 @@ const defaultTab = computed(() => {
         </TabsList>
       </template>
     </PageHeader>
-    <TabsContent v-if="canInventory" value="inventory">
+    <TabsContent value="inventory">
       <InventoryTab />
     </TabsContent>
-    <TabsContent v-if="canUnified" value="unified">
+    <TabsContent value="unified">
       <UnifiedTab />
     </TabsContent>
-    <TabsContent v-if="canGroups" value="groups">
+    <TabsContent value="groups">
       <GroupsTab />
     </TabsContent>
-    <TabsContent v-if="canOrder" value="order">
+    <TabsContent value="order">
       <OrderTab />
     </TabsContent>
-    <TabsContent v-if="canVisible" value="visible">
+    <TabsContent value="visible">
       <VisibleTab />
     </TabsContent>
   </TabsRoot>

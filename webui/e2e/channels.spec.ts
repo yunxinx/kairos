@@ -365,7 +365,7 @@ test.describe('channel manual model add', () => {
     try {
       const tokenResp = await page.request.post('/api/tokens', {
         headers: await e2eRootHeaders(page.request),
-        data: { name: 'manual-add-token', limit_usd_micros: null, enabled: true },
+        data: { name: 'manual-add-token', balance_usd_micros: null, enabled: true },
       });
       expect(tokenResp.ok()).toBeTruthy();
       const token = (await tokenResp.json()) as { token_key: string };

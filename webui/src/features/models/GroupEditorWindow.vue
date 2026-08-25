@@ -3,7 +3,7 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { ChannelView, GroupModel, ModelGroup, UnifiedModel } from '@/api/types';
+import type { ChannelSummary, GroupModel, ModelGroup, UnifiedModel } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
@@ -38,7 +38,10 @@ import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 const props = withDefaults(
   defineProps<{
     initial: ModelGroup | null;
-    channels: ChannelView[];
+    /** 只用于渲染来源判断，故取名录投影；写渠道定义是 root-only 的另一条路径。 */
+    channels: ChannelSummary[];
+    /** 渠道名录是否已到手；false 时不对成员来源下判断，避免误标「已失效」。 */
+    channelsKnown?: boolean;
     unifiedModels: UnifiedModel[];
     anchor?: FloatingWindowAnchor | null;
     stackOrder?: number;
@@ -46,7 +49,14 @@ const props = withDefaults(
     attention?: boolean;
     topmost?: boolean;
   }>(),
-  { anchor: null, stackOrder: 0, cascade: 0, attention: false, topmost: true },
+  {
+    channelsKnown: true,
+    anchor: null,
+    stackOrder: 0,
+    cascade: 0,
+    attention: false,
+    topmost: true,
+  },
 );
 
 const emit = defineEmits<{
@@ -93,7 +103,7 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const memberRows = computed(() =>
   editorMembers.value.map((member) =>
-    groupMemberSourceLine(member, props.channels, props.unifiedModels),
+    groupMemberSourceLine(member, props.channels, props.unifiedModels, props.channelsKnown),
   ),
 );
 

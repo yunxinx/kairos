@@ -95,13 +95,14 @@ async fn users_list_and_recharge_are_admin_plus() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 1_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "users-balance-1", "delta_usd_micros": 1_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(charged.status(), StatusCode::OK);
-    let wallet: Value = charged.json().await.expect("钱包应可解析");
-    assert_eq!(wallet["balance_usd_micros"], 1_000_000);
+    let adjustment: Value = charged.json().await.expect("余额操作应可解析");
+    assert_eq!(adjustment["before_balance_usd_micros"], 0);
+    assert_eq!(adjustment["after_balance_usd_micros"], 1_000_000);
 
     let detail = get_req(&gw, &gw.session, &format!("/users/{user_id}")).await;
     assert_eq!(detail.status(), StatusCode::OK);
@@ -122,7 +123,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         &user_token,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "mine", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "mine", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
@@ -153,6 +154,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         json!({
             "internal_name": "admin-token",
             "display_name": "admin-token",
+            "audience": "admin",
             "groups": ["default"],
             "capabilities": { "toggle_user_tokens": true }
         }),
@@ -177,7 +179,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         &admin_token,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "admin-own", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "admin-own", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(admin_creates.status(), StatusCode::CREATED);
@@ -262,9 +264,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         reqwest::Method::PUT,
         &format!("/tokens/{mine_id}"),
         json!({
-            "token_key": mine_key,
             "name": "hijacked",
-            "limit_usd_micros": null,
             "rate_limit_rpm": null,
             "enabled": false,
             "model_group": "default"
@@ -287,31 +287,27 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         reqwest::Method::PUT,
         &format!("/tokens/{admin_token_id}"),
         json!({
-            "token_key": admin_token_key,
             "name": "admin-renamed",
-            "limit_usd_micros": null,
             "enabled": true
         }),
     )
     .await;
     assert_eq!(own_update.status(), StatusCode::OK);
 
-    // 更新契约不允许通过 body 改变令牌归属；路径对应的库记录才是权威。
+    // 更新契约明确拒绝归属字段，而不是接收后静默忽略。
     let attempted_rebind = json_req(
         &gw,
         &admin_token,
         reqwest::Method::PUT,
         &format!("/tokens/{admin_token_id}"),
         json!({
-            "token_key": admin_token_key,
             "name": "admin-renamed",
-            "limit_usd_micros": null,
             "enabled": true,
             "user_id": user_id
         }),
     )
     .await;
-    assert_eq!(attempted_rebind.status(), StatusCode::OK);
+    assert_eq!(attempted_rebind.status(), StatusCode::BAD_REQUEST);
     let owner_after: (i64,) = sqlx::query_as("SELECT user_id FROM tokens WHERE id = ?")
         .bind(admin_token_id)
         .fetch_one(&gw.pool)
@@ -323,8 +319,8 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         &gw,
         &admin_token,
         reqwest::Method::POST,
-        "/users/1/balance",
-        json!({ "delta_usd_micros": 1_000_000 }),
+        "/users/1/balance-adjustments",
+        json!({ "operation_id": "users-balance-2", "delta_usd_micros": 1_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(recharge_root.status(), StatusCode::FORBIDDEN);
@@ -336,7 +332,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         "/tokens",
         json!({
             "name": "steal",
-            "limit_usd_micros": null,
+            "balance_usd_micros": null,
             "enabled": true,
             "user_id": user_id
         }),
@@ -363,9 +359,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         reqwest::Method::PUT,
         &format!("/tokens/{seeded_id}"),
         json!({
-            "token_key": TEST_TOKEN_KEY,
             "name": "hijack",
-            "limit_usd_micros": null,
             "enabled": false
         }),
     )
@@ -402,7 +396,7 @@ async fn deleting_user_archives_and_keeps_usage_history() {
         &user_token,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "doomed", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "doomed", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
@@ -820,7 +814,7 @@ async fn users_list_reports_missing_wallet_as_corruption() {
     assert!(
         body["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("缺少钱包"))
+            .is_some_and(|message| message == "内部存储错误")
     );
 }
 
@@ -890,8 +884,8 @@ async fn archived_user_recharge_is_root_only() {
         &gw,
         &admin_session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 1_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "users-balance-3", "delta_usd_micros": 1_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(
@@ -904,8 +898,8 @@ async fn archived_user_recharge_is_root_only() {
         &gw,
         &admin_session,
         reqwest::Method::POST,
-        "/users/999999/balance",
-        json!({ "delta_usd_micros": 1_000_000 }),
+        "/users/999999/balance-adjustments",
+        json!({ "operation_id": "users-balance-4", "delta_usd_micros": 1_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(never_existed.status(), StatusCode::NOT_FOUND);
@@ -914,8 +908,8 @@ async fn archived_user_recharge_is_root_only() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 1_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "users-balance-5", "delta_usd_micros": 1_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(as_root.status(), StatusCode::OK);

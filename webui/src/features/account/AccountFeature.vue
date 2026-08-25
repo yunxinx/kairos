@@ -18,7 +18,11 @@ import { downscaleAvatar, isAcceptedAvatarType } from '@/lib/avatar';
 import { formatDiscountBp, formatUsdMicros } from '@/lib/format';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import { useNavAvatarPreference } from '@/lib/preferences';
-import { setMe, useCurrentUser } from '@/lib/session';
+import {
+  captureSessionGeneration,
+  setMeForSession,
+  useCurrentUser,
+} from '@/lib/session';
 
 const { t } = useI18n();
 const { error, success } = useToast();
@@ -77,7 +81,8 @@ const roleBadgeClass = computed(() => {
 const profileMutation = useMutation({
   mutationFn: (body: MeUpdate) => apiClient.updateMe(body),
   onSuccess: async () => {
-    setMe(await apiClient.getMe());
+    const generation = captureSessionGeneration();
+    setMeForSession(await apiClient.getMe(), generation);
     profileCurrentPassword.value = '';
     success(t('account.saveSuccess'));
   },
@@ -89,7 +94,8 @@ const profileMutation = useMutation({
 const passwordMutation = useMutation({
   mutationFn: (body: MeUpdate) => apiClient.updateMe(body),
   onSuccess: async () => {
-    setMe(await apiClient.getMe());
+    const generation = captureSessionGeneration();
+    setMeForSession(await apiClient.getMe(), generation);
     currentPassword.value = '';
     newPassword.value = '';
     confirmPassword.value = '';

@@ -10,14 +10,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::store;
 use crate::store::resources::{
     Channel, ChannelRecord, GroupModel, ModelGroup, Price, UnifiedMember, UnifiedModel,
     channel_lists_callable,
 };
-use crate::store::{self, plans};
 
 use super::auth::{ManagementCapability, ManagementIdentity};
-use super::{AdminDeps, AdminError, begin_write, db_err, reload_and_swap};
+use super::{
+    AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, begin_write, db_err, reload_and_swap,
+    validate_bulk_targets,
+};
 
 pub(super) fn routes() -> Router<AdminDeps> {
     Router::new()
@@ -29,7 +32,9 @@ pub(super) fn routes() -> Router<AdminDeps> {
         )
         .route(
             "/model-groups",
-            get(list_model_groups).post(create_model_group),
+            get(list_model_groups)
+                .post(create_model_group)
+                .delete(delete_model_groups),
         )
         .route(
             "/model-groups/{name}",
@@ -37,7 +42,9 @@ pub(super) fn routes() -> Router<AdminDeps> {
         )
         .route(
             "/unified-models",
-            get(list_unified_models).post(create_unified_model),
+            get(list_unified_models)
+                .post(create_unified_model)
+                .delete(delete_unified_models),
         )
         .route(
             "/unified-models/{id}",
@@ -232,11 +239,7 @@ fn validate_channel_model_order(
 // --- 价格 ---
 
 /// 列出全部价格（按渠道 id、模型名排序，保证确定性）。
-async fn list_prices(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-) -> Result<Json<Vec<Price>>, AdminError> {
-    identity.require_capability(ManagementCapability::EditPrices)?;
+async fn list_prices(State(deps): State<AdminDeps>) -> Result<Json<Vec<Price>>, AdminError> {
     let snapshot = deps.snapshot.read().await;
     let mut prices: Vec<Price> = snapshot
         .prices
@@ -334,30 +337,11 @@ async fn delete_price(
 /// 列出全部模型组（按 `name` 排序，保证确定性）。
 async fn list_model_groups(
     State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<ModelGroup>>, AdminError> {
-    if identity.role() == crate::store::users::ManagementRole::Admin
-        && !identity.has_capability(ManagementCapability::ViewOwnPlanGroups)
-        && !identity.has_capability(ManagementCapability::ViewOtherGroups)
-    {
-        return Err(AdminError::Forbidden);
-    }
     let mut groups: Vec<ModelGroup> = {
         let snapshot = deps.snapshot.read().await;
         snapshot.model_groups.values().cloned().collect()
     };
-    if identity.role() == crate::store::users::ManagementRole::Admin
-        && !identity.has_capability(ManagementCapability::ViewOtherGroups)
-    {
-        let Some(plan_id) = identity.plan_id() else {
-            return Err(AdminError::Forbidden);
-        };
-        let assigned = plans::list_plan_groups(&deps.pool, plan_id)
-            .await
-            .map_err(AdminError::Store)?;
-        let assigned: HashSet<String> = assigned.into_iter().collect();
-        groups.retain(|group| assigned.contains(&group.name));
-    }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(groups))
 }
@@ -443,6 +427,42 @@ async fn delete_model_group(
     Ok(Json(deleted))
 }
 
+async fn delete_model_groups(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<BulkDeleteBody<String>>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<BulkDeleteResult<String>>, AdminError> {
+    identity.require_capability(ManagementCapability::EditModelGroups)?;
+    let targets = validate_bulk_targets(body.map_err(AdminError::bad_body)?.0.targets)?;
+    if targets
+        .iter()
+        .any(|name| name == crate::store::resources::DEFAULT_MODEL_GROUP)
+    {
+        return Err(AdminError::Conflict("内置组 default 不能删除".to_string()));
+    }
+    let mut tx = begin_write(&deps).await?;
+    for name in &targets {
+        if crate::store::resources::get_model_group(&mut tx, name)
+            .await
+            .map_err(AdminError::Store)?
+            .is_none()
+        {
+            return Err(AdminError::NotFound(format!("模型组 {name} 不存在")));
+        }
+    }
+    for name in &targets {
+        crate::store::resources::rebind_channels_to_default(&mut tx, name)
+            .await
+            .map_err(AdminError::Store)?;
+        crate::store::resources::delete_model_group(&mut tx, name)
+            .await
+            .map_err(AdminError::Store)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(BulkDeleteResult::new(targets)))
+}
+
 // --- 统一模型 ---
 
 /// 列出全部统一模型（按 `id` 排序，保证确定性）。
@@ -450,9 +470,7 @@ async fn delete_model_group(
 /// 读视图带 `available`：渠道已删/停用/不再登记该名时为 false，写契约不含此字段。
 async fn list_unified_models(
     State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<UnifiedModelView>>, AdminError> {
-    identity.require_capability(ManagementCapability::EditUnifiedModels)?;
     let snapshot = deps.snapshot.read().await;
     let mut models: Vec<UnifiedModelView> = snapshot
         .unified_models
@@ -552,6 +570,33 @@ async fn delete_unified_model(
     Ok(Json(deleted))
 }
 
+async fn delete_unified_models(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    body: Result<Json<BulkDeleteBody<String>>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<BulkDeleteResult<String>>, AdminError> {
+    identity.require_capability(ManagementCapability::EditUnifiedModels)?;
+    let targets = validate_bulk_targets(body.map_err(AdminError::bad_body)?.0.targets)?;
+    let mut tx = begin_write(&deps).await?;
+    for id in &targets {
+        if crate::store::resources::get_unified_model(&mut tx, id)
+            .await
+            .map_err(AdminError::Store)?
+            .is_none()
+        {
+            return Err(AdminError::NotFound(format!("统一模型 {id} 不存在")));
+        }
+    }
+    for id in &targets {
+        crate::store::resources::delete_unified_model(&mut tx, id)
+            .await
+            .map_err(AdminError::Store)?;
+    }
+    tx.commit().await.map_err(db_err)?;
+    reload_and_swap(&deps).await?;
+    Ok(Json(BulkDeleteResult::new(targets)))
+}
+
 async fn read_price(deps: &AdminDeps, channel_id: i64, model: &str) -> Result<Price, AdminError> {
     let snapshot = deps.snapshot.read().await;
     snapshot
@@ -614,16 +659,6 @@ async fn read_unified_model(deps: &AdminDeps, id: &str) -> Result<UnifiedModel, 
         .get(id)
         .cloned()
         .ok_or_else(|| AdminError::NotFound(format!("统一模型 {id} 不存在")))
-}
-
-/// 令牌绑定的组必须已存在。
-pub(super) async fn reject_unknown_group(deps: &AdminDeps, group: &str) -> Result<(), AdminError> {
-    let snapshot = deps.snapshot.read().await;
-    if snapshot.model_groups.contains_key(group) {
-        Ok(())
-    } else {
-        Err(AdminError::NotFound(format!("模型组 {group} 不存在")))
-    }
 }
 
 fn normalize_model_group(

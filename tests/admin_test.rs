@@ -180,7 +180,7 @@ async fn admin_not_configured_means_no_admin_routes() {
     }
     let resp = client
         .post(format!("{}/tokens", gw.base_url()))
-        .json(&json!({ "name": "x", "limit_usd_micros": null, "enabled": true }))
+        .json(&json!({ "name": "x", "balance_usd_micros": null, "enabled": true }))
         .send()
         .await
         .expect("协议监听应可请求");
@@ -251,7 +251,7 @@ async fn token_crud_roundtrip_and_immediate_effect() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "new-dev", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "new-dev", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
@@ -339,7 +339,7 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "life", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "life", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
@@ -390,7 +390,7 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
     let resp = admin_put(
         &gw,
         &format!("/tokens/{life_id}"),
-        json!({ "token_key": life_key, "name": "life", "limit_usd_micros": null, "enabled": false }),
+        json!({ "name": "life", "enabled": false }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -407,7 +407,7 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
     let resp = admin_put(
         &gw,
         &format!("/tokens/{life_id}"),
-        json!({ "token_key": life_key, "name": "life", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "life", "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -420,9 +420,6 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
 }
 
 /// PUT 不存在的令牌返回 404，不隐式创建；非整数 id 同样按不存在处理。
-///
-/// 令牌按库生成 id 寻址，body 里的 `token_key` 一律被忽略（界面上看到的是掩码，
-/// 写回来不能改坏密钥），所以「非法字符 key → 400」这条路径已不可达。
 #[tokio::test]
 async fn update_missing_token_is_404_and_non_numeric_id_is_404() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
@@ -430,9 +427,7 @@ async fn update_missing_token_is_404_and_non_numeric_id_is_404() {
         &gw,
         "/tokens/999999",
         json!({
-            "token_key": "does-not-exist",
             "name": "x",
-            "limit_usd_micros": null,
             "enabled": true
         }),
     )
@@ -443,9 +438,7 @@ async fn update_missing_token_is_404_and_non_numeric_id_is_404() {
         &gw,
         "/tokens/sk-bad!key",
         json!({
-            "token_key": "sk-bad!key",
             "name": "x",
-            "limit_usd_micros": null,
             "enabled": true
         }),
     )
@@ -1155,7 +1148,7 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "token_key": "ks-custom", "name": "x", "limit_usd_micros": null, "enabled": true }),
+        json!({ "token_key": "ks-custom", "name": "x", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
@@ -1428,7 +1421,7 @@ async fn runtime_resources_survive_process_restart() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "restart", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "restart", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
@@ -1438,9 +1431,9 @@ async fn runtime_resources_survive_process_restart() {
         .expect("应返回生成的 key")
         .to_string();
     let resp = reqwest::Client::new()
-        .post(format!("{}/users/1/balance", gw.admin_base_url()))
+        .post(format!("{}/users/1/balance-adjustments", gw.admin_base_url()))
         .bearer_auth(&gw.session)
-        .json(&json!({ "delta_usd_micros": 5_000_000 }))
+        .json(&json!({ "operation_id": "admin-balance-1", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
         .expect("应可充值");
@@ -1541,7 +1534,7 @@ async fn empty_db_bootstraps_via_admin_api() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "boot", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "boot", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
@@ -1579,9 +1572,9 @@ async fn empty_db_bootstraps_via_admin_api() {
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
     let resp = reqwest::Client::new()
-        .post(format!("{}/users/1/balance", gw.admin_base_url()))
+        .post(format!("{}/users/1/balance-adjustments", gw.admin_base_url()))
         .bearer_auth(&gw.session)
-        .json(&json!({ "delta_usd_micros": 5_000_000 }))
+        .json(&json!({ "operation_id": "admin-balance-2", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
         .expect("应可充值");
@@ -1608,7 +1601,7 @@ async fn deleting_token_clears_balance_row() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "cycle", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "cycle", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
@@ -1906,17 +1899,15 @@ async fn balance_adjustment_reflected_in_admission() {
 
     // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
     let resp = client
-        .post(format!("{admin}/users/1/balance"))
+        .post(format!("{admin}/users/1/balance-adjustments"))
         .bearer_auth(&gw.session)
-        .json(&json!({ "delta_usd_micros": -5_000_000 }))
+        .json(&json!({ "operation_id": "admin-balance-3", "delta_usd_micros": -5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
         .expect("应可调整余额");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    // 钱包端点回的是用户视图（ADR-0008：钱包在用户上，令牌不持有钱包）。
-    let wallet: Value = resp.json().await.expect("钱包应可解析");
-    assert_eq!(wallet["balance_usd_micros"], 0);
-    assert_eq!(wallet["id"], 1, "调整的是 root 的钱包");
+    let adjustment: Value = resp.json().await.expect("余额操作应可解析");
+    assert_eq!(adjustment["after_balance_usd_micros"], 0);
 
     // 零余额：计费准入拒绝。
     let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
@@ -1928,9 +1919,9 @@ async fn balance_adjustment_reflected_in_admission() {
 
     // 充值后恢复可用。
     let resp = client
-        .post(format!("{admin}/users/1/balance"))
+        .post(format!("{admin}/users/1/balance-adjustments"))
         .bearer_auth(&gw.session)
-        .json(&json!({ "delta_usd_micros": 5_000_000 }))
+        .json(&json!({ "operation_id": "admin-balance-4", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
         .expect("应可充值");
@@ -1948,9 +1939,9 @@ async fn token_attr_update_does_not_reset_balance() {
 
     // 充值 1 USD（初始 5 USD → 6 USD）。
     let resp = client
-        .post(format!("{admin}/users/1/balance"))
+        .post(format!("{admin}/users/1/balance-adjustments"))
         .bearer_auth(&gw.session)
-        .json(&json!({ "delta_usd_micros": 1_000_000 }))
+        .json(&json!({ "operation_id": "admin-balance-5", "delta_usd_micros": 1_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
         .expect("应可充值");
@@ -1960,19 +1951,13 @@ async fn token_attr_update_does_not_reset_balance() {
     let resp = admin_put(
         &gw,
         &format!("/tokens/{seeded_id}"),
-        json!({ "token_key": TEST_TOKEN_KEY, "name": "renamed", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "renamed", "enabled": true }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 余额不变：以 delta 0 读回应仍为 6_000_000。
-    let resp = client
-        .post(format!("{admin}/users/1/balance"))
-        .bearer_auth(&gw.session)
-        .json(&json!({ "delta_usd_micros": 0 }))
-        .send()
-        .await
-        .expect("应可读余额");
+    // 余额不变：从用户读视图确认仍为 6_000_000。
+    let resp = admin_get(&gw, "/users/1").await;
     let balance: Value = resp.json().await.expect("余额应可解析");
     assert_eq!(
         balance["balance_usd_micros"], 6_000_000,
@@ -2537,8 +2522,8 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
     let recharge = admin_json(
         &gw,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 5_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "admin-balance-6", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(recharge.status(), reqwest::StatusCode::OK);
@@ -2676,9 +2661,7 @@ async fn token_rate_limit_uses_global_fallback_and_token_override() {
         &gw,
         &format!("/tokens/{seeded_id}"),
         json!({
-            "token_key": TEST_TOKEN_KEY,
             "name": "dev",
-            "limit_usd_micros": null,
             "rate_limit_rpm": 0,
             "enabled": true,
             "model_group": "default"
@@ -2791,9 +2774,9 @@ async fn new_endpoints_structured_errors() {
 
     // 余额：不存在的令牌 → 404。
     let resp = client
-        .post(format!("{admin}/users/999999/balance"))
+        .post(format!("{admin}/users/999999/balance-adjustments"))
         .bearer_auth(&gw.session)
-        .json(&json!({ "delta_usd_micros": 100 }))
+        .json(&json!({ "operation_id": "admin-balance-7", "delta_usd_micros": 100, "reason": "manual_adjustment" }))
         .send()
         .await
         .expect("应可调整余额");

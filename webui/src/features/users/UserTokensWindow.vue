@@ -93,10 +93,7 @@ const toggleMutation = useMutation({
         <TableRowsSkeleton :columns="5" />
       </div>
       <EmptyState v-else-if="tokens.length === 0" :title="t('users.tokensEmpty')" />
-      <div
-        v-else
-        class="border-seed seed-scrollbar max-h-80 overflow-y-auto rounded-md border"
-      >
+      <div v-else class="border-seed seed-scrollbar max-h-80 overflow-y-auto rounded-md border">
         <table class="w-full border-collapse text-left text-xs">
           <TableHeader>
             <TableRow>
@@ -136,13 +133,12 @@ const toggleMutation = useMutation({
               </TableCell>
               <TableCell>
                 <div class="w-28" :title="quotaLabel(token)">
-                  <div class="text-fg-muted mb-1 flex justify-between font-mono text-xs">
-                    <span data-testid="token-settled">{{
-                      formatUsdFixed2(token.settled_usd_micros)
-                    }}</span>
-                    <span v-if="token.limit_usd_micros !== null" data-testid="token-limit">
-                      / {{ formatUsdFixed2(token.limit_usd_micros) }}
-                    </span>
+                  <div class="mb-1 font-mono text-xs font-semibold" data-testid="token-balance">
+                    {{
+                      token.balance_usd_micros === null
+                        ? t('common.unlimited')
+                        : formatUsdFixed2(token.balance_usd_micros)
+                    }}
                   </div>
                   <div
                     v-if="quotaRatio(token) !== null"

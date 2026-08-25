@@ -28,6 +28,7 @@ import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDele
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
+import TokenBalanceWindow from '@/features/tokens/TokenBalanceWindow.vue';
 import TokenEditorWindow from '@/features/tokens/TokenEditorWindow.vue';
 import {
   formatUnixMillis,
@@ -36,12 +37,12 @@ import {
   maskTokenKey,
   relativeTimeParts,
 } from '@/lib/format';
-import { useCurrentUser } from '@/lib/session';
 import { groupDisplayName } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type TokenWindowPayload =
   | { kind: 'editor'; token: TokenRow | null }
+  | { kind: 'balance'; token: TokenRow }
   | { kind: 'delete'; token: TokenRow }
   | BulkDeletePayload;
 
@@ -55,7 +56,6 @@ const COPY_FEEDBACK_MS = 2_000;
 
 const { t, locale } = useI18n();
 const { error } = useToast();
-const me = useCurrentUser();
 const queryClient = useQueryClient();
 
 const searchText = ref('');
@@ -133,7 +133,7 @@ const bulkDelete = useBulkDelete<number>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['tokens'],
-  deleteOne: (id) => apiClient.deleteToken(id),
+  deleteMany: (ids) => apiClient.deleteTokens(ids),
 });
 
 // 相对时间随时间推移刷新：定时推进 now，避免「3 秒前」长期停留。
@@ -163,14 +163,12 @@ async function copyKey(key: string) {
 }
 
 /**
- * 该令牌累计结算占其累计上限的比例；未设上限返回 null（不画进度条）。
+ * 该令牌累计结算占其可用余额上限的比例；未设上限返回 null（不画进度条）。
  *
- * 不用「余额」作分母：余额是所属用户的共享钱包（ADR-0008），拿它跟单个令牌的
- * settled 相比会让同一钱包下的每把令牌各显示一个无意义的百分比。
+ * 分母是令牌自己的 `limit_usd_micros`，不是钱包：钱包是所属用户的共享余额
+ * （ADR-0008），拿它跟单把令牌的 settled 相比会让同一钱包下每把令牌各显示一个
+ * 无意义的百分比。
  */
-/** 所属用户钱包剩余；未 hydrate 时为 null。 */
-const walletBalance = computed(() => me.value?.balance_usd_micros ?? null);
-
 function quotaRatio(token: TokenRow): number | null {
   const limit = token.limit_usd_micros;
   if (limit === null || limit <= 0) return null;
@@ -248,8 +246,7 @@ const deletingId = computed(() =>
 
 // 启用/禁用：只提交状态字段，成功后重取列表。
 const toggleMutation = useMutation({
-  mutationFn: (token: TokenRow) =>
-    apiClient.setTokenEnabled(token.id, !token.enabled),
+  mutationFn: (token: TokenRow) => apiClient.setTokenEnabled(token.id, !token.enabled),
   onSuccess: async () => {
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
@@ -268,14 +265,24 @@ function openCreate(event: Event) {
 
 function openEdit(token: TokenRow) {
   const existing = windows.value.find(
-    (entry) =>
-      entry.payload.kind === 'editor' && entry.payload.token?.id === token.id,
+    (entry) => entry.payload.kind === 'editor' && entry.payload.token?.id === token.id,
   );
   if (existing) {
     bringToFront(existing.id);
     return;
   }
   openWindow(takePendingAnchor(), { kind: 'editor', token });
+}
+
+function openBalance(token: TokenRow) {
+  const existing = windows.value.find(
+    (entry) => entry.payload.kind === 'balance' && entry.payload.token.id === token.id,
+  );
+  if (existing) {
+    bringToFront(existing.id);
+    return;
+  }
+  openWindow(takePendingAnchor(), { kind: 'balance', token });
 }
 
 function openDelete(token: TokenRow) {
@@ -329,16 +336,6 @@ function openBulkDelete() {
               test-id="tokens-status-filter"
             />
             <template #actions>
-              <!-- 钱包是用户级的，同一用户所有令牌共用；只在此处显示一次。 -->
-              <span
-                v-if="walletBalance !== null"
-                class="text-fg-muted font-mono text-xs"
-                data-testid="tokens-wallet-balance"
-                :title="t('tokens.walletGuide')"
-              >
-                {{ t('tokens.wallet') }}
-                <span class="text-fg font-semibold">{{ formatUsdFixed2(walletBalance) }}</span>
-              </span>
               <button
                 type="button"
                 class="btn btn-primary"
@@ -427,14 +424,12 @@ function openBulkDelete() {
               </TableCell>
               <TableCell>
                 <div class="w-32" :title="quotaLabel(token)">
-                  <div class="text-fg-muted mb-1 flex justify-between font-mono text-xs">
-                    <span data-testid="token-settled">{{
-                      formatUsdFixed2(token.settled_usd_micros)
-                    }}</span>
-                    <span v-if="token.limit_usd_micros !== null" data-testid="token-limit">
-                      / {{ formatUsdFixed2(token.limit_usd_micros) }}
-                    </span>
-                    <span v-else class="text-fg-subtle">{{ t('common.unlimited') }}</span>
+                  <div class="mb-1 font-mono text-xs font-semibold" data-testid="token-balance">
+                    {{
+                      token.balance_usd_micros === null
+                        ? t('common.unlimited')
+                        : formatUsdFixed2(token.balance_usd_micros)
+                    }}
                   </div>
                   <div
                     v-if="quotaRatio(token) !== null"
@@ -449,7 +444,11 @@ function openBulkDelete() {
                   </div>
                 </div>
               </TableCell>
-              <TableCell align="center" class="text-fg-muted font-mono text-xs" data-testid="token-rpm">
+              <TableCell
+                align="center"
+                class="text-fg-muted font-mono text-xs"
+                data-testid="token-rpm"
+              >
                 {{
                   token.rate_limit_rpm !== null
                     ? `${token.rate_limit_rpm} RPM`
@@ -495,6 +494,13 @@ function openBulkDelete() {
                   </button>
                   <DataTableRowActions>
                     <DataTableMenuItem
+                      data-testid="token-adjust-balance"
+                      @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                      @select="openBalance(token)"
+                    >
+                      {{ t('tokens.adjustBalance') }}
+                    </DataTableMenuItem>
+                    <DataTableMenuItem
                       danger
                       data-testid="token-delete"
                       @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
@@ -539,6 +545,18 @@ function openBulkDelete() {
       <TokenEditorWindow
         v-if="win.payload.kind === 'editor'"
         :initial="win.payload.token"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+      />
+      <TokenBalanceWindow
+        v-else-if="win.payload.kind === 'balance'"
+        :token="win.payload.token"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"

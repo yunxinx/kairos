@@ -27,6 +27,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
+import { CHANNEL_SUMMARY_KEY, invalidateChannelCaches } from '@/composables/useChannelDirectory';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -130,11 +131,13 @@ const bulkDelete = useBulkDelete<string>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['channels'],
-  deleteOne: (id) => apiClient.deleteChannel(Number(id)),
+  alsoInvalidate: [CHANNEL_SUMMARY_KEY],
+  deleteMany: (ids) => apiClient.deleteChannels(ids.map(Number)),
 });
 
+/** 完整定义与名录是同一份数据的两个投影，必须一起失效（见 `invalidateChannelCaches`）。 */
 function invalidateChannels() {
-  return queryClient.invalidateQueries({ queryKey: ['channels'] });
+  return invalidateChannelCaches(queryClient);
 }
 
 const deleteMutation = useMutation({

@@ -412,12 +412,34 @@ fn map_user_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserRecord, StoreError>
     })
 }
 
-/// 新建非 root 用户时按角色选择内置默认套餐。
-pub(crate) fn default_plan_id_for_role(role: ManagementRole) -> Option<i64> {
+/// 新建非 root 用户时按角色选择默认套餐。
+///
+/// 落到哪一档由 `plans.is_default` 决定（每个受众至多一档），不再硬编码内置 id：
+/// 运营可以新建一档设为默认，而不必去改内置档。若该受众还没有默认档，退回对应的
+/// 内置 id——建用户不能因为「没人设过默认」而失败。
+pub(crate) async fn default_plan_id_for_role(
+    conn: &mut SqliteConnection,
+    role: ManagementRole,
+) -> Result<Option<i64>, StoreError> {
+    let Some(audience) = plan_audience_for_role(role) else {
+        return Ok(None);
+    };
+    let fallback = match audience {
+        crate::store::plans::PlanAudience::Admin => crate::store::plans::ADMIN_PLAN_ID,
+        crate::store::plans::PlanAudience::User => crate::store::plans::STANDARD_PLAN_ID,
+    };
+    let configured = crate::store::plans::default_plan_id_on_conn(conn, audience).await?;
+    Ok(Some(configured.unwrap_or(fallback)))
+}
+
+/// 非 root 角色必须绑定的套餐受众；root 不挂套餐。
+pub(crate) fn plan_audience_for_role(
+    role: ManagementRole,
+) -> Option<crate::store::plans::PlanAudience> {
     match role {
         ManagementRole::Root => None,
-        ManagementRole::Admin => Some(crate::store::plans::ADMIN_PLAN_ID),
-        ManagementRole::User => Some(crate::store::plans::STANDARD_PLAN_ID),
+        ManagementRole::Admin => Some(crate::store::plans::PlanAudience::Admin),
+        ManagementRole::User => Some(crate::store::plans::PlanAudience::User),
     }
 }
 
@@ -445,7 +467,7 @@ pub async fn insert_user(
     new_user: NewUser<'_>,
     now: i64,
 ) -> Result<UserRecord, StoreError> {
-    let plan_id = default_plan_id_for_role(new_user.role);
+    let plan_id = default_plan_id_for_role(conn, new_user.role).await?;
     insert_user_with_plan(conn, new_user, now, plan_id).await
 }
 

@@ -71,7 +71,7 @@ const password = ref('');
 const role = ref<ManagementRole>(initialRole);
 const rateLimitRpm = ref(initialRpm);
 const enabled = ref(initialEnabled);
-const selectedPlanId = ref(initialPlanId || defaultPlanForRole(initialRole));
+const selectedPlanId = ref(initialPlanId);
 
 const isCreate = computed(() => props.initial === null);
 
@@ -94,19 +94,23 @@ const roleOptions = computed(() => [
   { value: 'admin', label: t('users.roleAdmin') },
 ]);
 
-const STANDARD_PLAN_ID = 1;
-const ADMIN_PLAN_ID = 2;
-
 function defaultPlanForRole(role: ManagementRole): string {
   if (role === 'root') return '';
-  return role === 'admin' ? String(ADMIN_PLAN_ID) : String(STANDARD_PLAN_ID);
+  const audience = role === 'admin' ? 'admin' : 'user';
+  const plan = (plansQuery.data.value ?? []).find(
+    (candidate) => candidate.audience === audience && candidate.is_default,
+  );
+  return plan ? String(plan.id) : '';
 }
 
 const planOptions = computed(() => {
-  const options = (plansQuery.data.value ?? []).map((plan) => ({
-    value: String(plan.id),
-    label: `${plan.display_name}${plan.internal_name ? ` (${plan.internal_name})` : ''}`,
-  }));
+  const audience = role.value === 'admin' ? 'admin' : 'user';
+  const options = (plansQuery.data.value ?? [])
+    .filter((plan) => plan.audience === audience)
+    .map((plan) => ({
+      value: String(plan.id),
+      label: `${plan.display_name}${plan.internal_name ? ` (${plan.internal_name})` : ''}`,
+    }));
   const selected = selectedPlanId.value;
   if (selected && !options.some((option) => option.value === selected)) {
     options.push({ value: selected, label: selected });
@@ -114,11 +118,17 @@ const planOptions = computed(() => {
   return options;
 });
 
-watch(role, (value) => {
-  if (isCreate.value) {
-    selectedPlanId.value = defaultPlanForRole(value);
-  }
-});
+watch(
+  [role, plansQuery.data],
+  ([value]) => {
+    if (isCreate.value || value !== initialRole) {
+      selectedPlanId.value = defaultPlanForRole(value);
+    } else {
+      selectedPlanId.value = initialPlanId;
+    }
+  },
+  { immediate: true },
+);
 
 const dirty = computed(() => {
   if (isCreate.value) {
@@ -128,7 +138,7 @@ const dirty = computed(() => {
       password.value !== '' ||
       role.value !== 'user' ||
       rateLimitRpm.value.trim() !== '' ||
-      selectedPlanId.value !== defaultPlanForRole(role.value)
+      (selectedPlanId.value !== '' && selectedPlanId.value !== defaultPlanForRole(role.value))
     );
   }
   return (
@@ -146,14 +156,18 @@ const saveMutation = useMutation({
   mutationFn: async () => {
     const parsedRpm = rateLimitRpm.value.trim() === '' ? null : Number(rateLimitRpm.value);
     if (isCreate.value) {
-      return apiClient.createUser({
+      const body: import('@/api/types').UserCreate = {
         email: email.value.trim(),
         display_name: displayName.value.trim(),
         password: password.value,
         role: canPickRole.value ? role.value : 'user',
         rate_limit_rpm: parsedRpm,
-        plan_id: Number(selectedPlanId.value),
-      });
+      };
+      const defaultPlanId = defaultPlanForRole(role.value);
+      if (selectedPlanId.value && selectedPlanId.value !== defaultPlanId) {
+        body.plan_id = Number(selectedPlanId.value);
+      }
+      return apiClient.createUser(body);
     } else if (props.initial) {
       const body: {
         display_name?: string;
@@ -175,6 +189,7 @@ const saveMutation = useMutation({
       const updated = await apiClient.updateUser(props.initial.id, body);
       if (
         selectedPlanId.value &&
+        role.value === initialRole &&
         selectedPlanId.value !== initialPlanId &&
         hasCapability(me.value, 'assign_plan')
       ) {
@@ -318,6 +333,7 @@ function handleSave() {
             :id="planId"
             v-model="selectedPlanId"
             :options="planOptions"
+            :disabled="!isCreate && role !== initialRole"
             data-testid="user-editor-plan"
           />
         </FormField>

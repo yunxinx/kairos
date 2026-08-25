@@ -97,7 +97,7 @@ export async function seedToken(
   const resp = await page.request.post('/api/tokens', {
     headers: await e2eRootHeaders(page.request),
     data: {
-      limit_usd_micros: null,
+      balance_usd_micros: null,
       enabled: true,
       model_group: 'default',
       ...body,

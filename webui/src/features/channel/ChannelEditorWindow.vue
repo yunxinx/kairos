@@ -26,6 +26,7 @@ import FormTextInput from '@/components/ui/FormTextInput.vue';
 import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
+import { invalidateChannelCaches } from '@/composables/useChannelDirectory';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import ChannelEditorChip from '@/features/channel/ChannelEditorChip.vue';
@@ -247,7 +248,7 @@ const saveMutation = useMutation({
       : apiClient.updateChannel(props.initial.id, body),
   onSuccess: async () => {
     emit('close');
-    await queryClient.invalidateQueries({ queryKey: ['channels'] });
+    await invalidateChannelCaches(queryClient);
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
   },
   onError: (err) => {

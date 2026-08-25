@@ -98,6 +98,15 @@ pub struct Token {
     pub user_id: i64,
 }
 
+/// 令牌可编辑属性；密钥、归属与累计消费上限不在通用更新契约中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenAttributes {
+    pub name: String,
+    pub rate_limit_rpm: Option<u64>,
+    pub enabled: bool,
+    pub model_group: String,
+}
+
 /// 模型组：令牌的可调用名允许名单（渠道模型、别名 key、统一模型 ID）。
 ///
 /// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
@@ -1028,22 +1037,15 @@ fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreE
     })
 }
 
-/// 新增或整体替换一个令牌（按 `token_key`），同一事务内幂等。
-///
-/// `created_at` 仅在首次插入时落库；冲突覆盖不改创建时间、`last_used_at`
-/// （编辑属性不算使用）与 `user_id`（归属只在插入时确定）。
-pub async fn upsert_token(
+/// 新增令牌；密钥冲突由唯一约束明确拒绝。
+pub async fn insert_token(
     conn: &mut SqliteConnection,
     token: &Token,
     created_at: i64,
 ) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO tokens (token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, model_group, user_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(token_key) DO UPDATE SET \
-           name = excluded.name, limit_usd_micros = excluded.limit_usd_micros, \
-           rate_limit_rpm = excluded.rate_limit_rpm, \
-           enabled = excluded.enabled, model_group = excluded.model_group",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&token.token_key)
     .bind(&token.name)
@@ -1056,6 +1058,48 @@ pub async fn upsert_token(
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 按库生成 id 更新令牌属性；不会改密钥、归属、累计消费上限或生命周期。
+pub async fn update_token_attributes(
+    conn: &mut SqliteConnection,
+    id: i64,
+    attributes: &TokenAttributes,
+) -> Result<(), StoreError> {
+    let updated = sqlx::query(
+        "UPDATE tokens SET name = ?, rate_limit_rpm = ?, enabled = ?, model_group = ? \
+         WHERE id = ?",
+    )
+    .bind(&attributes.name)
+    .bind(bind_rate_limit_rpm(attributes.rate_limit_rpm)?)
+    .bind(attributes.enabled)
+    .bind(bind_token_model_group(&attributes.model_group))
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::InvalidResource(format!("令牌 {id} 不存在")));
+    }
+    Ok(())
+}
+
+/// 余额命令专用的累计消费上限写入口；通用属性更新不能调用。
+pub async fn set_token_limit(
+    conn: &mut SqliteConnection,
+    id: i64,
+    limit_usd_micros: Option<i64>,
+) -> Result<(), StoreError> {
+    let updated = sqlx::query("UPDATE tokens SET limit_usd_micros = ? WHERE id = ?")
+        .bind(limit_usd_micros)
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::InvalidResource(format!("令牌 {id} 不存在")));
+    }
     Ok(())
 }
 
@@ -1170,12 +1214,33 @@ pub async fn delete_model_group(conn: &mut SqliteConnection, name: &str) -> Resu
 
 /// 读出全部统一模型。
 pub async fn list_unified_models(pool: &SqlitePool) -> Result<Vec<UnifiedModel>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    list_unified_models_on_conn(&mut conn).await
+}
+
+/// 在现有连接/事务上读出全部统一模型，供渠道校验与写入使用。
+pub async fn list_unified_models_on_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<UnifiedModel>, StoreError> {
     let rows = sqlx::query("SELECT id, models_json, hide FROM unified_models")
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
 
     rows.iter().map(map_unified_model).collect()
+}
+
+/// 在现有连接上按 id 读取统一模型。
+pub async fn get_unified_model(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Option<UnifiedModel>, StoreError> {
+    let row = sqlx::query("SELECT id, models_json, hide FROM unified_models WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    row.as_ref().map(map_unified_model).transpose()
 }
 
 /// 把统一模型行映射为 `UnifiedModel`；`hide` 以 0/1 整数落库，非 0 视为开启。
@@ -1870,7 +1935,7 @@ mod tests {
 
     /// 令牌播种 → 读回往返一致；limit 为 NULL 表示无上限，enabled 缺省启用。
     #[tokio::test]
-    async fn token_upsert_then_list_roundtrip() {
+    async fn token_insert_then_list_roundtrip() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
         let token = Token {
@@ -1882,7 +1947,7 @@ mod tests {
             model_group: DEFAULT_MODEL_GROUP.to_string(),
             user_id: ROOT_USER_ID,
         };
-        upsert_token(&mut conn, &token, 1_700_000_000_000)
+        insert_token(&mut conn, &token, 1_700_000_000_000)
             .await
             .expect("应能写令牌");
 
@@ -1904,7 +1969,7 @@ mod tests {
             model_group: DEFAULT_MODEL_GROUP.to_string(),
             user_id: ROOT_USER_ID,
         };
-        upsert_token(&mut conn, &token, 1_000)
+        insert_token(&mut conn, &token, 1_000)
             .await
             .expect("应能写令牌");
 
@@ -1916,13 +1981,19 @@ mod tests {
         assert_eq!(record.created_at, 1_000);
         assert_eq!(record.last_used_at, None, "未使用时为空");
 
-        // 覆盖更新（带不同的 created_at 入参）不改已有创建时间。
-        let mut renamed = token.clone();
-        renamed.name = "v2".to_string();
-        renamed.enabled = false;
-        upsert_token(&mut conn, &renamed, 9_999)
-            .await
-            .expect("应能覆盖令牌");
+        // 属性更新不接收 created_at，也就不可能改写生命周期。
+        update_token_attributes(
+            &mut conn,
+            id,
+            &TokenAttributes {
+                name: "v2".to_string(),
+                rate_limit_rpm: None,
+                enabled: false,
+                model_group: DEFAULT_MODEL_GROUP.to_string(),
+            },
+        )
+        .await
+        .expect("应能更新令牌属性");
         touch_token_used(&mut conn, "sk-a", 2_000)
             .await
             .expect("应能刷新最后使用时间");
@@ -1959,7 +2030,7 @@ mod tests {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
 
-        upsert_token(
+        insert_token(
             &mut conn,
             &Token {
                 token_key: "sk-a".to_string(),
@@ -1980,18 +2051,20 @@ mod tests {
         let before = list_tokens(&pool).await.expect("应能读令牌");
         assert_eq!(before[0].limit_usd_micros, None);
 
-        upsert_token(
+        let id = get_token_record_by_key(&pool, "sk-a")
+            .await
+            .expect("应能读令牌")
+            .expect("令牌应存在")
+            .id;
+        update_token_attributes(
             &mut conn,
-            &Token {
-                token_key: "sk-a".to_string(),
+            id,
+            &TokenAttributes {
                 name: "v2".to_string(),
-                limit_usd_micros: Some(9_000_000),
                 enabled: true,
                 rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
-                user_id: ROOT_USER_ID,
             },
-            2,
         )
         .await
         .expect("应能更新令牌");
@@ -2006,7 +2079,10 @@ mod tests {
         );
         let after = list_tokens(&pool).await.expect("应能读令牌");
         assert_eq!(after[0].name, "v2");
-        assert_eq!(after[0].limit_usd_micros, Some(9_000_000));
+        assert_eq!(
+            after[0].limit_usd_micros, None,
+            "通用属性更新不能改累计消费上限"
+        );
         assert_eq!(after[0].model_group, DEFAULT_MODEL_GROUP);
     }
 
@@ -2056,7 +2132,7 @@ mod tests {
         )
         .await
         .expect("应能写组");
-        upsert_token(
+        insert_token(
             &mut conn,
             &Token {
                 token_key: "sk-a".to_string(),

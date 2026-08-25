@@ -4,7 +4,6 @@ import { seedModelGroup } from './helpers/models';
 import type { Page } from '@playwright/test';
 import { openSession, seedUser } from './helpers/users';
 
-
 async function createPlan(
   page: Page,
   body: { internal_name: string; display_name: string; groups: string[] },
@@ -40,15 +39,18 @@ async function assignPlan(page: Page, userId: number, planId: number): Promise<v
 test.describe.configure({ mode: 'serial' });
 
 test.describe('role navigation', () => {
-  test('user cannot see channels, models, users, or settings', async ({ page }) => {
+  test('user cannot see channels, users, or settings but keeps a read-only models page', async ({
+    page,
+  }) => {
     await seedUser(page, { email: 'nav-user@example.com', role: 'user' });
     await openSession(page, 'nav-user@example.com');
 
     const nav = page.getByRole('navigation');
     await expect(nav.getByRole('link', { name: /^tokens$/i })).toBeVisible();
     await expect(nav.getByRole('link', { name: /^logs$/i })).toBeVisible();
+    // 模型页对普通用户是自助入口：他得知道自己能调什么，否则只能拿令牌打 /v1/models。
+    await expect(nav.getByRole('link', { name: /^models$/i })).toBeVisible();
     await expect(nav.getByRole('link', { name: /^channels$/i })).toHaveCount(0);
-    await expect(nav.getByRole('link', { name: /^models$/i })).toHaveCount(0);
     await expect(nav.getByRole('link', { name: /^users$/i })).toHaveCount(0);
     await expect(nav.getByRole('link', { name: /^settings$/i })).toHaveCount(0);
 
@@ -56,10 +58,15 @@ test.describe('role navigation', () => {
     await expect(page).toHaveURL(/\/overview/);
     await page.goto('/users');
     await expect(page).toHaveURL(/\/overview/);
-    await page.goto('/models');
-    await expect(page).toHaveURL(/\/overview/);
     await page.goto('/settings');
     await expect(page).toHaveURL(/\/overview/);
+
+    // 只读视图：不出运营标签页，也不出任何渠道信息。
+    await page.goto('/models');
+    await expect(page).toHaveURL(/\/models/);
+    await expect(page.getByTestId('my-models-table')).toBeVisible();
+    await expect(page.getByTestId('models-tab-inventory')).toHaveCount(0);
+    await expect(page.getByTestId('models-tab-groups')).toHaveCount(0);
   });
 
   test('admin can see users and models but not channels or settings', async ({ page }) => {
@@ -122,7 +129,7 @@ test.describe('role navigation', () => {
       headers: { Authorization: `Bearer ${sessionBody.token}` },
       data: {
         name: 'withdraw-me',
-        limit_usd_micros: null,
+        balance_usd_micros: null,
         enabled: true,
         model_group: 'e2e-withdraw',
       },

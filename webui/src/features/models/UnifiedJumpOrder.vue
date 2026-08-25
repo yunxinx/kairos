@@ -3,17 +3,23 @@
 import { computed } from 'vue';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';
-import type { ChannelView, UnifiedMember } from '@/api/types';
+import type { ChannelSummary, UnifiedMember } from '@/api/types';
 import UnifiedJumpLine from '@/features/models/UnifiedJumpLine.vue';
 import { overflowGridItems } from '@/lib/overflow-grid';
 import { channelNameForMember, memberSourceKind, unifiedMemberKey } from '@/lib/unified-sources';
 
-const props = defineProps<{
-  members: UnifiedMember[];
-  channels: ChannelView[];
-  /** 隐藏列是成员名单不是路由：传 true 用 ul 且永不标 hop。缺省用 ol，两条及以上才标。 */
-  hideIndex?: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    members: UnifiedMember[];
+    /** 只做来源渲染，取名录投影即可。 */
+    channels: ChannelSummary[];
+    /** 渠道表是否已到手；false 时不下失效判断（见 `memberSourceKind`）。 */
+    channelsKnown?: boolean;
+    /** 隐藏列是成员名单不是路由：传 true 用 ul 且永不标 hop。缺省用 ol，两条及以上才标。 */
+    hideIndex?: boolean;
+  }>(),
+  { channelsKnown: true, hideIndex: false },
+);
 
 const { t } = useI18n();
 
@@ -22,7 +28,7 @@ const lines = computed(() =>
     key: unifiedMemberKey(member),
     member: member.model,
     channel: channelNameForMember(props.channels, member),
-    kind: memberSourceKind(member, props.channels),
+    kind: memberSourceKind(member, props.channels, props.channelsKnown),
     hop: index + 1,
   })),
 );

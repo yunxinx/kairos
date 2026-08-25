@@ -33,10 +33,13 @@ const dirty = computed(() => selectedPlanId.value !== '' && selectedPlanId.value
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const planOptions = computed(() => {
-  const options = (plansQuery.data.value ?? []).map((plan) => ({
-    value: String(plan.id),
-    label: plan.display_name,
-  }));
+  const audience = props.user.role === 'admin' ? 'admin' : 'user';
+  const options = (plansQuery.data.value ?? [])
+    .filter((plan) => plan.audience === audience)
+    .map((plan) => ({
+      value: String(plan.id),
+      label: plan.display_name,
+    }));
   const current = currentPlanId.value;
   if (current && !options.some((option) => option.value === current)) {
     options.push({

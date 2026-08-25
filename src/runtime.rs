@@ -464,7 +464,7 @@ mod tests {
         )
         .await
         .expect("应能写渠道");
-        resources::upsert_token(
+        resources::insert_token(
             &mut conn,
             &resources::Token {
                 token_key: "sk-a".to_string(),

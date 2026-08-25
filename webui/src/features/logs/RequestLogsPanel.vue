@@ -31,6 +31,7 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow, { type RequestLogVisibleColumns } from '@/features/logs/LogTableRow.vue';
 import RequestLogDetailWindow from '@/features/logs/RequestLogDetailWindow.vue';
 import { useLogListControls } from '@/features/logs/useLogListControls';
+import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -223,18 +224,21 @@ const refreshOptions = computed(() => [
   { value: '30', label: t('logs.autoRefreshSeconds', { seconds: 30 }) },
 ]);
 
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
+// 协议映射只需要「渠道名 → 协议」，故走名录投影；完整定义是 root-only，
+// 用它会让 admin 吃 403。普通用户连名录也无权读，此时 map 保持 null。
+const { channels, channelsKnown } = useChannelDirectory();
 
+/**
+ * 渠道表未到手时返回 null，让详情只显示入站协议。
+ *
+ * 不能退化成空 Map：那会让 `resolveOutboundProtocol` 对每一行都判 `unknown`，
+ * 于是「我看不到渠道表」被显示成「这条渠道不在表里」。
+ */
 const channelProtocolMap = computed((): Map<string, string> | null => {
-  if (channelsQuery.isPending.value) {
+  if (!channelsKnown.value) {
     return null;
   }
-  return new Map<string, string>(
-    (channelsQuery.data.value ?? []).map((channel) => [channel.name, channel.protocol]),
-  );
+  return new Map<string, string>(channels.value.map((channel) => [channel.name, channel.protocol]));
 });
 
 watch(appliedSettled, resetResults);

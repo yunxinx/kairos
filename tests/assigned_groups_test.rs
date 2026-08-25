@@ -88,7 +88,12 @@ async fn first_channel_id(gw: &TestGateway) -> i64 {
         .expect("应有 id")
 }
 
-async fn create_plan(gw: &TestGateway, internal_name: &str, groups: &[&str]) -> i64 {
+async fn create_plan(
+    gw: &TestGateway,
+    internal_name: &str,
+    audience: &str,
+    groups: &[&str],
+) -> i64 {
     let response = admin_json(
         gw,
         &gw.session,
@@ -97,6 +102,7 @@ async fn create_plan(gw: &TestGateway, internal_name: &str, groups: &[&str]) -> 
         json!({
             "internal_name": internal_name,
             "display_name": internal_name,
+            "audience": audience,
             "groups": groups,
         }),
     )
@@ -169,7 +175,7 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
     )
     .await;
 
-    let plan_id = create_plan(&gw, "coder", &["coding"]).await;
+    let plan_id = create_plan(&gw, "coder", "user", &["coding"]).await;
     let assigned = admin_json(
         &gw,
         &gw.session,
@@ -190,7 +196,7 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
         &session,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "coder", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     assert_eq!(token_resp.status(), StatusCode::CREATED);
@@ -201,8 +207,8 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 5_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "assigned-balance-1", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
 
@@ -233,7 +239,7 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
         &session,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "again", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "again", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     assert!(
@@ -248,9 +254,7 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
         reqwest::Method::PUT,
         &format!("/tokens/{token_row_id}"),
         json!({
-            "token_key": key,
             "name": "coder",
-            "limit_usd_micros": null,
             "enabled": true,
             "model_group": "coding"
         }),
@@ -323,12 +327,12 @@ async fn admin_tokens_follow_plan_group_allowlist() {
         &session,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "operator", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "operator", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
-    let plan_id = create_plan(&gw, "operator", &["coding"]).await;
+    let plan_id = create_plan(&gw, "operator", "admin", &["coding"]).await;
     let assigned = admin_json(
         &gw,
         &gw.session,
@@ -344,7 +348,7 @@ async fn admin_tokens_follow_plan_group_allowlist() {
         &session,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "operator", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "operator", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     assert_eq!(created_token.status(), StatusCode::CREATED);
@@ -356,8 +360,8 @@ async fn admin_tokens_follow_plan_group_allowlist() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 5_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "assigned-balance-2", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
 
@@ -378,9 +382,7 @@ async fn admin_tokens_follow_plan_group_allowlist() {
         reqwest::Method::PUT,
         &format!("/tokens/{token_id}"),
         json!({
-            "token_key": key,
             "name": "operator",
-            "limit_usd_micros": null,
             "enabled": true,
             "model_group": "coding"
         }),
@@ -411,7 +413,7 @@ async fn delete_group_clears_assignments_and_root_can_use_any_group() {
         }),
     )
     .await;
-    let plan_id = create_plan(&gw, "coder", &["default", "coding"]).await;
+    let plan_id = create_plan(&gw, "coder", "user", &["default", "coding"]).await;
     let created = admin_json(
         &gw,
         &gw.session,
@@ -433,7 +435,7 @@ async fn delete_group_clears_assignments_and_root_can_use_any_group() {
         &gw.session,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "root-coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "root-coder", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     assert_eq!(

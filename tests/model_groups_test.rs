@@ -330,7 +330,7 @@ async fn token_binds_exactly_one_group() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "anon", "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": "anon", "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(created.status(), reqwest::StatusCode::CREATED);
@@ -342,7 +342,7 @@ async fn token_binds_exactly_one_group() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "coder", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     assert_eq!(coded.status(), reqwest::StatusCode::CREATED);
@@ -357,9 +357,7 @@ async fn token_binds_exactly_one_group() {
         reqwest::Method::PUT,
         &format!("/tokens/{default_id}"),
         json!({
-            "token_key": default_key,
             "name": "anon",
-            "limit_usd_micros": null,
             "enabled": true,
             "model_group": "coding"
         }),
@@ -374,9 +372,7 @@ async fn token_binds_exactly_one_group() {
         reqwest::Method::PUT,
         &format!("/tokens/{coding_id}"),
         json!({
-            "token_key": coding_key,
             "name": "coder",
-            "limit_usd_micros": null,
             "enabled": true,
             "model_group": "ghost"
         }),
@@ -417,7 +413,7 @@ async fn delete_group_nulls_token_group_without_rebind() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "coder", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
@@ -425,8 +421,8 @@ async fn delete_group_nulls_token_group_without_rebind() {
     admin_json(
         &gw,
         reqwest::Method::POST,
-        "/users/1/balance",
-        json!({ "delta_usd_micros": 5_000_000 }),
+        "/users/1/balance-adjustments",
+        json!({ "operation_id": "groups-balance-1", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
 
@@ -490,7 +486,7 @@ async fn out_of_group_model_is_not_found_not_503() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "coder", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
@@ -498,8 +494,8 @@ async fn out_of_group_model_is_not_found_not_503() {
     admin_json(
         &gw,
         reqwest::Method::POST,
-        "/users/1/balance",
-        json!({ "delta_usd_micros": 5_000_000 }),
+        "/users/1/balance-adjustments",
+        json!({ "operation_id": "groups-balance-2", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
 
@@ -886,7 +882,7 @@ async fn pinned_group_source_routes_only_that_channel() {
         &gw,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": "coder", "limit_usd_micros": null, "enabled": true, "model_group": "coding" }),
+        json!({ "name": "coder", "balance_usd_micros": null, "enabled": true, "model_group": "coding" }),
     )
     .await;
     let token: Value = token_resp.json().await.expect("令牌应可解析");
@@ -894,8 +890,8 @@ async fn pinned_group_source_routes_only_that_channel() {
     admin_json(
         &gw,
         reqwest::Method::POST,
-        "/users/1/balance",
-        json!({ "delta_usd_micros": 5_000_000 }),
+        "/users/1/balance-adjustments",
+        json!({ "operation_id": "groups-balance-3", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
 

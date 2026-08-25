@@ -49,6 +49,7 @@ const initialTab = computed<UserManageTab>(() => {
 const activeTab = ref<UserManageTab>(initialTab.value);
 const profileDirty = ref(false);
 const rechargeDirty = ref(false);
+const rechargeBusy = ref(false);
 
 const windowTitle = computed(() => {
   const name = props.user.display_name || props.user.email;
@@ -76,6 +77,7 @@ function emitDirty() {
     :cascade="cascade"
     :attention="attention"
     :topmost="topmost"
+    :close-disabled="rechargeBusy"
     wide
     @close="emit('close')"
     @pointerdown="emit('raise')"
@@ -84,10 +86,20 @@ function emitDirty() {
       <div class="px-4 pt-3">
         <TabsList class="page-tab-switch" :aria-label="t('users.manageTabs')">
           <TabsIndicator class="page-tab-switch-knob" />
-          <TabsTrigger value="profile" class="page-tab-switch-btn" data-testid="user-tab-profile">
+          <TabsTrigger
+            value="profile"
+            class="page-tab-switch-btn"
+            data-testid="user-tab-profile"
+            :disabled="rechargeBusy"
+          >
             {{ t('users.profile') }}
           </TabsTrigger>
-          <TabsTrigger value="recharge" class="page-tab-switch-btn" data-testid="user-tab-recharge">
+          <TabsTrigger
+            value="recharge"
+            class="page-tab-switch-btn"
+            data-testid="user-tab-recharge"
+            :disabled="rechargeBusy"
+          >
             {{ t('users.recharge') }}
           </TabsTrigger>
           <TabsTrigger
@@ -95,6 +107,7 @@ function emitDirty() {
             value="plan"
             class="page-tab-switch-btn"
             data-testid="user-tab-plan"
+            :disabled="rechargeBusy"
           >
             {{ t('users.plan') }}
           </TabsTrigger>
@@ -103,6 +116,7 @@ function emitDirty() {
             value="tokens"
             class="page-tab-switch-btn"
             data-testid="user-tab-tokens"
+            :disabled="rechargeBusy"
           >
             {{ t('users.viewTokens') }}
           </TabsTrigger>
@@ -124,6 +138,7 @@ function emitDirty() {
         <UserRechargeWindow
           :user="user"
           @close="emit('close')"
+          @busy-change="rechargeBusy = $event"
           @dirty-change="
             (dirty) => {
               rechargeDirty = dirty;

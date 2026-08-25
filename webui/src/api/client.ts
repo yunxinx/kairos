@@ -1,10 +1,13 @@
 import { invalidateAdminKey, getAdminKey } from '@/lib/session';
 import { ApiClientError, type ApiErrorBody } from '@/api/types';
 import type {
-  BalanceAdjustment,
+  BalanceAdjustmentResult,
+  BulkDeleteResult,
   Channel,
   ChannelModelOrder,
+  ChannelModelTarget,
   ChannelProbeResult,
+  ChannelSummary,
   ChannelView,
   LogQuery,
   LogPage,
@@ -18,6 +21,7 @@ import type {
   MeUpdate,
   MeView,
   ModelGroup,
+  MyModelsView,
   Price,
   CatalogModel,
   CatalogView,
@@ -26,17 +30,20 @@ import type {
   Settings,
   StatsView,
   LifetimeStats,
-  Token,
+  TokenBalanceCommand,
   TokenCreate,
+  TokenUpdate,
   TokenView,
   UnifiedModel,
   UpstreamModelsDraft,
   UpstreamModelsView,
   UserAdminView,
+  UserBalanceAdjustment,
   UserCreate,
   UserUpdate,
   UserView,
-  PlanInput,
+  PlanCreate,
+  PlanUpdate,
   PlanView,
 } from '@/api/types';
 
@@ -60,6 +67,10 @@ function buildQuery(params: object): string {
   return query ? `?${query}` : '';
 }
 
+function deleteMany<T>(path: string, targets: T[]): Promise<BulkDeleteResult<T>> {
+  return apiFetch(path, { method: 'DELETE', body: JSON.stringify({ targets }) });
+}
+
 /**
  * 调用管理 API。各方法传领域路径（如 `/tokens`），此处统一拼 `/api` 前缀；
  * 认证为 `Authorization: Bearer <会话令牌>`。
@@ -79,7 +90,12 @@ async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: strin
 
   const response = await fetch(`/api${path}`, { ...init, headers });
   if (!response.ok) {
-    if (response.status === 401 && key && keyOverride === undefined) {
+    if (
+      response.status === 401 &&
+      key &&
+      keyOverride === undefined &&
+      getAdminKey() === key
+    ) {
       invalidateAdminKey();
     }
     const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
@@ -109,6 +125,11 @@ export const apiClient = {
     return apiFetch('/me', { method: 'PUT', body: JSON.stringify(body) });
   },
 
+  /** 自己能调的模型：按套餐模型组分段，单价已折后。所有登录用户可读。 */
+  listMyModels(): Promise<MyModelsView> {
+    return apiFetch('/me/models');
+  },
+
   listUsers(): Promise<UserAdminView[]> {
     return apiFetch('/users');
   },
@@ -129,8 +150,15 @@ export const apiClient = {
     return apiFetch(`/users/${id}`, { method: 'DELETE' });
   },
 
-  rechargeUser(id: number, body: BalanceAdjustment): Promise<UserAdminView> {
-    return apiFetch(`/users/${id}/balance`, { method: 'POST', body: JSON.stringify(body) });
+  deleteUsers(ids: number[]): Promise<BulkDeleteResult<number>> {
+    return deleteMany('/users', ids);
+  },
+
+  adjustUserBalance(id: number, body: UserBalanceAdjustment): Promise<BalanceAdjustmentResult> {
+    return apiFetch(`/users/${id}/balance-adjustments`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
   },
 
   assignUserPlan(id: number, planId: number): Promise<UserView> {
@@ -144,16 +172,24 @@ export const apiClient = {
     return apiFetch('/plans');
   },
 
-  createPlan(body: PlanInput): Promise<PlanView> {
+  createPlan(body: PlanCreate): Promise<PlanView> {
     return apiFetch('/plans', { method: 'POST', body: JSON.stringify(body) });
   },
 
-  updatePlan(id: number, body: PlanInput): Promise<PlanView> {
+  updatePlan(id: number, body: PlanUpdate): Promise<PlanView> {
     return apiFetch(`/plans/${id}`, { method: 'PUT', body: JSON.stringify(body) });
   },
 
   deletePlan(id: number, force = false): Promise<PlanView> {
     return apiFetch(`/plans/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' });
+  },
+
+  deletePlans(ids: number[], force = false): Promise<BulkDeleteResult<number>> {
+    return deleteMany(`/plans${force ? '?force=true' : ''}`, ids);
+  },
+
+  setPlanDefault(id: number): Promise<PlanView> {
+    return apiFetch(`/plans/${id}/default`, { method: 'PUT' });
   },
 
   listUserTokens(id: number): Promise<TokenView[]> {
@@ -168,9 +204,19 @@ export const apiClient = {
     return apiFetch('/tokens', { method: 'POST', body: JSON.stringify(body) });
   },
 
-  updateToken(id: number, body: Token): Promise<TokenView> {
+  updateToken(id: number, body: TokenUpdate): Promise<TokenView> {
     return apiFetch(`/tokens/${id}`, {
       method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+
+  adjustTokenBalance(
+    id: number,
+    body: TokenBalanceCommand,
+  ): Promise<BalanceAdjustmentResult> {
+    return apiFetch(`/tokens/${id}/balance-adjustments`, {
+      method: 'POST',
       body: JSON.stringify(body),
     });
   },
@@ -186,8 +232,22 @@ export const apiClient = {
     return apiFetch(`/tokens/${id}`, { method: 'DELETE' });
   },
 
+  deleteTokens(ids: number[]): Promise<BulkDeleteResult<number>> {
+    return deleteMany('/tokens', ids);
+  },
+
   listChannels(): Promise<ChannelView[]> {
     return apiFetch('/channels');
+  },
+
+  /**
+   * 渠道名录：admin+ 可读的最小投影，模型页与日志页的渲染判断走这里。
+   *
+   * 完整的 `GET /channels` 是 root-only（含密钥与出站地址）；admin 调它拿 403，
+   * 渠道表会空掉，进而把「不知道」渲染成「渠道已失效」。
+   */
+  listChannelSummaries(): Promise<ChannelSummary[]> {
+    return apiFetch('/channels/summary');
   },
 
   createChannel(body: Channel): Promise<ChannelView> {
@@ -203,6 +263,16 @@ export const apiClient = {
 
   deleteChannel(id: number): Promise<ChannelView> {
     return apiFetch(`/channels/${id}`, { method: 'DELETE' });
+  },
+
+  deleteChannels(ids: number[]): Promise<BulkDeleteResult<number>> {
+    return deleteMany('/channels', ids);
+  },
+
+  deleteChannelModels(
+    targets: ChannelModelTarget[],
+  ): Promise<BulkDeleteResult<ChannelModelTarget>> {
+    return deleteMany('/channel-models', targets);
   },
 
   testChannel(id: number, model: string): Promise<ChannelProbeResult> {
@@ -255,6 +325,10 @@ export const apiClient = {
     return apiFetch(`/model-groups/${encodeURIComponent(name)}`, { method: 'DELETE' });
   },
 
+  deleteModelGroups(names: string[]): Promise<BulkDeleteResult<string>> {
+    return deleteMany('/model-groups', names);
+  },
+
   listUnifiedModels(): Promise<UnifiedModel[]> {
     return apiFetch('/unified-models');
   },
@@ -272,6 +346,10 @@ export const apiClient = {
 
   deleteUnifiedModel(id: string): Promise<UnifiedModel> {
     return apiFetch(`/unified-models/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  },
+
+  deleteUnifiedModels(ids: string[]): Promise<BulkDeleteResult<string>> {
+    return deleteMany('/unified-models', ids);
   },
 
   listChannelModelOrders(): Promise<ChannelModelOrder[]> {

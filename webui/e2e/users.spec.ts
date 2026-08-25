@@ -47,7 +47,7 @@ test.describe('users page', () => {
     const created = await seedUser(page, { email: 'e2e-tokens@example.com', role: 'user' });
     const tokenResp = await page.request.post('/api/tokens', {
       headers: await e2eRootHeaders(page.request),
-      data: { name: 'will-not-belong', limit_usd_micros: null, enabled: true },
+      data: { name: 'will-not-belong', balance_usd_micros: null, enabled: true },
     });
     expect(tokenResp.ok()).toBeTruthy();
 
@@ -58,7 +58,7 @@ test.describe('users page', () => {
     const sessionBody = (await session.json()) as { token: string };
     const own = await page.request.post('/api/tokens', {
       headers: { Authorization: `Bearer ${sessionBody.token}` },
-      data: { name: 'owned', limit_usd_micros: null, enabled: true },
+      data: { name: 'owned', balance_usd_micros: null, enabled: true },
     });
     expect(own.ok()).toBeTruthy();
     // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态。

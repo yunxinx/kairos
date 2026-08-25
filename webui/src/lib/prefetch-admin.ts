@@ -1,12 +1,14 @@
 import { queryClient } from '@/app/providers/query';
 import { apiClient } from '@/api/client';
 import { loadTokenRows } from '@/api/token-rows';
+import { CHANNEL_SUMMARY_KEY } from '@/composables/useChannelDirectory';
 import {
   LOGS_INITIAL_PAGE,
   LOGS_INITIAL_PAGE_SIZE,
   LOGS_INITIAL_QUERY_KEY,
   OVERVIEW_DEFAULT_DAYS,
 } from '@/lib/admin-query-defaults';
+import { getMe } from '@/lib/session';
 
 /** 导航悬停时预取对应页数据，进入时尽量已有缓存、不再拆布局。 */
 export function prefetchAdminRoute(to: string): void {
@@ -42,11 +44,24 @@ export function prefetchAdminRoute(to: string): void {
         queryKey: ['model-groups'],
         queryFn: () => apiClient.listModelGroups(),
       });
+      void queryClient.prefetchQuery({
+        queryKey: ['channel-model-orders'],
+        queryFn: () => apiClient.listChannelModelOrders(),
+      });
       return;
     case '/models':
+      // 普通用户的模型页是另一条数据源：下面四个端点对他全是 403，预取只会白吃四个。
+      if (getMe()?.role === 'user') {
+        void queryClient.prefetchQuery({
+          queryKey: ['my-models'],
+          queryFn: () => apiClient.listMyModels(),
+        });
+        return;
+      }
+      // 模型页只按名录渲染；完整定义是 root-only，预取它会让 admin 白吃一个 403。
       void queryClient.prefetchQuery({
-        queryKey: ['channels'],
-        queryFn: () => apiClient.listChannels(),
+        queryKey: [...CHANNEL_SUMMARY_KEY],
+        queryFn: () => apiClient.listChannelSummaries(),
       });
       void queryClient.prefetchQuery({
         queryKey: ['prices'],

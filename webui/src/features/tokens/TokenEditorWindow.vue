@@ -1,13 +1,9 @@
 <script setup lang="ts">
-// 令牌编辑器浮窗：只编辑令牌定义与启用开关。
-//
-// 不含钱包余额：钱包记在所属用户上（ADR-0008），这里只编辑令牌定义与累计结算展示。
-// 充值统一在用户管理页，避免同一用户的每把令牌重复显示同一个钱包数字。
 import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type { Token, TokenCreate } from '@/api/types';
+import type { TokenCreate, TokenUpdate } from '@/api/types';
 import type { TokenRow } from '@/api/token-rows';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
@@ -16,6 +12,7 @@ import FormTextInput from '@/components/ui/FormTextInput.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import { parseUsdToMicros } from '@/lib/format';
 import { useCurrentUser } from '@/lib/session';
 import {
   DEFAULT_MODEL_GROUP,
@@ -54,6 +51,7 @@ const nameInputId = `token-editor-name-${uid}`;
 const groupInputId = `token-editor-group-${uid}`;
 const rpmInputId = `token-editor-rpm-${uid}`;
 const enabledInputId = `token-editor-enabled-${uid}`;
+const initialBalanceInputId = `token-editor-initial-balance-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
@@ -66,8 +64,8 @@ const groupsQuery = useQuery({
   enabled: canListAllGroups,
 });
 
-const initialKey = props.initial ? props.initial.token_key : '';
 const initialName = props.initial ? props.initial.name : '';
+const initialBalance = '';
 const initialRpm =
   props.initial && props.initial.rate_limit_rpm !== null
     ? String(props.initial.rate_limit_rpm)
@@ -84,6 +82,7 @@ const initialGroup = (() => {
 })();
 
 const editorName = ref(initialName);
+const editorInitialBalance = ref(initialBalance);
 const editorRpm = ref(initialRpm);
 const editorEnabled = ref(initialEnabled);
 const editorGroup = ref(initialGroup);
@@ -110,6 +109,7 @@ const groupUnusable = computed(() => {
 const dirty = computed(
   () =>
     editorName.value !== initialName ||
+    (props.initial === null && editorInitialBalance.value !== initialBalance) ||
     editorRpm.value !== initialRpm ||
     editorEnabled.value !== initialEnabled ||
     editorGroup.value !== initialGroup,
@@ -118,8 +118,7 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 /** 保存载荷：新建由系统发 key，更新按库生成 id 定位。 */
 type SavePayload =
-  | { kind: 'create'; body: TokenCreate }
-  | { kind: 'update'; id: number; body: Token };
+  { kind: 'create'; body: TokenCreate } | { kind: 'update'; id: number; body: TokenUpdate };
 
 const saveMutation = useMutation({
   mutationFn: (payload: SavePayload) =>
@@ -140,6 +139,13 @@ function handleSave() {
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
     { name: 'rateLimitRpm', value: editorRpm.value, rules: [{ kind: 'uint', min: 0 }] },
   ];
+  if (props.initial === null) {
+    specs.push({
+      name: 'initialBalance',
+      value: editorInitialBalance.value,
+      rules: [{ kind: 'usd', min: 0 }],
+    });
+  }
   if (!validate(specs, t)) return;
   const name = editorName.value.trim();
   const rpmRaw = editorRpm.value.trim();
@@ -150,7 +156,10 @@ function handleSave() {
       kind: 'create',
       body: {
         name,
-        limit_usd_micros: null,
+        balance_usd_micros:
+          editorInitialBalance.value.trim() === ''
+            ? null
+            : parseUsdToMicros(editorInitialBalance.value),
         rate_limit_rpm,
         enabled,
         model_group: editorGroup.value,
@@ -161,9 +170,7 @@ function handleSave() {
       kind: 'update',
       id: props.initial.id,
       body: {
-        token_key: initialKey,
         name,
-        limit_usd_micros: null,
         rate_limit_rpm,
         enabled,
         model_group: editorGroup.value,
@@ -171,7 +178,6 @@ function handleSave() {
     });
   }
 }
-
 </script>
 
 <template>
@@ -261,6 +267,29 @@ function handleSave() {
           />
         </FormField>
 
+        <FormField
+          v-if="initial === null"
+          field-name="initialBalance"
+          :label="t('tokens.initialBalance')"
+          :input-id="initialBalanceInputId"
+          :error="fieldError('initialBalance')"
+          :guide="t('tokens.initialBalanceGuide')"
+        >
+          <template #default="{ hintId, invalid }">
+            <FormTextInput
+              :id="initialBalanceInputId"
+              v-model="editorInitialBalance"
+              type="text"
+              inputmode="decimal"
+              class="font-mono"
+              :placeholder="t('common.unlimited')"
+              data-testid="token-editor-initial-balance"
+              :invalid="invalid"
+              :hint-id="hintId"
+              v-on="fieldInputHandlers('initialBalance')"
+            />
+          </template>
+        </FormField>
       </div>
       <div class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">

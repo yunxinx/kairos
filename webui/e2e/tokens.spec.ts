@@ -18,6 +18,7 @@ test.describe('token resource page', () => {
     await expect(page.locator('[id^="token-editor-key"]')).toHaveCount(0);
     await page.locator('[id^="token-editor-name"]').fill('Alpha token');
     await page.getByTestId('token-editor-rpm').fill('60');
+    await page.getByTestId('token-editor-initial-balance').fill('12');
     await page.getByTestId('token-save').click();
 
     const createdRow = page.locator('[data-testid="token-row"]', { hasText: 'Alpha token' });
@@ -52,10 +53,13 @@ test.describe('token resource page', () => {
     await page.keyboard.press('Escape');
     await expect(row).toBeVisible();
 
-    // 编辑器只管令牌定义：钱包记在所属用户上（ADR-0008），充值在用户管理页。
+    await expect(row.getByTestId('token-balance')).toHaveText('$12.00');
+
+    // 通用编辑器不包含余额写入口，避免保存属性时覆盖并发消费或余额调整。
     await row.getByTestId('token-edit').click();
     await expect(page.getByTestId('token-editor-rpm')).toHaveValue('60');
-    await expect(page.getByTestId('token-quick-add-5')).toHaveCount(0);
+    await expect(page.getByTestId('token-editor-initial-balance')).toHaveCount(0);
+    await expect(page.getByTestId('token-balance-amount')).toHaveCount(0);
 
     // 修改名称与 RPM
     await page.locator('[id^="token-editor-name"]').fill('Alpha renamed');
@@ -95,19 +99,43 @@ test.describe('token resource page', () => {
     expect(secondKey).not.toBe(firstKey);
   });
 
-  test('shows the owning user wallet once, not per token row', async ({ page }) => {
+  test('adjusts token balance independently and switches finite modes explicitly', async ({
+    page,
+  }) => {
     await page.goto('/tokens');
-    for (const name of ['WalletA', 'WalletB']) {
+    for (const name of ['LimitA', 'LimitB']) {
       await page.getByTestId('create-token').click();
       await page.locator('[id^="token-editor-name"]').fill(name);
+      if (name === 'LimitA') {
+        await page.getByTestId('token-editor-initial-balance').fill('10');
+      }
       await page.getByTestId('token-save').click();
       await expect(page.locator('[data-testid="token-row"]', { hasText: name })).toBeVisible();
     }
 
-    // 钱包是用户级的、多把令牌共用，只在工具栏显示一次；逐行重复同一个数字会让
-    // 运营以为每把令牌各有一笔余额。
-    await expect(page.getByTestId('tokens-wallet-balance')).toHaveCount(1);
-    await expect(page.getByTestId('token-balance')).toHaveCount(0);
+    const rowA = page.locator('[data-testid="token-row"]', { hasText: 'LimitA' });
+    const rowB = page.locator('[data-testid="token-row"]', { hasText: 'LimitB' });
+    await expect(rowA.getByTestId('token-balance')).toHaveText('$10.00');
+    await expect(rowB.getByTestId('token-balance')).toHaveText('Unlimited');
+
+    await clickRowAction(rowA, page, 'token-adjust-balance');
+    await page.getByTestId('token-balance-quick-add-10').click();
+    await expect(page.getByTestId('token-expected-balance')).toHaveText('20');
+    await page.getByTestId('token-balance-save').click();
+    await expect(rowA.getByTestId('token-balance')).toHaveText('$20.00');
+    await expect(rowB.getByTestId('token-balance')).toHaveText('Unlimited');
+
+    await clickRowAction(rowB, page, 'token-adjust-balance');
+    await page.getByTestId('token-balance-mode-finite').click();
+    await page.getByTestId('token-balance-amount').fill('7');
+    await page.getByTestId('token-balance-save').click();
+    await expect(rowB.getByTestId('token-balance')).toHaveText('$7.00');
+
+    await clickRowAction(rowA, page, 'token-adjust-balance');
+    await page.getByTestId('token-balance-mode-unlimited').click();
+    await page.getByTestId('token-balance-save').click();
+    await expect(rowA.getByTestId('token-balance')).toHaveText('Unlimited');
+    await expect(rowB.getByTestId('token-balance')).toHaveText('$7.00');
   });
 
   test('bulk selects tokens and deletes them from the floating bulk bar', async ({ page }) => {

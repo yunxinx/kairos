@@ -543,8 +543,8 @@ async fn user_rate_limit_and_stats_roundtrip() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 10_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "management-balance-1", "delta_usd_micros": 10_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(recharge.status(), StatusCode::OK);
@@ -778,8 +778,8 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 10_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "management-balance-2", "delta_usd_micros": 10_000_000, "reason": "manual_adjustment" }),
     )
     .await;
 
@@ -994,8 +994,69 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         bearer_get(&gw, &admin_token, "/stats").await.status(),
         StatusCode::FORBIDDEN
     );
+    for path in [
+        "/channels/summary",
+        "/prices",
+        "/model-groups",
+        "/unified-models",
+        "/channel-model-orders",
+    ] {
+        assert_eq!(
+            bearer_get(&gw, &admin_token, path).await.status(),
+            StatusCode::OK,
+            "零能力管理员仍应可读模型运营资源: {path}"
+        );
+    }
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::POST,
+            "/model-groups",
+            json!({"name": "forbidden-write", "models": []}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::DELETE,
+            "/model-groups",
+            json!({"targets": ["default"]}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::PUT,
+            "/channel-model-orders/gpt-4o",
+            json!({"model": "gpt-4o", "channel_ids": []}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::DELETE,
+            "/channel-models",
+            json!({"targets": [{"channel_id": 1, "model": "gpt-4o"}]}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
 
-    // 只打开改价时，admin 能做该项，但不会被顺带授予用户运营或模型组查看。
+    // 只打开改价时，admin 能写价格，但完整模型资源仍按管理员角色只读可见。
     sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
         .bind("{\"edit_prices\":true}")
         .execute(&gw.pool)
@@ -1011,7 +1072,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         bearer_get(&gw, &admin_token, "/model-groups")
             .await
             .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
 
     let prices_body: Value = prices.json().await.expect("价格列表应可解析");
@@ -1050,6 +1111,18 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         bearer_get(&gw, &admin_token, "/channels").await.status(),
         StatusCode::FORBIDDEN
     );
+    // 完整定义仍 root-only，但名录必须可读：模型页要靠它判断某个已登记名挂在哪条
+    // 渠道、渠道还在不在。缺这一条时前端渠道表为空，会把「看不到」画成「已失效」。
+    let summary = bearer_get(&gw, &admin_token, "/channels/summary").await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let listed: Value = summary.json().await.expect("名录应可解析");
+    let first = &listed.as_array().expect("名录应为数组")[0];
+    assert!(first["name"].is_string(), "名录应给出渠道名");
+    assert!(first["models"].is_array(), "名录应给出可调用名");
+    assert!(
+        first.get("keys").is_none() && first.get("base_url").is_none(),
+        "名录不得泄露密钥与出站地址，实际 {first}"
+    );
     assert_eq!(
         bearer_get(&gw, &admin_token, "/settings").await.status(),
         StatusCode::FORBIDDEN
@@ -1087,4 +1160,49 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         bearer_get(&gw, &gw.session, "/settings").await.status(),
         StatusCode::OK
     );
+}
+
+/// 旁路写入造成跨受众脏绑定时，认证层按最小权限运行，不能采纳错误套餐的管理员能力。
+#[tokio::test]
+async fn cross_audience_plan_binding_cannot_grant_management_capabilities() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let created = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "cross-audience-admin@example.com",
+            "display_name": "跨受众管理员",
+            "password": "password1",
+            "role": "admin"
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let admin_id = created.json::<Value>().await.expect("管理员应可解析")["id"]
+        .as_i64()
+        .expect("应有管理员 id");
+    let admin_token = login_user(&gw, "cross-audience-admin@example.com").await;
+
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 1")
+        .bind("{\"manage_users\":true}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能构造带管理能力的 user 受众套餐");
+    sqlx::query("UPDATE users SET plan_id = 1 WHERE id = ?")
+        .bind(admin_id)
+        .execute(&gw.pool)
+        .await
+        .expect("应能构造跨受众脏绑定");
+
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::FORBIDDEN,
+        "admin 不能继承 user 受众套餐中的 manage_users"
+    );
+    let me = bearer_get(&gw, &admin_token, "/me").await;
+    assert_eq!(me.status(), StatusCode::OK);
+    let me: Value = me.json().await.expect("me 应可解析");
+    assert_eq!(me["capabilities"]["manage_users"], false);
 }

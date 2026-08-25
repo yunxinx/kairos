@@ -76,8 +76,8 @@ async fn user_and_balance_mutations_are_audited() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 25_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "audit-balance-1", "delta_usd_micros": 25_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(charged.status(), StatusCode::OK);

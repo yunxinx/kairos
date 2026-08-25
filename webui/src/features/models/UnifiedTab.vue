@@ -25,6 +25,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
+import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -45,6 +46,14 @@ const { error } = useToast();
 const queryClient = useQueryClient();
 const me = useCurrentUser();
 const canEditUnified = computed(() => hasCapability(me.value, 'edit_unified_models'));
+
+/**
+ * 表格实际列数：只读身份既没有勾选列也没有操作列。
+ *
+ * 表头曾无条件渲染操作列而单元格按能力隐藏，于是只读 admin 看到一列空表头——
+ * 空占位比没有更糟，它暗示这里本该有可点的东西。
+ */
+const tableColumnCount = computed(() => (canEditUnified.value ? 5 : 3));
 const searchText = ref('');
 const statusFilter = ref<string[]>([]);
 const selectedChannels = ref<string[]>([]);
@@ -71,16 +80,13 @@ const unifiedQuery = useQuery({
   queryKey: ['unified-models'],
   queryFn: () => apiClient.listUnifiedModels(),
 });
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
+// 渠道只用于渲染成员来源与筛选，取 admin+ 可读的名录投影。
+const { channels, channelsKnown } = useChannelDirectory();
 const pricesQuery = useQuery({
   queryKey: ['prices'],
   queryFn: () => apiClient.listPrices(),
 });
 
-const channels = computed(() => channelsQuery.data.value ?? []);
 const prices = computed(() => pricesQuery.data.value ?? []);
 const models = computed(() => unifiedQuery.data.value ?? []);
 const showTableSkeleton = computed(() => unifiedQuery.isPending.value && !unifiedQuery.data.value);
@@ -153,7 +159,7 @@ const bulkDelete = useBulkDelete<string>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['unified-models'],
-  deleteOne: (id) => apiClient.deleteUnifiedModel(id),
+  deleteMany: (ids) => apiClient.deleteUnifiedModels(ids),
 });
 
 const deleteMutation = useMutation({
@@ -262,7 +268,7 @@ function openBulkDelete() {
         </template>
         <TableHeader>
           <TableRow>
-            <TableHead class="w-10">
+            <TableHead v-if="canEditUnified" class="w-10">
               <div class="flex items-center justify-center">
                 <Checkbox
                   v-model="allVisibleSelected"
@@ -275,11 +281,17 @@ function openBulkDelete() {
             <TableHead class="w-[36%]">{{ t('models.unifiedId') }}</TableHead>
             <TableHead class="w-[46%]">{{ t('models.unifiedMembers') }}</TableHead>
             <TableHead class="w-32 whitespace-normal">{{ t('models.unifiedHide') }}</TableHead>
-            <TableHead align="center" class="w-24">{{ t('common.actions') }}</TableHead>
+            <TableHead v-if="canEditUnified" align="center" class="w-24">
+              {{ t('common.actions') }}
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="5" />
+          <TableRowsSkeleton
+            v-if="showTableSkeleton"
+            :has-select-column="canEditUnified"
+            :columns="tableColumnCount"
+          />
           <template v-else>
             <TableRow
               v-for="model in filtered"
@@ -289,6 +301,7 @@ function openBulkDelete() {
               :data-state="selection.isSelected(model.id) ? 'selected' : undefined"
             >
               <SelectCell
+                v-if="canEditUnified"
                 :checked="selection.isSelected(model.id)"
                 test-id="unified-select"
                 @toggle="selection.toggle(model.id)"
@@ -297,7 +310,11 @@ function openBulkDelete() {
                 <CopyableName :text="model.id" test-id="unified-model-name" />
               </TableCell>
               <TableCell class="whitespace-normal">
-                <UnifiedJumpOrder :members="model.models" :channels="channels" />
+                <UnifiedJumpOrder
+                  :members="model.models"
+                  :channels="channels"
+                  :channels-known="channelsKnown"
+                />
               </TableCell>
               <TableCell>
                 <span class="badge" :class="model.hide ? 'badge-warn' : 'badge-neutral'">
@@ -331,9 +348,14 @@ function openBulkDelete() {
               </TableCell>
             </TableRow>
             <TableRow v-if="filtered.length === 0">
-              <TableCell :colspan="5" class="h-24 whitespace-normal">
+              <TableCell :colspan="tableColumnCount" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.unifiedEmpty')">
-                  <button v-if="canEditUnified" type="button" class="btn btn-primary" @click="openCreate">
+                  <button
+                    v-if="canEditUnified"
+                    type="button"
+                    class="btn btn-primary"
+                    @click="openCreate"
+                  >
                     {{ t('models.unifiedCreate') }}
                   </button>
                 </EmptyState>

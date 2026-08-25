@@ -53,6 +53,12 @@ pub struct SystemLogQuery {
     pub targets: Vec<String>,
     /// 按操作者过滤；`None` 表示不限。
     pub actor_user_id: Option<i64>,
+    /// 只保留该用户自己的审计行（`actor_user_id` 相等），排除 actor 为 NULL 的运维事件。
+    ///
+    /// 与 `actor_user_id` 分开：那一维是「可由调用方指定的筛选」，这一维是身份注入的
+    /// 归属边界，普通用户不能通过参数解除。运维告警含内部细节（上游地址、失败堆栈），
+    /// 即便发生在自己的请求上也不对普通用户开放。
+    pub own_audit_only: Option<i64>,
     /// 排序列；缺省时间。
     pub sort_by: SystemLogSortBy,
     /// 排序方向；缺省倒序。
@@ -224,6 +230,11 @@ fn push_system_log_filters(
     if let Some(actor_user_id) = filter.actor_user_id {
         push_where_cond(qb, &mut first, "actor_user_id = ");
         qb.push_bind(actor_user_id);
+    }
+    // 归属边界：`actor_user_id = ?` 天然排除 NULL，运维事件不会漏给普通用户。
+    if let Some(owner) = filter.own_audit_only {
+        push_where_cond(qb, &mut first, "actor_user_id = ");
+        qb.push_bind(owner);
     }
     if include_target {
         push_column_in(qb, &mut first, "target", &filter.targets);

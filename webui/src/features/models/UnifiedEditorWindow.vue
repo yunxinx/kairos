@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import { unifiedMemberWriteBody } from '@/api/types';
-import type { ChannelView, Price, UnifiedMember, UnifiedModel } from '@/api/types';
+import type { ChannelSummary, Price, UnifiedMember, UnifiedModel } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
@@ -38,7 +38,10 @@ import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 const props = withDefaults(
   defineProps<{
     initial: UnifiedModel | null;
-    channels: ChannelView[];
+    /** 只用于渲染来源判断，故取名录投影；写渠道定义是 root-only 的另一条路径。 */
+    channels: ChannelSummary[];
+    /** 渠道名录是否已到手；未到手时不给成员标「渠道已失效」。 */
+    channelsKnown?: boolean;
     prices: Price[];
     anchor?: FloatingWindowAnchor | null;
     stackOrder?: number;
@@ -46,7 +49,14 @@ const props = withDefaults(
     attention?: boolean;
     topmost?: boolean;
   }>(),
-  { anchor: null, stackOrder: 0, cascade: 0, attention: false, topmost: true },
+  {
+    channelsKnown: true,
+    anchor: null,
+    stackOrder: 0,
+    cascade: 0,
+    attention: false,
+    topmost: true,
+  },
 );
 
 const emit = defineEmits<{
@@ -298,7 +308,7 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
                 <TableCell>
                   <ChannelSourceMark
                     :channel-name="pinnedChannelName(member)"
-                    :kind="memberSourceKind(member, channels)"
+                    :kind="memberSourceKind(member, channels, channelsKnown)"
                   />
                 </TableCell>
                 <TableCell align="center">

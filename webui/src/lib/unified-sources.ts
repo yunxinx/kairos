@@ -1,31 +1,37 @@
-import type { ChannelModelOrder, ChannelView, UnifiedMember } from '@/api/types';
+import type { ChannelModelOrder, ChannelSummary, UnifiedMember } from '@/api/types';
 
 export function unifiedMemberKey(member: Pick<UnifiedMember, 'channel_id' | 'model'>): string {
   return `${member.channel_id}:${member.model}`;
 }
 
 /** 渠道是否把该名当作可调用名（清单条目或别名 key）。 */
-function channelListsCallable(channel: ChannelView, model: string): boolean {
+function channelListsCallable(channel: ChannelSummary, model: string): boolean {
   return channel.models.includes(model) || Object.hasOwn(channel.model_aliases, model);
 }
 
 /** 成员钉死的渠道名；渠道已删则空串。 */
-export function channelNameForMember(channels: ChannelView[], member: UnifiedMember): string {
+export function channelNameForMember(channels: ChannelSummary[], member: UnifiedMember): string {
   return channels.find((channel) => channel.id === member.channel_id)?.name ?? '';
 }
 
 /** 统一模型是否有任一成员钉在该渠道上。 */
 export function unifiedUsesChannel(
   members: UnifiedMember[],
-  channels: ChannelView[],
+  channels: ChannelSummary[],
   channelName: string,
 ): boolean {
   const id = channels.find((channel) => channel.name === channelName)?.id;
   return id !== undefined && members.some((member) => member.channel_id === id);
 }
 
-/** 钉渠道成员相对当前渠道表的来源状态。 */
-export type MemberSourceKind = 'ok' | 'unlisted' | 'disabled' | 'gone';
+/**
+ * 钉渠道成员相对当前渠道表的来源状态。
+ *
+ * `unknown` 与其余三档性质不同：它表示「渠道表还没到手」（正在加载，或当前身份
+ * 无权读取），而不是对成员本身的判断。曾经缺这一档，渠道表为空就一律落到 `gone`，
+ * 把「不知道」显示成了「渠道已失效」。
+ */
+export type MemberSourceKind = 'ok' | 'unknown' | 'unlisted' | 'disabled' | 'gone';
 
 const MEMBER_SOURCE_I18N = {
   unlisted: 'models.memberSourceUnlisted',
@@ -33,22 +39,27 @@ const MEMBER_SOURCE_I18N = {
   gone: 'models.memberSourceGone',
 } as const;
 
-/** 状态标文案 key；正常不标。 */
+/** 状态标文案 key；正常与「渠道表未知」都不标。 */
 export function memberSourceI18nKey(
   kind: MemberSourceKind,
-): (typeof MEMBER_SOURCE_I18N)[Exclude<MemberSourceKind, 'ok'>] | undefined {
-  if (kind === 'ok') return undefined;
+): (typeof MEMBER_SOURCE_I18N)[Exclude<MemberSourceKind, 'ok' | 'unknown'>] | undefined {
+  if (kind === 'ok' || kind === 'unknown') return undefined;
   return MEMBER_SOURCE_I18N[kind];
 }
 
 /**
- * 渠道已删 → gone；还在但不登记该名 → unlisted；登记了但停用 → disabled。
- * 停用且未登记时优先 unlisted（缺模型比停用更具体）。
+ * 渠道表未知 → unknown（不下任何判断）；渠道已删 → gone；还在但不登记该名 →
+ * unlisted；登记了但停用 → disabled。停用且未登记时优先 unlisted（缺模型比停用更具体）。
+ *
+ * `channelsKnown` 为 false 时一律 unknown：没有渠道表就无法区分「渠道被删」与
+ * 「我看不到渠道」，此时报失效是在编造事实。
  */
 export function memberSourceKind(
   member: Pick<UnifiedMember, 'channel_id' | 'model'>,
-  channels: ChannelView[],
+  channels: ChannelSummary[],
+  channelsKnown = true,
 ): MemberSourceKind {
+  if (!channelsKnown) return 'unknown';
   const channel = channels.find((item) => item.id === member.channel_id);
   if (channel === undefined) return 'gone';
   if (!channelListsCallable(channel, member.model)) return 'unlisted';
@@ -62,7 +73,7 @@ export function memberSourceKind(
  */
 export function callableRouteMembers(
   model: string,
-  channels: ChannelView[],
+  channels: ChannelSummary[],
   orders: ChannelModelOrder[] = [],
 ): UnifiedMember[] {
   const order = orders.find((entry) => entry.model === model);

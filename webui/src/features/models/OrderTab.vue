@@ -17,23 +17,23 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
+import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { useToast } from '@/composables/useToast';
 import { moveItem } from '@/lib/move-item';
+import { useCurrentUser } from '@/lib/session';
 
 const { t } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
+const me = useCurrentUser();
+const canEditOrder = computed(() => me.value?.role === 'root');
 
 const ordersQuery = useQuery({
   queryKey: ['channel-model-orders'],
   queryFn: () => apiClient.listChannelModelOrders(),
 });
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
+const { query: channelsQuery, channels } = useChannelDirectory();
 
-const channels = computed(() => channelsQuery.data.value ?? []);
 const originalOrders = ref<ChannelModelOrder[]>([]);
 const draftOrders = ref<ChannelModelOrder[]>([]);
 
@@ -105,6 +105,7 @@ const dragFrom = ref<number | null>(null);
 const dropInsert = ref<number | null>(null);
 
 function onChannelDragStart(model: string, index: number, event: DragEvent) {
+  if (!canEditOrder.value) return;
   dragModel.value = model;
   dragFrom.value = index;
   event.dataTransfer?.setData('text/plain', `${model}\0${index}`);
@@ -112,6 +113,7 @@ function onChannelDragStart(model: string, index: number, event: DragEvent) {
 }
 
 function onChannelDragOver(model: string, index: number, event: DragEvent) {
+  if (!canEditOrder.value) return;
   if (dragModel.value !== model) return;
   event.preventDefault();
   if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
@@ -121,6 +123,7 @@ function onChannelDragOver(model: string, index: number, event: DragEvent) {
 }
 
 function onChannelDrop(model: string) {
+  if (!canEditOrder.value) return;
   if (dragModel.value !== model || dragFrom.value === null || dropInsert.value === null) {
     resetDrag();
     return;
@@ -182,6 +185,7 @@ function refetchAll() {
 </script>
 
 <template>
+  <!-- eslint-disable vuejs-accessibility/no-static-element-interactions -->
   <div class="flex flex-col">
     <InlineError
       v-if="ordersQuery.isError.value && !ordersQuery.data.value"
@@ -194,7 +198,9 @@ function refetchAll() {
           <TableRow>
             <TableHead class="min-w-44">{{ t('pricing.model') }}</TableHead>
             <TableHead>{{ t('models.orderChannels') }}</TableHead>
-            <TableHead align="center" class="w-28">{{ t('common.actions') }}</TableHead>
+            <TableHead v-if="canEditOrder" align="center" class="w-28">
+              {{ t('common.actions') }}
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -222,12 +228,13 @@ function refetchAll() {
                     :class="channelDropClass(order.model, index)"
                     data-testid="order-channel"
                     :data-channel="channel.name"
-                    role="button"
-                    tabindex="0"
+                    :role="canEditOrder ? 'button' : undefined"
+                    :tabindex="canEditOrder ? 0 : undefined"
                     @dragover.prevent="onChannelDragOver(order.model, index, $event)"
                     @drop.prevent="onChannelDrop(order.model)"
                   >
                     <button
+                      v-if="canEditOrder"
                       type="button"
                       class="text-fg-muted cursor-grab"
                       draggable="true"
@@ -256,7 +263,7 @@ function refetchAll() {
                   </li>
                 </ol>
               </TableCell>
-              <TableCell align="center">
+              <TableCell v-if="canEditOrder" align="center">
                 <button
                   type="button"
                   class="btn btn-sm"
@@ -269,7 +276,7 @@ function refetchAll() {
               </TableCell>
             </TableRow>
             <TableRow v-if="rows.length === 0">
-              <TableCell :colspan="3" class="h-24 whitespace-normal">
+              <TableCell :colspan="canEditOrder ? 3 : 2" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.orderEmpty')" />
               </TableCell>
             </TableRow>

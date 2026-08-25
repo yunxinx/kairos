@@ -177,8 +177,8 @@ body:has(.dotted-bg)::before {
 }
 
 html[lang='zh-CN'] {
-  --font-serif: 'Kaiti SC', KaiTi, STKaiti, 'Source Han Serif SC', 'Noto Serif CJK SC',
-    'Songti SC', serif;
+  --font-serif:
+    'Kaiti SC', KaiTi, STKaiti, 'Source Han Serif SC', 'Noto Serif CJK SC', 'Songti SC', serif;
 }
 
 .font-serif {
@@ -1428,7 +1428,14 @@ html[lang='zh-CN'] .font-serif {
 .form-field-inline .form-field-label {
   white-space: nowrap;
 }
+/*
+ * 控件盒子本身也做 flex 居中：块级盒里放 inline-flex 开关会生成行盒，行盒比
+ * 20px 的轨道高（含下伸部），把轨道顶得比左侧标签高约 3px。flex 容器不产生
+ * 行盒，开关与输入框都能和标签严格同轴。
+ */
 .form-field-inline .form-field-control {
+  display: flex;
+  align-items: center;
   margin-top: 0;
   flex-shrink: 0;
 }

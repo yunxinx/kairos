@@ -28,8 +28,16 @@ const props = withDefaults(
     cascade?: number;
     attention?: boolean;
     topmost?: boolean;
+    canFillFromCatalog?: boolean;
   }>(),
-  { anchor: null, stackOrder: 0, cascade: 0, attention: false, topmost: true },
+  {
+    anchor: null,
+    stackOrder: 0,
+    cascade: 0,
+    attention: false,
+    topmost: true,
+    canFillFromCatalog: false,
+  },
 );
 
 const emit = defineEmits<{
@@ -144,6 +152,7 @@ function handleSave() {
   >
     <template #header-extra>
       <button
+        v-if="canFillFromCatalog"
         type="button"
         class="btn btn-sm h-6 py-0 text-xs"
         data-testid="pricing-fill-from-catalog"

@@ -82,6 +82,27 @@ impl ManagementIdentity {
         self.user.plan_id
     }
 
+    /// 前端可见的生效能力；root 的角色天花板等价于全部开启。
+    pub(super) fn capabilities_for_view(&self) -> PlanCapabilities {
+        if self.role() == ManagementRole::Root {
+            PlanCapabilities {
+                manage_users: true,
+                assign_plan: true,
+                view_logs_stats: true,
+                settle_waive: true,
+                toggle_user_tokens: true,
+                view_own_plan_groups: true,
+                view_other_groups: true,
+                edit_prices: true,
+                edit_model_groups: true,
+                edit_unified_models: true,
+                edit_price_catalog: true,
+            }
+        } else {
+            self.capabilities
+        }
+    }
+
     /// 角色天花板与套餐开关的交集；root 不受套餐开关约束。
     pub(super) fn has_capability(&self, capability: ManagementCapability) -> bool {
         match self.role() {
@@ -161,8 +182,15 @@ pub(super) async fn admin_auth(
                         )))
                         .into_response();
                     };
-                    match plans::load_plan_capabilities(&auth.pool, plan_id).await {
-                        Ok(capabilities) => capabilities,
+                    match plans::load_plan_access_profile(&auth.pool, plan_id).await {
+                        Ok(profile)
+                            if users::plan_audience_for_role(user.role)
+                                == Some(profile.audience) =>
+                        {
+                            profile.capabilities
+                        }
+                        // 存量脏绑定按最小权限运行，不能让 user 档能力对 admin 生效。
+                        Ok(_) => PlanCapabilities::default(),
                         Err(err) => return AdminError::Store(err).into_response(),
                     }
                 }

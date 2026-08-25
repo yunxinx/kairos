@@ -18,6 +18,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
 import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
+import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { callableRouteMembers } from '@/lib/unified-sources';
 import {
   DEFAULT_MODEL_GROUP,
@@ -37,10 +38,8 @@ const unifiedQuery = useQuery({
   queryKey: ['unified-models'],
   queryFn: () => apiClient.listUnifiedModels(),
 });
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
+// 只读预览：走名录投影，admin 无渠道写权限也能正确渲染来源。
+const { query: channelsQuery, channels, channelsKnown } = useChannelDirectory();
 const pricesQuery = useQuery({
   queryKey: ['prices'],
   queryFn: () => apiClient.listPrices(),
@@ -53,15 +52,12 @@ const ordersQuery = useQuery({
 const groupOptions = computed(() => {
   const groups = groupsQuery.data.value ?? [];
   const unified = unifiedQuery.data.value ?? [];
-  const channelList = channelsQuery.data.value ?? [];
   return groups.map((group) => ({
     value: group.name,
     label: group.name === DEFAULT_MODEL_GROUP ? t('models.ungrouped') : group.name,
-    count: previewVisibleModels(groups, unified, channelList, group.name).visibleIds.length,
+    count: previewVisibleModels(groups, unified, channels.value, group.name).visibleIds.length,
   }));
 });
-
-const channels = computed(() => channelsQuery.data.value ?? []);
 
 const sections = computed(() => {
   const q = searchText.value.trim().toLowerCase();
@@ -218,15 +214,24 @@ function refetchAll() {
                 </TableCell>
                 <TableCell class="min-w-0 whitespace-normal">
                   <div v-if="row.unified" data-testid="visible-unified-order">
-                    <UnifiedJumpOrder :members="row.unified.models" :channels="channels" />
+                    <UnifiedJumpOrder
+                      :members="row.unified.models"
+                      :channels="channels"
+                      :channels-known="channelsKnown"
+                    />
                   </div>
                   <div
                     v-else-if="row.callableRoute.length > 0"
                     data-testid="visible-callable-order"
                   >
-                    <UnifiedJumpOrder :members="row.callableRoute" :channels="channels" />
+                    <UnifiedJumpOrder
+                      :members="row.callableRoute"
+                      :channels="channels"
+                      :channels-known="channelsKnown"
+                    />
                   </div>
-                  <ChannelSourceMark v-else kind="unlisted" />
+                  <!-- 渠道表未到手时不敢断言「未登记」：那时路由本来就算不出来。 -->
+                  <ChannelSourceMark v-else :kind="channelsKnown ? 'unlisted' : 'unknown'" />
                 </TableCell>
                 <TableCell
                   class="min-w-0 whitespace-normal"
@@ -240,6 +245,7 @@ function refetchAll() {
                     v-if="row.unified && row.unified.hiddenMembers.length > 0"
                     :members="row.unified.hiddenMembers"
                     :channels="channels"
+                    :channels-known="channelsKnown"
                     :hide-index="true"
                   />
                   <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>

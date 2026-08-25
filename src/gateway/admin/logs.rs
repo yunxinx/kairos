@@ -17,14 +17,13 @@ use super::auth::{ManagementCapability, ManagementIdentity};
 use super::tokens::mask_token_key;
 use super::{AdminDeps, AdminError, parse_comma_list};
 
+/// 归属收窄后对所有登录用户开放：请求日志按 `owner_scope`，系统日志按
+/// `own_audit_only`（普通用户只看自己的审计行，看不到运维事件）。
 pub(super) fn signed_in_routes() -> Router<AdminDeps> {
     Router::new()
         .route("/logs", get(query_logs))
         .route("/logs/{id}", get(get_log))
-}
-
-pub(super) fn admin_routes() -> Router<AdminDeps> {
-    Router::new().route("/system-logs", get(query_system_logs))
+        .route("/system-logs", get(query_system_logs))
 }
 
 /// 日志维护端点：只读体积统计与按时间窗清理，均要求 root（挂 `root_only` 层）。
@@ -319,13 +318,17 @@ pub(super) struct SystemLogPage {
     targets: Vec<String>,
 }
 
-/// 分页查询系统日志；该端点已经由路由层限制为 admin+。
+/// 分页查询系统日志。
+///
+/// 普通用户看得到自己的操作记录（改密码、建令牌等审计行），这是「我做过什么」的
+/// 自助视图；运维事件（actor 为 NULL 的告警，含上游地址与失败堆栈）只对 admin+
+/// 开放。归属由身份注入到 `own_audit_only`，客户端参数无法解除。
 pub(super) async fn query_system_logs(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<SystemLogQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<SystemLogPage>, AdminError> {
-    identity.require_capability(ManagementCapability::ViewLogsStats)?;
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
@@ -336,7 +339,13 @@ pub(super) async fn query_system_logs(
     filter.to_created_at = params.to_created_at;
     filter.levels = parse_comma_list(params.level.as_deref());
     filter.targets = parse_comma_list(params.target.as_deref());
-    filter.actor_user_id = params.actor_user_id;
+    // 归属边界先于调用方参数：普通用户的 actor 维被钉死为自己。
+    filter.own_audit_only = identity.owner_scope();
+    filter.actor_user_id = if filter.own_audit_only.is_some() {
+        None
+    } else {
+        params.actor_user_id
+    };
     filter.sort_by = params.sort_by.unwrap_or_default();
     filter.sort_dir = params.sort_dir.unwrap_or_default();
     let page = store::query_system_log_page(&deps.pool, &filter)

@@ -25,12 +25,19 @@ export interface BulkDeleteOptions<K extends string | number> {
   windowStack: BulkDeleteWindowStack;
   /** 列表查询键；落地后 invalidate 重取。 */
   queryKey: readonly unknown[];
-  /** 单条删除 API；管理 API 无批量端点，由本 composable 顺序逐条调用。 */
-  deleteOne(key: K): Promise<unknown>;
+  /**
+   * 同一份数据的其他投影键；与 `queryKey` 一并失效。
+   *
+   * 渠道有「完整定义」与「名录」两份缓存，只重取列表那一份会让模型页继续按
+   * 已删渠道渲染。
+   */
+  alsoInvalidate?: readonly (readonly unknown[])[];
+  /** 事务式集合删除 API；服务端保证整批成功或整批回滚。 */
+  deleteMany(keys: K[]): Promise<unknown>;
 }
 
 export interface BulkDelete<K extends string | number> {
-  /** 顺序逐条删除；任一失败即中止。 */
+  /** 一次提交整批目标。 */
   mutate(keys: K[]): void;
   /** 请求进行中标忙，供确认窗禁用按钮。 */
   isPending: Ref<boolean>;
@@ -39,10 +46,7 @@ export interface BulkDelete<K extends string | number> {
 }
 
 /**
- * 批量删除：顺序逐条调用单删 API。
- *
- * 无论成功或部分失败都 invalidate 列表，使服务端状态成为单一事实源；
- * 部分失败时把「已成功删除」的键移出选择集，避免重试重发已删键。
+ * 批量删除：一次调用事务式集合端点，失败时服务端状态不变，选择集保留供修正后重试。
  */
 export function useBulkDelete<K extends string | number>(
   options: BulkDeleteOptions<K>,
@@ -54,34 +58,27 @@ export function useBulkDelete<K extends string | number>(
     return options.windowStack.windows.value.find((entry) => entry.payload.kind === 'bulk-delete');
   }
 
+  /** 列表键与其余投影键一起失效。 */
+  async function invalidateAll(): Promise<void> {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: options.queryKey }),
+      ...(options.alsoInvalidate ?? []).map((key) =>
+        queryClient.invalidateQueries({ queryKey: key }),
+      ),
+    ]);
+  }
+
   const mutation = useMutation({
-    mutationFn: async (keys: K[]) => {
-      let done = 0;
-      try {
-        for (const key of keys) {
-          await options.deleteOne(key);
-          done += 1;
-        }
-      } catch (err) {
-        // 以中止位置切分已删/未删：已删键随后移出选择集，未删键保留供重试。
-        const succeeded = keys.slice(0, done);
-        const failed = keys.slice(done);
-        error.value = extractApiError(err).message;
-        options.selection.setMany(failed, true);
-        options.selection.setMany(succeeded, false);
-        throw err;
-      }
-    },
+    mutationFn: (keys: K[]) => options.deleteMany(keys),
     onSuccess: async () => {
       const entry = bulkWindow();
       if (entry) options.windowStack.close(entry.id);
       error.value = '';
       options.selection.clear();
-      await queryClient.invalidateQueries({ queryKey: options.queryKey });
+      await invalidateAll();
     },
-    onError: async () => {
-      // 部分删除已落库：重取列表让本地与服务端一致（watch 侧 prune 随之收敛）。
-      await queryClient.invalidateQueries({ queryKey: options.queryKey });
+    onError: (err) => {
+      error.value = extractApiError(err).message;
     },
   });
 

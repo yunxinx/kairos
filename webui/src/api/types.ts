@@ -24,11 +24,9 @@ export function channelOutboundUrl(protocol: Protocol, baseUrl: string): string 
   return `${baseUrl.replace(/\/+$/, '')}${UPSTREAM_PATH[protocol]}`;
 }
 
-/** 令牌写契约；余额与生命周期元数据不在其中。 */
-export interface Token {
-  token_key: string;
+/** 令牌可编辑属性；密钥、余额与生命周期元数据不在其中。 */
+export interface TokenUpdate {
   name: string;
-  limit_usd_micros: number | null;
   /** 每分钟请求上限；`null` 跟随全局兜底，`0` 表示该令牌不限速。 */
   rate_limit_rpm: number | null;
   enabled: boolean;
@@ -37,30 +35,35 @@ export interface Token {
 }
 
 /** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */
-export type TokenCreate = Omit<Token, 'token_key'>;
+export interface TokenCreate extends TokenUpdate {
+  /** 初始可用余额；`null` 表示无限额。 */
+  balance_usd_micros: number | null;
+}
 
-/** 令牌读响应：库生成身份 + 写契约字段 + 生命周期元数据 + 该令牌累计结算。 */
-export interface TokenView extends Token {
+export interface BulkDeleteResult<T> {
+  deleted: T[];
+}
+
+export interface ChannelModelTarget {
+  channel_id: number;
+  model: string;
+}
+
+/** 令牌读响应：属性 + 身份 + 额度与生命周期事实。 */
+export interface TokenView extends TokenUpdate {
   /** 库生成的稳定身份；管理面按它定位令牌。 */
   id: number;
+  token_key: string;
+  /** 累计消费上限；`null` 表示无限额。 */
+  limit_usd_micros: number | null;
+  /** 派生可用余额 = 累计消费上限 - 累计已结算；`null` 表示无限额。 */
+  balance_usd_micros: number | null;
   /** 创建时刻（unix 毫秒）。 */
   created_at: number;
   /** 最后使用时刻（unix 毫秒）；null 表示从未使用。 */
   last_used_at: number | null;
   /** 该令牌累计已结算（micro-USD），对照 `limit_usd_micros`。 */
   settled_usd_micros: number;
-}
-
-/** PUT 令牌：剥离只读字段。 */
-export function tokenWriteBody(view: Token): Token {
-  return {
-    token_key: view.token_key,
-    name: view.name,
-    limit_usd_micros: view.limit_usd_micros,
-    rate_limit_rpm: view.rate_limit_rpm,
-    enabled: view.enabled,
-    model_group: view.model_group,
-  };
 }
 
 /** 渠道：出站接入单元（写契约，不含库生成身份）。 */
@@ -97,6 +100,22 @@ export interface ChannelKey {
 /** 渠道读响应：库生成的稳定身份 + 写契约字段。 */
 export interface ChannelView extends Channel {
   id: number;
+}
+
+/**
+ * 渠道名录条目：`GET /channels/summary` 的 admin+ 只读投影。
+ *
+ * 够回答「某个已登记名挂在哪条渠道、那条渠道还在不在、协议是什么」，不含密钥与
+ * 出站地址（仍是 root-only 的运营机密）。`ChannelView` 结构上是它的超集，因此
+ * 只读渲染的辅助函数一律以此为参数类型，root 传完整视图也成立。
+ */
+export interface ChannelSummary {
+  id: number;
+  name: string;
+  protocol: Protocol;
+  enabled: boolean;
+  models: string[];
+  model_aliases: Record<string, string>;
 }
 
 /** 读视图 → 写契约：剥离只读 id（后端 `deny_unknown_fields` 拒收未知字段）。 */
@@ -227,10 +246,25 @@ export interface CatalogQuery {
   provider_id?: string | string[];
 }
 
-/** 余额相对调整请求。 */
-export interface BalanceAdjustment {
+/** 人工调整用户钱包的幂等命令。 */
+export interface UserBalanceAdjustment {
+  operation_id: string;
   delta_usd_micros: number;
+  reason: 'manual_adjustment';
 }
+
+/** 钱包或令牌余额命令的原始执行结果。 */
+export interface BalanceAdjustmentResult {
+  operation_id: string;
+  before_balance_usd_micros: number | null;
+  after_balance_usd_micros: number | null;
+}
+
+/** 令牌余额相对调整或显式模式切换命令。 */
+export type TokenBalanceCommand =
+  | { action: 'adjust'; operation_id: string; delta_usd_micros: number }
+  | { action: 'set_finite'; operation_id: string; balance_usd_micros: number }
+  | { action: 'set_unlimited'; operation_id: string };
 
 /** 套餐管理面能力开关。 */
 export interface PlanCapabilities {
@@ -247,6 +281,14 @@ export interface PlanCapabilities {
   edit_price_catalog: boolean;
 }
 
+/**
+ * 套餐受众：这一档是给普通用户还是给管理员用的。
+ *
+ * 决定能力开关是否有意义——用户档不展示它们（后端也不让它们生效）。创建后不可改：
+ * 中途切换会让已挂载的用户悄悄获得或失去管理能力。
+ */
+export type PlanAudience = 'user' | 'admin';
+
 /** 套餐读视图。`internal_name` 仅 root 可见。 */
 export interface PlanView {
   id: number;
@@ -260,13 +302,16 @@ export interface PlanView {
   initial_grant_usd_micros: number;
   capabilities: PlanCapabilities;
   shared_with_admin: boolean;
+  audience: PlanAudience;
+  /** 是否为本受众新用户的默认档；每个受众至多一档。 */
+  is_default: boolean;
   builtin: boolean;
   created_at: number;
   groups: string[];
 }
 
-/** 套餐写契约。 */
-export interface PlanInput {
+/** 套餐可编辑属性；受众与默认身份不在更新契约中。 */
+export interface PlanUpdate {
   internal_name: string;
   display_name: string;
   note: string;
@@ -278,6 +323,12 @@ export interface PlanInput {
   capabilities: PlanCapabilities;
   shared_with_admin: boolean;
   groups: string[];
+}
+
+/** 套餐创建契约；受众创建后不可变，默认身份随后只能通过转移命令修改。 */
+export interface PlanCreate extends PlanUpdate {
+  audience: PlanAudience;
+  is_default: boolean;
 }
 
 /** 管理角色：上级含下级权限。 */
@@ -314,6 +365,46 @@ export interface MeView extends UserView {
   input_tokens?: number;
   output_tokens?: number;
   last_used_at?: number | null;
+}
+
+/**
+ * 折后单价区间（micro-USD / 1M tokens）。
+ *
+ * 价格按渠道定，同一个可调用名挂在多条渠道上就可能有多个单价；单渠道时两端相等。
+ */
+export interface PriceRange {
+  min_micros: number;
+  max_micros: number;
+}
+
+/**
+ * `/me/models` 里的一个可调用名。
+ *
+ * 刻意不含任何渠道字段：这一投影存在的理由就是不向普通用户暴露渠道拓扑。
+ */
+export interface MyModelView {
+  /** 请求 body 的 `model` 直接填它。 */
+  id: string;
+  /** 统一模型（内部按序 failover），成员渠道不暴露。 */
+  unified: boolean;
+  /** 当前是否真能调用：有启用且已定价的渠道。 */
+  callable: boolean;
+  input?: PriceRange;
+  output?: PriceRange;
+  cache_read?: PriceRange;
+  cache_write?: PriceRange;
+}
+
+/** 一个模型组一段；同一个名字可以出现在多段里（组是允许名单，不是分区）。 */
+export interface MyGroupView {
+  name: string;
+  models: MyModelView[];
+}
+
+/** 调用者自己能用的模型。单价已折过，`discount_bp` 只用于界面标注。 */
+export interface MyModelsView {
+  discount_bp: number;
+  groups: MyGroupView[];
 }
 
 /** 用户管理列表/详情。不含 avatar：运营视图不渲染头像，自己的走 `/me`。 */
@@ -362,6 +453,8 @@ export interface UserUpdate {
   password?: string;
   display_name?: string;
   avatar?: string;
+  /** 与资料字段同一事务中换套餐。 */
+  plan_id?: number;
   rate_limit_rpm?: number | null;
 }
 
