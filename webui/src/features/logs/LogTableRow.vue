@@ -26,6 +26,7 @@ export type RequestLogVisibleColumns = {
   cache: boolean;
   cacheHit: boolean;
   cost: boolean;
+  settled: boolean;
   body: boolean;
 };
 
@@ -277,26 +278,24 @@ function handleRowClick(event: MouseEvent) {
       <span v-else class="text-fg-muted">-</span>
     </TableCell>
 
-    <TableCell v-if="visible.cost" class="font-mono text-xs">
-      <div class="inline-flex flex-col gap-0.5 whitespace-nowrap">
-        <span class="font-medium" data-testid="log-cost">{{
-          formatUsdMicros(entry.cost_usd_micros)
-        }}</span>
-        <span
-          v-if="entry.settled"
-          class="self-center font-medium text-emerald-600 dark:text-emerald-400"
-        >
-          {{ t('logs.settledYes') }}
-        </span>
-        <span
-          v-else
-          class="self-center font-medium text-amber-600 dark:text-amber-400"
-          data-testid="log-unsettled"
-          :title="t('logs.unsettled')"
-        >
-          {{ t('logs.settledNo') }}
-        </span>
-      </div>
+    <TableCell v-if="visible.cost" class="font-mono text-xs whitespace-nowrap">
+      <span class="font-medium" data-testid="log-cost">{{
+        formatUsdMicros(entry.cost_usd_micros)
+      }}</span>
+    </TableCell>
+
+    <TableCell v-if="visible.settled" class="font-mono text-xs whitespace-nowrap">
+      <span v-if="entry.settled" class="font-medium text-emerald-600 dark:text-emerald-400">
+        {{ t('logs.settledYes') }}
+      </span>
+      <span
+        v-else
+        class="font-medium text-amber-600 dark:text-amber-400"
+        data-testid="log-unsettled"
+        :title="t('logs.unsettled')"
+      >
+        {{ t('logs.settledNo') }}
+      </span>
     </TableCell>
 
     <TableCell align="center">

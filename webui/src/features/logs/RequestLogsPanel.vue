@@ -59,6 +59,7 @@ type RequestLogColumnId =
   | 'cache'
   | 'cacheHit'
   | 'cost'
+  | 'settled'
   | 'billing'
   | 'body';
 
@@ -73,6 +74,7 @@ const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
   { id: 'cache', defaultVisible: false },
   { id: 'cacheHit', defaultVisible: false },
   { id: 'cost' },
+  { id: 'settled', legacyFallbackId: 'cost' },
   { id: 'billing', locked: true },
   { id: 'body' },
 ];
@@ -87,6 +89,7 @@ const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
   'cache',
   'cacheHit',
   'cost',
+  'settled',
   'body',
 ];
 
@@ -148,6 +151,7 @@ const rowVisible = computed((): RequestLogVisibleColumns => ({
   cache: visible.value.cache,
   cacheHit: visible.value.cacheHit,
   cost: visible.value.cost,
+  settled: visible.value.settled,
   body: visible.value.body,
 }));
 
@@ -199,6 +203,7 @@ const columnLabels = computed((): Record<RequestLogColumnId, string> => ({
   cache: t('logs.cache'),
   cacheHit: t('logs.cacheHitRate'),
   cost: t('logs.cost'),
+  settled: t('logs.settled'),
   billing: t('logs.billingDetail'),
   body: t('logs.bodyDetail'),
 }));
@@ -627,6 +632,9 @@ function onFilterToken(tokenName: string) {
               @sort="onSort('cost', $event)"
               @clear="onClearSort"
             />
+          </TableHead>
+          <TableHead v-if="visible.settled" class="w-20">
+            {{ t('logs.settled') }}
           </TableHead>
           <TableHead align="center" class="w-20">{{ t('logs.billingDetail') }}</TableHead>
           <TableHead v-if="visible.body" align="center" class="w-20">{{

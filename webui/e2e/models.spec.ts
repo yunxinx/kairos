@@ -453,16 +453,6 @@ test.describe('models page', () => {
     await expect(visibleRow).toBeVisible();
     await visibleRow.getByTestId('visible-model-name').click();
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('coding');
-    await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-haiku');
-    await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-mini');
-    await expect(
-      page
-        .getByTestId('visible-hidden-members')
-        .locator('[data-testid="unified-member-line"][data-member="e2e-code-haiku"]'),
-    ).toHaveAttribute('data-channel', 'e2e-coding-channel');
-    await expect(
-      page.getByTestId('visible-hidden-members').getByTestId('unified-member-index'),
-    ).toHaveCount(0);
 
     await page.getByTestId('models-tab-groups').click();
     await page.getByTestId('group-create').click();

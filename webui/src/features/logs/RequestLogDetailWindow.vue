@@ -155,10 +155,6 @@ const calculationSteps = computed(() => {
         <span class="badge text-[11px]" :class="statusBadgeClass(entry.status_code)">
           {{ entry.status_code }}
         </span>
-
-        <span class="badge text-[10px]" :class="entry.settled ? 'badge-success' : 'badge-warn'">
-          {{ entry.settled ? t('logs.settledYes') : t('logs.settledNo') }}
-        </span>
       </div>
     </template>
 

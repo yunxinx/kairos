@@ -90,9 +90,6 @@ function copyMessage() {
   >
     <template #header-extra>
       <div class="mr-2 ml-auto flex items-center gap-1.5">
-        <span class="badge text-[10px]" :class="levelBadgeClass(entry.level)">
-          {{ levelLabel(entry.level) }}
-        </span>
         <button
           type="button"
           class="btn btn-ghost btn-sm gap-1"

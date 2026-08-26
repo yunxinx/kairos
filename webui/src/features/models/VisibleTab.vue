@@ -167,9 +167,8 @@ function refetchAll() {
         </template>
         <!-- 自动布局会把宽度让给双栏路由网格；固定后模型列吃到约三分之一，余量给请求路由。 -->
         <colgroup>
-          <col class="w-[32%]" />
+          <col class="w-[36%]" />
           <col />
-          <col class="w-[30%]" />
         </colgroup>
         <TableHeader>
           <TableRow>
@@ -186,11 +185,10 @@ function refetchAll() {
               </span>
             </TableHead>
             <TableHead>{{ t('models.visibleOrder') }}</TableHead>
-            <TableHead>{{ t('models.visibleHidden') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="3" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="2" />
           <template v-else>
             <template v-for="section in sections" :key="section.groupName">
               <TableRow
@@ -198,7 +196,7 @@ function refetchAll() {
                 data-testid="visible-section"
                 :data-group="section.groupName"
               >
-                <TableCell :colspan="3" class="inventory-section-cell">
+                <TableCell :colspan="2" class="inventory-section-cell">
                   {{ section.label }}
                 </TableCell>
               </TableRow>
@@ -233,27 +231,10 @@ function refetchAll() {
                   <!-- 渠道表未到手时不敢断言「未登记」：那时路由本来就算不出来。 -->
                   <ChannelSourceMark v-else :kind="channelsKnown ? 'unlisted' : 'unknown'" />
                 </TableCell>
-                <TableCell
-                  class="min-w-0 whitespace-normal"
-                  :data-testid="
-                    row.unified && row.unified.hiddenMembers.length > 0
-                      ? 'visible-hidden-members'
-                      : undefined
-                  "
-                >
-                  <UnifiedJumpOrder
-                    v-if="row.unified && row.unified.hiddenMembers.length > 0"
-                    :members="row.unified.hiddenMembers"
-                    :channels="channels"
-                    :channels-known="channelsKnown"
-                    :hide-index="true"
-                  />
-                  <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
-                </TableCell>
               </TableRow>
             </template>
             <TableRow v-if="sections.length === 0">
-              <TableCell :colspan="3" class="h-24 whitespace-normal">
+              <TableCell :colspan="2" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.visibleEmpty')" />
               </TableCell>
             </TableRow>

@@ -660,7 +660,7 @@
     "expand": "Details",
     "expandDetails": "Show request and response bodies",
     "collapseDetails": "Hide request and response bodies",
-    "billingDetail": "Billing",
+    "billingDetail": "Billing Details",
     "viewBilling": "View billing details",
     "billingTitle": "Billing Details",
     "basicInfo": "Basic Info",

@@ -258,6 +258,51 @@ test.describe('request logs page', () => {
     await expect(row.getByTestId('log-open-body')).toHaveCount(0);
   });
 
+  test('migrates the split settlement column from the stored cost preference', async ({ page }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-logs-column-migration',
+        token_name: 'Column migration token',
+        model: 'e2e-column-migration-model',
+        channel: 'e2e-column-migration-channel',
+        status_code: 200,
+        cost_usd_micros: 200,
+        settled: false,
+      },
+    ]);
+
+    await page.addInitScript(() => {
+      if (localStorage.getItem('kairos-logs-columns') === null) {
+        localStorage.setItem('kairos-logs-columns', JSON.stringify({ cost: false }));
+      }
+    });
+    await page.goto('/logs');
+    await page.locator('#logs-search').fill('sk-e2e-logs-column-migration');
+    const row = page.locator('[data-testid="log-row"][data-model="e2e-column-migration-model"]');
+    await expect(row).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Cost', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('columnheader', { name: 'Settled', exact: true })).toHaveCount(0);
+    await expect(row.getByTestId('log-cost')).toHaveCount(0);
+    await expect(row.getByTestId('log-unsettled')).toHaveCount(0);
+
+    await page.getByTestId('logs-columns').click();
+    await page.locator('[data-testid="logs-columns-option"][data-value="settled"]').click();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('columnheader', { name: 'Settled', exact: true })).toBeVisible();
+    await expect(row.getByTestId('log-unsettled')).toBeVisible();
+
+    await page.reload();
+    await page.locator('#logs-search').fill('sk-e2e-logs-column-migration');
+    await expect(page.getByRole('button', { name: 'Cost', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('columnheader', { name: 'Settled', exact: true })).toBeVisible();
+    await expect(
+      page
+        .locator('[data-testid="log-row"][data-model="e2e-column-migration-model"]')
+        .getByTestId('log-unsettled'),
+    ).toBeVisible();
+  });
+
   test('hides system-log columns from the toolbar', async ({ page }) => {
     seedSystemLogs([
       {
