@@ -93,6 +93,8 @@ export interface SeedSystemLogInput {
   level?: string;
   target: string;
   message: string;
+  event_code?: string | null;
+  event_params?: Record<string, unknown> | null;
 }
 
 /** 把系统日志直接写入 e2e 网关 SQLite。 */
@@ -102,7 +104,7 @@ export function seedSystemLogs(logs: SeedSystemLogInput[]): number[] {
   try {
     db.exec('PRAGMA busy_timeout = 5000');
     const stmt = db.prepare(
-      `INSERT INTO system_log (created_at, level, target, message) VALUES (?, ?, ?, ?)`,
+      `INSERT INTO system_log (created_at, level, target, message, event_code, event_params) VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const ids: number[] = [];
     const now = Date.now();
@@ -114,6 +116,8 @@ export function seedSystemLogs(logs: SeedSystemLogInput[]): number[] {
           log.level ?? 'error',
           log.target,
           log.message,
+          log.event_code ?? null,
+          log.event_params ? JSON.stringify(log.event_params) : null,
         );
         ids.push(Number(result.lastInsertRowid));
       }

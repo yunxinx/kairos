@@ -24,7 +24,9 @@ export type RequestLogVisibleColumns = {
   tokens: boolean;
   latency: boolean;
   cache: boolean;
+  cacheHit: boolean;
   cost: boolean;
+  body: boolean;
 };
 
 const props = withDefaults(
@@ -41,7 +43,8 @@ const props = withDefaults(
 );
 
 const emit = defineEmits<{
-  openDetail: [event: MouseEvent, entry: LogEntry];
+  openBilling: [event: MouseEvent, entry: LogEntry];
+  openBody: [event: MouseEvent, entry: LogEntry];
   filterModel: [model: string];
   filterChannel: [channel: string];
   filterToken: [token: string];
@@ -88,7 +91,7 @@ const rowClass = computed(() => {
 
 function handleRowClick(event: MouseEvent) {
   if ((event.target as HTMLElement).closest('button')) return;
-  emit('openDetail', event, props.entry);
+  emit('openBilling', event, props.entry);
 }
 </script>
 
@@ -185,25 +188,46 @@ function handleRowClick(event: MouseEvent) {
 
     <TableCell v-if="visible.inboundProtocol">
       <div class="flex min-w-0 flex-col items-start gap-1" data-testid="log-inbound-protocol">
-        <ProtocolBadge :protocol="entry.inbound_protocol" />
-        <div
-          v-if="outbound.status === 'converted'"
-          class="inline-flex items-center gap-0.5"
-          data-testid="log-row-outbound-protocol"
-          :title="`${t('logs.protocolConversion')}: ${entry.inbound_protocol} → ${outbound.protocol}`"
-        >
-          <UiIcon name="arrow-right" :size="9" class="text-fg-muted shrink-0" />
-          <ProtocolBadge :protocol="outbound.protocol" />
+        <div v-if="outbound.status === 'converted'" class="flex flex-col gap-1">
+          <div class="inline-flex items-center gap-1">
+            <span
+              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
+              >{{ t('logs.protoIn') }}</span
+            >
+            <ProtocolBadge :protocol="entry.inbound_protocol" />
+          </div>
+          <div
+            class="inline-flex items-center gap-1"
+            data-testid="log-row-outbound-protocol"
+            :title="`${t('logs.protocolConversion')}: ${entry.inbound_protocol} → ${outbound.protocol}`"
+          >
+            <span
+              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
+              >{{ t('logs.protoOut') }}</span
+            >
+            <ProtocolBadge :protocol="outbound.protocol" />
+          </div>
         </div>
-        <div
-          v-else-if="outbound.status === 'unknown'"
-          class="inline-flex items-center gap-0.5"
-          data-testid="log-outbound-protocol-unknown"
-        >
-          <UiIcon name="arrow-right" :size="9" class="text-fg-muted shrink-0" />
-          <span class="badge badge-neutral w-fit text-[10px]">{{
-            t('logs.outboundProtocolUnknown')
-          }}</span>
+        <div v-else-if="outbound.status === 'unknown'" class="flex flex-col gap-1">
+          <div class="inline-flex items-center gap-1">
+            <span
+              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
+              >{{ t('logs.protoIn') }}</span
+            >
+            <ProtocolBadge :protocol="entry.inbound_protocol" />
+          </div>
+          <div class="inline-flex items-center gap-1" data-testid="log-outbound-protocol-unknown">
+            <span
+              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
+              >{{ t('logs.protoOut') }}</span
+            >
+            <span class="badge badge-neutral w-fit text-[10px]">{{
+              t('logs.outboundProtocolUnknown')
+            }}</span>
+          </div>
+        </div>
+        <div v-else class="inline-flex items-center gap-1">
+          <ProtocolBadge :protocol="entry.inbound_protocol" />
         </div>
       </div>
     </TableCell>
@@ -230,22 +254,26 @@ function handleRowClick(event: MouseEvent) {
     </TableCell>
 
     <TableCell v-if="visible.cache" class="font-mono text-xs">
-      <div v-if="hasCache" class="flex items-center gap-3">
-        <div class="flex flex-col gap-0.5">
-          <span v-if="entry.cache_read_tokens > 0" class="text-blue-600 dark:text-blue-400">
-            {{ t('logs.cacheReadShort') }} {{ formatTokensCount(entry.cache_read_tokens) }}
-          </span>
-          <span v-if="entry.cache_write_tokens > 0" class="text-purple-600 dark:text-purple-400">
-            {{ t('logs.cacheWriteShort') }} {{ formatTokensCount(entry.cache_write_tokens) }}
-          </span>
-        </div>
-        <span
-          class="badge inline-block w-fit border-blue-500/20 bg-blue-500/10 font-mono text-[10px] text-blue-600 dark:text-blue-400"
-          :title="t('logs.cacheHit')"
-        >
-          ⚡ {{ cacheHitRatio }}%
+      <div v-if="hasCache" class="flex flex-col gap-0.5">
+        <span v-if="entry.cache_read_tokens > 0" class="text-blue-600 dark:text-blue-400">
+          {{ t('logs.cacheReadShort') }} {{ formatTokensCount(entry.cache_read_tokens) }}
+        </span>
+        <span v-if="entry.cache_write_tokens > 0" class="text-purple-600 dark:text-purple-400">
+          {{ t('logs.cacheWriteShort') }} {{ formatTokensCount(entry.cache_write_tokens) }}
         </span>
       </div>
+      <span v-else class="text-fg-muted">-</span>
+    </TableCell>
+
+    <TableCell v-if="visible.cacheHit" class="font-mono text-xs">
+      <span
+        v-if="hasCache && cacheHitRatio !== null"
+        class="badge inline-block w-fit border-blue-500/20 bg-blue-500/10 font-mono text-[10px] text-blue-600 dark:text-blue-400"
+        :title="t('logs.cacheHit')"
+        data-testid="log-cache-hit"
+      >
+        ⚡ {{ cacheHitRatio }}%
+      </span>
       <span v-else class="text-fg-muted">-</span>
     </TableCell>
 
@@ -276,11 +304,24 @@ function handleRowClick(event: MouseEvent) {
         type="button"
         class="btn btn-ghost btn-icon"
         data-testid="log-expand"
-        :aria-label="t('logs.expandDetails')"
-        :title="t('logs.expandDetails')"
-        @click.stop="emit('openDetail', $event, entry)"
+        :aria-label="t('logs.viewBilling')"
+        :title="t('logs.viewBilling')"
+        @click.stop="emit('openBilling', $event, entry)"
       >
         <UiIcon name="external-link" :size="15" />
+      </button>
+    </TableCell>
+
+    <TableCell v-if="visible.body" align="center">
+      <button
+        type="button"
+        class="btn btn-ghost btn-icon"
+        data-testid="log-open-body"
+        :aria-label="t('logs.viewBody')"
+        :title="t('logs.viewBody')"
+        @click.stop="emit('openBody', $event, entry)"
+      >
+        <UiIcon name="code" :size="15" />
       </button>
     </TableCell>
   </TableRow>

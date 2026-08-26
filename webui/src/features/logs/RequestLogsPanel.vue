@@ -30,6 +30,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow, { type RequestLogVisibleColumns } from '@/features/logs/LogTableRow.vue';
 import RequestLogDetailWindow from '@/features/logs/RequestLogDetailWindow.vue';
+import RequestLogBodyWindow from '@/features/logs/RequestLogBodyWindow.vue';
 import { useLogListControls } from '@/features/logs/useLogListControls';
 import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
@@ -40,7 +41,10 @@ import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent } from '@/lib/window-anchor';
 
+type RequestLogWindowType = 'billing' | 'body';
+
 type RequestLogWindowPayload = {
+  type: RequestLogWindowType;
   entry: LogEntry;
 };
 
@@ -53,8 +57,10 @@ type RequestLogColumnId =
   | 'tokens'
   | 'latency'
   | 'cache'
+  | 'cacheHit'
   | 'cost'
-  | 'actions';
+  | 'billing'
+  | 'body';
 
 const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
   { id: 'created', locked: true },
@@ -65,8 +71,10 @@ const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
   { id: 'tokens' },
   { id: 'latency' },
   { id: 'cache', defaultVisible: false },
+  { id: 'cacheHit', defaultVisible: false },
   { id: 'cost' },
-  { id: 'actions', locked: true },
+  { id: 'billing', locked: true },
+  { id: 'body' },
 ];
 
 const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
@@ -77,7 +85,9 @@ const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
   'tokens',
   'latency',
   'cache',
+  'cacheHit',
   'cost',
+  'body',
 ];
 
 const { t } = useI18n();
@@ -136,7 +146,9 @@ const rowVisible = computed((): RequestLogVisibleColumns => ({
   tokens: visible.value.tokens,
   latency: visible.value.latency,
   cache: visible.value.cache,
+  cacheHit: visible.value.cacheHit,
   cost: visible.value.cost,
+  body: visible.value.body,
 }));
 
 const columnMenuItems = computed(() => menuItems(REQUEST_LOG_HIDEABLE));
@@ -181,12 +193,14 @@ const columnLabels = computed((): Record<RequestLogColumnId, string> => ({
   token: t('logs.token'),
   model: t('logs.model'),
   channel: t('logs.channel'),
-  inboundProtocol: t('logs.inboundProtocol'),
+  inboundProtocol: t('logs.requestProtocol'),
   tokens: t('logs.tokens'),
   latency: t('logs.latencyAndSpeed'),
   cache: t('logs.cache'),
+  cacheHit: t('logs.cacheHitRate'),
   cost: t('logs.cost'),
-  actions: t('common.actions'),
+  billing: t('logs.billingDetail'),
+  body: t('logs.bodyDetail'),
 }));
 
 const activeLogIds = computed(() => new Set(windows.value.map((win) => win.payload.entry.id)));
@@ -378,12 +392,25 @@ async function loadDetail(id: number) {
   }
 }
 
-function openDetailWindow(event: MouseEvent, entry: LogEntry) {
-  const existing = windows.value.find((win) => win.payload.entry.id === entry.id);
+function openBillingWindow(event: MouseEvent, entry: LogEntry) {
+  const existing = windows.value.find(
+    (win) => win.payload.type === 'billing' && win.payload.entry.id === entry.id,
+  );
   if (existing) {
     bringToFront(existing.id);
   } else {
-    openWindow(anchorFromEvent(event), { entry });
+    openWindow(anchorFromEvent(event), { type: 'billing', entry });
+  }
+}
+
+function openBodyWindow(event: MouseEvent, entry: LogEntry) {
+  const existing = windows.value.find(
+    (win) => win.payload.type === 'body' && win.payload.entry.id === entry.id,
+  );
+  if (existing) {
+    bringToFront(existing.id);
+  } else {
+    openWindow(anchorFromEvent(event), { type: 'body', entry });
   }
   if (!details.value.has(entry.id)) {
     void loadDetail(entry.id);
@@ -561,7 +588,7 @@ function onFilterToken(tokenName: string) {
           <TableHead v-if="visible.token">{{ t('logs.token') }}</TableHead>
           <TableHead v-if="visible.model">{{ t('logs.model') }}</TableHead>
           <TableHead v-if="visible.channel">{{ t('logs.channel') }}</TableHead>
-          <TableHead v-if="visible.inboundProtocol">{{ t('logs.inboundProtocol') }}</TableHead>
+          <TableHead v-if="visible.inboundProtocol">{{ t('logs.requestProtocol') }}</TableHead>
           <TableHead v-if="visible.tokens" class="w-28" :aria-sort="ariaSort('tokens')">
             <DataTableColumnHeader
               :label="t('logs.tokens')"
@@ -589,6 +616,9 @@ function onFilterToken(tokenName: string) {
               @clear="onClearSort"
             />
           </TableHead>
+          <TableHead v-if="visible.cacheHit" class="w-24">
+            {{ t('logs.cacheHitShort') }}
+          </TableHead>
           <TableHead v-if="visible.cost" class="w-28" :aria-sort="ariaSort('cost')">
             <DataTableColumnHeader
               :label="t('logs.cost')"
@@ -598,7 +628,10 @@ function onFilterToken(tokenName: string) {
               @clear="onClearSort"
             />
           </TableHead>
-          <TableHead align="center">{{ t('common.actions') }}</TableHead>
+          <TableHead align="center" class="w-20">{{ t('logs.billingDetail') }}</TableHead>
+          <TableHead v-if="visible.body" align="center" class="w-20">{{
+            t('logs.bodyDetail')
+          }}</TableHead>
         </TableRow>
       </TableHeader>
 
@@ -612,7 +645,8 @@ function onFilterToken(tokenName: string) {
             :visible="rowVisible"
             :active="activeLogIds.has(entry.id)"
             :channel-protocol-map="channelProtocolMap"
-            @open-detail="openDetailWindow"
+            @open-billing="openBillingWindow"
+            @open-body="openBodyWindow"
             @filter-model="onFilterModel"
             @filter-channel="onFilterChannel"
             @filter-token="onFilterToken"
@@ -644,10 +678,8 @@ function onFilterToken(tokenName: string) {
 
     <template v-for="(win, index) in windows" :key="win.id">
       <RequestLogDetailWindow
+        v-if="win.payload.type === 'billing'"
         :entry="win.payload.entry"
-        :detail="details.get(win.payload.entry.id) ?? null"
-        :detail-loading="detailLoading.has(win.payload.entry.id)"
-        :detail-error="detailErrors.get(win.payload.entry.id) ?? ''"
         :closing="closingId === win.payload.entry.id"
         :can-settle="canSettleLogs"
         :channel-protocol-map="channelProtocolMap"
@@ -663,6 +695,21 @@ function onFilterToken(tokenName: string) {
         @filter-model="onFilterModel"
         @filter-channel="onFilterChannel"
         @filter-token="onFilterToken"
+      />
+      <RequestLogBodyWindow
+        v-else-if="win.payload.type === 'body'"
+        :entry="win.payload.entry"
+        :detail="details.get(win.payload.entry.id) ?? null"
+        :detail-loading="detailLoading.has(win.payload.entry.id)"
+        :detail-error="detailErrors.get(win.payload.entry.id) ?? ''"
+        :channel-protocol-map="channelProtocolMap"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
         @retry-detail="loadDetail(win.payload.entry.id)"
       />
     </template>

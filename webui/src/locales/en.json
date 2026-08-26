@@ -250,6 +250,8 @@
     "displayName": "Name",
     "showNavAvatar": "Show avatar in header",
     "showNavAvatarGuide": "Display avatar thumbnail in the top-right user menu badge.",
+    "showNavName": "Show name in header",
+    "showNavNameGuide": "Display display name in the top-right user menu badge.",
     "changeAvatar": "Change avatar",
     "removeAvatar": "Remove avatar",
     "invalidImage": "Please select a valid image file",
@@ -612,7 +614,7 @@
     },
     "search": "Search",
     "searchPlaceholder": "Token, name, model or channel",
-    "systemSearchPlaceholder": "Target or message",
+    "systemSearchPlaceholder": "Action or message",
     "settledFilter": "Settlement",
     "settledYes": "Settled",
     "settledNo": "Unsettled",
@@ -626,14 +628,14 @@
     "settleGuide": "Deduct this log's cost from the owner's wallet. Overdraft is allowed.",
     "waiveGuide": "Mark this log settled without changing the balance.",
     "levelFilter": "Level",
-    "targetFilter": "Target",
+    "targetFilter": "Action",
     "levels": {
       "error": "Error",
       "warn": "Warning",
       "info": "Info"
     },
     "level": "Level",
-    "target": "Target",
+    "target": "Action",
     "message": "Message",
     "model": "Model",
     "outboundModel": "Outbound model",
@@ -641,19 +643,42 @@
     "created": "Time",
     "token": "Token",
     "channel": "Channel",
-    "inboundProtocol": "Inbound Protocol",
+    "inboundProtocol": "Request Protocol",
+    "requestProtocol": "Request Protocol",
+    "protoIn": "IN",
+    "protoOut": "OUT",
     "status": "Status",
     "latency": "Latency",
     "latencyAndSpeed": "Latency & Speed",
     "cache": "Cache",
+    "cacheHit": "Cache Hit Rate",
+    "cacheHitRate": "Cache Hit Rate",
+    "cacheHitShort": "Hit Rate",
     "cacheReadShort": "R",
     "cacheWriteShort": "W",
     "cost": "Cost",
     "expand": "Details",
     "expandDetails": "Show request and response bodies",
     "collapseDetails": "Hide request and response bodies",
+    "billingDetail": "Billing",
+    "viewBilling": "View billing details",
+    "billingTitle": "Billing Details",
+    "basicInfo": "Basic Info",
+    "bodyDetail": "Body",
+    "viewBody": "View request & response body",
+    "bodyTitle": "Request & Response Body",
     "requestBody": "Request",
     "responseBody": "Response",
+    "assistantResponse": "Assistant Response",
+    "sseStream": "SSE Stream",
+    "finishReason": "Finish reason",
+    "callId": "Call ID",
+    "roles": {
+      "system": "System",
+      "user": "User",
+      "assistant": "Assistant",
+      "tool": "Tool"
+    },
     "bodyEmpty": "No body recorded.",
     "bodyLoading": "Loading body…",
     "bodyBinary": "Binary content ({bytes} bytes) is not displayed.",
@@ -705,7 +730,75 @@
     "discountFilter": "Discount",
     "baseTotal": "Base total",
     "discountRate": "Discount rate",
-    "chargedTotal": "Charged total"
+    "chargedTotal": "Charged total",
+    "eventValues": {
+      "archivedSuffix": " (archived)",
+      "changeSeparator": "; "
+    },
+    "events": {
+      "auth": {
+        "login_failed": "Login failed for {email} (IP: {ip})",
+        "login_succeeded": "Login succeeded (IP: {ip})",
+        "session_cleanup_failed": "Scheduled session cleanup failed: {error}"
+      },
+      "billing": {
+        "log_charged": "Charged unsettled log {log_id} for user {user_id} ({cost_usd_micros})",
+        "log_waived": "Waived unsettled log {log_id} for user {user_id} ({cost_usd_micros})",
+        "user_balance_adjusted": "Adjusted user {user_id} ({email}) balance by {delta_usd_micros} ({before_usd_micros} → {after_usd_micros}){archived_suffix}",
+        "token_balance_adjusted": "Adjusted token {token_id} ({token_name}) balance by {delta_usd_micros} ({before_usd_micros} → {after_usd_micros})",
+        "token_balance_set_finite": "Changed token {token_id} ({token_name}) from unlimited to finite with balance {delta_usd_micros}",
+        "token_balance_set_unlimited": "Changed token {token_id} ({token_name}) to unlimited",
+        "initial_grant_credited": "Credited {amount_usd_micros} initial grant to user {user_id} ({email}) under plan {plan_name}",
+        "usage_missing": "Upstream usage was missing; charged zero (token={token_name}, model={model}, channel={channel})",
+        "calculation_failed": "Usage cost calculation failed; the successful response was rejected: {error}",
+        "admission_calculation_failed": "Admission cost calculation failed; the upstream request was rejected: {error}"
+      },
+      "catalog": {
+        "sync_failed": "Scheduled pricing catalog sync failed: {error}"
+      },
+      "channel_model_orders": {
+        "updated": "Updated channel order for callable model {model}: {channel_ids_label}"
+      },
+      "channels": {
+        "created": "Created channel {channel_id} ({name}), protocol {protocol}, URL {base_url}",
+        "updated": "Updated channel {channel_id} ({previous_name} → {name}), status {enabled_label}, URL {base_url}",
+        "deleted": "Deleted channel {channel_id} ({name})",
+        "bulk_deleted": "Deleted {count} channels",
+        "models_bulk_removed": "Removed {count} channel model entries"
+      },
+      "logs": {
+        "cleaned": "Cleaned {removed_request_logs} settled request logs and {removed_system_logs} system logs older than {older_than_days} days",
+        "wal_checkpoint_failed": "Post-cleanup WAL checkpoint failed: {error}"
+      },
+      "plans": {
+        "created": "Created plan {plan_id} ({name})",
+        "updated": "Updated plan {plan_id} ({name})",
+        "default_set": "Set plan {plan_id} ({name}) as default",
+        "deleted": "Deleted plan {plan_id} ({name})",
+        "force_deleted": "Force-deleted plan {plan_id} ({name})",
+        "bulk_deleted": "Deleted {count} plans",
+        "bulk_force_deleted": "Force-deleted {count} plans"
+      },
+      "request_log": {
+        "token_last_used_update_failed": "Failed to update token last-used time: {error}",
+        "unsettled": "Request remains unsettled: {reason}",
+        "fallback_write_failed": "Request remains unsettled and fallback log write failed: {reason}; {error}"
+      },
+      "settings": {
+        "updated": "Updated runtime settings: {changes_label}"
+      },
+      "tokens": {
+        "enabled_changed": "Changed token {token_id} ({token_name}) status for user {user_id}: {before_enabled_label} → {enabled_label}"
+      },
+      "users": {
+        "self_updated": "User {user_id} ({email}) updated their account",
+        "created": "Created user {user_id} ({email}), role {role}",
+        "updated": "Updated user {user_id} ({email})",
+        "archived": "Archived user {user_id} ({email}); account, tokens, and sessions were disabled",
+        "bulk_archived": "Archived {count} users",
+        "plan_assigned": "Assigned user {user_id} ({email}) to plan {plan_id} ({plan_name})"
+      }
+    }
   },
   "a11y": {
     "skipToContent": "Skip to main content",
@@ -740,8 +833,8 @@
   },
   "plans": {
     "create": "Create plan",
-    "createUser": "User plan",
-    "createAdmin": "Admin plan",
+    "createUser": "Create User Plan",
+    "createAdmin": "Create Admin Plan",
     "editorCreate": "New plan",
     "editorEdit": "Edit plan",
     "editorCreateOf": "New {audience}",
@@ -791,7 +884,8 @@
     "sharedWithAdminGuide": "When enabled, admins may assign this plan to users; only root can edit the plan.",
     "share": "Shared",
     "builtin": "Built-in",
-    "groupsCount": "Groups",
+    "groupsCount": "Model Groups",
+    "createdAt": "Created",
     "currentPlan": "Current plan",
     "empty": "No plans yet",
     "deleteTitle": "Delete plan",

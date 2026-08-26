@@ -101,6 +101,12 @@ test.describe('models page', () => {
     await page.goto('/models');
     await page.getByTestId('models-tab-order').click();
 
+    await page.getByTestId('order-search').fill('e2e-order-shared');
+    await expect(page.locator('[data-testid="order-row"]')).toHaveCount(1);
+    await page.getByTestId('order-search').fill('e2e-order-single');
+    await expect(page.locator('[data-testid="order-row"]')).toHaveCount(0);
+    await page.getByTestId('order-search').fill('');
+
     const sharedRow = page.locator('[data-testid="order-row"][data-model="e2e-order-shared"]');
     await expect(sharedRow).toBeVisible();
     await expect(

@@ -281,7 +281,9 @@ export function computeCacheHitRatio(readTokens: number, inputTokens: number): n
 /** 万分比折扣率 → 百分比展示（10000 = 100%）。 */
 export function formatDiscountBp(discountBp: number): string {
   const percent = discountBp / 100;
-  const fixed = Number.isInteger(percent) ? String(percent) : percent.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  const fixed = Number.isInteger(percent)
+    ? String(percent)
+    : percent.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
   return `${fixed}%`;
 }
 

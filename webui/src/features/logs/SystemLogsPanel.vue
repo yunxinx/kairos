@@ -23,6 +23,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import SystemLogDetailWindow from '@/features/logs/SystemLogDetailWindow.vue';
+import { localizedSystemLogMessage } from '@/features/logs/systemLogMessage';
 import { useLogListControls } from '@/features/logs/useLogListControls';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useWindowStack } from '@/composables/useWindowStack';
@@ -47,7 +48,10 @@ const SYSTEM_LOG_COLUMNS: ColumnVisibilitySpec<SystemLogColumnId>[] = [
 
 const LEVELS = ['error', 'warn', 'info'] as const;
 
-const { t, locale } = useI18n();
+const i18n = useI18n();
+const { locale } = i18n;
+const t = (key: string, values?: Record<string, unknown>) => i18n.t(key, values ?? {});
+const te = (key: string) => i18n.te(key);
 const me = useCurrentUser();
 
 /**
@@ -194,6 +198,13 @@ const systemLogsQuery = useQuery({
 });
 
 const items = computed(() => systemLogsQuery.data.value?.items ?? []);
+const localizedItems = computed(() => {
+  void locale.value;
+  return items.value.map((entry) => ({
+    entry,
+    message: localizedSystemLogMessage(entry, t, te),
+  }));
+});
 const total = computed(() => systemLogsQuery.data.value?.total ?? 0);
 const targetOptions = computed(() =>
   (systemLogsQuery.data.value?.targets ?? []).map((target) => ({
@@ -252,6 +263,10 @@ function levelBadgeClass(level: string): string {
     default:
       return 'uppercase';
   }
+}
+
+function levelLabel(level: string): string {
+  return t(`logs.levels.${level.toLowerCase()}`);
 }
 </script>
 
@@ -358,7 +373,7 @@ function levelBadgeClass(level: string): string {
         <TableRowsSkeleton v-if="showTableSkeleton" :columns="effectiveColumnCount" />
         <template v-else>
           <TableRow
-            v-for="entry in items"
+            v-for="{ entry, message } in localizedItems"
             :key="entry.id"
             data-testid="system-log-row"
             :data-log-id="String(entry.id)"
@@ -375,7 +390,7 @@ function levelBadgeClass(level: string): string {
                 :class="levelBadgeClass(entry.level)"
                 data-testid="system-log-level"
               >
-                {{ entry.level }}
+                {{ levelLabel(entry.level) }}
               </span>
             </TableCell>
             <TableCell
@@ -419,11 +434,11 @@ function levelBadgeClass(level: string): string {
             <TableCell
               v-if="visible.message"
               truncate
-              :title="entry.message"
+              :title="message"
               data-testid="system-log-message"
               class="font-mono text-xs text-[var(--seed-fg)]"
             >
-              {{ entry.message }}
+              {{ message }}
             </TableCell>
             <TableCell align="center">
               <button

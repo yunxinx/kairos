@@ -60,7 +60,9 @@ const initialName = props.initial ? props.initial.display_name : '';
 const initialRole = props.initial ? props.initial.role : 'user';
 const initialEnabled = props.initial ? props.initial.enabled : true;
 const initialRpm =
-  props.initial && props.initial.rate_limit_rpm !== null && props.initial.rate_limit_rpm !== undefined
+  props.initial &&
+  props.initial.rate_limit_rpm !== null &&
+  props.initial.rate_limit_rpm !== undefined
     ? String(props.initial.rate_limit_rpm)
     : '';
 const initialPlanId = props.initial?.plan_id != null ? String(props.initial.plan_id) : '';
@@ -227,13 +229,13 @@ function handleSave() {
       rules: [{ kind: 'minLength', min: 8 }],
     });
   }
-    if (rateLimitRpm.value.trim()) {
-      specs.push({
-        name: 'rateLimitRpm',
-        value: rateLimitRpm.value,
-        rules: [{ kind: 'uint' }],
-      });
-    }
+  if (rateLimitRpm.value.trim()) {
+    specs.push({
+      name: 'rateLimitRpm',
+      value: rateLimitRpm.value,
+      rules: [{ kind: 'uint' }],
+    });
+  }
 
   if (!validate(specs, t)) return;
   saveMutation.mutate();

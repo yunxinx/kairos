@@ -48,7 +48,10 @@ export const EMPTY_CAPABILITIES: PlanCapabilities = {
 export type ManagementCapability = keyof PlanCapabilities;
 
 /** root 不受套餐开关约束；admin 取套餐开关；user 不具备管理面能力。 */
-export function hasCapability(me: MeView | null | undefined, capability: ManagementCapability): boolean {
+export function hasCapability(
+  me: MeView | null | undefined,
+  capability: ManagementCapability,
+): boolean {
   if (!me) return false;
   if (me.role === 'root') return true;
   if (me.role === 'admin') return me.capabilities[capability];

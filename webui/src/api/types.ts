@@ -24,8 +24,8 @@ export function channelOutboundUrl(protocol: Protocol, baseUrl: string): string 
   return `${baseUrl.replace(/\/+$/, '')}${UPSTREAM_PATH[protocol]}`;
 }
 
-/** 令牌可编辑属性；密钥、余额与生命周期元数据不在其中。 */
-export interface TokenUpdate {
+/** 令牌属性字段；密钥、余额与生命周期元数据不在其中。 */
+interface TokenAttributes {
   name: string;
   /** 每分钟请求上限；`null` 跟随全局兜底，`0` 表示该令牌不限速。 */
   rate_limit_rpm: number | null;
@@ -34,8 +34,14 @@ export interface TokenUpdate {
   model_group: string;
 }
 
+/** 令牌属性与可选余额命令构成一个原子更新。 */
+export interface TokenUpdate extends TokenAttributes {
+  /** 与属性更新同一事务提交的可选余额命令。 */
+  balance_change?: TokenBalanceCommand;
+}
+
 /** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */
-export interface TokenCreate extends TokenUpdate {
+export interface TokenCreate extends TokenAttributes {
   /** 初始可用余额；`null` 表示无限额。 */
   balance_usd_micros: number | null;
 }
@@ -50,7 +56,7 @@ export interface ChannelModelTarget {
 }
 
 /** 令牌读响应：属性 + 身份 + 额度与生命周期事实。 */
-export interface TokenView extends TokenUpdate {
+export interface TokenView extends TokenAttributes {
   /** 库生成的稳定身份；管理面按它定位令牌。 */
   id: number;
   token_key: string;
@@ -545,6 +551,10 @@ export interface SystemLogEntry {
   level: string;
   target: string;
   message: string;
+  /** 稳定事件编码；旧式自由文本日志为空。 */
+  event_code?: string | null;
+  /** 事件模板参数；旧式自由文本日志为空。 */
+  event_params?: Record<string, unknown> | null;
   /** 操作者；系统自身产生的运维事件为 null。 */
   actor_user_id?: number | null;
   actor_email?: string | null;

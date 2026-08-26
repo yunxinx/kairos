@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { UserAdminView } from '@/api/types';
-import FieldInfoHint from '@/components/ui/FieldInfoHint.vue';
+import FormField from '@/components/ui/FormField.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
@@ -92,22 +92,19 @@ function applyQuick(deltaUsd: number) {
   const base = totalDelta.value ?? 0;
   editorAmount.value = formatUsdAmount(base + deltaUsd * 1_000_000);
 }
-
-function resetAdjustment() {
-  editorAmount.value = '';
-}
 </script>
 
 <template>
   <form novalidate @submit.prevent="handleSave">
     <div class="card-body space-y-3">
-      <fieldset class="border-seed rounded-md border p-3">
-        <legend class="text-fg-muted flex items-center gap-1.5 px-1 text-xs font-medium">
-          {{ t('users.rechargeSection') }}
-          <FieldInfoHint>
-            <p class="field-info-hint-text">{{ t('users.rechargeGuide') }}</p>
-          </FieldInfoHint>
-        </legend>
+      <div>
+        <p class="text-fg-muted text-xs">{{ t('users.currentBalance') }}</p>
+        <p class="font-mono text-base font-semibold" data-testid="user-current-balance">
+          {{ formatUsdAmount(snapshotBalance) }}
+        </p>
+      </div>
+
+      <div class="space-y-3">
         <div class="flex flex-col gap-1.5">
           <div class="flex gap-1.5">
             <button
@@ -138,67 +135,40 @@ function resetAdjustment() {
             </button>
           </div>
         </div>
-        <p class="text-fg-muted mt-1 text-center text-xs" data-testid="user-current-balance">
-          {{ t('users.currentBalance') }}
-          <span class="text-fg font-mono font-semibold">{{
-            formatUsdAmount(snapshotBalance)
-          }}</span>
-        </p>
-        <div class="mt-2 flex items-end justify-center gap-3">
-          <div class="w-1/3" data-form-field="amount">
-            <div class="form-field-control">
-              <FormTextInput
-                :id="amountInputId"
-                v-model="editorAmount"
-                type="text"
-                inputmode="decimal"
-                class="font-mono"
-                data-testid="user-recharge-amount"
-                :invalid="Boolean(fieldError('amount'))"
-                :hint-id="`${amountInputId}-error`"
-                :disabled="isPending"
-                v-on="fieldInputHandlers('amount')"
-              />
-              <p
-                v-if="fieldError('amount')"
-                :id="`${amountInputId}-error`"
-                class="form-field-hint"
-                role="alert"
-              >
-                {{ fieldError('amount') }}
-              </p>
-            </div>
-          </div>
-          <!-- 算式容器与输入框同高（2.25rem）并底对齐，数字恰好落在输入框中线上。 -->
-          <div
-            v-if="totalDelta !== null && totalDelta !== 0 && expectedBalance !== null"
-            class="flex h-9 items-center gap-3"
-            aria-live="polite"
-          >
-            <p
-              class="font-mono text-lg font-semibold"
-              :class="totalDelta > 0 ? 'text-success' : 'text-danger'"
-              data-testid="user-balance-delta"
-            >
-              {{ totalDelta > 0 ? '+' : '-' }}{{ formatUsdAmount(Math.abs(totalDelta)) }}
-            </p>
-            <p class="text-fg-muted font-mono text-lg" aria-hidden="true">→</p>
-            <p class="font-mono text-lg font-semibold" data-testid="user-balance-result">
-              {{ formatUsdAmount(expectedBalance) }}
-            </p>
-            <button
-              type="button"
-              class="btn btn-sm"
-              data-testid="user-quick-cancel"
-              :aria-label="t('users.rechargeReset')"
+
+        <FormField
+          field-name="amount"
+          :label="t('users.rechargeAmount')"
+          :input-id="amountInputId"
+          :error="fieldError('amount')"
+        >
+          <template #default="{ hintId, invalid }">
+            <FormTextInput
+              :id="amountInputId"
+              v-model="editorAmount"
+              type="text"
+              inputmode="decimal"
+              class="font-mono"
+              data-testid="user-recharge-amount"
+              :invalid="invalid"
+              :hint-id="hintId"
               :disabled="isPending"
-              @click="resetAdjustment"
-            >
-              {{ t('users.rechargeReset') }}
-            </button>
-          </div>
+              v-on="fieldInputHandlers('amount')"
+            />
+          </template>
+        </FormField>
+
+        <div
+          v-if="expectedBalance !== null"
+          class="bg-surface-alt flex items-center justify-between rounded-md px-3 py-2"
+          aria-live="polite"
+        >
+          <span class="text-fg-muted text-xs">{{ t('users.newBalance') }}</span>
+          <span class="font-mono font-semibold" data-testid="user-balance-result">
+            {{ formatUsdAmount(expectedBalance) }}
+          </span>
         </div>
-      </fieldset>
+      </div>
     </div>
 
     <div class="card-footer card-body flex justify-between gap-2">

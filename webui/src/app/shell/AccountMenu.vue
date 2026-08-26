@@ -8,22 +8,26 @@ import {
   DropdownMenuPortal,
   DropdownMenuRoot,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from 'reka-ui';
 import { apiClient } from '@/api/client';
-import { toggleLocale } from '@/app/providers/i18n';
+import { setLocale } from '@/app/providers/i18n';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import { useResolvedDarkTheme } from '@/composables/useResolvedDarkTheme';
 import { formatUsdMicros } from '@/lib/format';
-import { useNavAvatarPreference } from '@/lib/preferences';
+import { useNavAvatarPreference, useNavNamePreference } from '@/lib/preferences';
 import { clearAdminKey, useCurrentUser } from '@/lib/session';
 import { getStoredTheme, resolveDark, toggleTheme } from '@/lib/theme';
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const navigate = useNavigate();
 const me = useCurrentUser();
 const isDark = useResolvedDarkTheme();
 const { showNavAvatar } = useNavAvatarPreference();
+const { showNavName } = useNavNamePreference();
 
 const isOpen = ref(false);
 let hoverTimer: ReturnType<typeof setTimeout> | undefined;
@@ -62,6 +66,12 @@ const roleBadgeClass = computed(() => {
   return 'badge-neutral';
 });
 
+const currentLocaleLabel = computed(() => {
+  if (locale.value === 'zh-CN') return '简体中文';
+  if (locale.value === 'en') return 'English';
+  return locale.value;
+});
+
 function handleToggleTheme() {
   toggleTheme();
   isDark.value = resolveDark(getStoredTheme());
@@ -81,11 +91,7 @@ async function handleLogout() {
 
 <template>
   <!-- eslint-disable vuejs-accessibility/mouse-events-have-key-events, vuejs-accessibility/no-static-element-interactions -->
-  <div
-    class="relative inline-flex"
-    @mouseenter="handleMouseEnter"
-    @mouseleave="handleMouseLeave"
-  >
+  <div class="relative inline-flex" @mouseenter="handleMouseEnter" @mouseleave="handleMouseLeave">
     <DropdownMenuRoot v-model:open="isOpen" :modal="false">
       <DropdownMenuTrigger as-child>
         <button
@@ -93,7 +99,11 @@ async function handleLogout() {
           class="hover:bg-surface-elevated flex h-8 max-w-64 cursor-pointer items-center gap-2 rounded-full px-2 py-1 text-xs font-medium transition-colors"
           data-testid="account-menu-trigger"
           :title="me ? `${label} (${formatUsdMicros(me.balance_usd_micros)})` : label"
-          @pointerdown="(e) => { if (isOpen) e.preventDefault(); }"
+          @pointerdown="
+            (e) => {
+              if (isOpen) e.preventDefault();
+            }
+          "
           @click="isOpen = true"
         >
           <!-- 头像 -->
@@ -102,22 +112,17 @@ async function handleLogout() {
             class="border-seed bg-surface-elevated text-fg-muted relative flex size-6 shrink-0 items-center justify-center overflow-hidden rounded-full border text-xs font-bold"
             data-testid="account-menu-avatar"
           >
-            <img
-              v-if="me?.avatar"
-              :src="me.avatar"
-              alt="avatar"
-              class="size-full object-cover"
-            />
+            <img v-if="me?.avatar" :src="me.avatar" alt="avatar" class="size-full object-cover" />
             <UiIcon v-else name="user" class="size-3.5" />
           </div>
 
           <!-- 用户名称 -->
-          <span class="text-fg max-w-28 truncate font-medium">{{ label }}</span>
+          <span v-if="showNavName" class="text-fg max-w-28 truncate font-medium">{{ label }}</span>
 
           <!-- 余额 -->
           <span
             v-if="me"
-            class="bg-[color-mix(in_srgb,var(--seed-primary)_14%,var(--seed-surface))] border-[color-mix(in_srgb,var(--seed-primary)_30%,transparent)] text-[var(--seed-primary)] rounded-full border px-2 py-0.5 font-mono text-xs font-semibold tracking-tight"
+            class="rounded-full border border-[color-mix(in_srgb,var(--seed-primary)_30%,transparent)] bg-[color-mix(in_srgb,var(--seed-primary)_14%,var(--seed-surface))] px-2 py-0.5 font-mono text-xs font-semibold tracking-tight text-[var(--seed-primary)]"
           >
             {{ formatUsdMicros(me.balance_usd_micros) }}
           </span>
@@ -125,7 +130,7 @@ async function handleLogout() {
       </DropdownMenuTrigger>
       <DropdownMenuPortal>
         <DropdownMenuContent
-          class="data-table-menu min-w-56"
+          class="data-table-menu w-64 min-w-64"
           align="end"
           :side-offset="6"
           @mouseenter="handleMouseEnter"
@@ -133,7 +138,9 @@ async function handleLogout() {
         >
           <div class="px-3 py-2.5">
             <div class="flex items-center justify-between gap-1.5">
-              <p class="truncate text-sm font-semibold">{{ me?.display_name || t('nav.account') }}</p>
+              <p class="truncate text-sm font-semibold">
+                {{ me?.display_name || t('nav.account') }}
+              </p>
               <span v-if="me" class="badge text-[10px]" :class="roleBadgeClass">
                 {{ roleLabel }}
               </span>
@@ -167,20 +174,59 @@ async function handleLogout() {
               {{ isDark ? t('app.themeDark') : t('app.themeLight') }}
             </span>
           </DropdownMenuItem>
-          <DropdownMenuItem
-            class="data-table-menu-item flex items-center justify-between"
-            data-testid="nav-locale-toggle"
-            @select.prevent="toggleLocale()"
-          >
-            <div class="flex items-center gap-2">
-              <UiIcon name="globe" class="text-fg-muted size-3.5" />
-              <span>{{ t('app.language') }}</span>
-            </div>
-            <span class="text-fg-muted font-mono text-xs">{{ t('app.localeToggle') }}</span>
-          </DropdownMenuItem>
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger
+              class="data-table-menu-item flex items-center justify-between"
+              data-testid="nav-locale-toggle"
+            >
+              <div class="flex items-center gap-2">
+                <UiIcon name="globe" class="text-fg-muted size-3.5" />
+                <span>{{ t('app.language') }}</span>
+              </div>
+              <div class="flex items-center gap-1">
+                <span class="text-fg-muted font-mono text-xs">{{ currentLocaleLabel }}</span>
+                <UiIcon name="chevron-right" class="text-fg-muted size-3 opacity-70" />
+              </div>
+            </DropdownMenuSubTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuSubContent
+                class="data-table-menu min-w-36"
+                :side-offset="6"
+                @mouseenter="handleMouseEnter"
+                @mouseleave="handleMouseLeave"
+              >
+                <DropdownMenuItem
+                  class="data-table-menu-item flex items-center justify-between"
+                  :class="{ 'font-semibold text-[var(--seed-primary)]': locale === 'zh-CN' }"
+                  data-testid="nav-locale-zh"
+                  @select.prevent="setLocale('zh-CN')"
+                >
+                  <span>简体中文</span>
+                  <UiIcon
+                    v-if="locale === 'zh-CN'"
+                    name="check"
+                    class="size-3.5 text-[var(--seed-primary)]"
+                  />
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  class="data-table-menu-item flex items-center justify-between"
+                  :class="{ 'font-semibold text-[var(--seed-primary)]': locale === 'en' }"
+                  data-testid="nav-locale-en"
+                  @select.prevent="setLocale('en')"
+                >
+                  <span>English</span>
+                  <UiIcon
+                    v-if="locale === 'en'"
+                    name="check"
+                    class="size-3.5 text-[var(--seed-primary)]"
+                  />
+                </DropdownMenuItem>
+              </DropdownMenuSubContent>
+            </DropdownMenuPortal>
+          </DropdownMenuSub>
           <DropdownMenuSeparator class="data-table-menu-separator" />
           <DropdownMenuItem
-            class="data-table-menu-item text-danger focus:text-danger flex items-center gap-2"
+            class="data-table-menu-item hover:bg-danger/20 mt-1 flex items-center gap-2 bg-[var(--danger-bg)] font-medium text-[var(--danger)] transition-colors"
             data-testid="nav-logout"
             @select="handleLogout"
           >

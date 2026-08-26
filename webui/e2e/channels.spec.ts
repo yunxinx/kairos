@@ -502,7 +502,8 @@ test.describe('channel manual model add', () => {
 
       await page.goto('/channels');
       await page.getByTestId('account-menu-trigger').hover();
-      await page.getByTestId('nav-locale-toggle').click();
+      await page.getByTestId('nav-locale-toggle').hover();
+      await page.getByTestId('nav-locale-zh').click();
       await channelRow.getByTestId('channel-edit').click();
       await expect(page.getByTestId('channel-add-model')).toHaveText('添加');
       await page.getByTestId('channel-add-model').click();

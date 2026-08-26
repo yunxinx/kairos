@@ -31,14 +31,18 @@ test.describe('users page', () => {
 
     await row.getByTestId('user-edit').click();
     await page.getByTestId('user-tab-recharge').click();
+    await expect(page.getByTestId('user-current-balance')).toBeVisible();
+    await expect(page.getByTestId('user-quick-add-5')).toBeVisible();
+    await expect(page.getByTestId('user-quick-sub-5')).toBeVisible();
     await page.getByTestId('user-recharge-amount').fill('3.5');
+    await expect(page.getByTestId('user-balance-result')).toHaveText('3.5');
     await page.getByTestId('user-recharge-save').click();
     await expect(row).toContainText('3.5');
 
     await row.getByTestId('user-edit').click();
     await page.getByTestId('user-tab-plan').click();
     await expect(page.getByTestId('user-plan-select')).toBeVisible();
-    await expect(page.getByTestId('user-current-plan')).toContainText(/standard/i);
+    await expect(page.getByTestId('user-current-plan')).toHaveCount(0);
     await page.keyboard.press('Escape');
 
     await row.getByTestId('user-toggle-enabled').click();

@@ -3,13 +3,7 @@ import { useId, computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import type {
-  PlanAudience,
-  PlanCapabilities,
-  PlanCreate,
-  PlanUpdate,
-  PlanView,
-} from '@/api/types';
+import type { PlanAudience, PlanCapabilities, PlanCreate, PlanUpdate, PlanView } from '@/api/types';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import DataTablePanel from '@/components/ui/DataTablePanel.vue';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
@@ -147,7 +141,7 @@ const groupRows = computed(() => {
 });
 
 /** 与 `colspan` 等长；`table-layout:fixed` 下由 colgroup 定宽。 */
-const groupColumns = [{ width: 'w-10' }, { width: 'auto' }];
+const groupColumns = [{ width: '2.5rem' }, { width: 'auto' }];
 
 function toggleGroup(name: string, checked: boolean) {
   if (checked) {
@@ -158,6 +152,24 @@ function toggleGroup(name: string, checked: boolean) {
     selectedGroups.value = selectedGroups.value.filter((item) => item !== name);
   }
 }
+
+const allVisibleGroupsSelected = computed({
+  get: () => groupRows.value.length > 0 && groupRows.value.every((row) => row.checked),
+  set: (val: boolean) => {
+    if (val) {
+      const set = new Set(selectedGroups.value);
+      for (const row of groupRows.value) {
+        set.add(row.name);
+      }
+      selectedGroups.value = Array.from(set);
+    } else {
+      const remove = new Set(groupRows.value.map((row) => row.name));
+      selectedGroups.value = selectedGroups.value.filter((name) => !remove.has(name));
+    }
+  },
+});
+
+const someVisibleGroupsSelected = computed(() => groupRows.value.some((row) => row.checked));
 
 const dirty = computed(() => {
   if (!isEdit.value) {
@@ -192,8 +204,7 @@ const dirty = computed(() => {
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 type SavePayload =
-  | { kind: 'create'; body: PlanCreate }
-  | { kind: 'update'; id: number; body: PlanUpdate };
+  { kind: 'create'; body: PlanCreate } | { kind: 'update'; id: number; body: PlanUpdate };
 
 const saveMutation = useMutation({
   mutationFn: (payload: SavePayload) =>
@@ -480,12 +491,14 @@ function capabilityLabel(key: keyof PlanCapabilities): string {
 
         <div>
           <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <p class="form-field-label m-0">
-              {{ t('plans.modelGroups') }}
-              <span class="text-fg-muted font-normal" data-testid="plan-groups-count">
+            <div class="flex items-center gap-2">
+              <p class="form-field-label m-0">
+                {{ t('plans.modelGroups') }}
+              </p>
+              <span class="badge badge-neutral text-xs" data-testid="plan-groups-count">
                 {{ t('plans.groupsSelected', { count: selectedGroups.length }) }}
               </span>
-            </p>
+            </div>
             <SearchInput
               :id="`plan-group-search-${uid}`"
               v-model="groupSearch"
@@ -508,19 +521,30 @@ function capabilityLabel(key: keyof PlanCapabilities): string {
             >
               <template #header>
                 <TableRow>
-                  <TableHead class="w-10" />
+                  <TableHead class="w-10">
+                    <div class="flex items-center justify-center">
+                      <Checkbox
+                        v-model="allVisibleGroupsSelected"
+                        :indeterminate="someVisibleGroupsSelected && !allVisibleGroupsSelected"
+                        data-testid="plan-groups-select-all"
+                        :aria-label="t('common.selectAll')"
+                      />
+                    </div>
+                  </TableHead>
                   <TableHead>{{ t('plans.modelGroups') }}</TableHead>
                 </TableRow>
               </template>
               <template #row="{ row }">
                 <TableRow data-testid="plan-group-row" :data-group-name="row.name">
                   <TableCell>
-                    <Checkbox
-                      :model-value="row.checked"
-                      :data-testid="`plan-group-${row.name}`"
-                      :aria-label="groupDisplayName(row.name, t('models.ungrouped'))"
-                      @update:model-value="(checked: boolean) => toggleGroup(row.name, checked)"
-                    />
+                    <div class="flex items-center justify-center">
+                      <Checkbox
+                        :model-value="row.checked"
+                        :data-testid="`plan-group-${row.name}`"
+                        :aria-label="groupDisplayName(row.name, t('models.ungrouped'))"
+                        @update:model-value="(checked: boolean) => toggleGroup(row.name, checked)"
+                      />
+                    </div>
                   </TableCell>
                   <TableCell truncate :title="row.name">
                     <span class="font-mono text-sm">

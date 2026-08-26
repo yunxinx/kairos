@@ -2,12 +2,7 @@ import { redirect } from '@tanstack/vue-router';
 import { apiClient } from '@/api/client';
 import { roleAtLeast, type ManagementRole } from '@/api/types';
 import { hasCapability, type ManagementCapability } from '@/lib/capabilities';
-import {
-  captureSessionGeneration,
-  getAdminKey,
-  getMe,
-  setMeForSession,
-} from '@/lib/session';
+import { captureSessionGeneration, getAdminKey, getMe, setMeForSession } from '@/lib/session';
 
 /** 拉一次 `/me` 填进会话；已有则跳过。 */
 export async function ensureMe(): Promise<void> {

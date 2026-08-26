@@ -9,8 +9,10 @@ import type { ChannelModelOrder } from '@/api/types';
 import CopyableName from '@/components/ui/CopyableName.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import InlineError from '@/components/ui/InlineError.vue';
+import SearchInput from '@/components/ui/SearchInput.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
+import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
@@ -71,6 +73,8 @@ interface OrderRow extends ChannelModelOrder {
   channels: Array<{ id: number; name: string; enabled: boolean | undefined }>;
 }
 
+const searchText = ref('');
+
 const rows = computed<OrderRow[]>(() =>
   draftOrders.value.map((order) => ({
     ...order,
@@ -81,6 +85,16 @@ const rows = computed<OrderRow[]>(() =>
     })),
   })),
 );
+
+const filteredRows = computed<OrderRow[]>(() => {
+  const q = searchText.value.trim().toLowerCase();
+  if (!q) return rows.value;
+  return rows.value.filter(
+    (order) =>
+      order.model.toLowerCase().includes(q) ||
+      order.channels.some((c) => c.name.toLowerCase().includes(q)),
+  );
+});
 
 function sameOrder(left: ChannelModelOrder, right: ChannelModelOrder): boolean {
   return (
@@ -194,6 +208,18 @@ function refetchAll() {
     />
     <div v-else class="flex flex-col">
       <DataTable class="[&_[data-slot=table]]:table-fixed" :busy="showTableSkeleton">
+        <template #toolbar>
+          <DataTableToolbar>
+            <SearchInput
+              id="order-search"
+              v-model="searchText"
+              class="max-w-sm"
+              data-testid="order-search"
+              :placeholder="t('models.search')"
+              :aria-label="t('models.search')"
+            />
+          </DataTableToolbar>
+        </template>
         <TableHeader>
           <TableRow>
             <TableHead class="min-w-44">{{ t('pricing.model') }}</TableHead>
@@ -207,7 +233,7 @@ function refetchAll() {
           <TableRowsSkeleton v-if="showTableSkeleton" :columns="3" />
           <template v-else>
             <TableRow
-              v-for="order in rows"
+              v-for="order in filteredRows"
               :key="order.model"
               data-testid="order-row"
               :data-model="order.model"
@@ -247,15 +273,20 @@ function refetchAll() {
                       <UiIcon name="grip-vertical" :size="14" />
                     </button>
                     <span
-                      class="route-index"
+                      class="route-index shrink-0"
                       :aria-label="t('models.routeHopIndex', { n: index + 1 })"
                     >
                       {{ index + 1 }}
                     </span>
-                    <span class="min-w-0 truncate font-mono text-sm">{{ channel.name }}</span>
+                    <span
+                      class="badge badge-info max-w-[12rem] min-w-0 truncate font-mono text-xs"
+                      :title="channel.name"
+                    >
+                      {{ channel.name }}
+                    </span>
                     <span
                       v-if="channel.enabled === false"
-                      class="badge badge-danger"
+                      class="badge badge-danger shrink-0 text-[10px] whitespace-nowrap"
                       data-testid="order-channel-disabled"
                     >
                       {{ t('channel.statusDisabled') }}
@@ -275,9 +306,11 @@ function refetchAll() {
                 </button>
               </TableCell>
             </TableRow>
-            <TableRow v-if="rows.length === 0">
+            <TableRow v-if="filteredRows.length === 0">
               <TableCell :colspan="canEditOrder ? 3 : 2" class="h-24 whitespace-normal">
-                <EmptyState :title="t('models.orderEmpty')" />
+                <EmptyState
+                  :title="rows.length === 0 ? t('models.orderEmpty') : t('common.emptyList')"
+                />
               </TableCell>
             </TableRow>
           </template>

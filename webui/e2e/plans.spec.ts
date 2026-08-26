@@ -7,19 +7,27 @@ import type { Page } from '@playwright/test';
 /** 经 API 建档：表格能力的用例只关心列表里有几行，不必走一遍编辑器表单。 */
 async function seedPlan(
   page: Page,
-  body: { internal_name: string; display_name: string; audience?: 'user' | 'admin' },
+  body: {
+    internal_name: string;
+    display_name: string;
+    audience?: 'user' | 'admin';
+    note?: string;
+    initial_grant_usd_micros?: number;
+    groups?: string[];
+  },
 ): Promise<void> {
   const resp = await page.request.post('/api/plans', {
     headers: await e2eRootHeaders(page.request),
     data: {
       internal_name: body.internal_name,
       display_name: body.display_name,
-      note: '',
+      note: body.note ?? '',
       discount_bp: 10000,
       default_rpm: null,
       shared_rpm: null,
       audience: body.audience ?? 'user',
-      groups: [],
+      initial_grant_usd_micros: body.initial_grant_usd_micros ?? 0,
+      groups: body.groups ?? [],
     },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -159,6 +167,41 @@ test.describe('plans page', () => {
     // 内置档仍在：批量删除只作用于可选行。
     await page.getByTestId('plans-search').fill('');
     await expect(builtin).toBeVisible();
+  });
+
+  test('clears route search when the query parameter is removed and shows plan details', async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      localStorage.removeItem('kairos-plans-columns');
+    });
+    await seedModelGroup(page, { name: 'e2e-plan-details-group', models: [] });
+    await seedPlan(page, {
+      internal_name: 'e2e-plan-details',
+      display_name: 'E2E Plan Details',
+      note: 'Visible plan note',
+      initial_grant_usd_micros: 1_500_000,
+      groups: ['e2e-plan-details-group'],
+    });
+
+    await page.goto('/plans?q=e2e-plan-details');
+    await expect(page.getByTestId('plans-search')).toHaveValue('e2e-plan-details');
+    const row = page.locator('[data-testid="plan-row"]', { hasText: 'e2e-plan-details' });
+    await expect(row).toBeVisible();
+    await expect(row.getByTestId('plan-note-cell')).toHaveText('Visible plan note');
+    await expect(row.getByTestId('plan-initial-grant')).toContainText('$1.5');
+    await expect(row.getByTestId('plan-groups')).toContainText('e2e-plan-details-group');
+    await expect(row.getByTestId('plan-created-at')).not.toHaveText('');
+
+    await page.getByTestId('plans-columns').click();
+    await page.locator('[data-testid="plans-columns-option"][data-value="note"]').click();
+    await page.keyboard.press('Escape');
+    await expect(row.getByTestId('plan-note-cell')).toHaveCount(0);
+
+    await page.getByRole('link', { name: /^plans$/i }).click();
+    await expect(page).toHaveURL(/\/plans$/);
+    await expect(page.getByTestId('plans-search')).toHaveValue('');
+    await expect(page.locator('[data-testid="plan-row"]')).not.toHaveCount(0);
   });
 
   test('aligns inline switches with their labels in the editor', async ({ page }) => {

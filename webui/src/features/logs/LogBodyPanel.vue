@@ -95,6 +95,11 @@ function roleBadgeClass(role: string): string {
       return 'bg-slate-500/15 text-slate-600 dark:text-slate-400 border border-slate-500/30';
   }
 }
+
+function roleLabel(role: string): string {
+  const key = `logs.roles.${role.toLowerCase()}`;
+  return t(key);
+}
 </script>
 
 <template>
@@ -161,7 +166,7 @@ function roleBadgeClass(role: string): string {
           <span
             class="rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] tracking-wide uppercase"
           >
-            System
+            {{ roleLabel('system') }}
           </span>
           <span>{{ t('logs.systemPrompt') }}</span>
         </div>
@@ -210,10 +215,10 @@ function roleBadgeClass(role: string): string {
               class="rounded px-2 py-0.5 font-mono text-[10px] font-bold tracking-wider uppercase"
               :class="roleBadgeClass(msg.role)"
             >
-              {{ msg.role }} {{ msg.name ? `(${msg.name})` : '' }}
+              {{ roleLabel(msg.role) }} {{ msg.name ? `(${msg.name})` : '' }}
             </span>
             <span v-if="msg.toolUseId" class="font-mono text-[10px] text-[var(--fg-muted)]">
-              call_id: {{ msg.toolUseId }}
+              {{ t('logs.callId') }}: {{ msg.toolUseId }}
             </span>
           </div>
 
@@ -253,17 +258,17 @@ function roleBadgeClass(role: string): string {
             <span
               class="rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 font-mono text-[10px] font-bold tracking-wider text-emerald-600 uppercase dark:text-emerald-400"
             >
-              Assistant (Response)
+              {{ t('logs.assistantResponse') }}
             </span>
             <span v-if="inspection.response.isStream" class="badge badge-info text-[10px]">
-              SSE Stream
+              {{ t('logs.sseStream') }}
             </span>
           </div>
           <span
             v-if="inspection.response.finishReason"
             class="badge bg-[var(--seed-surface-alt)] font-mono text-[10px] text-[var(--fg-muted)]"
           >
-            finish: {{ inspection.response.finishReason }}
+            {{ t('logs.finishReason') }}: {{ inspection.response.finishReason }}
           </span>
         </div>
 

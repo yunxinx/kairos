@@ -90,12 +90,7 @@ async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: strin
 
   const response = await fetch(`/api${path}`, { ...init, headers });
   if (!response.ok) {
-    if (
-      response.status === 401 &&
-      key &&
-      keyOverride === undefined &&
-      getAdminKey() === key
-    ) {
+    if (response.status === 401 && key && keyOverride === undefined && getAdminKey() === key) {
       invalidateAdminKey();
     }
     const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
@@ -211,10 +206,7 @@ export const apiClient = {
     });
   },
 
-  adjustTokenBalance(
-    id: number,
-    body: TokenBalanceCommand,
-  ): Promise<BalanceAdjustmentResult> {
+  adjustTokenBalance(id: number, body: TokenBalanceCommand): Promise<BalanceAdjustmentResult> {
     return apiFetch(`/tokens/${id}/balance-adjustments`, {
       method: 'POST',
       body: JSON.stringify(body),

@@ -73,7 +73,7 @@ test.describe('request logs page', () => {
     await expect(jsonRow.getByTestId('log-speed')).toHaveText('—');
     await expect(jsonRow.getByTestId('log-cost')).toHaveText(usdLabel(1_500));
 
-    await jsonRow.getByTestId('log-expand').click();
+    await jsonRow.getByTestId('log-open-body').click();
     const requestBody = page.getByTestId('log-request-body');
     await expect(requestBody).toContainText('"hello": "world"');
     await expect(requestBody).toContainText('"n": 1');
@@ -89,7 +89,7 @@ test.describe('request logs page', () => {
     await expect(filterRow).toHaveAttribute('data-status-code', '429');
     await expect(filterRow.getByTestId('log-model')).toHaveText('e2e-filter-model');
 
-    await filterRow.getByTestId('log-expand').click();
+    await filterRow.getByTestId('log-open-body').click();
     await expect(page.getByTestId('log-request-body-binary')).toBeVisible();
     await expect(page.getByTestId('log-request-body-binary')).toContainText(/binary/i);
     await expect(page.getByTestId('log-response-body')).toHaveText('plain text body');
@@ -200,9 +200,7 @@ test.describe('request logs page', () => {
       .locator('[data-testid="system-logs-level-filter-option"][data-value="warn"]')
       .click();
     // 同样不断言总数：登录失败也记 warn（审计），整个 e2e 跑共用一个库。
-    const warned = page
-      .getByTestId('system-log-row')
-      .filter({ hasText: 'e2e catalog warning' });
+    const warned = page.getByTestId('system-log-row').filter({ hasText: 'e2e catalog warning' });
     await expect(warned).toHaveCount(1);
     await expect(warned.getByTestId('system-log-target')).toHaveText('catalog');
     await expect(
@@ -215,9 +213,17 @@ test.describe('request logs page', () => {
     await page
       .locator('[data-testid="system-logs-target-filter-option"][data-value="billing"]')
       .click();
-    await expect(page.getByTestId('system-log-row')).toHaveCount(1);
-    await expect(page.getByTestId('system-log-target')).toHaveText('billing');
-    await expect(page.getByTestId('system-log-message')).toContainText('e2e settlement failed');
+    const billingRow = page
+      .getByTestId('system-log-row')
+      .filter({ hasText: 'e2e settlement failed' });
+    await expect(billingRow).toBeVisible();
+    await expect(billingRow.getByTestId('system-log-target')).toHaveText('billing');
+    await expect(billingRow.getByTestId('system-log-message')).toContainText(
+      'e2e settlement failed',
+    );
+    await expect(
+      page.getByTestId('system-log-row').filter({ hasText: 'e2e catalog warning' }),
+    ).toHaveCount(0);
   });
 
   test('hides request-log columns from the toolbar', async ({ page }) => {
@@ -245,9 +251,11 @@ test.describe('request logs page', () => {
     await page.locator('[data-testid="logs-columns-option"][data-value="cache"]').click();
     await expect(page.getByRole('button', { name: 'Cache', exact: true })).toBeVisible();
     await page.locator('[data-testid="logs-columns-option"][data-value="token"]').click();
+    await page.locator('[data-testid="logs-columns-option"][data-value="body"]').click();
     await page.keyboard.press('Escape');
     await expect(page.getByRole('button', { name: 'Token', exact: true })).toHaveCount(0);
     await expect(row.getByText('Columns token')).toHaveCount(0);
+    await expect(row.getByTestId('log-open-body')).toHaveCount(0);
   });
 
   test('hides system-log columns from the toolbar', async ({ page }) => {
@@ -395,7 +403,42 @@ test.describe('request logs page', () => {
   });
 });
 
-test('details show base price, discount, and charged amount; list filters by discount', async ({ page }) => {
+test.describe('system log events', () => {
+  test('localizes structured event messages when locale changes', async ({ page }) => {
+    seedSystemLogs([
+      {
+        level: 'warn',
+        target: 'billing-i18n',
+        message: 'fallback usage message',
+        event_code: 'billing.usage_missing',
+        event_params: {
+          token_name: 'I18n token',
+          model: 'I18n model',
+          channel: 'I18n channel',
+        },
+      },
+    ]);
+
+    await page.goto('/logs');
+    await page.getByTestId('logs-tab-system').click();
+    const row = page.getByTestId('system-log-row').filter({ hasText: 'I18n token' });
+    await expect(row).toContainText('Upstream usage was missing');
+    await row.click();
+    const detail = page.getByTestId('system-log-detail-window');
+    await expect(detail).toContainText('Upstream usage was missing');
+
+    await page.getByTestId('account-menu-trigger').hover();
+    await page.getByTestId('nav-locale-toggle').hover();
+    await page.getByTestId('nav-locale-zh').click();
+    await expect(row).toContainText('上游未回报 usage');
+    await expect(detail).toContainText('上游未回报 usage');
+    await expect(row).not.toContainText('fallback usage message');
+  });
+});
+
+test('details show base price, discount, and charged amount; list filters by discount', async ({
+  page,
+}) => {
   seedRequestLogs([
     {
       created_at: Date.now(),

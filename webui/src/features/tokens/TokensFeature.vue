@@ -28,7 +28,6 @@ import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDele
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
-import TokenBalanceWindow from '@/features/tokens/TokenBalanceWindow.vue';
 import TokenEditorWindow from '@/features/tokens/TokenEditorWindow.vue';
 import {
   formatUnixMillis,
@@ -42,7 +41,6 @@ import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor'
 
 type TokenWindowPayload =
   | { kind: 'editor'; token: TokenRow | null }
-  | { kind: 'balance'; token: TokenRow }
   | { kind: 'delete'; token: TokenRow }
   | BulkDeletePayload;
 
@@ -274,17 +272,6 @@ function openEdit(token: TokenRow) {
   openWindow(takePendingAnchor(), { kind: 'editor', token });
 }
 
-function openBalance(token: TokenRow) {
-  const existing = windows.value.find(
-    (entry) => entry.payload.kind === 'balance' && entry.payload.token.id === token.id,
-  );
-  if (existing) {
-    bringToFront(existing.id);
-    return;
-  }
-  openWindow(takePendingAnchor(), { kind: 'balance', token });
-}
-
 function openDelete(token: TokenRow) {
   const existing = windows.value.find(
     (entry) => entry.payload.kind === 'delete' && entry.payload.token.id === token.id,
@@ -423,13 +410,18 @@ function openBulkDelete() {
                 </span>
               </TableCell>
               <TableCell>
-                <div class="w-32" :title="quotaLabel(token)">
-                  <div class="mb-1 font-mono text-xs font-semibold" data-testid="token-balance">
-                    {{
-                      token.balance_usd_micros === null
-                        ? t('common.unlimited')
-                        : formatUsdFixed2(token.balance_usd_micros)
-                    }}
+                <div class="w-36" :title="quotaLabel(token)">
+                  <div class="mb-1 flex items-center justify-between font-mono text-xs">
+                    <span class="text-fg-muted" data-testid="token-settled">
+                      {{ formatUsdFixed2(token.settled_usd_micros) }}
+                    </span>
+                    <span class="font-semibold" data-testid="token-balance">
+                      {{
+                        token.balance_usd_micros === null
+                          ? t('common.unlimited')
+                          : formatUsdFixed2(token.balance_usd_micros)
+                      }}
+                    </span>
                   </div>
                   <div
                     v-if="quotaRatio(token) !== null"
@@ -449,11 +441,7 @@ function openBulkDelete() {
                 class="text-fg-muted font-mono text-xs"
                 data-testid="token-rpm"
               >
-                {{
-                  token.rate_limit_rpm !== null
-                    ? `${token.rate_limit_rpm} RPM`
-                    : t('common.unlimited')
-                }}
+                {{ token.rate_limit_rpm !== null ? token.rate_limit_rpm : t('common.unlimited') }}
               </TableCell>
               <TableCell align="center">
                 <button
@@ -493,13 +481,6 @@ function openBulkDelete() {
                     <UiIcon name="pencil" :size="16" />
                   </button>
                   <DataTableRowActions>
-                    <DataTableMenuItem
-                      data-testid="token-adjust-balance"
-                      @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
-                      @select="openBalance(token)"
-                    >
-                      {{ t('tokens.adjustBalance') }}
-                    </DataTableMenuItem>
                     <DataTableMenuItem
                       danger
                       data-testid="token-delete"
@@ -545,18 +526,6 @@ function openBulkDelete() {
       <TokenEditorWindow
         v-if="win.payload.kind === 'editor'"
         :initial="win.payload.token"
-        :anchor="win.anchor"
-        :stack-order="win.z"
-        :cascade="index"
-        :attention="win.attention"
-        :topmost="win.id === topmostId"
-        @close="closeWindow(win.id)"
-        @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
-      />
-      <TokenBalanceWindow
-        v-else-if="win.payload.kind === 'balance'"
-        :token="win.payload.token"
         :anchor="win.anchor"
         :stack-order="win.z"
         :cascade="index"

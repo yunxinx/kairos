@@ -245,8 +245,7 @@ test.describe('overview page', () => {
     const expectedModelShares = [...stats.by_model]
       .sort(
         (left, right) =>
-          right.cost_usd_micros - left.cost_usd_micros ||
-          right.request_count - left.request_count,
+          right.cost_usd_micros - left.cost_usd_micros || right.request_count - left.request_count,
       )
       .slice(0, 5);
     const modelShares = page.getByTestId('overview-model-share');
@@ -256,10 +255,7 @@ test.describe('overview page', () => {
         `[data-testid="overview-model-share"][data-model="${share.model}"]`,
       );
       await expect(modelShare).toBeVisible();
-      await expect(modelShare).toHaveAttribute(
-        'data-request-count',
-        String(share.request_count),
-      );
+      await expect(modelShare).toHaveAttribute('data-request-count', String(share.request_count));
       await expect(modelShare).toHaveAttribute(
         'data-cost-usd-micros',
         String(share.cost_usd_micros),

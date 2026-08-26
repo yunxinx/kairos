@@ -220,8 +220,11 @@ test.describe('email password login', () => {
       .poll(() => page.evaluate(() => document.documentElement.classList.contains('dark')))
       .not.toBe(before);
 
-    // 切语言：菜单同样保持展开。
-    await localeToggle.click();
+    // 切语言：子菜单展开并选择，菜单同样保持展开。
+    await localeToggle.hover();
+    const zhOption = page.getByTestId('nav-locale-zh');
+    await expect(zhOption).toBeVisible();
+    await zhOption.click();
     await expect(localeToggle).toBeVisible();
 
     // 「账户」是导航动作，仍应关闭菜单。
@@ -230,7 +233,7 @@ test.describe('email password login', () => {
     await expect(themeToggle).toHaveCount(0);
   });
 
-  test('account page can update display name and toggle top avatar visibility', async ({
+  test('account page can update display name and toggle top identity visibility', async ({
     page,
   }) => {
     await page.goto('/login');
@@ -253,6 +256,12 @@ test.describe('email password login', () => {
     await page.getByTestId('account-display-name').fill('Root operator');
     await page.getByTestId('account-save').click();
     await expect(page.getByTestId('toast')).toContainText(/account saved|账户已保存/i);
+    await expect(page.getByTestId('account-menu-trigger')).toContainText('Root operator');
+
+    // 名称和头像都是账户页可独立控制的导航偏好。
+    await page.getByTestId('account-show-nav-name').click();
+    await expect(page.getByTestId('account-menu-trigger')).not.toContainText('Root operator');
+    await page.getByTestId('account-show-nav-name').click();
     await expect(page.getByTestId('account-menu-trigger')).toContainText('Root operator');
 
     // 切换隐藏右上角头像

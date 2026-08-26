@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useSearch } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { PlanAudience, PlanView } from '@/api/types';
@@ -17,7 +18,9 @@ import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
 import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
+import DataTableViewOptions from '@/components/ui/data-table/DataTableViewOptions.vue';
 import SelectCell from '@/components/ui/data-table/SelectCell.vue';
+import OverflowChips from '@/components/ui/OverflowChips.vue';
 import TableBody from '@/components/ui/table/TableBody.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 import TableHead from '@/components/ui/table/TableHead.vue';
@@ -25,11 +28,12 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
+import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
 import PlanEditorWindow from '@/features/plans/PlanEditorWindow.vue';
-import { formatDiscountBp } from '@/lib/format';
+import { formatDiscountBp, formatUnixMillis, formatUsdMicros } from '@/lib/format';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type PlanWindowPayload =
@@ -38,13 +42,42 @@ type PlanWindowPayload =
   | { kind: 'delete'; plan: PlanView }
   | BulkDeletePayload;
 
-const { t } = useI18n();
+type PlanColumnId = 'note' | 'initialGrant' | 'groups' | 'createdAt';
+
+const PLAN_COLUMNS: ColumnVisibilitySpec<PlanColumnId>[] = [
+  { id: 'note' },
+  { id: 'initialGrant' },
+  { id: 'groups' },
+  { id: 'createdAt' },
+];
+
+const { t, locale } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
-const searchText = ref('');
+const routeSearch = useSearch({ from: '/plans' });
+const searchText = ref(routeSearch.value.q ?? '');
 const audienceFilter = ref<string[]>([]);
 const flagFilter = ref<string[]>([]);
+const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
+  'kairos-plans-columns',
+  PLAN_COLUMNS,
+);
+const columnMenuItems = computed(() => menuItems(PLAN_COLUMNS.map((column) => column.id)));
+const columnLabels = computed((): Record<PlanColumnId, string> => ({
+  note: t('plans.note'),
+  initialGrant: t('plans.initialGrant'),
+  groups: t('plans.modelGroups'),
+  createdAt: t('plans.createdAt'),
+}));
+const visibleColumnCount = computed(() => 9 + columnCount.value);
+
+watch(
+  () => routeSearch.value.q,
+  (nextQ) => {
+    searchText.value = nextQ ?? '';
+  },
+);
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
   const anchor = pendingAnchor.value;
@@ -292,6 +325,12 @@ watch(plans, (rows) => {
               test-id="plans-flag-filter"
             />
             <template #actions>
+              <DataTableViewOptions
+                :items="columnMenuItems"
+                :labels="columnLabels"
+                test-id="plans-columns"
+                @toggle="setVisible"
+              />
               <!--
                 两个按钮而非一个下拉：受众建后不可改（改档会让已挂载用户悄悄增减
                 管理能力），所以在入口就把选择摊开，而不是藏在表单里的一个字段。
@@ -331,16 +370,23 @@ watch(plans, (rows) => {
             <TableHead>{{ t('plans.internalName') }}</TableHead>
             <TableHead>{{ t('plans.displayName') }}</TableHead>
             <TableHead>{{ t('plans.audience') }}</TableHead>
+            <TableHead v-if="visible.note">{{ t('plans.note') }}</TableHead>
             <TableHead>{{ t('plans.discount') }}</TableHead>
             <TableHead>{{ t('plans.defaultRpm') }}</TableHead>
             <TableHead>{{ t('plans.sharedRpm') }}</TableHead>
-            <TableHead>{{ t('plans.groupsCount') }}</TableHead>
+            <TableHead v-if="visible.initialGrant">{{ t('plans.initialGrant') }}</TableHead>
+            <TableHead v-if="visible.groups">{{ t('plans.modelGroups') }}</TableHead>
             <TableHead>{{ t('plans.share') }}</TableHead>
+            <TableHead v-if="visible.createdAt">{{ t('plans.createdAt') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="10" />
+          <TableRowsSkeleton
+            v-if="showTableSkeleton"
+            has-select-column
+            :columns="visibleColumnCount"
+          />
           <template v-else>
             <TableRow
               v-for="plan in filteredPlans"
@@ -386,6 +432,15 @@ watch(plans, (rows) => {
                   }}
                 </span>
               </TableCell>
+              <TableCell
+                v-if="visible.note"
+                class="max-w-56"
+                truncate
+                :title="plan.note"
+                data-testid="plan-note-cell"
+              >
+                {{ plan.note || '-' }}
+              </TableCell>
               <TableCell class="font-mono" data-testid="plan-discount-cell">
                 {{ formatDiscountBp(plan.discount_bp) }}
               </TableCell>
@@ -397,7 +452,16 @@ watch(plans, (rows) => {
                 <span v-if="plan.shared_rpm">{{ plan.shared_rpm }}</span>
                 <span v-else class="text-fg-muted">-</span>
               </TableCell>
-              <TableCell class="font-mono">{{ plan.groups.length }}</TableCell>
+              <TableCell
+                v-if="visible.initialGrant"
+                class="font-mono"
+                data-testid="plan-initial-grant"
+              >
+                {{ formatUsdMicros(plan.initial_grant_usd_micros) }}
+              </TableCell>
+              <TableCell v-if="visible.groups" data-testid="plan-groups">
+                <OverflowChips :items="plan.groups" />
+              </TableCell>
               <TableCell>
                 <span
                   v-if="plan.shared_with_admin"
@@ -406,7 +470,16 @@ watch(plans, (rows) => {
                 >
                   {{ t('common.yes') }}
                 </span>
-                <span v-else class="text-fg-muted">{{ t('common.no') }}</span>
+                <span v-else class="badge badge-neutral" data-testid="plan-shared-badge">
+                  {{ t('common.no') }}
+                </span>
+              </TableCell>
+              <TableCell
+                v-if="visible.createdAt"
+                class="font-mono text-xs"
+                data-testid="plan-created-at"
+              >
+                {{ formatUnixMillis(plan.created_at, locale) }}
               </TableCell>
               <TableCell align="center">
                 <span class="inline-flex items-center gap-1">
@@ -444,7 +517,7 @@ watch(plans, (rows) => {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredPlans.length === 0">
-              <TableCell :colspan="10" class="h-24 whitespace-normal">
+              <TableCell :colspan="visibleColumnCount" class="h-24 whitespace-normal">
                 <!-- 一条都没有 vs 筛没了是两回事：后者给「新建」会把用户引向错误动作。 -->
                 <EmptyState :title="plans.length === 0 ? t('plans.empty') : t('common.emptyList')">
                   <button

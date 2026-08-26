@@ -250,6 +250,8 @@
     "displayName": "名称",
     "showNavAvatar": "显示右上角头像",
     "showNavAvatarGuide": "在顶部导航栏右上角的用户徽标中显示头像缩略图。",
+    "showNavName": "显示右上角名称",
+    "showNavNameGuide": "在顶部导航栏右上角的用户菜单按钮中显示名称。",
     "changeAvatar": "更换头像",
     "removeAvatar": "移除头像",
     "invalidImage": "请选择有效的图片文件",
@@ -612,7 +614,7 @@
     },
     "search": "搜索",
     "searchPlaceholder": "令牌 / 名称 / 模型 / 渠道",
-    "systemSearchPlaceholder": "目标 / 消息",
+    "systemSearchPlaceholder": "操作行为 / 消息",
     "settledFilter": "结算",
     "settledYes": "已结算",
     "settledNo": "未结算",
@@ -626,14 +628,14 @@
     "settleGuide": "按该行费用扣减所属用户钱包，允许透支。",
     "waiveGuide": "只把该行标为已结算，不改余额。",
     "levelFilter": "级别",
-    "targetFilter": "目标",
+    "targetFilter": "操作行为",
     "levels": {
       "error": "错误",
       "warn": "警告",
       "info": "信息"
     },
     "level": "级别",
-    "target": "目标",
+    "target": "操作行为",
     "message": "消息",
     "model": "模型",
     "outboundModel": "出站模型",
@@ -641,19 +643,42 @@
     "created": "时间",
     "token": "令牌",
     "channel": "渠道",
-    "inboundProtocol": "入站协议",
+    "inboundProtocol": "请求协议",
+    "requestProtocol": "请求协议",
+    "protoIn": "入",
+    "protoOut": "出",
     "status": "状态码",
     "latency": "耗时",
     "latencyAndSpeed": "耗时与速率",
     "cache": "缓存",
+    "cacheHit": "缓存命中率",
+    "cacheHitRate": "缓存命中率",
+    "cacheHitShort": "命中率",
     "cacheReadShort": "读",
     "cacheWriteShort": "写",
     "cost": "费用",
     "expand": "详情",
     "expandDetails": "查看请求与响应 body",
     "collapseDetails": "收起请求与响应 body",
+    "billingDetail": "计费",
+    "viewBilling": "查看计费详情",
+    "billingTitle": "计费详情",
+    "basicInfo": "基础信息",
+    "bodyDetail": "报文",
+    "viewBody": "查看请求与响应报文",
+    "bodyTitle": "请求与响应报文",
     "requestBody": "请求",
     "responseBody": "响应",
+    "assistantResponse": "模型响应",
+    "sseStream": "流式响应",
+    "finishReason": "结束原因",
+    "callId": "调用标识",
+    "roles": {
+      "system": "系统",
+      "user": "用户",
+      "assistant": "模型",
+      "tool": "工具"
+    },
     "bodyEmpty": "未记录 body。",
     "bodyLoading": "正在加载 body…",
     "bodyBinary": "二进制内容（{bytes} 字节）已隐藏，避免不安全展示。",
@@ -705,7 +730,75 @@
     "discountFilter": "折扣率",
     "baseTotal": "原价合计",
     "discountRate": "折扣率",
-    "chargedTotal": "实收合计"
+    "chargedTotal": "实收合计",
+    "eventValues": {
+      "archivedSuffix": "（已归档）",
+      "changeSeparator": "；"
+    },
+    "events": {
+      "auth": {
+        "login_failed": "登录失败：{email}（IP：{ip}）",
+        "login_succeeded": "登录成功（IP：{ip}）",
+        "session_cleanup_failed": "管理会话定时清理失败：{error}"
+      },
+      "billing": {
+        "log_charged": "补扣未结算日志 {log_id}（用户 {user_id}，{cost_usd_micros}）",
+        "log_waived": "豁免未结算日志 {log_id}（用户 {user_id}，{cost_usd_micros}）",
+        "user_balance_adjusted": "调整用户 {user_id}（{email}）余额 {delta_usd_micros}（{before_usd_micros} → {after_usd_micros}）{archived_suffix}",
+        "token_balance_adjusted": "调整令牌 {token_id}（{token_name}）余额 {delta_usd_micros}（{before_usd_micros} → {after_usd_micros}）",
+        "token_balance_set_finite": "令牌 {token_id}（{token_name}）从无限额切换为有限额，初始余额 {delta_usd_micros}",
+        "token_balance_set_unlimited": "令牌 {token_id}（{token_name}）切换为无限额",
+        "initial_grant_credited": "按套餐 {plan_name} 向用户 {user_id}（{email}）入账起步金 {amount_usd_micros}",
+        "usage_missing": "上游未回报 usage，本次按零计费（token={token_name}，model={model}，channel={channel}）",
+        "calculation_failed": "费用计算失败，已拒绝返回成功响应：{error}",
+        "admission_calculation_failed": "准入费用计算失败，已拒绝出站：{error}"
+      },
+      "catalog": {
+        "sync_failed": "价格目录定时同步失败：{error}"
+      },
+      "channel_model_orders": {
+        "updated": "调整可调用名 {model} 的渠道顺序：{channel_ids_label}"
+      },
+      "channels": {
+        "created": "创建渠道 {channel_id}（{name}），协议 {protocol}，地址 {base_url}",
+        "updated": "修改渠道 {channel_id}（{previous_name} → {name}），状态 {enabled_label}，地址 {base_url}",
+        "deleted": "删除渠道 {channel_id}（{name}）",
+        "bulk_deleted": "批量删除 {count} 条渠道",
+        "models_bulk_removed": "批量移除 {count} 条渠道模型清单项"
+      },
+      "logs": {
+        "cleaned": "清理日志：删除 {removed_request_logs} 条已结算请求日志与 {removed_system_logs} 条系统日志（早于 {older_than_days} 天）",
+        "wal_checkpoint_failed": "清理后 WAL 收尾失败：{error}"
+      },
+      "plans": {
+        "created": "创建套餐 {plan_id}（{name}）",
+        "updated": "修改套餐 {plan_id}（{name}）",
+        "default_set": "把套餐 {plan_id}（{name}）设为默认档",
+        "deleted": "删除套餐 {plan_id}（{name}）",
+        "force_deleted": "强制删除套餐 {plan_id}（{name}）",
+        "bulk_deleted": "批量删除 {count} 个套餐",
+        "bulk_force_deleted": "批量强制删除 {count} 个套餐"
+      },
+      "request_log": {
+        "token_last_used_update_failed": "刷新令牌最后使用时间失败：{error}",
+        "unsettled": "请求仍未结算：{reason}",
+        "fallback_write_failed": "请求仍未结算且回退日志写入失败：{reason}；{error}"
+      },
+      "settings": {
+        "updated": "修改运行时设置：{changes_label}"
+      },
+      "tokens": {
+        "enabled_changed": "修改用户 {user_id} 的令牌 {token_id}（{token_name}）状态：{before_enabled_label} → {enabled_label}"
+      },
+      "users": {
+        "self_updated": "用户 {user_id}（{email}）修改自己的账户",
+        "created": "创建用户 {user_id}（{email}），角色 {role}",
+        "updated": "修改用户 {user_id}（{email}）",
+        "archived": "归档用户 {user_id}（{email}）：停用账号、令牌与会话",
+        "bulk_archived": "批量归档 {count} 个用户",
+        "plan_assigned": "用户 {user_id}（{email}）换套餐 {plan_id}（{plan_name}）"
+      }
+    }
   },
   "a11y": {
     "skipToContent": "跳到主内容",
@@ -740,8 +833,8 @@
   },
   "plans": {
     "create": "创建套餐",
-    "createUser": "用户套餐",
-    "createAdmin": "管理员套餐",
+    "createUser": "创建用户套餐",
+    "createAdmin": "创建管理员套餐",
     "editorCreate": "新建套餐",
     "editorEdit": "编辑套餐",
     "editorCreateOf": "新建{audience}",
@@ -791,7 +884,8 @@
     "sharedWithAdminGuide": "开启后管理员可把该档赋给普通用户；配方仍只由 root 编辑。",
     "share": "分享",
     "builtin": "内置",
-    "groupsCount": "组数",
+    "groupsCount": "模型组数",
+    "createdAt": "创建时间",
     "currentPlan": "当前套餐",
     "empty": "还没有套餐",
     "deleteTitle": "删除套餐",

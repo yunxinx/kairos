@@ -31,7 +31,7 @@ test.describe('token resource page', () => {
     await expect(row).not.toContainText(tokenKey as string);
     await expect(row.getByTestId('token-toggle-enabled')).toHaveText('Enabled');
     await expect(row.getByTestId('token-last-used')).toHaveText(/never used/i);
-    await expect(row.getByTestId('token-rpm')).toHaveText('60 RPM');
+    await expect(row.getByTestId('token-rpm')).toHaveText('60');
 
     await page.getByTestId('tokens-search').fill('Alpha');
     await expect(row).toBeVisible();
@@ -55,18 +55,33 @@ test.describe('token resource page', () => {
 
     await expect(row.getByTestId('token-balance')).toHaveText('$12.00');
 
-    // 通用编辑器不包含余额写入口，避免保存属性时覆盖并发消费或余额调整。
+    // 编辑器包含余额调整面板
     await row.getByTestId('token-edit').click();
     await expect(page.getByTestId('token-editor-rpm')).toHaveValue('60');
     await expect(page.getByTestId('token-editor-initial-balance')).toHaveCount(0);
-    await expect(page.getByTestId('token-balance-amount')).toHaveCount(0);
+    await expect(page.getByTestId('token-current-balance')).toHaveText('12');
 
-    // 修改名称与 RPM
+    // 属性和相对余额调整由同一个 PUT 原子提交。
     await page.locator('[id^="token-editor-name"]').fill('Alpha renamed');
     await page.getByTestId('token-editor-rpm').fill('120');
+    await page.getByTestId('token-balance-quick-add-5').click();
+    const compoundUpdate = page.waitForRequest(
+      (request) => request.method() === 'PUT' && /\/api\/tokens\/\d+$/.test(request.url()),
+    );
     await page.getByTestId('token-save').click();
+    const compoundBody = (await compoundUpdate).postDataJSON() as {
+      name: string;
+      rate_limit_rpm: number;
+      balance_change: { action: string; delta_usd_micros: number };
+    };
+    expect(compoundBody).toMatchObject({
+      name: 'Alpha renamed',
+      rate_limit_rpm: 120,
+      balance_change: { action: 'adjust', delta_usd_micros: 5_000_000 },
+    });
     await expect(row.getByText('Alpha renamed')).toBeVisible();
-    await expect(row.getByTestId('token-rpm')).toHaveText('120 RPM');
+    await expect(row.getByTestId('token-rpm')).toHaveText('120');
+    await expect(row.getByTestId('token-balance')).toHaveText('$17.00');
 
     // 禁用 → 状态徽章变更；再启用 → 恢复。
     await row.getByTestId('token-toggle-enabled').click();
@@ -118,24 +133,73 @@ test.describe('token resource page', () => {
     await expect(rowA.getByTestId('token-balance')).toHaveText('$10.00');
     await expect(rowB.getByTestId('token-balance')).toHaveText('Unlimited');
 
-    await clickRowAction(rowA, page, 'token-adjust-balance');
+    await rowA.getByTestId('token-edit').click();
     await page.getByTestId('token-balance-quick-add-10').click();
     await expect(page.getByTestId('token-expected-balance')).toHaveText('20');
-    await page.getByTestId('token-balance-save').click();
+    await page.getByTestId('token-save').click();
     await expect(rowA.getByTestId('token-balance')).toHaveText('$20.00');
     await expect(rowB.getByTestId('token-balance')).toHaveText('Unlimited');
 
-    await clickRowAction(rowB, page, 'token-adjust-balance');
+    await rowB.getByTestId('token-edit').click();
     await page.getByTestId('token-balance-mode-finite').click();
     await page.getByTestId('token-balance-amount').fill('7');
-    await page.getByTestId('token-balance-save').click();
+    await page.getByTestId('token-save').click();
     await expect(rowB.getByTestId('token-balance')).toHaveText('$7.00');
 
-    await clickRowAction(rowA, page, 'token-adjust-balance');
+    await rowA.getByTestId('token-edit').click();
     await page.getByTestId('token-balance-mode-unlimited').click();
-    await page.getByTestId('token-balance-save').click();
+    await page.getByTestId('token-save').click();
     await expect(rowA.getByTestId('token-balance')).toHaveText('Unlimited');
     await expect(rowB.getByTestId('token-balance')).toHaveText('$7.00');
+  });
+
+  test('rotates the balance operation id only when the command changes', async ({ page }) => {
+    await page.goto('/tokens');
+    await page.getByTestId('create-token').click();
+    await page.locator('[id^="token-editor-name"]').fill('Retry balance');
+    await page.getByTestId('token-editor-initial-balance').fill('10');
+    await page.getByTestId('token-save').click();
+    const row = page.locator('[data-testid="token-row"]', { hasText: 'Retry balance' });
+    await expect(row).toBeVisible();
+
+    const operationIds: string[] = [];
+    let failedRequests = 0;
+    await page.route('**/api/tokens/*', async (route) => {
+      const request = route.request();
+      if (request.method() !== 'PUT') {
+        await route.continue();
+        return;
+      }
+      const body = request.postDataJSON() as {
+        balance_change?: { operation_id: string };
+      };
+      if (body.balance_change) operationIds.push(body.balance_change.operation_id);
+      if (failedRequests < 2) {
+        failedRequests += 1;
+        await route.fulfill({
+          status: 500,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: { code: 'internal', message: 'retry test' } }),
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    await row.getByTestId('token-edit').click();
+    await page.getByTestId('token-balance-amount').fill('1');
+    await page.getByTestId('token-save').click();
+    await expect(page.getByTestId('toast').getByText('retry test')).toBeVisible();
+
+    await page.getByTestId('token-save').click();
+    await expect.poll(() => operationIds.length).toBe(2);
+    expect(operationIds[1]).toBe(operationIds[0]);
+
+    await page.getByTestId('token-balance-amount').fill('2');
+    await page.getByTestId('token-save').click();
+    await expect(row.getByTestId('token-balance')).toHaveText('$12.00');
+    expect(operationIds).toHaveLength(3);
+    expect(operationIds[2]).not.toBe(operationIds[1]);
   });
 
   test('bulk selects tokens and deletes them from the floating bulk bar', async ({ page }) => {

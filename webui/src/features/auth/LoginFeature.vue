@@ -3,11 +3,7 @@ import { ref } from 'vue';
 import { useNavigate } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import {
-  captureSessionGeneration,
-  setAdminKey,
-  setMeForSession,
-} from '@/lib/session';
+import { captureSessionGeneration, setAdminKey, setMeForSession } from '@/lib/session';
 import MarketingSiteHeader from '@/app/shell/MarketingSiteHeader.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';

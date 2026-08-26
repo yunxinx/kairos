@@ -302,7 +302,8 @@ function handleSave() {
 
       <div
         :class="{
-          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60': isRootUser,
+          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60':
+            isRootUser,
         }"
       >
         <FormField
@@ -339,7 +340,8 @@ function handleSave() {
 
       <div
         :class="{
-          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60': isRootUser,
+          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60':
+            isRootUser,
         }"
       >
         <FormField

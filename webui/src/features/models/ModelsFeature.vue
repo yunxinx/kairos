@@ -38,32 +38,16 @@ const defaultTab = 'inventory';
           >
             {{ t('models.tabInventory') }}
           </TabsTrigger>
-          <TabsTrigger
-            value="unified"
-            class="page-tab-switch-btn"
-            data-testid="models-tab-unified"
-          >
+          <TabsTrigger value="unified" class="page-tab-switch-btn" data-testid="models-tab-unified">
             {{ t('models.tabUnified') }}
           </TabsTrigger>
-          <TabsTrigger
-            value="groups"
-            class="page-tab-switch-btn"
-            data-testid="models-tab-groups"
-          >
+          <TabsTrigger value="groups" class="page-tab-switch-btn" data-testid="models-tab-groups">
             {{ t('models.tabGroups') }}
           </TabsTrigger>
-          <TabsTrigger
-            value="order"
-            class="page-tab-switch-btn"
-            data-testid="models-tab-order"
-          >
+          <TabsTrigger value="order" class="page-tab-switch-btn" data-testid="models-tab-order">
             {{ t('models.tabOrder') }}
           </TabsTrigger>
-          <TabsTrigger
-            value="visible"
-            class="page-tab-switch-btn"
-            data-testid="models-tab-visible"
-          >
+          <TabsTrigger value="visible" class="page-tab-switch-btn" data-testid="models-tab-visible">
             {{ t('models.tabVisible') }}
           </TabsTrigger>
         </TabsList>

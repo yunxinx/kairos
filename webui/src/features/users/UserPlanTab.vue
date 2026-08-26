@@ -29,7 +29,9 @@ const currentPlanId = computed(() =>
   props.user.plan_id != null ? String(props.user.plan_id) : '',
 );
 const selectedPlanId = ref(currentPlanId.value);
-const dirty = computed(() => selectedPlanId.value !== '' && selectedPlanId.value !== currentPlanId.value);
+const dirty = computed(
+  () => selectedPlanId.value !== '' && selectedPlanId.value !== currentPlanId.value,
+);
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
 const planOptions = computed(() => {
@@ -81,23 +83,15 @@ function handleSave() {
         <div class="text-fg-muted text-xs leading-relaxed">
           {{ t('users.planTabGuide') }}
         </div>
-        <div class="flex flex-col gap-3">
-          <div>
-            <p class="text-fg-muted text-xs font-medium">{{ t('plans.currentPlan') }}</p>
-            <p class="font-mono text-sm font-semibold" data-testid="user-current-plan">
-              {{ props.user.plan_display_name || t('common.unlimited') }}
-            </p>
-          </div>
-          <label for="user-plan-select" class="flex flex-col gap-1 text-sm">
-            <span class="text-fg-muted text-xs font-medium">{{ t('users.plan') }}</span>
-            <UiSelect
-              id="user-plan-select"
-              v-model="selectedPlanId"
-              :options="planOptions"
-              data-testid="user-plan-select"
-            />
-          </label>
-        </div>
+        <label for="user-plan-select" class="flex flex-col gap-1 text-sm">
+          <span class="text-fg-muted text-xs font-medium">{{ t('users.plan') }}</span>
+          <UiSelect
+            id="user-plan-select"
+            v-model="selectedPlanId"
+            :options="planOptions"
+            data-testid="user-plan-select"
+          />
+        </label>
       </template>
     </div>
     <div class="card-footer card-body flex justify-between gap-2">
