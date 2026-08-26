@@ -1,7 +1,7 @@
 //! 令牌额度命令。
 //!
-//! 令牌属性、启停与余额有不同的写契约；额度命令单独放在此模块，避免后续修改
-//! 额度语义时误触令牌密钥或模型组更新。
+//! 额度的计算、幂等与审计逻辑集中在此；独立余额端点和令牌复合更新共用同一个
+//! 事务内执行入口。
 
 use axum::{
     Extension, Json,
@@ -14,6 +14,7 @@ use crate::store;
 use crate::store::balance_operations::{
     BalanceOperationKind, BalanceOperationRecord, BalanceTargetKind,
 };
+use crate::store::resources::TokenRecord;
 
 use super::auth::ManagementIdentity;
 use super::tokens::{available_balance, parse_token_id, reject_cross_owner_mutation};
@@ -87,28 +88,25 @@ impl TokenBalanceCommand {
     }
 }
 
-pub(super) async fn adjust_token_balance(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(raw_id): Path<String>,
-    body: Result<Json<TokenBalanceCommand>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<BalanceAdjustmentResult>, AdminError> {
-    let id = parse_token_id(&raw_id)?;
-    let command = body.map_err(AdminError::bad_body)?.0;
+/// 在调用方已经开启的写事务中执行令牌余额命令。
+///
+/// 该函数只负责余额、幂等事实和审计，不提交事务也不重载运行时快照，因而可与
+/// 令牌属性更新共享同一个原子提交点。
+pub(super) async fn apply_token_balance_command(
+    conn: &mut sqlx::SqliteConnection,
+    identity: &ManagementIdentity,
+    id: i64,
+    existing: &TokenRecord,
+    command: TokenBalanceCommand,
+    audit_name: &str,
+) -> Result<BalanceOperationRecord, AdminError> {
     command.validate()?;
     let operation_id = command.operation_id().to_string();
     let operation_kind = command.operation_kind();
     let amount_usd_micros = command.amount_usd_micros();
 
-    let mut tx = begin_write(&deps).await?;
-    let existing = store::resources::get_token_record_on_conn(&mut tx, id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
-    reject_cross_owner_mutation(&identity, &existing)?;
-
     if let Some(record) = store::balance_operations::get_balance_operation(
-        &mut tx,
+        conn,
         BalanceTargetKind::TokenBalance,
         id,
         identity.user_id(),
@@ -128,14 +126,10 @@ pub(super) async fn adjust_token_balance(
                 "operation_id 已用于不同的余额操作".to_string(),
             ));
         }
-        tx.commit().await.map_err(db_err)?;
-        // 首次命令可能在库已提交后因重载失败而向客户端报错；重试命中幂等记录时
-        // 仍须重新加载快照，不能把「库已更新、运行时未更新」永久化。
-        reload_and_swap(&deps).await?;
-        return Ok(Json(balance_operation_result(record)));
+        return Ok(record);
     }
 
-    let settled_usd_micros = store::get_token_settlement(&mut tx, &existing.token.token_key)
+    let settled_usd_micros = store::get_token_settlement(conn, &existing.token.token_key)
         .await
         .map_err(AdminError::Store)?
         .map(|settlement| settlement.settled_usd_micros)
@@ -174,7 +168,7 @@ pub(super) async fn adjust_token_balance(
                 format!(
                     "令牌 {} ({}) 余额 {}{} USD（{} → {}）",
                     id,
-                    existing.token.name,
+                    audit_name,
                     if delta_usd_micros > 0 { "+" } else { "" },
                     super::format_usd_micros(delta_usd_micros),
                     super::format_usd_micros(before),
@@ -199,7 +193,7 @@ pub(super) async fn adjust_token_balance(
                 format!(
                     "令牌 {} ({}) 从无限额切换为有限额，初始余额 {} USD",
                     id,
-                    existing.token.name,
+                    audit_name,
                     super::format_usd_micros(balance_usd_micros)
                 ),
             )
@@ -207,13 +201,13 @@ pub(super) async fn adjust_token_balance(
         TokenBalanceCommand::SetUnlimited { .. } => (
             None,
             None,
-            format!("令牌 {} ({}) 切换为无限额", id, existing.token.name),
+            format!("令牌 {} ({}) 切换为无限额", id, audit_name),
         ),
     };
 
     let changed = next_limit_usd_micros != existing.token.limit_usd_micros;
     if changed {
-        store::resources::set_token_limit(&mut tx, id, next_limit_usd_micros)
+        store::resources::set_token_limit(conn, id, next_limit_usd_micros)
             .await
             .map_err(AdminError::Store)?;
     }
@@ -229,18 +223,64 @@ pub(super) async fn adjust_token_balance(
         after_usd_micros,
         created_at: logging::unix_millis(),
     };
-    store::balance_operations::insert_balance_operation(&mut tx, &record)
+    store::balance_operations::insert_balance_operation(conn, &record)
         .await
         .map_err(AdminError::Store)?;
     if changed {
-        store::record_audit(&mut tx, identity.actor(), "billing", &audit_message)
-            .await
-            .map_err(AdminError::Store)?;
+        let event_code = match operation_kind {
+            BalanceOperationKind::Adjust => "billing.token_balance_adjusted",
+            BalanceOperationKind::SetFinite => "billing.token_balance_set_finite",
+            BalanceOperationKind::SetUnlimited => "billing.token_balance_set_unlimited",
+        };
+        store::record_audit(
+            conn,
+            identity.actor(),
+            "billing",
+            &store::SystemLogEvent::new(
+                event_code,
+                serde_json::json!({
+                    "token_id": id,
+                    "token_name": audit_name,
+                    "delta_usd_micros": amount_usd_micros,
+                    "before_usd_micros": before_usd_micros,
+                    "after_usd_micros": after_usd_micros,
+                }),
+                audit_message,
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
     }
+    Ok(record)
+}
+
+pub(super) async fn adjust_token_balance(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(raw_id): Path<String>,
+    body: Result<Json<TokenBalanceCommand>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<BalanceAdjustmentResult>, AdminError> {
+    let id = parse_token_id(&raw_id)?;
+    let command = body.map_err(AdminError::bad_body)?.0;
+    command.validate()?;
+
+    let mut tx = begin_write(&deps).await?;
+    let existing = store::resources::get_token_record_on_conn(&mut tx, id)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
+    reject_cross_owner_mutation(&identity, &existing)?;
+    let record = apply_token_balance_command(
+        &mut tx,
+        &identity,
+        id,
+        &existing,
+        command,
+        &existing.token.name,
+    )
+    .await?;
     tx.commit().await.map_err(db_err)?;
-    if changed {
-        reload_and_swap(&deps).await?;
-    }
+    reload_and_swap(&deps).await?;
     Ok(Json(balance_operation_result(record)))
 }
 

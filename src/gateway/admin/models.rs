@@ -110,15 +110,22 @@ async fn replace_channel_model_order(
         &mut tx,
         identity.actor(),
         "channel_model_orders",
-        &format!(
-            "调整可调用名 {} 的渠道顺序：{}",
-            requested.model,
-            requested
-                .channel_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" → ")
+        &store::SystemLogEvent::new(
+            "channel_model_orders.updated",
+            serde_json::json!({
+                "model": requested.model,
+                "channel_ids": requested.channel_ids,
+            }),
+            format!(
+                "调整可调用名 {} 的渠道顺序：{}",
+                requested.model,
+                requested
+                    .channel_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            ),
         ),
     )
     .await

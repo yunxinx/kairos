@@ -132,7 +132,11 @@ async fn login(
             None,
             "warn",
             "auth",
-            &format!("登录失败：{} from {}", body.email, ip),
+            &store::SystemLogEvent::new(
+                "auth.login_failed",
+                serde_json::json!({ "email": body.email, "ip": ip.to_string() }),
+                format!("登录失败：{}（IP：{}）", body.email, ip),
+            ),
         )
         .await;
         return Err(AdminError::Unauthorized);
@@ -151,7 +155,11 @@ async fn login(
         }),
         "info",
         "auth",
-        &format!("登录成功 from {ip}"),
+        &store::SystemLogEvent::new(
+            "auth.login_succeeded",
+            serde_json::json!({ "ip": ip.to_string() }),
+            format!("登录成功（IP：{ip}）"),
+        ),
     )
     .await;
     Ok(Json(LoginView {
@@ -351,11 +359,19 @@ async fn update_me(
             &mut tx,
             identity.actor(),
             "users",
-            &format!(
-                "用户 {} ({}) 修改自己的账户：{}",
-                user_id,
-                identity.user.email,
-                changes.join("；")
+            &store::SystemLogEvent::new(
+                "users.self_updated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "email": identity.user.email,
+                    "changes": changes,
+                }),
+                format!(
+                    "用户 {} ({}) 修改自己的账户：{}",
+                    user_id,
+                    identity.user.email,
+                    changes.join("；")
+                ),
             ),
         )
         .await
@@ -445,11 +461,19 @@ async fn create_user(
         &mut tx,
         identity.actor(),
         "users",
-        &format!(
-            "创建用户 {} ({}) role={}",
-            user.id,
-            user.email,
-            user.role.as_str()
+        &store::SystemLogEvent::new(
+            "users.created",
+            serde_json::json!({
+                "user_id": user.id,
+                "email": user.email,
+                "role": user.role.as_str(),
+            }),
+            format!(
+                "创建用户 {} ({})，角色 {}",
+                user.id,
+                user.email,
+                user.role.as_str()
+            ),
         ),
     )
     .await
@@ -458,12 +482,21 @@ async fn create_user(
         &mut tx,
         identity.actor(),
         "billing",
-        &format!(
-            "新建用户 {} ({}) 按套餐 {} 入账起步金 {} USD",
-            user.id,
-            user.email,
-            plan.display_name,
-            format_usd_micros(plan.initial_grant_usd_micros)
+        &store::SystemLogEvent::new(
+            "billing.initial_grant_credited",
+            serde_json::json!({
+                "user_id": user.id,
+                "email": user.email,
+                "plan_name": plan.display_name,
+                "amount_usd_micros": plan.initial_grant_usd_micros,
+            }),
+            format!(
+                "新建用户 {} ({}) 按套餐 {} 入账起步金 {} USD",
+                user.id,
+                user.email,
+                plan.display_name,
+                format_usd_micros(plan.initial_grant_usd_micros)
+            ),
         ),
     )
     .await
@@ -758,14 +791,22 @@ async fn update_user(
             .rate_limit_rpm
             .map_or_else(|| "跟随全局".to_string(), |n| n.to_string());
         let after = rpm_update.map_or_else(|| "跟随全局".to_string(), |n| n.to_string());
-        changes.push(format!("rate_limit_rpm {before} → {after}"));
+        changes.push(format!("RPM 限流 {before} → {after}"));
     }
     if !changes.is_empty() {
         store::record_audit(
             &mut tx,
             identity.actor(),
             "users",
-            &format!("修改用户 {} ({})：{}", id, target.email, changes.join("；")),
+            &store::SystemLogEvent::new(
+                "users.updated",
+                serde_json::json!({
+                    "user_id": id,
+                    "email": target.email,
+                    "changes": changes,
+                }),
+                format!("修改用户 {} ({})：{}", id, target.email, changes.join("；")),
+            ),
         )
         .await
         .map_err(AdminError::Store)?;
@@ -798,9 +839,13 @@ async fn delete_user(
         &mut tx,
         identity.actor(),
         "users",
-        &format!(
-            "归档用户 {} ({})：停用、令牌失效、会话吊销",
-            id, target.email
+        &store::SystemLogEvent::new(
+            "users.archived",
+            serde_json::json!({ "user_id": id, "email": target.email }),
+            format!(
+                "归档用户 {} ({})：停用、令牌失效、会话吊销",
+                id, target.email
+            ),
         ),
     )
     .await
@@ -837,7 +882,11 @@ async fn delete_users(
         &mut tx,
         identity.actor(),
         "users",
-        &format!("批量归档 {} 个用户", records.len()),
+        &store::SystemLogEvent::new(
+            "users.bulk_archived",
+            serde_json::json!({ "count": records.len() }),
+            format!("批量归档 {} 个用户", records.len()),
+        ),
     )
     .await
     .map_err(AdminError::Store)?;

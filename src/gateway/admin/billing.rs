@@ -91,12 +91,24 @@ async fn close_unsettled_log(
         &mut tx,
         identity.actor(),
         "billing",
-        &format!(
-            "{}未结算日志 {}（用户 {}，{} USD）",
-            if charge { "补扣" } else { "豁免" },
-            id,
-            log.user_id,
-            format_usd_micros(log.cost_usd_micros)
+        &store::SystemLogEvent::new(
+            if charge {
+                "billing.log_charged"
+            } else {
+                "billing.log_waived"
+            },
+            serde_json::json!({
+                "log_id": id,
+                "user_id": log.user_id,
+                "cost_usd_micros": log.cost_usd_micros,
+            }),
+            format!(
+                "{}未结算日志 {}（用户 {}，{} USD）",
+                if charge { "补扣" } else { "豁免" },
+                id,
+                log.user_id,
+                format_usd_micros(log.cost_usd_micros)
+            ),
         ),
     )
     .await

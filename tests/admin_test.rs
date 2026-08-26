@@ -2690,6 +2690,18 @@ async fn system_logs_list_inserted_rows() {
     store::insert_system_log(&gw.pool, "warn", "throttle", "限流触发")
         .await
         .expect("应能写系统日志");
+    store::record_audit_detached(
+        &gw.pool,
+        None,
+        "info",
+        "events",
+        &store::SystemLogEvent::new(
+            "catalog.sync_failed",
+            json!({ "error": "timeout" }),
+            "目录同步失败: timeout",
+        ),
+    )
+    .await;
 
     let page: Value = admin_get(&gw, "/system-logs?keyword=billing")
         .await
@@ -2700,6 +2712,14 @@ async fn system_logs_list_inserted_rows() {
     assert_eq!(page["items"][0]["target"], "billing");
     assert_eq!(page["items"][0]["message"], "结算失败");
     assert_eq!(page["targets"], json!(["billing"]));
+
+    let event_page: Value = admin_get(&gw, "/system-logs?target=events")
+        .await
+        .json()
+        .await
+        .expect("结构化系统日志应可解析");
+    assert_eq!(event_page["items"][0]["event_code"], "catalog.sync_failed");
+    assert_eq!(event_page["items"][0]["event_params"]["error"], "timeout");
 
     let by_level: Value = admin_get(&gw, "/system-logs?level=error")
         .await

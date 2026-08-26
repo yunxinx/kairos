@@ -226,7 +226,11 @@ async fn create_plan(
         &mut tx,
         identity.actor(),
         "plans",
-        &format!("创建套餐 {} ({})", plan.id, plan.internal_name),
+        &store::SystemLogEvent::new(
+            "plans.created",
+            serde_json::json!({ "plan_id": plan.id, "name": plan.internal_name }),
+            format!("创建套餐 {} ({})", plan.id, plan.internal_name),
+        ),
     )
     .await
     .map_err(AdminError::Store)?;
@@ -263,7 +267,11 @@ async fn update_plan(
         &mut tx,
         identity.actor(),
         "plans",
-        &format!("修改套餐 {} ({})", id, before.internal_name),
+        &store::SystemLogEvent::new(
+            "plans.updated",
+            serde_json::json!({ "plan_id": id, "name": before.internal_name }),
+            format!("修改套餐 {} ({})", id, before.internal_name),
+        ),
     )
     .await
     .map_err(AdminError::Store)?;
@@ -300,7 +308,11 @@ async fn set_default_plan(
             &mut tx,
             identity.actor(),
             "plans",
-            &format!("把套餐 {} ({}) 设为默认档", id, before.internal_name),
+            &store::SystemLogEvent::new(
+                "plans.default_set",
+                serde_json::json!({ "plan_id": id, "name": before.internal_name }),
+                format!("把套餐 {} ({}) 设为默认档", id, before.internal_name),
+            ),
         )
         .await
         .map_err(AdminError::Store)?;
@@ -349,11 +361,19 @@ async fn delete_plan(
         &mut tx,
         identity.actor(),
         "plans",
-        &format!(
-            "删除套餐 {} ({}){}",
-            id,
-            plan.internal_name,
-            if force { "（强制）" } else { "" }
+        &store::SystemLogEvent::new(
+            if force {
+                "plans.force_deleted"
+            } else {
+                "plans.deleted"
+            },
+            serde_json::json!({ "plan_id": id, "name": plan.internal_name }),
+            format!(
+                "删除套餐 {} ({}){}",
+                id,
+                plan.internal_name,
+                if force { "（强制）" } else { "" }
+            ),
         ),
     )
     .await
@@ -378,7 +398,15 @@ async fn delete_plans(
         &mut tx,
         identity.actor(),
         "plans",
-        &format!("批量删除 {} 个套餐", deleted.len()),
+        &store::SystemLogEvent::new(
+            if force {
+                "plans.bulk_force_deleted"
+            } else {
+                "plans.bulk_deleted"
+            },
+            serde_json::json!({ "count": deleted.len() }),
+            format!("批量删除 {} 个套餐", deleted.len()),
+        ),
     )
     .await
     .map_err(AdminError::Store)?;
@@ -540,9 +568,18 @@ async fn assign_plan(
         &mut tx,
         identity.actor(),
         "users",
-        &format!(
-            "用户 {} ({}) 换套餐 {} ({})",
-            id, target.email, plan_id, plan.display_name
+        &store::SystemLogEvent::new(
+            "users.plan_assigned",
+            serde_json::json!({
+                "user_id": id,
+                "email": target.email,
+                "plan_id": plan_id,
+                "plan_name": plan.display_name,
+            }),
+            format!(
+                "用户 {} ({}) 换套餐 {} ({})",
+                id, target.email, plan_id, plan.display_name
+            ),
         ),
     )
     .await

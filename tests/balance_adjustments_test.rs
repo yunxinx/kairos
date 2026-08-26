@@ -168,6 +168,120 @@ async fn token_attributes_and_balance_commands_have_disjoint_write_surfaces() {
 }
 
 #[tokio::test]
+async fn token_update_commits_attributes_and_balance_atomically() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let created = post(
+        &gw,
+        "/tokens",
+        json!({
+            "name": "atomic-before",
+            "balance_usd_micros": 10_000_000,
+            "rate_limit_rpm": 30,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await.expect("令牌应可解析");
+    let id = created["id"].as_i64().expect("应有令牌 id");
+    let path = format!("/tokens/{id}");
+
+    let updated = reqwest::Client::new()
+        .put(admin_url(&gw, &path))
+        .bearer_auth(&gw.session)
+        .json(&json!({
+            "name": "atomic-after",
+            "rate_limit_rpm": 60,
+            "enabled": false,
+            "balance_change": {
+                "action": "adjust",
+                "operation_id": "token-atomic-success",
+                "delta_usd_micros": 2_000_000
+            }
+        }))
+        .send()
+        .await
+        .expect("复合更新应可达");
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated: Value = updated.json().await.expect("令牌应可解析");
+    assert_eq!(updated["name"], "atomic-after");
+    assert_eq!(updated["rate_limit_rpm"], 60);
+    assert_eq!(updated["enabled"], false);
+    assert_eq!(updated["balance_usd_micros"], 12_000_000);
+
+    let replay = reqwest::Client::new()
+        .put(admin_url(&gw, &path))
+        .bearer_auth(&gw.session)
+        .json(&json!({
+            "name": "replayed-attributes",
+            "rate_limit_rpm": 90,
+            "enabled": true,
+            "balance_change": {
+                "action": "adjust",
+                "operation_id": "token-atomic-success",
+                "delta_usd_micros": 2_000_000
+            }
+        }))
+        .send()
+        .await
+        .expect("幂等重试应可达");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay: Value = replay.json().await.expect("令牌应可解析");
+    assert_eq!(replay["name"], "replayed-attributes");
+    assert_eq!(replay["rate_limit_rpm"], 90);
+    assert_eq!(replay["balance_usd_micros"], 12_000_000);
+
+    let failed = reqwest::Client::new()
+        .put(admin_url(&gw, &path))
+        .bearer_auth(&gw.session)
+        .json(&json!({
+            "name": "must-roll-back",
+            "rate_limit_rpm": 120,
+            "enabled": false,
+            "balance_change": {
+                "action": "adjust",
+                "operation_id": "token-atomic-failure",
+                "delta_usd_micros": -20_000_000
+            }
+        }))
+        .send()
+        .await
+        .expect("失败更新应可达");
+    assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+
+    let conflict = reqwest::Client::new()
+        .put(admin_url(&gw, &path))
+        .bearer_auth(&gw.session)
+        .json(&json!({
+            "name": "must-also-roll-back",
+            "rate_limit_rpm": 120,
+            "enabled": false,
+            "balance_change": {
+                "action": "adjust",
+                "operation_id": "token-atomic-success",
+                "delta_usd_micros": 3_000_000
+            }
+        }))
+        .send()
+        .await
+        .expect("幂等冲突应可达");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let (name, rate_limit_rpm, enabled, limit): (String, Option<i64>, bool, Option<i64>) =
+        sqlx::query_as(
+            "SELECT name, rate_limit_rpm, enabled, limit_usd_micros FROM tokens WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&gw.pool)
+        .await
+        .expect("令牌应存在");
+    assert_eq!(name, "replayed-attributes");
+    assert_eq!(rate_limit_rpm, Some(90));
+    assert!(enabled);
+    assert_eq!(limit, Some(12_000_000));
+}
+
+#[tokio::test]
 async fn token_mode_changes_are_explicit_and_finite_balance_is_derived_from_settlement() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let created = post(

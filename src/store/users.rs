@@ -1053,7 +1053,11 @@ pub async fn run_session_cleanup_loop(pool: SqlitePool) {
             crate::store::record_system_error(
                 &pool,
                 "auth",
-                &format!("管理会话定时清理失败: {err}"),
+                &crate::store::SystemLogEvent::new(
+                    "auth.session_cleanup_failed",
+                    serde_json::json!({ "error": err.to_string() }),
+                    format!("管理会话定时清理失败: {err}"),
+                ),
             )
             .await;
         }

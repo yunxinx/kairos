@@ -14,9 +14,9 @@ mod system_log;
 pub mod users;
 
 pub use system_log::{
-    Actor, SystemLog, SystemLogList, SystemLogQuery, SystemLogSortBy, insert_system_log,
-    purge_system_logs_before, query_system_log_page, record_audit, record_audit_detached,
-    record_system_error, record_system_warn,
+    Actor, SystemLog, SystemLogEvent, SystemLogList, SystemLogQuery, SystemLogSortBy,
+    insert_system_log, purge_system_logs_before, query_system_log_page, record_audit,
+    record_audit_detached, record_system_error, record_system_warn,
 };
 
 use std::collections::HashMap;
@@ -1618,6 +1618,7 @@ fn map_request_log_row(
 mod tests {
     use super::*;
     use crate::core::billing::PriceSnapshot;
+    use serde_json::json;
     use sqlx::Connection;
 
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
@@ -2928,5 +2929,63 @@ mod tests {
             .expect("应能按目标过滤");
         assert_eq!(catalog.total, 1);
         assert_eq!(catalog.items[0].target, "catalog");
+    }
+
+    #[tokio::test]
+    async fn structured_system_log_event_roundtrips_and_legacy_rows_fallback() {
+        let (_dir, pool) = test_pool().await;
+        let event = SystemLogEvent::new(
+            "billing.user_balance_adjusted",
+            json!({ "user_id": 42, "delta_usd_micros": 1_000_000 }),
+            "用户 42 余额 +$1.00",
+        );
+        let mut tx = pool.begin().await.expect("应能开启事务");
+        record_audit(
+            &mut tx,
+            Actor {
+                user_id: 1,
+                email: "root@example.com",
+            },
+            "billing",
+            &event,
+        )
+        .await
+        .expect("结构化事件应能写入");
+        tx.commit().await.expect("应能提交事务");
+
+        insert_system_log(&pool, "error", "catalog", "旧式日志")
+            .await
+            .expect("旧式日志应能写入");
+        let page = query_system_log_page(&pool, &SystemLogQuery::new(1, 10))
+            .await
+            .expect("应能查询系统日志");
+        let structured = page
+            .items
+            .iter()
+            .find(|item| item.event_code.as_deref() == Some("billing.user_balance_adjusted"))
+            .expect("应取回事件编码");
+        assert_eq!(
+            structured.event_params,
+            Some(json!({
+                "user_id": 42,
+                "delta_usd_micros": 1_000_000
+            }))
+        );
+        let legacy = page
+            .items
+            .iter()
+            .find(|item| item.message == "旧式日志")
+            .expect("应取回旧式日志");
+        assert!(legacy.event_code.is_none());
+        assert!(legacy.event_params.is_none());
+
+        let malformed = sqlx::query(
+            "INSERT INTO system_log \
+             (created_at, level, target, message, event_code, event_params) \
+             VALUES (0, 'info', 'test', 'fallback', 'test.invalid', 'not-json')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(malformed.is_err(), "事件参数必须是合法 JSON");
     }
 }

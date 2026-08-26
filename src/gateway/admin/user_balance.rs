@@ -131,15 +131,26 @@ pub(super) async fn adjust_user_balance(
         &mut tx,
         identity.actor(),
         "billing",
-        &format!(
-            "用户 {} ({}) 余额 {}{} USD（{} → {}）{}",
-            id,
-            target.email,
-            if delta > 0 { "+" } else { "" },
-            format_usd_micros(delta),
-            format_usd_micros(change.before_usd_micros),
-            format_usd_micros(change.after_usd_micros),
-            if archived { "（已归档）" } else { "" }
+        &store::SystemLogEvent::new(
+            "billing.user_balance_adjusted",
+            serde_json::json!({
+                "user_id": id,
+                "email": target.email,
+                "delta_usd_micros": delta,
+                "before_usd_micros": change.before_usd_micros,
+                "after_usd_micros": change.after_usd_micros,
+                "archived": archived,
+            }),
+            format!(
+                "用户 {} ({}) 余额 {}{} USD（{} → {}）{}",
+                id,
+                target.email,
+                if delta > 0 { "+" } else { "" },
+                format_usd_micros(delta),
+                format_usd_micros(change.before_usd_micros),
+                format_usd_micros(change.after_usd_micros),
+                if archived { "（已归档）" } else { "" }
+            ),
         ),
     )
     .await

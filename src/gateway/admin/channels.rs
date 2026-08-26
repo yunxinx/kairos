@@ -170,12 +170,21 @@ async fn create_channel(
         &mut tx,
         identity.actor(),
         "channels",
-        &format!(
-            "创建渠道 {} ({}) protocol={} base_url={}",
-            id,
-            channel.name,
-            logging::protocol_name(channel.protocol),
-            channel.base_url
+        &store::SystemLogEvent::new(
+            "channels.created",
+            serde_json::json!({
+                "channel_id": id,
+                "name": channel.name,
+                "protocol": logging::protocol_name(channel.protocol),
+                "base_url": channel.base_url,
+            }),
+            format!(
+                "创建渠道 {} ({})，协议 {}，地址 {}",
+                id,
+                channel.name,
+                logging::protocol_name(channel.protocol),
+                channel.base_url
+            ),
         ),
     )
     .await
@@ -246,9 +255,23 @@ async fn update_channel(
         &mut tx,
         identity.actor(),
         "channels",
-        &format!(
-            "修改渠道 {} ({} → {}) enabled={} base_url={}",
-            id, previous.name, channel.name, channel.enabled, channel.base_url
+        &store::SystemLogEvent::new(
+            "channels.updated",
+            serde_json::json!({
+                "channel_id": id,
+                "previous_name": previous.name,
+                "name": channel.name,
+                "enabled": channel.enabled,
+                "base_url": channel.base_url,
+            }),
+            format!(
+                "修改渠道 {} ({} → {})，状态 {}，地址 {}",
+                id,
+                previous.name,
+                channel.name,
+                if channel.enabled { "启用" } else { "停用" },
+                channel.base_url
+            ),
         ),
     )
     .await
@@ -291,7 +314,11 @@ async fn delete_channel(
         &mut tx,
         identity.actor(),
         "channels",
-        &format!("删除渠道 {} ({})", id, deleted.channel.name),
+        &store::SystemLogEvent::new(
+            "channels.deleted",
+            serde_json::json!({ "channel_id": id, "name": deleted.channel.name }),
+            format!("删除渠道 {} ({})", id, deleted.channel.name),
+        ),
     )
     .await
     .map_err(AdminError::Store)?;
@@ -324,7 +351,11 @@ async fn delete_channels(
         &mut tx,
         identity.actor(),
         "channels",
-        &format!("批量删除 {} 条渠道", targets.len()),
+        &store::SystemLogEvent::new(
+            "channels.bulk_deleted",
+            serde_json::json!({ "count": targets.len() }),
+            format!("批量删除 {} 条渠道", targets.len()),
+        ),
     )
     .await
     .map_err(AdminError::Store)?;
@@ -405,7 +436,11 @@ async fn delete_channel_models(
         &mut tx,
         identity.actor(),
         "channels",
-        &format!("批量移除 {} 条渠道模型清单项", targets.len()),
+        &store::SystemLogEvent::new(
+            "channels.models_bulk_removed",
+            serde_json::json!({ "count": targets.len() }),
+            format!("批量移除 {} 条渠道模型清单项", targets.len()),
+        ),
     )
     .await
     .map_err(AdminError::Store)?;

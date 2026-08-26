@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::store;
 
@@ -265,9 +266,17 @@ async fn cleanup_logs(
         Some(identity.actor()),
         "info",
         "logs",
-        &format!(
-            "清理日志：删除 {removed_request_logs} 条已结算请求日志与 \
-             {removed_system_logs} 条系统日志（早于 {days} 天）"
+        &store::SystemLogEvent::new(
+            "logs.cleaned",
+            serde_json::json!({
+                "removed_request_logs": removed_request_logs,
+                "removed_system_logs": removed_system_logs,
+                "older_than_days": days,
+            }),
+            format!(
+                "清理日志：删除 {removed_request_logs} 条已结算请求日志与 \
+                 {removed_system_logs} 条系统日志（早于 {days} 天）"
+            ),
         ),
     )
     .await;
@@ -275,7 +284,16 @@ async fn cleanup_logs(
     // 行已删掉、审计已留痕，截断失败只记系统日志，不让清理整体报错；该告警
     // 本身会产生少量 WAL，但避免把未完成的收尾伪报为成功。
     if let Err(err) = store::checkpoint_wal_truncate(&deps.pool).await {
-        store::record_system_warn(&deps.pool, "logs", &format!("清理后 WAL 收尾失败: {err}")).await;
+        store::record_system_warn(
+            &deps.pool,
+            "logs",
+            &store::SystemLogEvent::new(
+                "logs.wal_checkpoint_failed",
+                serde_json::json!({ "error": err.to_string() }),
+                format!("清理后 WAL 收尾失败: {err}"),
+            ),
+        )
+        .await;
     }
     Ok(Json(CleanupResultView {
         removed_request_logs,
@@ -305,6 +323,8 @@ struct SystemLogEntry {
     level: String,
     target: String,
     message: String,
+    event_code: Option<String>,
+    event_params: Option<Value>,
     actor_user_id: Option<i64>,
     actor_email: Option<String>,
 }
@@ -361,6 +381,8 @@ pub(super) async fn query_system_logs(
                 level: log.level,
                 target: log.target,
                 message: log.message,
+                event_code: log.event_code,
+                event_params: log.event_params,
                 actor_user_id: log.actor_user_id,
                 actor_email: log.actor_email,
             })

@@ -355,6 +355,9 @@ pub(super) struct TokenUpdate {
     enabled: bool,
     #[serde(default = "crate::store::resources::default_model_group")]
     model_group: String,
+    /// 可选余额命令；存在时与属性更新共用同一事务。
+    #[serde(default)]
+    balance_change: Option<super::token_balance::TokenBalanceCommand>,
 }
 
 const TOKEN_KEY_PREFIX: &str = "ks-";
@@ -417,6 +420,7 @@ pub(super) async fn update_token(
 ) -> Result<Json<TokenView>, AdminError> {
     let id = parse_token_id(&raw_id)?;
     let update = body.map_err(AdminError::bad_body)?.0;
+    let balance_change = update.balance_change;
     let attributes = TokenAttributes {
         name: update.name,
         rate_limit_rpm: update.rate_limit_rpm,
@@ -434,6 +438,17 @@ pub(super) async fn update_token(
     crate::store::resources::update_token_attributes(&mut tx, id, &attributes)
         .await
         .map_err(AdminError::Store)?;
+    if let Some(command) = balance_change {
+        super::token_balance::apply_token_balance_command(
+            &mut tx,
+            &identity,
+            id,
+            &existing,
+            command,
+            &attributes.name,
+        )
+        .await?;
+    }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_token_record(&deps, id).await?;
@@ -468,13 +483,27 @@ pub(super) async fn set_token_enabled(
                 &mut tx,
                 identity.actor(),
                 "tokens",
-                &format!(
-                    "修改用户 {} 的令牌 {}（{}）enabled {} → {}",
-                    existing.token.user_id,
-                    id,
-                    existing.token.name,
-                    existing.token.enabled,
-                    enabled
+                &store::SystemLogEvent::new(
+                    "tokens.enabled_changed",
+                    serde_json::json!({
+                        "user_id": existing.token.user_id,
+                        "token_id": id,
+                        "token_name": existing.token.name,
+                        "before_enabled": existing.token.enabled,
+                        "enabled": enabled,
+                    }),
+                    format!(
+                        "修改用户 {} 的令牌 {}（{}）状态 {} → {}",
+                        existing.token.user_id,
+                        id,
+                        existing.token.name,
+                        if existing.token.enabled {
+                            "启用"
+                        } else {
+                            "停用"
+                        },
+                        if enabled { "启用" } else { "停用" }
+                    ),
                 ),
             )
             .await

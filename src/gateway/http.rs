@@ -1403,7 +1403,11 @@ async fn passthrough_non_stream_completion(
                 store::record_system_error(
                     &ctx.deps.pool,
                     "billing",
-                    &format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                    &store::SystemLogEvent::new(
+                        "billing.calculation_failed",
+                        serde_json::json!({ "mode": "non_stream", "error": err.to_string() }),
+                        format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                    ),
                 )
                 .await;
                 return Outbound::Fatal {
@@ -1763,7 +1767,11 @@ async fn non_stream_completion(
                         store::record_system_error(
                             &deps.pool,
                             "billing",
-                            &format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                            &store::SystemLogEvent::new(
+                                "billing.calculation_failed",
+                                serde_json::json!({ "mode": "non_stream", "error": err.to_string() }),
+                                format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                            ),
                         )
                         .await;
                         return Outbound::Fatal {
@@ -2510,7 +2518,11 @@ async fn billing_error_response(
     store::record_system_error(
         &deps.pool,
         "billing",
-        &format!("准入费用计算失败，已拒绝出站: {err}"),
+        &store::SystemLogEvent::new(
+            "billing.admission_calculation_failed",
+            serde_json::json!({ "error": err.to_string() }),
+            format!("准入费用计算失败，已拒绝出站: {err}"),
+        ),
     )
     .await;
     error_response(

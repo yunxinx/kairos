@@ -156,9 +156,17 @@ pub(super) async fn log_request(
         store::record_system_warn(
             &deps.pool,
             "billing",
-            &format!(
-                "上游未回报 usage，本次按零计费（token={} model={model} channel={channel}）",
-                token.name
+            &store::SystemLogEvent::new(
+                "billing.usage_missing",
+                serde_json::json!({
+                    "token_name": token.name,
+                    "model": model,
+                    "channel": channel,
+                }),
+                format!(
+                    "上游未回报 usage，本次按零计费（token={} model={model} channel={channel}）",
+                    token.name
+                ),
             ),
         )
         .await;
@@ -266,7 +274,11 @@ async fn touch_last_used_best_effort(pool: &sqlx::SqlitePool, log: &store::Reque
             store::record_system_warn(
                 pool,
                 "request_log",
-                &format!("刷新令牌最后使用时间失败: {err}"),
+                &store::SystemLogEvent::new(
+                    "request_log.token_last_used_update_failed",
+                    serde_json::json!({ "error": err.to_string() }),
+                    format!("刷新令牌最后使用时间失败: {err}"),
+                ),
             )
             .await;
             return;
@@ -278,7 +290,11 @@ async fn touch_last_used_best_effort(pool: &sqlx::SqlitePool, log: &store::Reque
         store::record_system_warn(
             pool,
             "request_log",
-            &format!("刷新令牌最后使用时间失败: {err}"),
+            &store::SystemLogEvent::new(
+                "request_log.token_last_used_update_failed",
+                serde_json::json!({ "error": err.to_string() }),
+                format!("刷新令牌最后使用时间失败: {err}"),
+            ),
         )
         .await;
     }
@@ -310,13 +326,26 @@ async fn write_unsettled_request_log(
     match store::insert_request_log(&deps.pool, &log).await {
         Ok(_) => {
             touch_last_used_best_effort(&deps.pool, &log).await;
-            store::record_system_error(&deps.pool, system_target, reason).await;
+            store::record_system_error(
+                &deps.pool,
+                system_target,
+                &store::SystemLogEvent::new(
+                    "request_log.unsettled",
+                    serde_json::json!({ "reason": reason }),
+                    reason.to_string(),
+                ),
+            )
+            .await;
         }
         Err(err) => {
             store::record_system_error(
                 &deps.pool,
                 "request_log",
-                &format!("{reason}；回退写入也失败: {err}"),
+                &store::SystemLogEvent::new(
+                    "request_log.fallback_write_failed",
+                    serde_json::json!({ "reason": reason, "error": err.to_string() }),
+                    format!("{reason}；回退写入也失败: {err}"),
+                ),
             )
             .await;
         }

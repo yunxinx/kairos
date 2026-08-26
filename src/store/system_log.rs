@@ -3,6 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use super::{
@@ -18,12 +19,35 @@ pub struct SystemLog {
     pub level: String,
     pub target: String,
     pub message: String,
+    /// 稳定的事件编码；旧式自由文本日志为空。
+    pub event_code: Option<String>,
+    /// 事件参数 JSON；解析失败的存量行视为无结构化参数。
+    pub event_params: Option<Value>,
     /// 操作者 id；系统自身产生的运维事件为 `None`。
     pub actor_user_id: Option<i64>,
     /// 操作者邮箱（写入时冗余定格）。
     ///
     /// 不只存 id：用户可被归档改名，审计行要能独立还原「当时是谁」。
     pub actor_email: Option<String>,
+}
+
+/// 可本地化的系统日志事件。
+#[derive(Debug)]
+pub struct SystemLogEvent {
+    code: &'static str,
+    params: Value,
+    /// 面向旧客户端、未知事件和复制原文的回退消息。
+    message: String,
+}
+
+impl SystemLogEvent {
+    pub fn new(code: &'static str, params: Value, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            params,
+            message: message.into(),
+        }
+    }
 }
 
 /// 审计事件的操作者。
@@ -98,7 +122,8 @@ pub async fn insert_system_log(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let result = sqlx::query(
-        "INSERT INTO system_log (created_at, level, target, message) VALUES (?, ?, ?, ?)",
+        "INSERT INTO system_log (created_at, level, target, message, event_code, event_params) \
+         VALUES (?, ?, ?, ?, NULL, NULL)",
     )
     .bind(now)
     .bind(level)
@@ -108,6 +133,38 @@ pub async fn insert_system_log(
     .await
     .map_err(StoreError::Query)?;
     Ok(result.last_insert_rowid())
+}
+
+async fn insert_system_log_event_on(
+    conn: &mut SqliteConnection,
+    level: &str,
+    target: &str,
+    event: &SystemLogEvent,
+    actor: Option<Actor<'_>>,
+) -> Result<(), StoreError> {
+    let params = serde_json::to_string(&event.params)
+        .map_err(|err| StoreError::InvalidResource(format!("系统日志事件参数序列化失败: {err}")))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    sqlx::query(
+        "INSERT INTO system_log \
+         (created_at, level, target, message, event_code, event_params, actor_user_id, actor_email) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(now)
+    .bind(level)
+    .bind(target)
+    .bind(&event.message)
+    .bind(event.code)
+    .bind(params)
+    .bind(actor.map(|a| a.user_id))
+    .bind(actor.map(|a| a.email.to_string()))
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(())
 }
 
 /// 记一条带操作者的审计事件（info 级），与业务写在同一事务内。
@@ -121,25 +178,9 @@ pub async fn record_audit(
     conn: &mut SqliteConnection,
     actor: Actor<'_>,
     target: &str,
-    message: &str,
+    event: &SystemLogEvent,
 ) -> Result<(), StoreError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    sqlx::query(
-        "INSERT INTO system_log (created_at, level, target, message, actor_user_id, actor_email) \
-         VALUES (?, 'info', ?, ?, ?, ?)",
-    )
-    .bind(now)
-    .bind(target)
-    .bind(message)
-    .bind(actor.user_id)
-    .bind(actor.email)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    Ok(())
+    insert_system_log_event_on(conn, "info", target, event, Some(actor)).await
 }
 
 /// 同 [`record_audit`]，但不参与调用方事务、失败只打 tracing。
@@ -150,23 +191,12 @@ pub async fn record_audit_detached(
     actor: Option<Actor<'_>>,
     level: &str,
     target: &str,
-    message: &str,
+    event: &SystemLogEvent,
 ) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let result = sqlx::query(
-        "INSERT INTO system_log (created_at, level, target, message, actor_user_id, actor_email) \
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(now)
-    .bind(level)
-    .bind(target)
-    .bind(message)
-    .bind(actor.map(|a| a.user_id))
-    .bind(actor.map(|a| a.email.to_string()))
-    .execute(pool)
+    let result = async {
+        let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+        insert_system_log_event_on(&mut conn, level, target, event, actor).await
+    }
     .await;
     if let Err(err) = result {
         tracing::error!(target: "system_log", "审计日志落库失败: {err}");
@@ -174,17 +204,27 @@ pub async fn record_audit_detached(
 }
 
 /// 记录一条 error 级系统日志，同时打 tracing；落库失败只再记 tracing，避免递归。
-pub async fn record_system_error(pool: &SqlitePool, target: &str, message: &str) {
-    tracing::error!(target, "{message}");
-    if let Err(err) = insert_system_log(pool, "error", target, message).await {
+pub async fn record_system_error(pool: &SqlitePool, target: &str, event: &SystemLogEvent) {
+    tracing::error!(target, "{}", event.message);
+    let result = async {
+        let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+        insert_system_log_event_on(&mut conn, "error", target, event, None).await
+    }
+    .await;
+    if let Err(err) = result {
         tracing::error!(target: "system_log", "系统日志落库失败: {err}");
     }
 }
 
 /// 记录一条 warn 级系统日志，同时打 tracing；落库失败只再记 tracing，避免递归。
-pub async fn record_system_warn(pool: &SqlitePool, target: &str, message: &str) {
-    tracing::warn!(target, "{message}");
-    if let Err(err) = insert_system_log(pool, "warn", target, message).await {
+pub async fn record_system_warn(pool: &SqlitePool, target: &str, event: &SystemLogEvent) {
+    tracing::warn!(target, "{}", event.message);
+    let result = async {
+        let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+        insert_system_log_event_on(&mut conn, "warn", target, event, None).await
+    }
+    .await;
+    if let Err(err) = result {
         tracing::error!(target: "system_log", "系统日志落库失败: {err}");
     }
 }
@@ -222,6 +262,10 @@ fn push_system_log_filters(
         push_where_cond(qb, &mut first, "(target LIKE ");
         qb.push_bind(pattern.clone());
         qb.push(" ESCAPE '\\' OR message LIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" ESCAPE '\\' OR event_code LIKE ");
+        qb.push_bind(pattern.clone());
+        qb.push(" ESCAPE '\\' OR event_params LIKE ");
         qb.push_bind(pattern);
         qb.push(" ESCAPE '\\')");
     }
@@ -258,7 +302,7 @@ async fn query_system_logs_on(
     filter: &SystemLogQuery,
 ) -> Result<Vec<SystemLog>, StoreError> {
     let mut qb = sqlx::QueryBuilder::new(
-        "SELECT id, created_at, level, target, message, actor_user_id, actor_email \
+        "SELECT id, created_at, level, target, message, event_code, event_params, actor_user_id, actor_email \
              FROM system_log",
     );
     push_system_log_filters(&mut qb, filter, true);
@@ -277,6 +321,11 @@ async fn query_system_logs_on(
             level: row.try_get("level").map_err(StoreError::Query)?,
             target: row.try_get("target").map_err(StoreError::Query)?,
             message: row.try_get("message").map_err(StoreError::Query)?,
+            event_code: row.try_get("event_code").map_err(StoreError::Query)?,
+            event_params: row
+                .try_get::<Option<String>, _>("event_params")
+                .map_err(StoreError::Query)?
+                .and_then(|raw| serde_json::from_str(&raw).ok()),
             actor_user_id: row.try_get("actor_user_id").map_err(StoreError::Query)?,
             actor_email: row.try_get("actor_email").map_err(StoreError::Query)?,
         });
