@@ -8,7 +8,6 @@ import type { Page } from '@playwright/test';
 async function seedPlan(
   page: Page,
   body: {
-    internal_name: string;
     display_name: string;
     audience?: 'user' | 'admin';
     note?: string;
@@ -19,7 +18,6 @@ async function seedPlan(
   const resp = await page.request.post('/api/plans', {
     headers: await e2eRootHeaders(page.request),
     data: {
-      internal_name: body.internal_name,
       display_name: body.display_name,
       note: body.note ?? '',
       discount_bp: 10000,
@@ -41,15 +39,18 @@ test.describe('plans page', () => {
     await expect(page.getByRole('heading', { name: /plans/i })).toBeVisible();
 
     await page.getByTestId('create-plan-admin').click();
-    await page.getByTestId('plan-internal-name').fill('e2e-plan');
+    // 内部名由系统生成：编辑器不应再出现内部名字段。
+    await expect(page.getByTestId('plan-internal-name')).toHaveCount(0);
     await page.getByTestId('plan-display-name').fill('E2E Plan');
     await page.getByTestId('plan-discount').fill('80');
     await page.getByTestId('plan-grant').fill('1');
     await page.getByTestId('plan-shared-switch').click();
     await page.getByTestId('plan-save').click();
 
-    const row = page.locator('[data-testid="plan-row"]', { hasText: 'e2e-plan' });
+    const row = page.locator('[data-testid="plan-row"]', { hasText: 'E2E Plan' });
     await expect(row).toBeVisible();
+    // 内部名列从前端移除：内部管理标识不作为一列展示。
+    await expect(row.getByTestId('plan-internal')).toHaveCount(0);
     await expect(row).toContainText('E2E Plan');
     await expect(row.getByTestId('plan-discount-cell')).toContainText('80%');
     await expect(row.getByTestId('plan-shared-badge')).toBeVisible();
@@ -79,11 +80,10 @@ test.describe('plans page', () => {
     await page.getByTestId('plan-group-e2e-plan-group').click();
     await expect(page.getByTestId('plan-groups-count')).toContainText('1');
 
-    await page.getByTestId('plan-internal-name').fill('e2e-user-plan');
     await page.getByTestId('plan-display-name').fill('E2E User Plan');
     await page.getByTestId('plan-save').click();
 
-    const userPlan = page.locator('[data-testid="plan-row"]', { hasText: 'e2e-user-plan' });
+    const userPlan = page.locator('[data-testid="plan-row"]', { hasText: 'E2E User Plan' });
     await expect(userPlan.getByTestId('plan-audience')).toContainText(/user/i);
     await expect(userPlan.getByTestId('plan-default-badge')).toHaveCount(0);
 
@@ -118,15 +118,15 @@ test.describe('plans page', () => {
   });
 
   test('searches, filters, and bulk deletes from the selection bar', async ({ page }) => {
-    await seedPlan(page, { internal_name: 'e2e-bulk-a', display_name: 'E2E Bulk A' });
-    await seedPlan(page, { internal_name: 'e2e-bulk-b', display_name: 'E2E Bulk B' });
+    await seedPlan(page, { display_name: 'E2E Bulk A' });
+    await seedPlan(page, { display_name: 'E2E Bulk B' });
     await page.goto('/plans');
 
     const rows = page.locator('[data-testid="plan-row"]');
-    await expect(rows.filter({ hasText: 'e2e-bulk-a' })).toBeVisible();
+    await expect(rows.filter({ hasText: 'E2E Bulk A' })).toBeVisible();
 
-    // 搜索按内部名/显示名/备注/组名收窄。
-    await page.getByTestId('plans-search').fill('e2e-bulk');
+    // 搜索按显示名/备注/组名收窄。
+    await page.getByTestId('plans-search').fill('E2E Bulk');
     await expect(rows).toHaveCount(2);
     await page.getByTestId('plans-search').fill('no-such-plan');
     await expect(rows).toHaveCount(0);
@@ -136,7 +136,7 @@ test.describe('plans page', () => {
     await page.getByTestId('plans-audience-filter').click();
     await page.locator('[data-testid="plans-audience-filter-option"][data-value="admin"]').click();
     await page.keyboard.press('Escape');
-    await expect(rows.filter({ hasText: 'e2e-bulk-a' })).toHaveCount(0);
+    await expect(rows.filter({ hasText: 'E2E Bulk A' })).toHaveCount(0);
     await page.getByTestId('plans-audience-filter').click();
     await page.getByTestId('plans-audience-filter-clear').click();
     await page.keyboard.press('Escape');
@@ -145,7 +145,7 @@ test.describe('plans page', () => {
     await page.getByTestId('plans-flag-filter').click();
     await page.locator('[data-testid="plans-flag-filter-option"][data-value="default"]').click();
     await page.keyboard.press('Escape');
-    await expect(rows.filter({ hasText: 'e2e-bulk' })).toHaveCount(0);
+    await expect(rows.filter({ hasText: 'E2E Bulk' })).toHaveCount(0);
     await page.getByTestId('plans-flag-filter').click();
     await page.getByTestId('plans-flag-filter-clear').click();
     await page.keyboard.press('Escape');
@@ -154,7 +154,7 @@ test.describe('plans page', () => {
     const builtin = rows.filter({ hasText: 'standard' });
     await expect(builtin.getByTestId('plan-select')).toBeDisabled();
 
-    await page.getByTestId('plans-search').fill('e2e-bulk');
+    await page.getByTestId('plans-search').fill('E2E Bulk');
     await page.getByTestId('plans-select-all').click();
     await expect(page.getByTestId('plans-bulk-bar')).toBeVisible();
     await expect(page.getByTestId('bulk-count')).toHaveText('2 selected');
@@ -177,16 +177,15 @@ test.describe('plans page', () => {
     });
     await seedModelGroup(page, { name: 'e2e-plan-details-group', models: [] });
     await seedPlan(page, {
-      internal_name: 'e2e-plan-details',
       display_name: 'E2E Plan Details',
       note: 'Visible plan note',
       initial_grant_usd_micros: 1_500_000,
       groups: ['e2e-plan-details-group'],
     });
 
-    await page.goto('/plans?q=e2e-plan-details');
-    await expect(page.getByTestId('plans-search')).toHaveValue('e2e-plan-details');
-    const row = page.locator('[data-testid="plan-row"]', { hasText: 'e2e-plan-details' });
+    await page.goto('/plans?q=E2E%20Plan%20Details');
+    await expect(page.getByTestId('plans-search')).toHaveValue('E2E Plan Details');
+    const row = page.locator('[data-testid="plan-row"]', { hasText: 'E2E Plan Details' });
     await expect(row).toBeVisible();
     await expect(row.getByTestId('plan-note-cell')).toHaveText('Visible plan note');
     await expect(row.getByTestId('plan-initial-grant')).toContainText('$1.5');

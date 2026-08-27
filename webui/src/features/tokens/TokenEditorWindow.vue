@@ -9,8 +9,8 @@ import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
+import ListboxSelect from '@/components/ui/ListboxSelect.vue';
 import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
-import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import { formatUsdAmount, parseUsdToMicros } from '@/lib/format';
@@ -306,10 +306,11 @@ function handleSave() {
           :input-id="groupInputId"
           :guide="t('tokens.modelGroupGuide')"
         >
-          <UiSelect
+          <ListboxSelect
             :id="groupInputId"
             v-model="editorGroup"
             :options="groupOptions"
+            :search-placeholder="t('tokens.modelGroup')"
             data-testid="token-editor-group"
           />
           <p

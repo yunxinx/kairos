@@ -295,10 +295,9 @@ export interface PlanCapabilities {
  */
 export type PlanAudience = 'user' | 'admin';
 
-/** 套餐读视图。`internal_name` 仅 root 可见。 */
+/** 套餐读视图。内部名由系统按 `plan-{id}` 生成，不对外暴露。 */
 export interface PlanView {
   id: number;
-  internal_name?: string;
   display_name: string;
   note: string;
   note_visible_to_admin: boolean;
@@ -316,9 +315,8 @@ export interface PlanView {
   groups: string[];
 }
 
-/** 套餐可编辑属性；受众与默认身份不在更新契约中。 */
+/** 套餐可编辑属性；受众、默认身份与内部名（系统托管）不在更新契约中。 */
 export interface PlanUpdate {
-  internal_name: string;
   display_name: string;
   note: string;
   note_visible_to_admin: boolean;

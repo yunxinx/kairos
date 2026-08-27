@@ -945,7 +945,6 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         reqwest::Method::POST,
         "/plans",
         json!({
-            "internal_name": "explicit-assignment-check",
             "display_name": "显式分配校验",
             "shared_with_admin": true
         }),
@@ -1141,7 +1140,6 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
             reqwest::Method::PUT,
             "/plans/2",
             json!({
-                "internal_name": "admin",
                 "display_name": "admin",
                 "groups": []
             }),

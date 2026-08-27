@@ -70,7 +70,7 @@ const columnLabels = computed((): Record<PlanColumnId, string> => ({
   groups: t('plans.modelGroups'),
   createdAt: t('plans.createdAt'),
 }));
-const visibleColumnCount = computed(() => 9 + columnCount.value);
+const visibleColumnCount = computed(() => 8 + columnCount.value);
 
 watch(
   () => routeSearch.value.q,
@@ -149,7 +149,6 @@ const filteredPlans = computed(() => {
     }
     if (!q) return true;
     return (
-      (plan.internal_name ?? '').toLowerCase().includes(q) ||
       plan.display_name.toLowerCase().includes(q) ||
       plan.note.toLowerCase().includes(q) ||
       plan.groups.some((name) => name.toLowerCase().includes(q))
@@ -367,7 +366,6 @@ watch(plans, (rows) => {
                 />
               </div>
             </TableHead>
-            <TableHead>{{ t('plans.internalName') }}</TableHead>
             <TableHead>{{ t('plans.displayName') }}</TableHead>
             <TableHead>{{ t('plans.audience') }}</TableHead>
             <TableHead v-if="visible.note">{{ t('plans.note') }}</TableHead>
@@ -401,17 +399,12 @@ watch(plans, (rows) => {
                 test-id="plan-select"
                 @toggle="selection.toggle(plan.id)"
               />
-              <TableCell class="font-mono" data-testid="plan-internal">
-                <span class="inline-flex items-center gap-1.5">
-                  {{ plan.internal_name }}
-                  <span v-if="plan.builtin" class="badge badge-neutral text-[10px]">
-                    {{ t('plans.builtin') }}
-                  </span>
-                </span>
-              </TableCell>
               <TableCell data-testid="plan-display">
                 <span class="inline-flex min-w-0 items-center gap-1.5">
                   <span class="min-w-0 shrink truncate">{{ plan.display_name }}</span>
+                  <span v-if="plan.builtin" class="badge badge-neutral shrink-0 text-[10px]">
+                    {{ t('plans.builtin') }}
+                  </span>
                   <!-- 默认档：新用户会落到这一档，运营最常问的就是「现在默认是哪个」。 -->
                   <span
                     v-if="plan.is_default"

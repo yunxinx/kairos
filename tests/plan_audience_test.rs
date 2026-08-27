@@ -46,7 +46,7 @@ async fn plan(gw: &TestGateway, id: i64) -> Value {
 
 /// 建一档，返回 id。
 async fn create_plan(gw: &TestGateway, name: &str, extra: Value) -> i64 {
-    let mut body = json!({ "internal_name": name, "display_name": name });
+    let mut body = json!({ "display_name": name });
     let map = body.as_object_mut().expect("应为对象");
     for (key, value) in extra.as_object().expect("附加字段应为对象") {
         map.insert(key.clone(), value.clone());
@@ -175,10 +175,7 @@ async fn update_rejects_immutable_audience_and_default_fields() {
         json!({ "audience": "admin" }),
         json!({ "is_default": true }),
     ] {
-        let mut body = json!({
-            "internal_name": "stays-user",
-            "display_name": "不能落库"
-        });
+        let mut body = json!({ "display_name": "不能落库" });
         body.as_object_mut()
             .expect("应为对象")
             .extend(immutable.as_object().expect("应为对象").clone());
@@ -417,4 +414,45 @@ async fn role_and_plan_migration_is_atomic() {
         .await
         .expect("应能读取角色");
     assert_eq!(role, "user", "事务失败后角色必须保持原值");
+}
+
+/// 内部名由系统按自增 id 生成（`plan-{id}`），不随创建/更新请求提供，也不出现在响应里。
+#[tokio::test]
+async fn internal_name_is_system_generated_and_not_exposed() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let plan_id = create_plan(&gw, "系统命名档", json!({})).await;
+
+    let view = plan(&gw, plan_id).await;
+    assert!(
+        view.get("internal_name").is_none(),
+        "内部名是系统托管标识，不应出现在响应中"
+    );
+
+    let stored: Option<String> = sqlx::query_scalar("SELECT internal_name FROM plans WHERE id = ?")
+        .bind(plan_id)
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应能读库");
+    assert_eq!(stored.as_deref(), Some(format!("plan-{plan_id}").as_str()));
+
+    // 更新不触碰内部名：系统托管标识不因显示名变化而漂移。
+    let updated = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        &format!("/plans/{plan_id}"),
+        json!({ "display_name": "改名后" }),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK, "改显示名不应失败");
+    let stored_after: Option<String> =
+        sqlx::query_scalar("SELECT internal_name FROM plans WHERE id = ?")
+            .bind(plan_id)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能读库");
+    assert_eq!(
+        stored_after.as_deref(),
+        Some(format!("plan-{plan_id}").as_str()),
+        "更新后内部名必须保持稳定"
+    );
 }

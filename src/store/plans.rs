@@ -78,9 +78,10 @@ pub struct PlanRecord {
 }
 
 /// 管理面套餐创建字段。
+///
+/// `internal_name` 不在此列：由系统在插入后按 `plan-{自增 id}` 生成并托管。
 #[derive(Debug, Clone)]
 pub struct PlanCreateInput {
-    pub internal_name: String,
     pub display_name: String,
     pub note: String,
     pub note_visible_to_admin: bool,
@@ -96,10 +97,9 @@ pub struct PlanCreateInput {
     pub groups: Vec<String>,
 }
 
-/// 管理面套餐属性更新字段；受众与默认身份不属于可编辑属性。
+/// 管理面套餐属性更新字段；受众、默认身份与内部名（系统托管）不属于可编辑属性。
 #[derive(Debug, Clone)]
 pub struct PlanUpdateInput {
-    pub internal_name: String,
     pub display_name: String,
     pub note: String,
     pub note_visible_to_admin: bool,
@@ -542,15 +542,17 @@ pub async fn insert_plan(
     let capabilities_json = serialize_capabilities_json(&input.capabilities)?;
     let default_rpm = rpm_to_db(input.default_rpm)?;
     let shared_rpm = rpm_to_db(input.shared_rpm)?;
+    // 内部名由系统托管：先以随机占位值插入（满足 UNIQUE 约束），拿到自增 id 后
+    // 立即改写为 `plan-{id}`。占位值只在本事务内短暂存在，任何路径都看不到它。
+    // 随机而非固定常量：即使未来出现不经 `begin_write` 的直接写路径也不会撞唯一索引。
     // 先按非默认插入，再走 `apply_default_flag`：新行若直接带 is_default = 1，
     // 会和同受众的现任默认档同时满足唯一索引条件而插入失败。
     let result = sqlx::query(
         "INSERT INTO plans (internal_name, display_name, note, note_visible_to_admin, \
          discount_bp, default_rpm, shared_rpm, initial_grant_usd_micros, capabilities_json, \
          shared_with_admin, audience, is_default, builtin, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+         VALUES ('__pending_' || lower(hex(randomblob(12))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
     )
-    .bind(&input.internal_name)
     .bind(&input.display_name)
     .bind(&input.note)
     .bind(input.note_visible_to_admin)
@@ -566,6 +568,12 @@ pub async fn insert_plan(
     .await
     .map_err(StoreError::Query)?;
     let id = result.last_insert_rowid();
+    sqlx::query("UPDATE plans SET internal_name = ? WHERE id = ?")
+        .bind(format!("plan-{id}"))
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
     if input.is_default {
         move_default_to(conn, id, input.audience).await?;
     }
@@ -585,18 +593,17 @@ pub async fn update_plan(
     input: &PlanUpdateInput,
 ) -> Result<PlanRecord, StoreError> {
     validate_fields(
-        &input.internal_name,
         &input.display_name,
         input.discount_bp,
         input.initial_grant_usd_micros,
     )?;
     let capabilities_json = serialize_capabilities_json(&input.capabilities)?;
+    // 内部名不随更新改动：它是系统托管的稳定标识，改名需求走显示名。
     let result = sqlx::query(
-        "UPDATE plans SET internal_name = ?, display_name = ?, note = ?, note_visible_to_admin = ?, \
+        "UPDATE plans SET display_name = ?, note = ?, note_visible_to_admin = ?, \
          discount_bp = ?, default_rpm = ?, shared_rpm = ?, initial_grant_usd_micros = ?, \
          capabilities_json = ?, shared_with_admin = ? WHERE id = ?",
     )
-    .bind(&input.internal_name)
     .bind(&input.display_name)
     .bind(&input.note)
     .bind(input.note_visible_to_admin)
@@ -652,7 +659,6 @@ pub async fn default_plan_id_on_conn(
 
 fn validate_input(input: &PlanCreateInput) -> Result<(), StoreError> {
     validate_fields(
-        &input.internal_name,
         &input.display_name,
         input.discount_bp,
         input.initial_grant_usd_micros,
@@ -660,12 +666,11 @@ fn validate_input(input: &PlanCreateInput) -> Result<(), StoreError> {
 }
 
 fn validate_fields(
-    internal_name: &str,
     display_name: &str,
     discount_bp: i64,
     initial_grant_usd_micros: i64,
 ) -> Result<(), StoreError> {
-    if internal_name.trim().is_empty() || display_name.trim().is_empty() {
+    if display_name.trim().is_empty() {
         return Err(StoreError::InvalidResource("套餐名称不能为空".to_string()));
     }
     if !(billing::MIN_DISCOUNT_BP..=billing::MAX_DISCOUNT_BP).contains(&discount_bp) {

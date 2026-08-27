@@ -236,8 +236,6 @@
     "groupsRemoveUnknown": "将移除 {groups} 个可用组；绑定令牌数未知，相关令牌可能立即失效。",
     "plan": "套餐",
     "planGuide": "新用户会获得该套餐的模型组、折扣率、默认限速与起步金。",
-    "planUpdated": "套餐已更新",
-    "planTabGuide": "换套餐会立即改变该用户的可用模型组与折扣；已有余额和令牌绑定不受影响。",
     "currentPlan": "当前套餐"
   },
   "account": {
@@ -839,7 +837,7 @@
     "editorEdit": "编辑套餐",
     "editorCreateOf": "新建{audience}",
     "editorEditOf": "编辑{audience}",
-    "search": "搜索内部名、显示名、备注或模型组",
+    "search": "搜索显示名、备注或模型组",
     "attributes": "属性",
     "audience": "受众",
     "audienceUser": "用户套餐",
@@ -852,7 +850,6 @@
     "groupSearch": "搜索模型组",
     "groupSearchEmpty": "没有匹配的模型组。",
     "groupsSelected": "已选 {count} 个",
-    "internalName": "内部名",
     "displayName": "显示名",
     "note": "备注",
     "noteVisible": "管理员可见备注",

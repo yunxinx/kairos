@@ -16,7 +16,6 @@ export interface NavTab {
 export const NAV_TABS: NavTab[] = [
   { to: '/overview', labelKey: 'nav.overview', minRole: 'user', userSelfService: true },
   { to: '/tokens', labelKey: 'nav.tokens', minRole: 'user', userSelfService: true },
-  { to: '/plans', labelKey: 'nav.plans', minRole: 'root' },
   { to: '/channels', labelKey: 'nav.channel', minRole: 'root' },
   // 普通用户看到的是另一张表（自己能调什么、按什么价收），不是管理视图；
   // 入口共用一条导航项，由页面按角色分流。
@@ -26,6 +25,7 @@ export const NAV_TABS: NavTab[] = [
     minRole: 'user',
     userSelfService: true,
   },
+  { to: '/plans', labelKey: 'nav.plans', minRole: 'root' },
   { to: '/users', labelKey: 'nav.users', minRole: 'admin', capability: 'manage_users' },
   {
     to: '/logs',

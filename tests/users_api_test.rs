@@ -152,7 +152,6 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         reqwest::Method::POST,
         "/plans",
         json!({
-            "internal_name": "admin-token",
             "display_name": "admin-token",
             "audience": "admin",
             "groups": ["default"],

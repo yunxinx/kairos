@@ -236,8 +236,6 @@
     "groupsRemoveUnknown": "Removes {groups} assigned group(s); the affected token count is unknown, bound tokens may stop working immediately.",
     "plan": "Plan",
     "planGuide": "New users receive this plan’s groups, discount, default RPM, and initial grant.",
-    "planUpdated": "Plan updated",
-    "planTabGuide": "Changing the plan immediately changes the user’s available groups and discount; existing balance and token bindings remain.",
     "currentPlan": "Current plan"
   },
   "account": {
@@ -852,7 +850,6 @@
     "groupSearch": "Search model groups",
     "groupSearchEmpty": "No matching model groups.",
     "groupsSelected": "{count} selected",
-    "internalName": "Internal name",
     "displayName": "Display name",
     "note": "Note",
     "noteVisible": "Note visible to admins",

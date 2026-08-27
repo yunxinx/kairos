@@ -15,6 +15,13 @@ test.describe('users page', () => {
     await expect(page.getByRole('heading', { name: /users/i })).toBeVisible();
 
     await page.getByTestId('create-user').click();
+    await expect(page.getByTestId('user-editor-plan')).toHaveAttribute('tabindex', '0');
+    await expect(page.getByTestId('user-editor-plan')).toHaveAttribute('aria-label', 'Plan');
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'Administrator' }).click();
+    await expect(page.getByTestId('user-editor-plan')).toBeEnabled();
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'User', exact: true }).click();
     await page.getByTestId('user-editor-email').fill('e2e-user@example.com');
     await page.getByTestId('user-editor-display-name').fill('E2E User');
     await page.getByTestId('user-editor-password').fill('password1');
@@ -25,6 +32,14 @@ test.describe('users page', () => {
 
     // 编辑用户资料
     await row.getByTestId('user-edit').click();
+    const profilePlan = page.getByTestId('user-editor-plan');
+    await expect(profilePlan).toBeEnabled();
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'Administrator' }).click();
+    await expect(profilePlan).toBeDisabled();
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'User', exact: true }).click();
+    await expect(profilePlan).toBeEnabled();
     await page.getByTestId('user-editor-display-name').fill('E2E User Renamed');
     await page.getByTestId('user-save').click();
     await expect(row).toContainText('E2E User Renamed');
@@ -40,9 +55,7 @@ test.describe('users page', () => {
     await expect(row).toContainText('3.5');
 
     await row.getByTestId('user-edit').click();
-    await page.getByTestId('user-tab-plan').click();
-    await expect(page.getByTestId('user-plan-select')).toBeVisible();
-    await expect(page.getByTestId('user-current-plan')).toHaveCount(0);
+    await expect(page.getByTestId('user-editor-plan')).toBeVisible();
     await page.keyboard.press('Escape');
 
     await row.getByTestId('user-toggle-enabled').click();
@@ -75,6 +88,9 @@ test.describe('users page', () => {
     const tokenRow = page.locator(`[data-testid="user-token-row"][data-token-id="${owned.id}"]`);
     await expect(tokenRow).toBeVisible();
     await expect(tokenRow).not.toContainText(owned.token_key);
+    // 余额列与用户列表同款：纯 mono 数值，不再绘制额度进度条。
+    await expect(tokenRow.getByTestId('token-balance')).toHaveText('Unlimited');
+    await expect(tokenRow.locator('[data-testid="token-quota-track"]')).toHaveCount(0);
     await tokenRow.getByTestId('user-token-toggle-enabled').click();
     await expect(tokenRow).toContainText(/disabled/i);
     await tokenRow.getByTestId('user-token-toggle-enabled').click();

@@ -23,9 +23,9 @@ import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
+import ListboxSelect from '@/components/ui/ListboxSelect.vue';
 import SegmentSwitch, { type SegmentPair } from '@/components/ui/SegmentSwitch.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
-import UiSelect from '@/components/ui/UiSelect.vue';
 import { invalidateChannelCaches } from '@/composables/useChannelDirectory';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
@@ -575,10 +575,12 @@ function handleSave() {
               :input-id="protocolInputId"
             >
               <template #default>
-                <UiSelect
+                <ListboxSelect
                   :id="protocolInputId"
                   v-model="editorProtocol"
                   :options="protocolOptions"
+                  :search-placeholder="t('channel.requestProtocol')"
+                  data-testid="channel-editor-protocol"
                 />
               </template>
             </FormField>
@@ -761,10 +763,11 @@ function handleSave() {
               :input-id="groupInputId"
               :guide="t('channel.modelGroupGuide')"
             >
-              <UiSelect
+              <ListboxSelect
                 :id="groupInputId"
                 v-model="editorGroup"
                 :options="groupOptions"
+                :search-placeholder="t('channel.modelGroup')"
                 data-testid="channel-editor-group"
               />
             </FormField>

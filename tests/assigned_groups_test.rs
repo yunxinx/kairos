@@ -88,23 +88,13 @@ async fn first_channel_id(gw: &TestGateway) -> i64 {
         .expect("应有 id")
 }
 
-async fn create_plan(
-    gw: &TestGateway,
-    internal_name: &str,
-    audience: &str,
-    groups: &[&str],
-) -> i64 {
+async fn create_plan(gw: &TestGateway, display_name: &str, audience: &str, groups: &[&str]) -> i64 {
     let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
         "/plans",
-        json!({
-            "internal_name": internal_name,
-            "display_name": internal_name,
-            "audience": audience,
-            "groups": groups,
-        }),
+        json!({ "display_name": display_name, "audience": audience, "groups": groups }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -116,7 +106,7 @@ async fn create_plan(
 async fn replace_plan_groups(
     gw: &TestGateway,
     plan_id: i64,
-    internal_name: &str,
+    display_name: &str,
     groups: &[&str],
 ) -> Value {
     let response = admin_json(
@@ -124,11 +114,7 @@ async fn replace_plan_groups(
         &gw.session,
         reqwest::Method::PUT,
         &format!("/plans/{plan_id}"),
-        json!({
-            "internal_name": internal_name,
-            "display_name": internal_name,
-            "groups": groups,
-        }),
+        json!({ "display_name": display_name, "groups": groups }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

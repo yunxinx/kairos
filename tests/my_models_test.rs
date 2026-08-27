@@ -131,12 +131,7 @@ async fn create_plan(gw: &TestGateway, name: &str, groups: &[&str], discount_bp:
         &gw.session,
         reqwest::Method::POST,
         "/plans",
-        json!({
-            "internal_name": name,
-            "display_name": name,
-            "groups": groups,
-            "discount_bp": discount_bp
-        }),
+        json!({ "display_name": name, "groups": groups, "discount_bp": discount_bp }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED, "建档应成功");
@@ -152,7 +147,7 @@ async fn set_plan_groups(gw: &TestGateway, plan_id: i64, name: &str, groups: &[&
         &gw.session,
         reqwest::Method::PUT,
         &format!("/plans/{plan_id}"),
-        json!({ "internal_name": name, "display_name": name, "groups": groups }),
+        json!({ "display_name": name, "groups": groups }),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK, "改档应成功");
@@ -297,7 +292,6 @@ async fn admin_model_view_is_unrestricted_but_token_binding_remains_restricted()
         reqwest::Method::POST,
         "/plans",
         json!({
-            "internal_name": "narrow-admin",
             "display_name": "narrow-admin",
             "audience": "admin",
             "groups": ["default"],

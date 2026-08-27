@@ -10,13 +10,12 @@ import type { Page } from '@playwright/test';
 /** 建一档带组名单与折扣的套餐，返回 id。 */
 async function createPlan(
   page: Page,
-  body: { internal_name: string; groups: string[]; discount_bp?: number },
+  body: { display_name: string; groups: string[]; discount_bp?: number },
 ): Promise<number> {
   const resp = await page.request.post('/api/plans', {
     headers: await e2eRootHeaders(page.request),
     data: {
-      internal_name: body.internal_name,
-      display_name: body.internal_name,
+      display_name: body.display_name,
       note: '',
       note_visible_to_admin: false,
       discount_bp: body.discount_bp ?? 10000,
@@ -83,7 +82,7 @@ test.describe('my models page', () => {
 
     // 五折档 + 两个组：验证分段、折后价与区间。
     const planId = await createPlan(page, {
-      internal_name: 'e2e-my-plan',
+      display_name: 'e2e-my-plan',
       groups: ['default', 'e2e-my-coding'],
       discount_bp: 5000,
     });

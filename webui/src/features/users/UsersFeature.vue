@@ -38,7 +38,7 @@ import { formatCount, formatTokensCount, formatUnixMillis, formatUsdMicros } fro
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
-type UserManageTab = 'profile' | 'recharge' | 'plan' | 'tokens';
+type UserManageTab = 'profile' | 'recharge' | 'tokens';
 
 type UserWindowPayload =
   | { kind: 'create' }

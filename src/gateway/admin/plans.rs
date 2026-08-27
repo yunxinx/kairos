@@ -37,8 +37,6 @@ pub(super) fn root_routes() -> Router<AdminDeps> {
 #[derive(Debug, Serialize)]
 struct PlanView {
     id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    internal_name: Option<String>,
     display_name: String,
     note: String,
     note_visible_to_admin: bool,
@@ -62,7 +60,6 @@ impl PlanView {
         let expose_note = is_root || record.note_visible_to_admin;
         Self {
             id: record.id,
-            internal_name: is_root.then_some(record.internal_name),
             display_name: record.display_name,
             note: if expose_note {
                 record.note
@@ -88,7 +85,6 @@ impl PlanView {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreatePlanBody {
-    internal_name: String,
     display_name: String,
     #[serde(default)]
     note: String,
@@ -121,7 +117,6 @@ fn default_discount() -> i64 {
 impl CreatePlanBody {
     fn into_input(self) -> plans::PlanCreateInput {
         plans::PlanCreateInput {
-            internal_name: self.internal_name.trim().to_string(),
             display_name: self.display_name.trim().to_string(),
             note: self.note,
             note_visible_to_admin: self.note_visible_to_admin,
@@ -141,7 +136,6 @@ impl CreatePlanBody {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdatePlanBody {
-    internal_name: String,
     display_name: String,
     #[serde(default)]
     note: String,
@@ -164,7 +158,6 @@ struct UpdatePlanBody {
 impl UpdatePlanBody {
     fn into_input(self) -> plans::PlanUpdateInput {
         plans::PlanUpdateInput {
-            internal_name: self.internal_name.trim().to_string(),
             display_name: self.display_name.trim().to_string(),
             note: self.note,
             note_visible_to_admin: self.note_visible_to_admin,
@@ -218,7 +211,6 @@ async fn create_plan(
 ) -> Result<(StatusCode, Json<PlanView>), AdminError> {
     let input = body.map_err(AdminError::bad_body)?.0.into_input();
     let mut tx = begin_write(&deps).await?;
-    reject_duplicate_name(&mut tx, &input.internal_name, None).await?;
     let plan = plans::insert_plan(&mut tx, &input, logging::unix_millis())
         .await
         .map_err(map_plan_error)?;
@@ -259,7 +251,6 @@ async fn update_plan(
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("套餐 {id} 不存在")))?;
-    reject_duplicate_name(&mut tx, &input.internal_name, Some(id)).await?;
     plans::update_plan(&mut tx, id, &input)
         .await
         .map_err(map_plan_error)?;
@@ -591,24 +582,6 @@ async fn assign_plan(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     Ok(Json(super::users::UserView::from_record(user)))
-}
-
-async fn reject_duplicate_name(
-    conn: &mut sqlx::SqliteConnection,
-    name: &str,
-    except: Option<i64>,
-) -> Result<(), AdminError> {
-    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM plans WHERE internal_name = ?")
-        .bind(name)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(db_err)?;
-    if found.is_some_and(|id| Some(id) != except) {
-        return Err(AdminError::Conflict(
-            "套餐 internal_name 已存在".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 fn map_plan_error(err: store::StoreError) -> AdminError {

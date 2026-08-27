@@ -61,7 +61,6 @@ const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
 
 const uid = useId();
-const internalId = `plan-internal-${uid}`;
 const displayId = `plan-display-${uid}`;
 const noteId = `plan-note-${uid}`;
 const discountId = `plan-discount-${uid}`;
@@ -71,7 +70,6 @@ const grantId = `plan-grant-${uid}`;
 
 const isEdit = computed(() => props.initial !== null);
 
-const initialInternal = props.initial?.internal_name ?? '';
 const initialDisplay = props.initial?.display_name ?? '';
 const initialNote = props.initial?.note ?? '';
 const initialDiscount = props.initial ? String(props.initial.discount_bp / 100) : '100';
@@ -102,7 +100,6 @@ const windowTitle = computed(() => {
     : t('plans.editorCreateOf', { audience: kind });
 });
 
-const internalName = ref(initialInternal);
 const displayName = ref(initialDisplay);
 const note = ref(initialNote);
 const discountPercent = ref(initialDiscount);
@@ -174,7 +171,6 @@ const someVisibleGroupsSelected = computed(() => groupRows.value.some((row) => r
 const dirty = computed(() => {
   if (!isEdit.value) {
     return Boolean(
-      internalName.value.trim() ||
       displayName.value.trim() ||
       note.value.trim() ||
       discountPercent.value.trim() ||
@@ -188,7 +184,6 @@ const dirty = computed(() => {
     );
   }
   return (
-    internalName.value !== initialInternal ||
     displayName.value !== initialDisplay ||
     note.value !== initialNote ||
     discountPercent.value !== initialDiscount ||
@@ -222,7 +217,6 @@ const saveMutation = useMutation({
 
 function handleSave() {
   const specs: FieldValidationSpec[] = [
-    { name: 'internalName', value: internalName.value, rules: [{ kind: 'required' }] },
     { name: 'displayName', value: displayName.value, rules: [{ kind: 'required' }] },
     { name: 'discountPercent', value: discountPercent.value, rules: [{ kind: 'required' }] },
     { name: 'grantUsd', value: grantUsd.value, rules: [{ kind: 'usd' }] },
@@ -256,7 +250,6 @@ function handleSave() {
     discountBp = Math.round(discountNumber * 100);
   }
   const body: PlanUpdate = {
-    internal_name: internalName.value.trim(),
     display_name: displayName.value.trim(),
     note: note.value,
     note_visible_to_admin: noteVisible.value,
@@ -299,44 +292,24 @@ function capabilityLabel(key: keyof PlanCapabilities): string {
   >
     <form novalidate @submit.prevent="handleSave">
       <div class="card-body space-y-4">
-        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <FormField
-            field-name="internalName"
-            :label="t('plans.internalName')"
-            :input-id="internalId"
-            :error="fieldError('internalName')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormTextInput
-                :id="internalId"
-                v-model="internalName"
-                type="text"
-                data-testid="plan-internal-name"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('internalName')"
-              />
-            </template>
-          </FormField>
-          <FormField
-            field-name="displayName"
-            :label="t('plans.displayName')"
-            :input-id="displayId"
-            :error="fieldError('displayName')"
-          >
-            <template #default="{ hintId, invalid }">
-              <FormTextInput
-                :id="displayId"
-                v-model="displayName"
-                type="text"
-                data-testid="plan-display-name"
-                :invalid="invalid"
-                :hint-id="hintId"
-                v-on="fieldInputHandlers('displayName')"
-              />
-            </template>
-          </FormField>
-        </div>
+        <FormField
+          field-name="displayName"
+          :label="t('plans.displayName')"
+          :input-id="displayId"
+          :error="fieldError('displayName')"
+        >
+          <template #default="{ hintId, invalid }">
+            <FormTextInput
+              :id="displayId"
+              v-model="displayName"
+              type="text"
+              data-testid="plan-display-name"
+              :invalid="invalid"
+              :hint-id="hintId"
+              v-on="fieldInputHandlers('displayName')"
+            />
+          </template>
+        </FormField>
 
         <FormField
           field-name="discountPercent"

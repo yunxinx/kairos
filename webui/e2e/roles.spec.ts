@@ -6,15 +6,15 @@ import { openSession, seedUser } from './helpers/users';
 
 async function createPlan(
   page: Page,
-  body: { internal_name: string; display_name: string; groups: string[] },
+  body: { display_name: string; groups: string[]; note?: string },
 ): Promise<number> {
   const resp = await page.request.post('/api/plans', {
     headers: await e2eRootHeaders(page.request),
     data: {
-      internal_name: body.internal_name,
       display_name: body.display_name,
-      note: '',
-      note_visible_to_admin: false,
+      note: body.note ?? '',
+      // 备注在管理员侧受 note_visible_to_admin 管控：选档浮窗只呈现 API 给出的可见备注。
+      note_visible_to_admin: Boolean(body.note),
       discount_bp: 10000,
       default_rpm: null,
       shared_rpm: null,
@@ -90,7 +90,6 @@ test.describe('role navigation', () => {
     await seedModelGroup(page, { name: 'e2e-hidden', models: [] });
     const user = await seedUser(page, { email: 'nav-groups@example.com', role: 'user' });
     const planId = await createPlan(page, {
-      internal_name: 'e2e-assigned-plan',
       display_name: 'Assigned Plan',
       groups: ['e2e-assigned'],
     });
@@ -114,7 +113,6 @@ test.describe('role navigation', () => {
     await seedModelGroup(page, { name: 'e2e-withdraw', models: [] });
     const user = await seedUser(page, { email: 'nav-withdraw@example.com', role: 'user' });
     const planId = await createPlan(page, {
-      internal_name: 'e2e-withdraw-plan',
       display_name: 'Withdraw Plan',
       groups: ['e2e-withdraw'],
     });
@@ -141,13 +139,12 @@ test.describe('role navigation', () => {
       headers: await e2eRootHeaders(page.request),
     });
     expect(planResp.ok(), await planResp.text()).toBeTruthy();
-    const plans = (await planResp.json()) as Array<{ id: number; internal_name?: string }>;
+    const plans = (await planResp.json()) as Array<{ id: number }>;
     const withdrawPlan = plans.find((plan) => plan.id === planId);
     expect(withdrawPlan).toBeTruthy();
     const withdraw = await page.request.put(`/api/plans/${planId}`, {
       headers: await e2eRootHeaders(page.request),
       data: {
-        internal_name: 'e2e-withdraw-plan',
         display_name: 'Withdraw Plan',
         note: '',
         note_visible_to_admin: false,
@@ -175,8 +172,8 @@ test.describe('role navigation', () => {
     await seedUser(page, { email: 'nav-admin-ops@example.com', role: 'admin' });
     const target = await seedUser(page, { email: 'nav-admin-target@example.com', role: 'user' });
     const planId = await createPlan(page, {
-      internal_name: 'e2e-admin-plan',
       display_name: 'Admin Shared Plan',
+      note: 'Shared plan note',
       groups: ['e2e-admin-assign'],
     });
 
@@ -186,10 +183,23 @@ test.describe('role navigation', () => {
     await expect(page.getByTestId('users-role-filter')).toHaveCount(0);
     const row = page.locator(`[data-testid="user-row"][data-user-id="${target.id}"]`);
     await row.getByTestId('user-edit').click();
-    await page.getByTestId('user-tab-plan').click();
-    await page.getByTestId('user-plan-select').click();
-    await page.getByRole('option', { name: 'Admin Shared Plan' }).click();
-    await page.getByTestId('user-plan-save').click();
-    await expect(page.getByTestId('user-plan-select')).toHaveCount(0);
+    await expect(page.getByTestId('user-editor-plan')).toBeVisible();
+    await page.getByTestId('user-editor-plan').click();
+    const planSearch = page.getByRole('combobox', { name: 'Plan' });
+    await planSearch.fill('missing plan');
+    await expect(page.getByText('No results found.')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await page.getByTestId('user-editor-plan').click();
+    await expect(planSearch).toHaveValue('');
+    // 选项行同时呈现说明（备注）与默认档徽章，便于运营在套餐间做出选择。
+    const sharedOption = page.getByRole('option', { name: 'Admin Shared Plan' });
+    await expect(sharedOption).toContainText('Shared plan note');
+    await expect(page.getByRole('option', { name: 'Standard' })).toContainText(/default/i);
+    await planSearch.fill('Admin Shared Plan');
+    await page.keyboard.press('Home');
+    await page.keyboard.press('Enter');
+    await expect(page.getByTestId('user-editor-plan')).toContainText('Admin Shared Plan');
+    await page.getByTestId('user-save').click();
+    await expect(page.getByTestId('user-editor-plan')).toHaveCount(0);
   });
 });

@@ -76,7 +76,6 @@ async fn create_plan(gw: &TestGateway, name: &str, is_default: bool) -> i64 {
         reqwest::Method::POST,
         "/plans",
         json!({
-            "internal_name": name,
             "display_name": name,
             "audience": "user",
             "is_default": is_default

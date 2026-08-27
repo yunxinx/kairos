@@ -4,7 +4,6 @@ import { useI18n } from 'vue-i18n';
 import { TabsContent, TabsIndicator, TabsList, TabsRoot, TabsTrigger } from 'reka-ui';
 import type { UserAdminView } from '@/api/types';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
-import UserPlanTab from '@/features/users/UserPlanTab.vue';
 import UserProfileTab from '@/features/users/UserProfileTab.vue';
 import UserRechargeWindow from '@/features/users/UserRechargeWindow.vue';
 import UserTokensWindow from '@/features/users/UserTokensWindow.vue';
@@ -12,7 +11,7 @@ import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
-export type UserManageTab = 'profile' | 'recharge' | 'plan' | 'tokens';
+export type UserManageTab = 'profile' | 'recharge' | 'tokens';
 
 const props = withDefaults(
   defineProps<{
@@ -36,13 +35,10 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const me = useCurrentUser();
 const isSelf = computed(() => me.value !== null && me.value.id === props.user.id);
-const isRootUser = computed(() => props.user.role === 'root');
-const canAssignPlan = computed(() => hasCapability(me.value, 'assign_plan'));
 const canToggleTokens = computed(() => hasCapability(me.value, 'toggle_user_tokens'));
 
 const initialTab = computed<UserManageTab>(() => {
   if (props.tab === 'tokens' && (isSelf.value || !canToggleTokens.value)) return 'profile';
-  if (props.tab === 'plan' && (isRootUser.value || !canAssignPlan.value)) return 'profile';
   return props.tab;
 });
 
@@ -103,15 +99,6 @@ function emitDirty() {
             {{ t('users.recharge') }}
           </TabsTrigger>
           <TabsTrigger
-            v-if="canAssignPlan && !isRootUser"
-            value="plan"
-            class="page-tab-switch-btn"
-            data-testid="user-tab-plan"
-            :disabled="rechargeBusy"
-          >
-            {{ t('users.plan') }}
-          </TabsTrigger>
-          <TabsTrigger
             v-if="!isSelf && canToggleTokens"
             value="tokens"
             class="page-tab-switch-btn"
@@ -142,17 +129,6 @@ function emitDirty() {
           @dirty-change="
             (dirty) => {
               rechargeDirty = dirty;
-              emitDirty();
-            }
-          "
-        />
-      </TabsContent>
-      <TabsContent v-if="canAssignPlan && !isRootUser" value="plan">
-        <UserPlanTab
-          :user="user"
-          @close="emit('close')"
-          @dirty-change="
-            () => {
               emitDirty();
             }
           "

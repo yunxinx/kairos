@@ -8,7 +8,10 @@ import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
+import ListboxSelect from '@/components/ui/ListboxSelect.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
+import type { ListboxSelectOption } from '@/lib/listbox-option';
+import { toPlanSelectOptions } from '@/lib/plan-select-options';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import { hasCapability } from '@/lib/capabilities';
@@ -91,25 +94,16 @@ function defaultPlanForRole(selectedRole: ManagementRole): string {
   return plan ? String(plan.id) : '';
 }
 
-const planOptions = computed(() => {
+const planOptions = computed((): ListboxSelectOption[] => {
   const audience = role.value === 'admin' ? 'admin' : 'user';
-  const options = (plansQuery.data.value ?? [])
-    .filter((plan) => plan.audience === audience)
-    .map((plan) => ({
-      value: String(plan.id),
-      label: plan.display_name,
-    }));
-  if (
-    role.value === initialRole &&
-    initialPlanId &&
-    !options.some((option) => option.value === initialPlanId)
-  ) {
-    options.push({
-      value: initialPlanId,
-      label: props.user.plan_display_name || initialPlanId,
-    });
-  }
-  return options;
+  return toPlanSelectOptions(
+    plansQuery.data.value ?? [],
+    audience,
+    t('plans.defaultBadge'),
+    initialPlanId && role.value === initialRole
+      ? { value: initialPlanId, label: props.user.plan_display_name || initialPlanId }
+      : undefined,
+  );
 });
 
 watch(
@@ -329,10 +323,13 @@ function handleSave() {
         :input-id="planId"
         :guide="t('users.planGuide')"
       >
-        <UiSelect
+        <ListboxSelect
           :id="planId"
           v-model="selectedPlanId"
           :options="planOptions"
+          :placeholder="t('common.none')"
+          :search-placeholder="t('users.plan')"
+          menu-class="listbox-select-menu-wide"
           :disabled="role !== initialRole"
           data-testid="user-editor-plan"
         />

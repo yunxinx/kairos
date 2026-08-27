@@ -173,7 +173,6 @@ async fn archive_groups_and_settings_are_audited() {
         reqwest::Method::PUT,
         "/plans/1",
         json!({
-            "internal_name": "standard",
             "display_name": "standard",
             "groups": []
         }),
