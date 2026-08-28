@@ -32,12 +32,12 @@ use crate::core::stream::SseFrame;
 /// wire 解码错误，网关映射为 400。
 #[derive(Debug, Error)]
 pub enum DecodeError {
-    #[error("请求体不是合法 JSON 对象")]
-    NotObject,
-    #[error("缺少模型字段")]
-    MissingModel,
-    #[error("缺少 max_tokens")]
-    MissingMaxTokens,
+    /// wire 形状不符：携带 serde 的具体原因与出错字段的 JSON 路径
+    /// （如 `temperature: invalid type: string "hot"`；untagged 枚举处形如
+    /// `messages[1].content: data did not match any variant of untagged
+    /// enum WireContent`；顶层错误无路径前缀）。
+    #[error("wire 形状不符: {detail}")]
+    InvalidShape { detail: String },
     #[error("消息 {index} 缺少角色")]
     MissingRole { index: usize },
     #[error("消息 {index} 角色未知")]
@@ -318,9 +318,10 @@ struct WireMessageDelta {
 
 /// 解码入站 Anthropic Messages 请求为 IR。
 pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
-    let wire = serde_json::from_value::<WireRequest>(value.clone()).map_err(|_| {
-        // 区分 NotObject 与缺模型：都归为请求体不合法 JSON 对象。
-        DecodeError::NotObject
+    let wire: WireRequest = serde_path_to_error::deserialize(value.clone()).map_err(|err| {
+        DecodeError::InvalidShape {
+            detail: err.to_string(),
+        }
     })?;
 
     let mut messages = Vec::new();
@@ -1124,8 +1125,11 @@ fn text_parts(parts: &[ContentPart]) -> Option<String> {
 
 /// 解码上游 Anthropic Messages 响应为 IR。
 pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
-    let wire = serde_json::from_value::<WireResponse>(value.clone())
-        .map_err(|_| DecodeError::NotObject)?;
+    let wire: WireResponse = serde_path_to_error::deserialize(value.clone()).map_err(|err| {
+        DecodeError::InvalidShape {
+            detail: err.to_string(),
+        }
+    })?;
 
     let mut content = Vec::new();
     for block in &wire.content {
@@ -1823,6 +1827,29 @@ mod tests {
     use super::*;
     use crate::core::stream::StreamAccumulator;
     use crate::core::testing::frames_to_snapshot;
+    use similar_asserts::assert_eq;
+
+    /// wire 形状错误指明出错字段的 JSON 路径，而非笼统的「不是合法 JSON 对象」。
+    #[test]
+    fn invalid_wire_shape_reports_field_path() {
+        let wire = json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 64,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "user", "content": 42 }
+            ]
+        });
+        match decode_request(&wire) {
+            Err(DecodeError::InvalidShape { detail }) => {
+                assert!(
+                    detail.contains("messages[1].content"),
+                    "报错应含字段路径: {detail}"
+                );
+            }
+            other => panic!("应报 InvalidShape: {other:?}"),
+        }
+    }
 
     /// 黄金样例请求 decode → encode 往返还原 wire。
     ///

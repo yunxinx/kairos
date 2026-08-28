@@ -404,6 +404,7 @@ mod tests {
     use super::*;
     use crate::core::ir::{FinishReason, FinishReasonUnified, Usage};
     use serde_json::json;
+    use similar_asserts::assert_eq;
 
     /// 同构：非流式响应 → 流事件 → 累积，得到与非流式解码一致的响应。
     ///
