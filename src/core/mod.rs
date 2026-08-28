@@ -11,4 +11,7 @@ pub mod openai_responses;
 pub mod stream;
 
 #[cfg(test)]
+mod roundtrip;
+
+#[cfg(test)]
 pub(crate) mod testing;
