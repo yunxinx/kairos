@@ -1,10 +1,9 @@
 //! OpenAI Responses 协议适配器：wire ↔ IR 双向编解码。
 //!
 //! wire 结构体全部私有，透过 `decode_*`/`encode_*` 公共函数暴露 IR 边界，
-//! wire 类型不出本模块边界（ADR-0001 hub-and-spoke）。
+//! wire 类型不出本模块边界。
 //!
-//! 映射对齐 Vercel AI SDK `convert-to-openai-responses-input.ts` 与
-//! `openai-responses-language-model.ts`：
+//! 映射要点：
 //! - 请求侧：`input` 数组的 message/function_call/function_call_output/reasoning
 //!   项映射为对应 IR 消息；顶层 `instructions` 提升为首条 System 消息；`text`/
 //!   `reasoning` 面板经请求级逃生舱 `provider_options["openai"]` 无损往返。
@@ -1545,7 +1544,7 @@ fn encode_usage(usage: &Usage) -> Value {
 
 /// 流式解码器：把上游 Responses SSE 事件解码为 IR 流事件。
 ///
-/// 对齐 AI SDK：`output_item.added` 开启块（message→text、function_call→tool、
+/// `output_item.added` 开启块（message→text、function_call→tool、
 /// reasoning→reasoning），`output_text.delta`/`function_call_arguments.delta`/
 /// `reasoning_summary_text.delta` 产出增量，`output_item.done` 收尾（function_call
 /// 在此解析出完整 arguments），`response.completed`/`incomplete` 产出 Finish。
@@ -1650,7 +1649,7 @@ impl StreamDecoder {
                             openai.insert(REASONING_ENCRYPTED.into(), json!(encrypted));
                         }
                         events.push(StreamEvent::ReasoningStart {
-                            // 对齐 AI SDK：reasoning-start id 为 `${itemId}:${summaryIndex}`。
+                            // reasoning-start id 为 `${itemId}:${summaryIndex}`。
                             id: format!("{id}:0"),
                             provider_options: if openai.is_empty() {
                                 HashMap::new()
@@ -2326,8 +2325,8 @@ mod tests {
         ));
     }
 
-    /// 跨协议：音频媒体（audio/mp3）在 Responses 出站编码为 `input_file`（对齐
-    /// AI SDK：Responses 无 input_audio 输入 part，音频媒体映射为文件）。
+    /// 跨协议：音频媒体（audio/mp3）在 Responses 出站编码为 `input_file`
+    ///（Responses 无 input_audio 输入 part，音频媒体映射为文件）。
     #[test]
     fn audio_media_encodes_to_input_file() {
         use crate::core::ir::Message;

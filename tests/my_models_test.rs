@@ -400,7 +400,7 @@ async fn response_carries_no_channel_topology() {
     assert!(raw.contains(TEST_MODEL), "应确实列出了可调用名：{raw}");
 }
 
-/// 从套餐名单撤组后该段消失（延续 ADR-0010 的撤组语义）。
+/// 从套餐名单撤组后该段消失。
 #[tokio::test]
 async fn withdrawing_a_group_removes_its_section() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;

@@ -1,10 +1,9 @@
 //! Anthropic Messages 协议适配器：wire ↔ IR 双向编解码。
 //!
 //! wire 结构体全部私有，透过 `decode_*`/`encode_*` 公共函数暴露 IR 边界，
-//! wire 类型不出本模块边界（ADR-0001 hub-and-spoke）。
+//! wire 类型不出本模块边界。
 //!
-//! 映射对齐 Vercel AI SDK `convert-to-anthropic-prompt.ts` 与
-//! `anthropic-messages-language-model.ts`：
+//! 映射要点：
 //! - 请求侧：首个 system 消息提升为顶层 `system`；assistant 内容块
 //!   `text`/`thinking`/`redacted_thinking`/`tool_use` 与 user 内容块
 //!   `text`/`tool_result`/`image`/`document`（base64/URL source）双向映射；
@@ -724,7 +723,7 @@ fn decode_media_part(
 ///
 /// 首个 System 消息提升为顶层 `system`；请求级 `provider_options["anthropic"]`
 /// 原样回传（thinking 配置经 IR 路径不丢失）。目标协议无法表达的内容追加到
-/// `warnings`（对齐 AI SDK `doGenerate` 的 warnings 累积）。
+/// `warnings`。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
     let (system, messages) = encode_messages(&request.messages, warnings);
 
@@ -734,7 +733,7 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
         obj.insert("system".into(), json!(system));
     }
     obj.insert("messages".into(), Value::Array(messages));
-    // Anthropic 强制要求 max_tokens：缺省时补 4096（one-api 同款默认），
+    // Anthropic 强制要求 max_tokens：缺省时补 4096，
     // 否则跨协议请求（如 OpenAI 入站未带 max_tokens）会被上游 400 拒绝。
     let max_tokens = request.max_tokens.filter(|&v| v > 0).unwrap_or(4096);
     obj.insert("max_tokens".into(), json!(max_tokens));
@@ -1351,7 +1350,7 @@ fn convert_usage(wire: WireUsage) -> Usage {
     }
 }
 
-/// unified finish reason 映射，对齐 mapAnthropicStopReason。
+/// unified stop reason 映射（Anthropic stop_reason 值）。
 fn map_stop_reason(raw: Option<&str>) -> FinishReasonUnified {
     match raw {
         Some("end_turn") | Some("stop_sequence") | Some("pause_turn") => FinishReasonUnified::Stop,
@@ -1468,7 +1467,7 @@ fn encode_usage(usage: &Usage) -> Value {
 
 /// 流式解码器：把上游 Anthropic SSE 事件解码为 IR 流事件。
 ///
-/// 对齐 AI SDK 的流式处理：`content_block_start` 开启块，`content_block_delta`
+/// 流式事件处理：`content_block_start` 开启块，`content_block_delta`
 /// 产出增量（`signature_delta` 以零长增量携带 signature），`content_block_stop`
 /// 收尾（tool_use 在此解析出完整 input），`message_delta` 产出 Finish（最终
 /// usage + stop_reason）。
@@ -2357,7 +2356,7 @@ mod tests {
             }
         }
         let response = accumulator.finish();
-        // 恰好一个 tool-call，无重复（ADR-0001 流式/非流式同构）。
+        // 恰好一个 tool-call，无重复（流式/非流式同构）。
         assert_eq!(
             response.content.len(),
             1,

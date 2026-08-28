@@ -209,7 +209,7 @@ mod tests {
         }
     }
 
-    /// 已废弃的资源段（v1 的 tokens/channels/prices/logging）出现在配置中直接报错，
+    /// 已废弃的资源段（tokens/channels/prices/logging）出现在配置中直接报错，
     /// 不做兼容迁移。
     #[test]
     fn deprecated_resource_segments_are_rejected() {

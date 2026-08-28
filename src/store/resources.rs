@@ -1,7 +1,7 @@
 //! 运行时资源存储：渠道、令牌、价格、模型组、统一模型与运行时开关的读写原语。
 //!
 //! 资源 CRUD 写操作接受 `&mut SqliteConnection`，可组合进事务；读操作接受
-//! `&SqlitePool`。金额一律整数 micro-USD（ADR-0002）。wire 协议类型复用
+//! `&SqlitePool`。金额一律整数 micro-USD。wire 协议类型复用
 //! `crate::config::Protocol`，落库为其 serde rename 字符串。
 
 use std::collections::{HashMap, HashSet};
@@ -185,7 +185,7 @@ impl std::fmt::Display for UnifiedMember {
     }
 }
 
-/// 统一模型：一个下游可调用名，按顺序尝试若干钉渠道的成员（ADR-0004）。
+/// 统一模型：一个下游可调用名，按顺序尝试若干钉渠道的成员。
 ///
 /// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
 /// 错误直接报错而非静默忽略。统一 ID 本身没有价格行。
@@ -405,8 +405,7 @@ pub const SETTING_RATE_LIMIT_RPM: &str = "rate_limit_rpm";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
 pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
-/// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片，与参考网关 bifrost
-/// 的 `max_request_body_size_mb: 100` 对齐。
+/// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片请求。
 pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 100 * 1024 * 1024;
 /// 上游非流式响应体上限缺省值（字节）：与入站上限同档，避免镜像/异常上游把
 /// 整段 JSON 读进内存撑爆进程。流式路径另有 `sse_reassembly_max_bytes`。

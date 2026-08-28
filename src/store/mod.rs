@@ -2,7 +2,7 @@
 //!
 //! 本模块承载请求日志（`request_log`）、系统日志（`system_log`）、冒烟记录
 //! （`smoke_probe`）、管理用户钱包（`user_balance`）与令牌累计结算
-//! （`token_balance`，只保存令牌累计结算）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats` 与
+//! （`token_balance`，只保存令牌累计结算）。金额一律整数 micro-USD。管理面 `/stats` 与
 //! `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
 pub mod balance_operations;

@@ -1,6 +1,6 @@
 //! 规范表示（IR）：网关内部唯一的消息规范模型。
 //!
-//! 形状遵循 ADR-0001 与 Vercel AI SDK `LanguageModelV4`：严格的 role + content
+//! 严格的 role + content
 //! parts 核心，配 `provider_options`（入）/`provider_metadata`（出）逃生舱。
 //! 所有协议适配器都在此中枢与各自 wire 类型之间双向编解码，wire 类型不出
 //! 适配器边界。
@@ -13,14 +13,14 @@ use serde_json::Value;
 
 /// 逃生舱：`provider_options`（入站解析留存）与 `provider_metadata`（出站/响应侧）。
 ///
-/// 形状对齐 AI SDK `Record<string, JSONObject>`：外层按 provider 名，内层为
+/// 外层按 provider 名，内层为
 /// provider 特有字段。Anthropic thinking signature、Responses encrypted reasoning
 /// 均经此往返。
 pub type ProviderOptions = HashMap<String, Value>;
 
 /// 转换过程中无法表达的内容或设置，随响应显式回传给下游。
 ///
-/// 形状对齐 AI SDK `SharedV4Warning`。跨协议族转换是有损的（ADR-0001）：丢失的
+/// 跨协议族转换是有损的：丢失的
 /// reasoning、目标协议不支持的媒体类型或采样参数等一律记 warning，不静默吞掉。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -71,8 +71,7 @@ pub enum Role {
 
 /// 媒体 part 的数据源：原始字节（base64）或 URL 二选一。
 ///
-/// 形状对齐 AI SDK `FilePart` 的 `data` 判别联合（`{type:'data'}`/`{type:'url'}`）；
-/// 网关只承载两种载体，`reference` 等 provider 托管形态经 `provider_options`
+/// 网关只承载原始字节与 URL 两种载体，`reference` 等 provider 托管形态经 `provider_options`
 /// 逃生舱表达。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
@@ -98,7 +97,7 @@ pub fn split_data_url(url: &str) -> Option<(String, String)> {
 
 /// 媒体类型顶层段（`image/png` → `image`）；无 `/` 时原样返回。
 ///
-/// 对齐 AI SDK `getTopLevelMediaType`：目标协议按顶层段判定媒体类别（Anthropic
+/// 目标协议按顶层段判定媒体类别（Anthropic
 /// 据此分派 `image`/`document`，Responses 据此分派 `input_image`/`input_file`）。
 pub fn top_level_media_type(media_type: &str) -> &str {
     media_type.split('/').next().unwrap_or(media_type)
@@ -106,8 +105,7 @@ pub fn top_level_media_type(media_type: &str) -> &str {
 
 /// 消息内容 part 枚举。`type` 为 serde tag，序列化为 `snake_case`。
 ///
-/// `media` 由 ADR-0001 预留的占位演进为携带真实载荷的媒体 part（形状演进
-/// 见 ADR-0003）；跨协议族转换有损时记 warning 而非静默吞掉。
+/// 跨协议族转换有损时记 warning 而非静默吞掉。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -117,23 +115,22 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 推理内容。v1 的 openai_chat 非流式路径不产出，同协议族经逃生舱往返。
+    /// 推理内容。同协议族经逃生舱往返；跨协议族转换有损时记 warning。
     Reasoning {
         text: String,
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
     /// 媒体内容（多模态）。`media_type` 为 IANA 媒体类型（如 `image/png`），
-    /// 携带数据源（base64 字节或 URL）+ provider_options 逃生舱。v1 的 `File`
-    /// 占位演进为此形状，wire 类型不出适配器边界。
+    /// 携带数据源（base64 字节或 URL）+ provider_options 逃生舱；wire 类型不出
+    /// 适配器边界。
     Media {
         media_type: String,
         data: MediaSource,
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 工具调用。`input` 统一为 `Value`（AI SDK prompt 侧对象/流侧字符串的
-    /// 不一致不照搬）。
+    /// 工具调用。`input` 统一为 `Value`。
     ToolCall {
         tool_call_id: String,
         tool_name: String,
@@ -203,7 +200,7 @@ impl Usage {
     ///
     /// Anthropic 的 usage 分散在各事件（`message_start` 有输入侧 input/cache 早期值，
     /// `message_delta` 有最终 output），任一帧都不完整；逐分量取 max 可无顺序依赖地
-    /// 合并出最终值（bifrost passthrough 同款机制）。
+    /// 合并出最终值。
     pub fn union_max(&mut self, other: Usage) {
         self.input_tokens = self.input_tokens.max(other.input_tokens);
         self.output_tokens = self.output_tokens.max(other.output_tokens);
@@ -233,7 +230,7 @@ pub struct Tool {
     pub parameters: Option<Value>,
 }
 
-/// 工具选择：跨协议类型化（对齐 AI SDK `ToolChoice`）。
+/// 工具选择：跨协议类型化枚举。
 ///
 /// 三协议的 wire 形状差异（Anthropic 的 `any`、Chat 的嵌套 `function` 对象、
 /// Responses 的扁平 `function` 对象）由各适配器双向承担；Anthropic 附加语义
@@ -434,7 +431,7 @@ pub struct ChatResponse {
 
 /// 流式事件（IR 侧）：start/delta/end 成对事件 + 生命周期事件。
 ///
-/// 形状遵循 ADR-0001 与 AI SDK `LanguageModelV4StreamPart`：text/reasoning/
+/// text/reasoning/
 /// tool-input 三类 content 各以 start/delta/end 成对出现，tool-call 在 input
 /// 汇聚完成后单发，生命周期事件含 stream-start/response-metadata/finish。
 /// 流式与非流式同构——`StreamAccumulator` 可将流无损归约为 `ChatResponse`。
@@ -507,7 +504,7 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 生命周期：流开始，携带本次转换的 warnings（对齐 AI SDK `stream-start`）。
+    /// 生命周期：流开始，携带本次转换的 warnings。
     StreamStart {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<Warning>,

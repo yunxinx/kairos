@@ -380,7 +380,7 @@ pub struct SeedToken {
 
 /// 测试资源清单：播种进 DB 后由网关加载进运行时快照。
 ///
-/// 替代 v1 的 `config::Config` 资源段；渠道/价格复用 `store::resources` 行类型，
+/// 替代旧 `config::Config` 资源段；渠道/价格复用 `store::resources` 行类型，
 /// 令牌因含初始余额而单独定义。
 pub struct Seed {
     pub channels: Vec<Channel>,

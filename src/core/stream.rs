@@ -1,4 +1,4 @@
-//! 流式累积器：把 IR 流事件无损归约为非流式响应（ADR-0001 同构）。
+//! 流式累积器：把 IR 流事件无损归约为非流式响应（流式与非流式同构）。
 //!
 //! 流式与非流式同构：一条流的 `start/delta/end` 与生命周期事件经
 //! [`StreamAccumulator`] 累积后得到与直接解码非流式响应一致的 [`ChatResponse`]。
@@ -277,8 +277,7 @@ impl StreamAccumulator {
     }
 
     fn push_tool_call(&mut self, tool: PendingTool) {
-        // 空/非法累积参数收尾为 `{}`（Anthropic 要求 tool_use 必有对象 input，
-        // AI SDK 同款默认），避免 `null` 被上游拒绝。
+        // 空/非法累积参数收尾为 `{}`（Anthropic 要求 tool_use 必有对象 input），避免 `null` 被上游拒绝。
         let input = serde_json::from_str(&tool.arguments).unwrap_or_else(|_| serde_json::json!({}));
         self.response.content.push(ContentPart::ToolCall {
             tool_call_id: tool.tool_call_id,
@@ -290,7 +289,7 @@ impl StreamAccumulator {
 
     /// 取出累积的完整响应；未收到 `tool-input-end` 的进行中工具调用在此收尾。
     ///
-    /// 对齐 AI SDK 流 flush 时 `StreamingToolCallTracker::flush()`：未完成的工具
+    /// 流 flush：未完成的工具
     /// 调用在流结束时以已累积的参数收尾为 `tool-call`。
     pub fn finish(mut self) -> ChatResponse {
         let pending: Vec<PendingTool> = self.pending_tools.drain().map(|(_, t)| t).collect();

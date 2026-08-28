@@ -205,10 +205,9 @@ pub fn router(
         ));
     // 管理 API 整体挂在 `/api` 下，SPA 独占根命名空间。
     //
-    // 此前两者共用一个扁平命名空间，于是每个 SPA 路由都得起个别名来躲开同名 API
-    // （`/token` 躲 `/tokens`、`/config` 躲 `/settings`、`/admin/users` 躲 `/users`），
-    // `/login` 更是只能按 method 拆成「POST 给 API、GET 给 SPA」。两个参考项目都给
-    // 管理 API 加了前缀（旧 kairos `baseURL: '/api'`、one-api `router.Group("/api")`）。
+    // 管理 API 与 SPA 曾共用扁平命名空间：SPA 路由只能起别名躲开同名 API，
+    // 深链刷新也无法返回页面。API 统一收进 `/api` 前缀后，SPA 独占根命名空间，
+    // 深链刷新才能正常命中页面路由。
     let api = Router::new()
         .merge(protected)
         .merge(users::public_routes())
@@ -240,7 +239,7 @@ pub(super) fn format_usd_micros(micros: i64) -> String {
 
 /// admin 不能管理 admin/root；user 不能管理任何人；改角色到更高档需 root。
 ///
-/// root 全局唯一（内置 id=1，ADR-0009 修订）：任何角色都不能把别人升成 root，
+/// root 全局唯一（内置 id=1）：任何角色都不能把别人升成 root，
 /// 也不能经创建接口造出第二个 root。「最后一个 root」保护仍是兜底——它另经
 /// 直连数据库等旁路守住禁用/删除。
 pub(in crate::gateway::admin) fn reject_user_management(

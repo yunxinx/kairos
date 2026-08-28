@@ -724,10 +724,9 @@ async fn handle_request(
     // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。
     //
     // 同渠道 failover 由 `run_failover` 处理（429/5xx 可重试，其它 4xx 为 Fatal
-    // 立即返回）。统一模型 hop 之间对齐 one-api `shouldRetry`：400 视为请求本身
-    // 有问题，不再打后续成员（bifrost 对 400/404/422 也不做 key 轮换）；429/5xx
-    // 及其余非 2xx 继续下一成员。hop 间不等待——成员钉在不同渠道，换成员不是
-    // 同渠道退避。
+    // 立即返回）。统一模型 hop 之间：400 视为请求本身有问题，不再打后续成员；
+    // 429/5xx 及其余非 2xx 继续下一成员。hop 间不等待——成员钉在不同渠道，
+    // 换成员不是同渠道退避。
     let mut last_failure: Option<Response> = None;
     for hop in &hops {
         let response = dispatch_hop(
@@ -1454,7 +1453,7 @@ async fn passthrough_non_stream_completion(
 
 /// 直通快路径的出站请求体：以下游请求体为准，仅做目标性 JSON 补丁。
 ///
-/// spec 授权的补丁仅一项：OpenAI 流式时注入 `stream_options.include_usage`（供
+/// 直通补丁仅一项：OpenAI 流式时注入 `stream_options.include_usage`（供
 /// 逐帧嗅探 usage 计费；非流式响应体已自带顶层 usage）。Anthropic 流式自带
 /// usage（message_delta），无需补丁，请求体字节级原样转发。`stream` 字段由下游
 /// 请求自带，不做改写。
@@ -2228,7 +2227,7 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
-/// 统一模型 hop 是否继续下一成员。对齐 one-api `shouldRetry`：400 不换下一成员，
+/// 统一模型 hop 是否继续下一成员：400 不换下一成员，
 /// 429/5xx 换；其余非 2xx（如 401/403）也换，因为可能是该成员渠道的密钥/权限问题。
 fn should_try_next_hop(status: StatusCode) -> bool {
     let code = status.as_u16();

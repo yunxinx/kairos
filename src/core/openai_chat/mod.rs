@@ -1,10 +1,7 @@
 //! OpenAI Chat Completions 协议适配器：wire ↔ IR 双向编解码。
 //!
 //! wire 结构体全部私有，透过 `decode_*`/`encode_*` 公共函数暴露 IR 边界，
-//! wire 类型不出本模块边界（ADR-0001 hub-and-spoke）。
-//!
-//! 映射对齐 Vercel AI SDK `convert-to-openai-chat-messages.ts` 与
-//! `openai-chat-language-model.ts`。
+//! wire 类型不出本模块边界。
 
 use std::collections::HashMap;
 
@@ -255,7 +252,7 @@ struct WireStreamDelta {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct WireStreamToolCall {
-    /// 工具调用在流中的稳定序号（跨帧一致），对齐 AI SDK 的 index 语义。
+    /// 工具调用在流中的稳定序号（跨帧一致）。
     #[serde(default)]
     index: usize,
     #[serde(default)]
@@ -556,7 +553,7 @@ fn split_data_url(url: &str) -> (String, MediaSource) {
     )
 }
 
-/// 顶层媒体段是否为图片（对齐 AI SDK `getTopLevelMediaType`）。
+/// 顶层媒体段是否为图片。
 fn is_image_media(media_type: &str) -> bool {
     crate::core::ir::top_level_media_type(media_type) == "image"
 }
@@ -566,7 +563,7 @@ fn is_image_media(media_type: &str) -> bool {
 /// 编码 IR 请求为出站 Chat Completions 请求体。
 ///
 /// 目标协议无法表达的内容（`top_k`、reasoning part）追加到 `warnings`，由网关
-/// 随响应回传给下游（对齐 AI SDK `doGenerate` 的 warnings 累积）。
+/// 随响应回传给下游。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
     let messages: Vec<Value> = request
         .messages
@@ -667,7 +664,7 @@ fn encode_tool_choice(choice: &ToolChoice) -> Value {
 /// 编码单条 IR 消息为 wire 消息。
 ///
 /// `reasoning` part 在 Chat Completions 无对应字段：跨协议族转换时丢弃并记
-/// warning（ADR-0001 设计行为，不静默吞掉）。
+/// warning。
 fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
     if message
         .content
@@ -925,7 +922,7 @@ fn convert_usage(wire: WireUsage) -> Usage {
     }
 }
 
-/// unified finish reason 映射，对齐 mapOpenAIFinishReason。
+/// unified finish reason 映射为 Chat Completions wire 值。
 fn map_finish_reason(raw: Option<&str>) -> FinishReasonUnified {
     match raw {
         Some("stop") => FinishReasonUnified::Stop,
@@ -959,7 +956,7 @@ fn encode_finish_reason(finish_reason: &FinishReason) -> &'static str {
 /// 响应与官方形状字节一致。响应 content 中的 reasoning part 在此丢弃并记 warning。
 pub fn encode_response(response: &ChatResponse) -> Value {
     // OpenAI Chat Completions 无 reasoning 内容块：响应中的推理内容在重编码时
-    // 被丢弃，显式记 warning（ADR-0001 设计行为，不静默吞掉）。
+    // 被丢弃，显式记 warning。
     let mut warnings = response.warnings.clone();
     if response
         .content
@@ -1078,7 +1075,7 @@ fn encode_usage(usage: &Usage) -> Value {
 
 /// 流式解码器：把上游 Chat Completions 流式 chunk 解码为 IR 流事件。
 ///
-/// 对齐 AI SDK 的 `StreamingToolCallTracker`：跨帧维护 tool-call 的 index→id
+/// 跨帧维护 tool-call 的 index→id
 /// 映射，后续只带 index 的增量帧能匹配到首帧记录的 id。text delta 产出
 /// text-start/delta/end，tool-call delta 按 index 累积为 tool-input-start/delta/end，
 /// usage 与 finish_reason 在出现时产出生命周期事件。
@@ -1124,7 +1121,7 @@ impl StreamDecoder {
         if let Some(choice) = choice
             && let Some(delta) = &choice.delta
         {
-            // role 只出现在文本流的首帧：以此开启文本块（对齐 AI SDK isActiveText）。
+            // role 只出现在文本流的首帧：以此开启文本块。
             if delta.role.is_some() {
                 events.push(StreamEvent::TextStart {
                     id: "0".to_string(),

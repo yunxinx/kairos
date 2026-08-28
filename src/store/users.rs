@@ -1,7 +1,7 @@
 //! 管理用户与管理会话：邮箱密码、角色、会话令牌哈希。
 //!
 //! 密码用 Argon2id 的 PHC 串落库；会话只存 SHA-256，不存明文。最后一个启用的
-//! root 不能删除、禁用或降级（ADR-0009）。
+//! root 不能删除、禁用或降级。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

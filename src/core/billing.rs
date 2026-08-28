@@ -1,4 +1,4 @@
-//! 计费：四档价格快照与费用计算，全程整数 micro-USD（ADR-0002）。
+//! 计费：四档价格快照与费用计算，全程整数 micro-USD。
 //!
 //! 价格表经管理 API 维护，库内以「每 1M tokens 的 micro-USD」整数存储；费用
 //! 计算只做整数乘除。缓存档缺省时该档为 0，不回退 `input`；reasoning tokens

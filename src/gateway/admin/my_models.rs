@@ -26,7 +26,7 @@ pub(super) fn routes() -> Router<AdminDeps> {
 
 /// 单价区间（micro-USD / 1M tokens，已折后）。
 ///
-/// 价格按渠道定（ADR-0007），同一个可调用名挂在多条渠道上就可能有多个单价；
+/// 价格按渠道定，同一个可调用名挂在多条渠道上就可能有多个单价；
 /// 请求实际落哪条由路由决定，所以这里给区间而不是假装只有一个数。
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(super) struct PriceRange {
