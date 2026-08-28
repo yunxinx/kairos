@@ -10,6 +10,7 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::core::billing;
 use crate::store::StoreError;
+use crate::store::ids;
 
 /// 内置 `standard` 档固定 id：删档兜底与迁移基线。
 ///
@@ -79,7 +80,7 @@ pub struct PlanRecord {
 
 /// 管理面套餐创建字段。
 ///
-/// `internal_name` 不在此列：由系统在插入后按 `plan-{自增 id}` 生成并托管。
+/// `internal_name` 不在此列：由系统按时间有序 id 生成 `plan-{id}` 并托管。
 #[derive(Debug, Clone)]
 pub struct PlanCreateInput {
     pub display_name: String,
@@ -532,7 +533,7 @@ async fn move_default_to(
     Ok(())
 }
 
-/// 新建套餐，返回带数据库 id 的资源。
+/// 新建套餐，返回带时间有序 id 的资源。
 pub async fn insert_plan(
     conn: &mut SqliteConnection,
     input: &PlanCreateInput,
@@ -542,17 +543,18 @@ pub async fn insert_plan(
     let capabilities_json = serialize_capabilities_json(&input.capabilities)?;
     let default_rpm = rpm_to_db(input.default_rpm)?;
     let shared_rpm = rpm_to_db(input.shared_rpm)?;
-    // 内部名由系统托管：先以随机占位值插入（满足 UNIQUE 约束），拿到自增 id 后
-    // 立即改写为 `plan-{id}`。占位值只在本事务内短暂存在，任何路径都看不到它。
-    // 随机而非固定常量：即使未来出现不经 `begin_write` 的直接写路径也不会撞唯一索引。
+    // 内部名与主键在同一条写入语句生成，避免事务中出现任何可观察的占位名称。
     // 先按非默认插入，再走 `apply_default_flag`：新行若直接带 is_default = 1，
     // 会和同受众的现任默认档同时满足唯一索引条件而插入失败。
-    let result = sqlx::query(
-        "INSERT INTO plans (internal_name, display_name, note, note_visible_to_admin, \
+    let id = ids::next_id()?;
+    sqlx::query(
+        "INSERT INTO plans (id, internal_name, display_name, note, note_visible_to_admin, \
          discount_bp, default_rpm, shared_rpm, initial_grant_usd_micros, capabilities_json, \
          shared_with_admin, audience, is_default, builtin, created_at) \
-         VALUES ('__pending_' || lower(hex(randomblob(12))), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)",
     )
+    .bind(id)
+    .bind(format!("plan-{id}"))
     .bind(&input.display_name)
     .bind(&input.note)
     .bind(input.note_visible_to_admin)
@@ -567,13 +569,6 @@ pub async fn insert_plan(
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
-    let id = result.last_insert_rowid();
-    sqlx::query("UPDATE plans SET internal_name = ? WHERE id = ?")
-        .bind(format!("plan-{id}"))
-        .bind(id)
-        .execute(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
     if input.is_default {
         move_default_to(conn, id, input.audience).await?;
     }
@@ -687,6 +682,24 @@ fn validate_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::open;
+
+    fn sample_input(display_name: &str) -> PlanCreateInput {
+        PlanCreateInput {
+            display_name: display_name.to_string(),
+            note: String::new(),
+            note_visible_to_admin: false,
+            discount_bp: billing::MAX_DISCOUNT_BP,
+            default_rpm: None,
+            shared_rpm: None,
+            initial_grant_usd_micros: 0,
+            capabilities: PlanCapabilities::default(),
+            shared_with_admin: false,
+            audience: PlanAudience::User,
+            is_default: false,
+            groups: vec![],
+        }
+    }
 
     #[test]
     fn capability_json_defaults_new_fields_to_off() {
@@ -717,5 +730,30 @@ mod tests {
             parse_capabilities_json(7, &raw).expect("编码结果应能回读"),
             capabilities
         );
+    }
+
+    #[tokio::test]
+    async fn recreating_a_deleted_plan_never_reuses_its_identity() {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let pool = open(&dir.path().join("test.db"))
+            .await
+            .expect("应能打开临时库");
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+
+        let first = insert_plan(&mut conn, &sample_input("first"), 1_700_000_000_000)
+            .await
+            .expect("应能创建首个套餐");
+        sqlx::query("DELETE FROM plans WHERE id = ?")
+            .bind(first.id)
+            .execute(&mut *conn)
+            .await
+            .expect("应能删除自定义套餐");
+        let second = insert_plan(&mut conn, &sample_input("second"), 1_700_000_000_001)
+            .await
+            .expect("应能创建替代套餐");
+
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.internal_name, second.internal_name);
+        assert_eq!(second.internal_name, format!("plan-{}", second.id));
     }
 }

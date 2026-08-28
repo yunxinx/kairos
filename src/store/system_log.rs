@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
+use super::ids;
 use super::{
     SortDir, StoreError, as_count, clamp_page, like_substring_pattern, push_column_in,
     push_created_at_range, push_limit_offset, push_where_cond,
@@ -121,10 +122,12 @@ pub async fn insert_system_log(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let result = sqlx::query(
-        "INSERT INTO system_log (created_at, level, target, message, event_code, event_params) \
-         VALUES (?, ?, ?, ?, NULL, NULL)",
+    let id = ids::next_id()?;
+    sqlx::query(
+        "INSERT INTO system_log (id, created_at, level, target, message, event_code, event_params) \
+         VALUES (?, ?, ?, ?, ?, NULL, NULL)",
     )
+    .bind(id)
     .bind(now)
     .bind(level)
     .bind(target)
@@ -132,7 +135,7 @@ pub async fn insert_system_log(
     .execute(pool)
     .await
     .map_err(StoreError::Query)?;
-    Ok(result.last_insert_rowid())
+    Ok(id)
 }
 
 async fn insert_system_log_event_on(
@@ -148,11 +151,13 @@ async fn insert_system_log_event_on(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+    let id = ids::next_id()?;
     sqlx::query(
         "INSERT INTO system_log \
-         (created_at, level, target, message, event_code, event_params, actor_user_id, actor_email) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, created_at, level, target, message, event_code, event_params, actor_user_id, actor_email) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(now)
     .bind(level)
     .bind(target)

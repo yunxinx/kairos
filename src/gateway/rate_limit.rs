@@ -9,14 +9,19 @@
 //! [`super::throttle::AuthThrottle`]，两套计数不互通。
 
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use lru::LruCache;
 
 use crate::store::channel_keys::{
     StoredChannelKey, eligible_channel_keys, select_weighted_channel_key,
 };
 
 const STICKY_TTL: Duration = Duration::from_secs(60 * 60);
+const STICKY_MAX_ENTRIES: usize = 10_000;
+const STICKY_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct StickyKey {
@@ -33,14 +38,43 @@ struct StickyEntry {
 /// 进程内会话粘性缓存；密钥选择与校验在同一把锁内完成，避免并发首次请求分叉。
 #[derive(Clone)]
 pub(super) struct SessionStickyCache {
-    inner: Arc<Mutex<HashMap<StickyKey, StickyEntry>>>,
+    inner: Arc<Mutex<LruCache<StickyKey, StickyEntry>>>,
 }
 
 impl SessionStickyCache {
     pub(super) fn new() -> Self {
+        let cache = Self::with_capacity(STICKY_MAX_ENTRIES);
+        cache.start_cleanup();
+        cache
+    }
+
+    fn with_capacity(max_entries: usize) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::MIN),
+            ))),
         }
+    }
+
+    /// 在 Tokio 运行时中启动过期清理；同步单元测试等无运行时场景保持纯构造。
+    fn start_cleanup(&self) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let weak_inner = Arc::downgrade(&self.inner);
+        drop(handle.spawn(async move {
+            let mut interval = tokio::time::interval(STICKY_CLEANUP_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(inner) = weak_inner.upgrade() else {
+                    break;
+                };
+                let now = Instant::now();
+                let mut map = inner.lock().unwrap_or_else(PoisonError::into_inner);
+                prune_sticky_expired(&mut map, now);
+            }
+        }));
     }
 
     pub(super) fn select(
@@ -53,31 +87,31 @@ impl SessionStickyCache {
         let candidates = eligible_channel_keys(keys, model);
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        prune_sticky_expired(&mut map, now);
         let cache_key = StickyKey {
             channel_id,
             model: model.to_string(),
             session,
         };
         if candidates.is_empty() {
-            map.remove(&cache_key);
+            map.pop(&cache_key);
             return None;
         }
         if candidates.len() == 1 {
             // 单密钥渠道不使用粘性；清掉旧的多密钥缓存，避免恢复后错误复用。
-            map.remove(&cache_key);
+            map.pop(&cache_key);
             return Some(candidates[0].clone());
         }
 
-        if let Some(entry) = map.get(&cache_key) {
-            if let Some(key) = candidates.iter().find(|key| key.id == entry.key_id) {
-                return Some((*key).clone());
-            }
-            map.remove(&cache_key);
+        if let Some(entry) = map.get_mut(&cache_key)
+            && entry.expires_at > now
+            && let Some(key) = candidates.iter().find(|key| key.id == entry.key_id)
+        {
+            return Some((*key).clone());
         }
+        map.pop(&cache_key);
 
         let selected = select_weighted_channel_key(&candidates)?.clone();
-        map.insert(
+        map.put(
             cache_key,
             StickyEntry {
                 key_id: selected.id,
@@ -88,8 +122,15 @@ impl SessionStickyCache {
     }
 }
 
-fn prune_sticky_expired(map: &mut HashMap<StickyKey, StickyEntry>, now: Instant) {
-    map.retain(|_, entry| entry.expires_at > now);
+fn prune_sticky_expired(map: &mut LruCache<StickyKey, StickyEntry>, now: Instant) {
+    let expired_keys: Vec<StickyKey> = map
+        .iter()
+        .filter(|(_, entry)| entry.expires_at <= now)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in expired_keys {
+        map.pop(&key);
+    }
 }
 
 /// 滑动窗口长度：RPM 按自然分钟计数。
@@ -385,7 +426,7 @@ mod tests {
             model: "model".to_string(),
             session: 42,
         };
-        cache.inner.lock().expect("缓存锁不应被污染").insert(
+        cache.inner.lock().expect("缓存锁不应被污染").put(
             cache_key,
             StickyEntry {
                 key_id: 1,
@@ -395,5 +436,96 @@ mod tests {
         let keys = [key(1, 0, true), key(2, 100, true)];
         let selected = cache.select(7, "model", 42, &keys).expect("应重选");
         assert_eq!(selected.id, 2);
+    }
+
+    #[test]
+    fn sticky_cache_evicts_least_recently_used_entry_at_capacity() {
+        let cache = SessionStickyCache::with_capacity(2);
+        let now = Instant::now();
+        let oldest = StickyKey {
+            channel_id: 7,
+            model: "oldest".to_string(),
+            session: 1,
+        };
+        let newest = StickyKey {
+            channel_id: 7,
+            model: "newest".to_string(),
+            session: 2,
+        };
+        {
+            let mut map = cache.inner.lock().expect("缓存锁不应被污染");
+            map.put(
+                oldest.clone(),
+                StickyEntry {
+                    key_id: 1,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+            map.put(
+                newest.clone(),
+                StickyEntry {
+                    key_id: 1,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+        }
+
+        let keys = [key(1, 1, true), key(2, 1, true)];
+        cache
+            .select(7, "inserted", 3, &keys)
+            .expect("应能插入新粘性项");
+
+        let map = cache.inner.lock().expect("缓存锁不应被污染");
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains(&oldest));
+        assert!(map.contains(&newest));
+    }
+
+    #[test]
+    fn sticky_hit_refreshes_lru_recency() {
+        let cache = SessionStickyCache::with_capacity(2);
+        let keys = [key(1, 1, true), key(2, 1, true)];
+        cache.select(7, "kept", 1, &keys).expect("应写入缓存");
+        cache.select(7, "evicted", 2, &keys).expect("应写入缓存");
+        cache.select(7, "kept", 1, &keys).expect("应命中缓存");
+        cache.select(7, "inserted", 3, &keys).expect("应写入缓存");
+
+        let map = cache.inner.lock().expect("缓存锁不应被污染");
+        assert!(map.iter().any(|(key, _)| key.model == "kept"));
+        assert!(!map.iter().any(|(key, _)| key.model == "evicted"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn explicit_cleanup_removes_only_expired_entries() {
+        let now = Instant::now();
+        let mut map = lru::LruCache::new(std::num::NonZeroUsize::new(2).expect("容量至少为 1"));
+        map.put(
+            StickyKey {
+                channel_id: 7,
+                model: "expired".to_string(),
+                session: 1,
+            },
+            StickyEntry {
+                key_id: 1,
+                expires_at: now - Duration::from_secs(1),
+            },
+        );
+        map.put(
+            StickyKey {
+                channel_id: 7,
+                model: "live".to_string(),
+                session: 2,
+            },
+            StickyEntry {
+                key_id: 1,
+                expires_at: now + Duration::from_secs(1),
+            },
+        );
+
+        super::prune_sticky_expired(&mut map, now);
+
+        assert_eq!(map.len(), 1);
+        assert!(map.iter().all(|(key, _)| key.model == "live"));
     }
 }

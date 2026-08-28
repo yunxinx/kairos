@@ -8,6 +8,7 @@
 pub mod balance_operations;
 pub mod catalog;
 pub mod channel_keys;
+mod ids;
 pub mod plans;
 pub mod resources;
 mod system_log;
@@ -67,6 +68,10 @@ pub enum StoreError {
     EmailTaken,
     #[error("密码处理失败")]
     PasswordHash,
+    #[error("系统时钟早于资源 id 纪元")]
+    EntityIdClockBeforeEpoch,
+    #[error("资源 id 空间已耗尽")]
+    EntityIdExhausted,
 }
 
 /// 写锁等待上限：与 sqlx-sqlite 缺省一致，此处显式声明意图——SQLite 单写者下
@@ -101,24 +106,28 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
         .await
         .map_err(StoreError::Migrate)?;
 
+    ids::initialize(&pool).await?;
+
     Ok(pool)
 }
 
-/// 写一条冒烟记录，返回插入的自增 id。
+/// 写一条冒烟记录，返回时间有序 id。
 pub async fn insert_smoke(pool: &SqlitePool, note: &str) -> Result<i64, StoreError> {
-    let result = sqlx::query("INSERT INTO smoke_probe (note) VALUES (?)")
+    let id = ids::next_id()?;
+    sqlx::query("INSERT INTO smoke_probe (id, note) VALUES (?, ?)")
+        .bind(id)
         .bind(note)
         .execute(pool)
         .await
         .map_err(StoreError::Query)?;
 
-    Ok(result.last_insert_rowid())
+    Ok(id)
 }
 
 /// 一条请求日志的可持久化字段。
 #[derive(Debug, Clone)]
 pub struct RequestLog {
-    /// 自增主键：新增时由库分配，读回后才有效（插入构造时填 0）。
+    /// 时间有序主键：新增时由存储层分配，插入构造时填 0。
     pub id: i64,
     /// unix 毫秒时间戳。
     pub created_at: i64,
@@ -168,7 +177,7 @@ pub struct RequestLog {
     pub response_body: Option<Vec<u8>>,
 }
 
-/// 落一条请求日志，返回插入的自增 id。
+/// 落一条请求日志，返回时间有序 id。
 pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i64, StoreError> {
     let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
     insert_request_log_on(&mut conn, log).await
@@ -179,16 +188,18 @@ pub async fn insert_request_log_on(
     conn: &mut SqliteConnection,
     log: &RequestLog,
 ) -> Result<i64, StoreError> {
-    let result = sqlx::query(
+    let id = ids::next_id()?;
+    sqlx::query(
         "INSERT INTO request_log \
-         (created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
+         (id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
           channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
           cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
           cache_read_price_usd_micros, cache_write_price_usd_micros, \
           base_cost_usd_micros, discount_bp, cost_usd_micros, \
           settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(log.created_at)
     .bind(&log.token_name)
     .bind(&log.token_key)
@@ -219,7 +230,7 @@ pub async fn insert_request_log_on(
     .await
     .map_err(StoreError::Query)?;
 
-    Ok(result.last_insert_rowid())
+    Ok(id)
 }
 
 /// 所属用户的钱包余额。

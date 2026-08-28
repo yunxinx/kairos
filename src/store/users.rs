@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::store::StoreError;
+use crate::store::ids;
 use crate::store::resources::ROOT_USER_ID;
 
 /// 管理角色：上级含下级权限。
@@ -498,10 +499,12 @@ pub async fn insert_user_with_plan(
         Some(plan_id) => crate::store::plans::initial_grant_on_conn(conn, plan_id).await?,
         None => 0,
     };
-    let result = sqlx::query(
-        "INSERT INTO users (email, display_name, password_hash, role, enabled, created_at, rate_limit_rpm, plan_id) \
-         VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+    let id = ids::next_id()?;
+    sqlx::query(
+        "INSERT INTO users (id, email, display_name, password_hash, role, enabled, created_at, rate_limit_rpm, plan_id) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
+    .bind(id)
     .bind(&email)
     .bind(display_name)
     .bind(&password_hash)
@@ -512,7 +515,6 @@ pub async fn insert_user_with_plan(
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
-    let id = result.last_insert_rowid();
     sqlx::query(
         "INSERT INTO user_balance (user_id, balance_usd_micros, settled_usd_micros, created_at) \
          VALUES (?, ?, 0, ?)",
