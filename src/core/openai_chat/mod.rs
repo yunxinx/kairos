@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
-    Message, Role, StreamEvent, Tool, Usage, Warning,
+    Message, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
 };
 use crate::core::stream::SseFrame;
 
@@ -45,6 +45,8 @@ pub enum DecodeError {
     ToolContentNotString { index: usize },
     #[error("消息 {index} 的 tool_call 参数不是 JSON 字符串")]
     ToolCallArgumentsNotString { index: usize },
+    #[error("tool_choice 形状无法识别: {detail}")]
+    InvalidToolChoice { detail: String },
     #[error("响应缺少 choices")]
     MissingChoices,
     #[error("响应的 choice 缺少 message")]
@@ -309,9 +311,53 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                 parameters: t.function.parameters,
             })
             .collect(),
-        tool_choice: wire.tool_choice,
+        tool_choice: wire
+            .tool_choice
+            .as_ref()
+            .map(decode_tool_choice)
+            .transpose()?,
         provider_options: HashMap::new(),
     })
+}
+
+/// 解码 wire `tool_choice` 为 IR 类型化枚举。
+///
+/// 已知形状之外直接拒绝：原样透传时代未知形状被静默忽略，跨协议转换后
+/// 即成上游 400 雷，提前到入站面报错并指明字段。
+fn decode_tool_choice(value: &Value) -> Result<ToolChoice, DecodeError> {
+    match value {
+        Value::String(s) => match s.as_str() {
+            "auto" => Ok(ToolChoice::Auto),
+            "none" => Ok(ToolChoice::None),
+            "required" => Ok(ToolChoice::Required),
+            other => Err(DecodeError::InvalidToolChoice {
+                detail: format!("未知字符串值 {other:?}"),
+            }),
+        },
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(DecodeError::InvalidToolChoice {
+                    detail: "对象形状仅支持 {\"type\":\"function\"}".to_string(),
+                });
+            }
+            let name = map
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if name.is_empty() {
+                return Err(DecodeError::InvalidToolChoice {
+                    detail: "type=function 缺少 function.name".to_string(),
+                });
+            }
+            Ok(ToolChoice::Tool {
+                name: name.to_string(),
+            })
+        }
+        _ => Err(DecodeError::InvalidToolChoice {
+            detail: "仅支持字符串或对象".to_string(),
+        }),
+    }
 }
 
 /// 解码单条 wire 消息为 IR 消息。
@@ -582,10 +628,22 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             ),
         );
     }
-    if let Some(v) = &request.tool_choice {
-        obj.insert("tool_choice".into(), v.clone());
+    if let Some(choice) = &request.tool_choice {
+        obj.insert("tool_choice".into(), encode_tool_choice(choice));
     }
     Value::Object(obj)
+}
+
+/// 编码 IR tool_choice 为 Chat Completions wire 值。
+fn encode_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::None => json!("none"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Tool { name } => {
+            json!({ "type": "function", "function": { "name": name } })
+        }
+    }
 }
 
 /// 编码单条 IR 消息为 wire 消息。

@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
-    StreamEvent, Tool, Usage, Warning,
+    StreamEvent, Tool, ToolChoice, Usage, Warning,
 };
 use crate::core::stream::SseFrame;
 
@@ -57,6 +57,8 @@ pub enum DecodeError {
     MissingText { index: usize },
     #[error("function_call 项 {index} 的 arguments 不是字符串")]
     ArgumentsNotString { index: usize },
+    #[error("tool_choice 形状无法识别: {detail}")]
+    InvalidToolChoice { detail: String },
     #[error("响应缺少 output")]
     MissingOutput,
 }
@@ -333,7 +335,11 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                 })
             })
             .collect(),
-        tool_choice: wire.tool_choice,
+        tool_choice: wire
+            .tool_choice
+            .as_ref()
+            .map(decode_tool_choice)
+            .transpose()?,
         provider_options,
     })
 }
@@ -772,8 +778,8 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             ),
         );
     }
-    if let Some(tc) = &request.tool_choice {
-        obj.insert("tool_choice".into(), tc.clone());
+    if let Some(choice) = &request.tool_choice {
+        obj.insert("tool_choice".into(), encode_tool_choice(choice));
     }
 
     // 请求级逃生舱回传；有状态特性出站丢弃并显式 warning。
@@ -798,6 +804,51 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
         }
     }
     Value::Object(obj)
+}
+
+/// 解码 wire `tool_choice` 为 IR 类型化枚举（Responses 的工具选择为扁平
+/// `{"type":"function","name"}` 形状）。已知形状之外直接拒绝，避免跨协议
+/// 转换时静默降级为上游 400。
+fn decode_tool_choice(value: &Value) -> Result<ToolChoice, DecodeError> {
+    match value {
+        Value::String(s) => match s.as_str() {
+            "auto" => Ok(ToolChoice::Auto),
+            "none" => Ok(ToolChoice::None),
+            "required" => Ok(ToolChoice::Required),
+            other => Err(DecodeError::InvalidToolChoice {
+                detail: format!("未知字符串值 {other:?}"),
+            }),
+        },
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(DecodeError::InvalidToolChoice {
+                    detail: "对象形状仅支持 {\"type\":\"function\"}".to_string(),
+                });
+            }
+            let name = map.get("name").and_then(Value::as_str).unwrap_or_default();
+            if name.is_empty() {
+                return Err(DecodeError::InvalidToolChoice {
+                    detail: "type=function 缺少 name".to_string(),
+                });
+            }
+            Ok(ToolChoice::Tool {
+                name: name.to_string(),
+            })
+        }
+        _ => Err(DecodeError::InvalidToolChoice {
+            detail: "仅支持字符串或对象".to_string(),
+        }),
+    }
+}
+
+/// 编码 IR tool_choice 为 Responses wire 值。
+fn encode_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::None => json!("none"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Tool { name } => json!({ "type": "function", "name": name }),
+    }
 }
 
 /// 编码 user 消息为 message 项；媒体 part 映射为 `input_image`/`input_file`。

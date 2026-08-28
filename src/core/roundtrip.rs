@@ -25,7 +25,7 @@ use super::{anthropic_messages, openai_chat, openai_responses};
 use crate::config::Protocol;
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role, Tool,
-    Usage, Warning,
+    ToolChoice, Usage, Warning,
 };
 
 /// 全部有向协议对（a 自往返后经 b 中转再回 a）。
@@ -77,13 +77,20 @@ fn encode_request_wire(protocol: Protocol, request: &ChatRequest) -> (Value, Vec
 }
 
 fn decode_request_wire(protocol: Protocol, wire: &Value) -> ChatRequest {
+    decode_request_result(protocol, wire)
+        .unwrap_or_else(|err| panic!("{protocol:?} 请求解码应成功: {err}"))
+}
+
+/// 解码请求的原始 `Result` 形态：供「非法形状应在入站拒绝」类用例断言错误。
+fn decode_request_result(protocol: Protocol, wire: &Value) -> Result<ChatRequest, String> {
     match protocol {
-        Protocol::OpenAiChat => openai_chat::decode_request(wire)
-            .unwrap_or_else(|err| panic!("OpenAiChat 请求解码应成功: {err}")),
-        Protocol::OpenAiResponses => openai_responses::decode_request(wire)
-            .unwrap_or_else(|err| panic!("OpenAiResponses 请求解码应成功: {err}")),
-        Protocol::AnthropicMessages => anthropic_messages::decode_request(wire)
-            .unwrap_or_else(|err| panic!("AnthropicMessages 请求解码应成功: {err}")),
+        Protocol::OpenAiChat => openai_chat::decode_request(wire).map_err(|err| err.to_string()),
+        Protocol::OpenAiResponses => {
+            openai_responses::decode_request(wire).map_err(|err| err.to_string())
+        }
+        Protocol::AnthropicMessages => {
+            anthropic_messages::decode_request(wire).map_err(|err| err.to_string())
+        }
     }
 }
 
@@ -175,6 +182,7 @@ fn project_request(request: &ChatRequest) -> Value {
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
         "top_p": request.top_p,
+        "tool_choice": request.tool_choice,
     })
 }
 
@@ -435,4 +443,173 @@ fn responses_reasoning_escape_hatch_survives_same_family() {
     let wire = encode_response_wire(Protocol::OpenAiResponses, &response);
     let back = decode_response_wire(Protocol::OpenAiResponses, &wire);
     assert_eq!(project_response(&back), project_response(&response));
+}
+
+/// 各协议 tool_choice 的 wire 形状 → IR 类型化期望值表。
+fn tool_choice_wire_shapes(protocol: Protocol) -> Vec<(Value, ToolChoice)> {
+    match protocol {
+        Protocol::OpenAiChat => vec![
+            (json!("auto"), ToolChoice::Auto),
+            (json!("none"), ToolChoice::None),
+            (json!("required"), ToolChoice::Required),
+            (
+                json!({ "type": "function", "function": { "name": "f" } }),
+                ToolChoice::Tool {
+                    name: "f".to_string(),
+                },
+            ),
+        ],
+        Protocol::OpenAiResponses => vec![
+            (json!("auto"), ToolChoice::Auto),
+            (json!("none"), ToolChoice::None),
+            (json!("required"), ToolChoice::Required),
+            (
+                json!({ "type": "function", "name": "f" }),
+                ToolChoice::Tool {
+                    name: "f".to_string(),
+                },
+            ),
+        ],
+        Protocol::AnthropicMessages => vec![
+            (json!({ "type": "auto" }), ToolChoice::Auto),
+            (json!({ "type": "none" }), ToolChoice::None),
+            (json!({ "type": "any" }), ToolChoice::Required),
+            (
+                json!({ "type": "tool", "name": "f" }),
+                ToolChoice::Tool {
+                    name: "f".to_string(),
+                },
+            ),
+        ],
+    }
+}
+
+/// 三入站协议的全部 tool_choice wire 形状（含 anthropic `any`）都解码为
+/// 正确的 IR 类型化值。
+#[test]
+fn tool_choice_wire_shapes_decode_to_typed_across_protocols() {
+    for protocol in [
+        Protocol::OpenAiChat,
+        Protocol::OpenAiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        for (shape, expected) in tool_choice_wire_shapes(protocol) {
+            let mut request = base_request();
+            request.tool_choice = Some(expected.clone());
+            let (mut wire, _) = encode_request_wire(protocol, &request);
+            wire["tool_choice"] = shape.clone();
+            let back = decode_request_wire(protocol, &wire);
+            assert_eq!(
+                back.tool_choice,
+                Some(expected),
+                "{protocol:?} 解码 {shape}"
+            );
+        }
+    }
+}
+
+/// 四种 IR tool_choice 变体编码到每个协议时都产出该协议的规范 wire 形状。
+#[test]
+fn tool_choice_typed_encodes_to_each_protocol_shape() {
+    for protocol in [
+        Protocol::OpenAiChat,
+        Protocol::OpenAiResponses,
+        Protocol::AnthropicMessages,
+    ] {
+        for (canonical, choice) in tool_choice_wire_shapes(protocol) {
+            let mut request = base_request();
+            request.tool_choice = Some(choice);
+            let (wire, warnings) = encode_request_wire(protocol, &request);
+            assert!(warnings.is_empty(), "{protocol:?} 编码不应有 warning");
+            assert_eq!(wire["tool_choice"], canonical, "{protocol:?} 编码形状");
+        }
+    }
+}
+
+/// 四种 tool_choice 变体经全部有向对往返保持 IR 类型化语义
+/// （`any↔required` 等差异由适配器归一，IR 面无感）。
+#[test]
+fn tool_choice_all_variants_survive_all_six_pairs() {
+    let variants = vec![
+        ToolChoice::Auto,
+        ToolChoice::None,
+        ToolChoice::Required,
+        ToolChoice::Tool {
+            name: "f".to_string(),
+        },
+    ];
+    for variant in variants {
+        for (a, b) in directed_pairs() {
+            let mut request = base_request();
+            request.tool_choice = Some(variant.clone());
+            request_survives(a, b, &request);
+        }
+    }
+}
+
+/// anthropic 附加语义逃生舱：入站 `disable_parallel_tool_use` 捕获进
+/// 请求级逃生舱并与 thinking 共存；同族出站并回 tool_choice 对象。
+#[test]
+fn anthropic_tool_choice_extra_survives_same_family() {
+    let mut request = base_request();
+    request.tool_choice = Some(ToolChoice::Auto);
+    let (mut wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    wire["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": true });
+
+    let decoded = decode_request_wire(Protocol::AnthropicMessages, &wire);
+    assert_eq!(decoded.tool_choice, Some(ToolChoice::Auto));
+    assert_eq!(
+        decoded.provider_options["anthropic"]["tool_choice_extra"]["disable_parallel_tool_use"],
+        json!(true)
+    );
+
+    let (wire_back, warnings) = encode_request_wire(Protocol::AnthropicMessages, &decoded);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        wire_back["tool_choice"],
+        json!({ "type": "auto", "disable_parallel_tool_use": true })
+    );
+
+    // 逃生舱与 thinking 共存：同一 anthropic 对象内两个键互不覆盖。
+    let mut both = base_request();
+    both.tool_choice = Some(ToolChoice::Auto);
+    both.provider_options = options(&[(
+        "anthropic",
+        json!({ "thinking": { "type": "enabled", "budget_tokens": 1024 } }),
+    )]);
+    let (mut wire_both, _) = encode_request_wire(Protocol::AnthropicMessages, &both);
+    wire_both["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": true });
+    let decoded_both = decode_request_wire(Protocol::AnthropicMessages, &wire_both);
+    assert_eq!(
+        decoded_both.provider_options["anthropic"]["thinking"]["budget_tokens"],
+        json!(1024)
+    );
+    assert!(decoded_both.provider_options["anthropic"]["tool_choice_extra"].is_object());
+}
+
+/// 未知 tool_choice 形状在入站面直接拒绝，错误信息指明字段。
+#[test]
+fn unknown_tool_choice_shapes_are_rejected_at_ingress() {
+    let cases = vec![
+        (Protocol::OpenAiChat, json!("bogus")),
+        (Protocol::OpenAiChat, json!({ "type": "allowed_tools" })),
+        (Protocol::OpenAiChat, json!(true)),
+        (Protocol::OpenAiResponses, json!("bogus")),
+        (Protocol::OpenAiResponses, json!(true)),
+        (Protocol::AnthropicMessages, json!({ "type": "bogus" })),
+        (Protocol::AnthropicMessages, json!("auto")),
+        (Protocol::AnthropicMessages, json!({ "type": "tool" })),
+    ];
+    for (protocol, shape) in cases {
+        let mut request = base_request();
+        request.tool_choice = Some(ToolChoice::Auto);
+        let (mut wire, _) = encode_request_wire(protocol, &request);
+        wire["tool_choice"] = shape;
+        let err =
+            decode_request_result(protocol, &wire).expect_err("未知 tool_choice 形状应被拒绝");
+        assert!(
+            err.contains("tool_choice"),
+            "{protocol:?} 错误应指明字段: {err}"
+        );
+    }
 }

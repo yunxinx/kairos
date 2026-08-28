@@ -23,7 +23,7 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
-    StreamEvent, Tool, Usage, Warning,
+    StreamEvent, Tool, ToolChoice, Usage, Warning,
 };
 use crate::core::stream::SseFrame;
 
@@ -48,6 +48,8 @@ pub enum DecodeError {
     UnknownContentBlock { index: usize },
     #[error("消息 {index} 的 tool_result 缺少 tool_use_id")]
     MissingToolUseId { index: usize },
+    #[error("tool_choice 形状无法识别: {detail}")]
+    InvalidToolChoice { detail: String },
     #[error("响应缺少 usage")]
     MissingUsage,
 }
@@ -348,6 +350,11 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     if let Some(thinking) = wire.thinking {
         provider_options.insert("anthropic".to_string(), json!({ "thinking": thinking }));
     }
+    let tool_choice = wire
+        .tool_choice
+        .as_ref()
+        .map(|value| decode_tool_choice(value, &mut provider_options))
+        .transpose()?;
 
     Ok(ChatRequest {
         model: wire.model,
@@ -373,7 +380,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                 parameters: t.input_schema,
             })
             .collect(),
-        tool_choice: wire.tool_choice,
+        tool_choice,
         provider_options,
     })
 }
@@ -392,6 +399,56 @@ fn system_text(system: &Value) -> Option<String> {
             Some(text)
         }
         _ => None,
+    }
+}
+
+/// 解码 wire `tool_choice` 为 IR 类型化枚举。
+///
+/// `type`/`name` 之外的键（如 `disable_parallel_tool_use`）是 Anthropic 附加
+/// 语义，经请求级逃生舱 `provider_options["anthropic"]["tool_choice_extra"]`
+/// 保留，只在 Anthropic 出站写回；逃生舱并入已有的 `anthropic` 对象，
+/// thinking 等先前捕获的配置共存。
+fn decode_tool_choice(
+    value: &Value,
+    provider_options: &mut crate::core::ir::ProviderOptions,
+) -> Result<ToolChoice, DecodeError> {
+    let Value::Object(map) = value else {
+        return Err(DecodeError::InvalidToolChoice {
+            detail: "应为对象形状".to_string(),
+        });
+    };
+    let extra: serde_json::Map<String, Value> = map
+        .iter()
+        .filter(|(key, _)| key.as_str() != "type" && key.as_str() != "name")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if !extra.is_empty() {
+        let entry = provider_options
+            .entry("anthropic".to_string())
+            .or_insert_with(|| json!({}));
+        if let Value::Object(anthropic) = entry {
+            anthropic.insert("tool_choice_extra".into(), Value::Object(extra));
+        }
+    }
+    match map.get("type").and_then(Value::as_str) {
+        Some("auto") => Ok(ToolChoice::Auto),
+        Some("any") => Ok(ToolChoice::Required),
+        Some("none") => Ok(ToolChoice::None),
+        Some("tool") => {
+            let name = map.get("name").and_then(Value::as_str).unwrap_or_default();
+            if name.is_empty() {
+                Err(DecodeError::InvalidToolChoice {
+                    detail: "type=tool 缺少 name".to_string(),
+                })
+            } else {
+                Ok(ToolChoice::Tool {
+                    name: name.to_string(),
+                })
+            }
+        }
+        other => Err(DecodeError::InvalidToolChoice {
+            detail: format!("未知 type {other:?}"),
+        }),
     }
 }
 
@@ -700,8 +757,11 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             ),
         );
     }
-    if let Some(tc) = &request.tool_choice {
-        obj.insert("tool_choice".into(), tc.clone());
+    if let Some(choice) = &request.tool_choice {
+        obj.insert(
+            "tool_choice".into(),
+            encode_tool_choice(choice, &request.provider_options),
+        );
     }
     // 请求级逃生舱回传：Anthropic thinking 配置等。
     if let Some(anthropic) = request.provider_options.get("anthropic")
@@ -717,6 +777,40 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
 /// 合并连续 assistant 消息（Anthropic 要求）与连续 tool 消息（拆为单条 user 的
 /// 多个 tool_result 块）。首个 System 消息提升为 system；其余 System 消息以
 /// user 文本夹在消息流中，保持顺序。
+/// 编码 IR tool_choice 为 Anthropic wire 值；请求级逃生舱
+/// `tool_choice_extra` 的附加键（如 `disable_parallel_tool_use`）并回对象。
+fn encode_tool_choice(
+    choice: &ToolChoice,
+    provider_options: &crate::core::ir::ProviderOptions,
+) -> Value {
+    let mut obj = serde_json::Map::new();
+    match choice {
+        ToolChoice::Auto => {
+            obj.insert("type".into(), json!("auto"));
+        }
+        ToolChoice::None => {
+            obj.insert("type".into(), json!("none"));
+        }
+        ToolChoice::Required => {
+            obj.insert("type".into(), json!("any"));
+        }
+        ToolChoice::Tool { name } => {
+            obj.insert("type".into(), json!("tool"));
+            obj.insert("name".into(), json!(name));
+        }
+    }
+    if let Some(extra) = provider_options
+        .get("anthropic")
+        .and_then(|anthropic| anthropic.get("tool_choice_extra"))
+        .and_then(Value::as_object)
+    {
+        for (key, value) in extra {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(obj)
+}
+
 fn encode_messages(
     ir_messages: &[Message],
     warnings: &mut Vec<Warning>,

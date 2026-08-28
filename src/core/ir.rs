@@ -233,6 +233,22 @@ pub struct Tool {
     pub parameters: Option<Value>,
 }
 
+/// 工具选择：跨协议类型化（对齐 AI SDK `ToolChoice`）。
+///
+/// 三协议的 wire 形状差异（Anthropic 的 `any`、Chat 的嵌套 `function` 对象、
+/// Responses 的扁平 `function` 对象）由各适配器双向承担；Anthropic 附加语义
+/// （如 `disable_parallel_tool_use`）经请求级逃生舱
+/// `provider_options["anthropic"]["tool_choice_extra"]` 保留，只在
+/// Anthropic 出站写回。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Tool { name: String },
+}
+
 /// 非流式聊天请求的 IR 中枢。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -265,7 +281,7 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<ToolChoice>,
     /// 请求级逃生舱：入站解析留存的 provider 特有请求设置。
     ///
     /// Anthropic 的 `thinking`（budget_tokens/display）是请求级而非消息级配置：
