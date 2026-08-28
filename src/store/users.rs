@@ -3,7 +3,6 @@
 //! 密码用 Argon2id 的 PHC 串落库；会话只存 SHA-256，不存明文。最后一个启用的
 //! root 不能删除、禁用或降级（ADR-0009）。
 
-use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +10,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::store::StoreError;
-use crate::store::resources::{DEFAULT_MODEL_GROUP, ROOT_USER_ID};
+use crate::store::ids;
+use crate::store::resources::ROOT_USER_ID;
 
 /// 管理角色：上级含下级权限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +193,8 @@ pub struct UserRecord {
     pub enabled: bool,
     pub avatar: Option<String>,
     pub rate_limit_rpm: Option<u64>,
+    /// 所属套餐；仅 root 为 `None`。
+    pub plan_id: Option<i64>,
 }
 
 /// 快照加载所需的用户投影；不携带头像、邮箱等管理面字段。
@@ -202,6 +204,7 @@ pub(crate) struct SnapshotUser {
     pub(crate) role: ManagementRole,
     pub(crate) enabled: bool,
     pub(crate) rate_limit_rpm: Option<u64>,
+    pub(crate) plan_id: Option<i64>,
 }
 
 /// 新建管理用户时的字段。
@@ -348,7 +351,7 @@ pub fn validate_password_shape(password: &str) -> Result<(), StoreError> {
 /// 按 id 读用户；不存在返回 `None`。
 pub async fn get_user(pool: &SqlitePool, id: i64) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ? AND deleted_at IS NULL",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, plan_id FROM users WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -367,7 +370,7 @@ pub(crate) async fn get_user_including_archived_on_conn(
     id: i64,
 ) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ?",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, plan_id FROM users WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -383,7 +386,7 @@ pub async fn get_user_by_email(
 ) -> Result<Option<UserRecord>, StoreError> {
     let email = normalize_email(email);
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ? AND deleted_at IS NULL",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, plan_id FROM users WHERE email = ? AND deleted_at IS NULL",
     )
     .bind(email)
     .fetch_optional(pool)
@@ -406,14 +409,75 @@ fn map_user_row(row: &sqlx::sqlite::SqliteRow) -> Result<UserRecord, StoreError>
         enabled: enabled != 0,
         avatar,
         rate_limit_rpm,
+        plan_id: row.try_get("plan_id").map_err(StoreError::Query)?,
     })
 }
 
-/// 创建用户：同步建零额钱包与默认可用组 `default`。
+/// 新建非 root 用户时按角色选择默认套餐。
+///
+/// 落到哪一档由 `plans.is_default` 决定（每个受众至多一档），不再硬编码内置 id：
+/// 运营可以新建一档设为默认，而不必去改内置档。若该受众还没有默认档，退回对应的
+/// 内置 id——建用户不能因为「没人设过默认」而失败。
+pub(crate) async fn default_plan_id_for_role(
+    conn: &mut SqliteConnection,
+    role: ManagementRole,
+) -> Result<Option<i64>, StoreError> {
+    let Some(audience) = plan_audience_for_role(role) else {
+        return Ok(None);
+    };
+    let fallback = match audience {
+        crate::store::plans::PlanAudience::Admin => crate::store::plans::ADMIN_PLAN_ID,
+        crate::store::plans::PlanAudience::User => crate::store::plans::STANDARD_PLAN_ID,
+    };
+    let configured = crate::store::plans::default_plan_id_on_conn(conn, audience).await?;
+    Ok(Some(configured.unwrap_or(fallback)))
+}
+
+/// 非 root 角色必须绑定的套餐受众；root 不挂套餐。
+pub(crate) fn plan_audience_for_role(
+    role: ManagementRole,
+) -> Option<crate::store::plans::PlanAudience> {
+    match role {
+        ManagementRole::Root => None,
+        ManagementRole::Admin => Some(crate::store::plans::PlanAudience::Admin),
+        ManagementRole::User => Some(crate::store::plans::PlanAudience::User),
+    }
+}
+
+/// 修改用户套餐绑定；调用方负责角色与授权范围校验。
+pub async fn set_user_plan(
+    conn: &mut SqliteConnection,
+    user_id: i64,
+    plan_id: i64,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE users SET plan_id = ? WHERE id = ? AND deleted_at IS NULL")
+        .bind(plan_id)
+        .bind(user_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::UserNotFound(user_id));
+    }
+    Ok(())
+}
+
+/// 创建用户：同步建零额钱包，并按角色挂到内置默认套餐。
 pub async fn insert_user(
     conn: &mut SqliteConnection,
     new_user: NewUser<'_>,
     now: i64,
+) -> Result<UserRecord, StoreError> {
+    let plan_id = default_plan_id_for_role(conn, new_user.role).await?;
+    insert_user_with_plan(conn, new_user, now, plan_id).await
+}
+
+/// 创建用户并挂到指定套餐；起步金与钱包在同一事务中一次性写入。
+pub async fn insert_user_with_plan(
+    conn: &mut SqliteConnection,
+    new_user: NewUser<'_>,
+    now: i64,
+    plan_id: Option<i64>,
 ) -> Result<UserRecord, StoreError> {
     let email = normalize_email(new_user.email);
     if email.is_empty() || !email.contains('@') {
@@ -431,35 +495,36 @@ pub async fn insert_user(
     }
     let password_hash = hash_password(new_user.password).await?;
     let rpm_val = rate_limit_rpm_to_db(new_user.rate_limit_rpm)?;
-    let result = sqlx::query(
-        "INSERT INTO users (email, display_name, password_hash, role, enabled, created_at, rate_limit_rpm) \
-         VALUES (?, ?, ?, ?, 1, ?, ?)",
+    let initial_grant = match plan_id {
+        Some(plan_id) => crate::store::plans::initial_grant_on_conn(conn, plan_id).await?,
+        None => 0,
+    };
+    let id = ids::next_id()?;
+    sqlx::query(
+        "INSERT INTO users (id, email, display_name, password_hash, role, enabled, created_at, rate_limit_rpm, plan_id) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
+    .bind(id)
     .bind(&email)
     .bind(display_name)
     .bind(&password_hash)
     .bind(new_user.role.as_str())
     .bind(now)
     .bind(rpm_val)
+    .bind(plan_id)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
-    let id = result.last_insert_rowid();
     sqlx::query(
         "INSERT INTO user_balance (user_id, balance_usd_micros, settled_usd_micros, created_at) \
-         VALUES (?, 0, 0, ?)",
+         VALUES (?, ?, 0, ?)",
     )
     .bind(id)
+    .bind(initial_grant)
     .bind(now)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
-    sqlx::query("INSERT INTO user_model_groups (user_id, group_name) VALUES (?, ?)")
-        .bind(id)
-        .bind(DEFAULT_MODEL_GROUP)
-        .execute(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
     Ok(UserRecord {
         id,
         email,
@@ -468,13 +533,14 @@ pub async fn insert_user(
         enabled: true,
         avatar: None,
         rate_limit_rpm: new_user.rate_limit_rpm,
+        plan_id,
     })
 }
 
 /// 列出全部管理用户（不含密码）。
 pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError> {
     let rows = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE deleted_at IS NULL",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, plan_id FROM users WHERE deleted_at IS NULL",
     )
     .fetch_all(pool)
     .await
@@ -490,11 +556,12 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError
 pub(crate) async fn list_users_for_snapshot(
     pool: &SqlitePool,
 ) -> Result<Vec<SnapshotUser>, StoreError> {
-    let rows =
-        sqlx::query("SELECT id, role, enabled, rate_limit_rpm FROM users WHERE deleted_at IS NULL")
-            .fetch_all(pool)
-            .await
-            .map_err(StoreError::Query)?;
+    let rows = sqlx::query(
+        "SELECT id, role, enabled, rate_limit_rpm, plan_id FROM users WHERE deleted_at IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let role: String = row.try_get("role").map_err(StoreError::Query)?;
@@ -506,100 +573,10 @@ pub(crate) async fn list_users_for_snapshot(
             role: ManagementRole::parse(&role)?,
             enabled: enabled != 0,
             rate_limit_rpm: rate_limit_rpm_from_db(rate_limit_rpm)?,
+            plan_id: row.try_get("plan_id").map_err(StoreError::Query)?,
         });
     }
     Ok(out)
-}
-
-/// 读出全部用户可用模型组（未排序）。
-pub async fn list_all_assigned_groups(pool: &SqlitePool) -> Result<Vec<(i64, String)>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT g.user_id, g.group_name FROM user_model_groups g \
-         JOIN users u ON u.id = g.user_id \
-         WHERE u.deleted_at IS NULL",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(StoreError::Query)?;
-    let mut out = Vec::with_capacity(rows.len());
-    for row in &rows {
-        out.push((
-            row.try_get("user_id").map_err(StoreError::Query)?,
-            row.try_get("group_name").map_err(StoreError::Query)?,
-        ));
-    }
-    Ok(out)
-}
-
-/// 按用户读可用模型组，按组名排序。
-pub async fn list_assigned_groups(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<Vec<String>, StoreError> {
-    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
-    list_assigned_groups_on_conn(&mut conn, user_id).await
-}
-
-/// 在现有连接/事务上读取用户可用模型组。
-pub(crate) async fn list_assigned_groups_on_conn(
-    conn: &mut SqliteConnection,
-    user_id: i64,
-) -> Result<Vec<String>, StoreError> {
-    let rows = sqlx::query("SELECT group_name FROM user_model_groups WHERE user_id = ?")
-        .bind(user_id)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    let mut names = Vec::with_capacity(rows.len());
-    for row in &rows {
-        names.push(row.try_get("group_name").map_err(StoreError::Query)?);
-    }
-    names.sort();
-    Ok(names)
-}
-
-/// 整体替换用户可用模型组；空名单表示撤掉全部（含 `default`）。
-pub async fn replace_assigned_groups(
-    conn: &mut SqliteConnection,
-    user_id: i64,
-    groups: &[String],
-) -> Result<Vec<String>, StoreError> {
-    if get_user_on_conn(conn, user_id).await?.is_none() {
-        return Err(StoreError::UserNotFound(user_id));
-    }
-    let mut unique = Vec::new();
-    let mut seen = HashSet::new();
-    for group in groups {
-        let name = group.trim();
-        if name.is_empty() {
-            return Err(StoreError::InvalidResource("模型组名不能为空".to_string()));
-        }
-        if !seen.insert(name.to_string()) {
-            continue;
-        }
-        if crate::store::resources::get_model_group(conn, name)
-            .await?
-            .is_none()
-        {
-            return Err(StoreError::InvalidResource(format!("模型组 {name} 不存在")));
-        }
-        unique.push(name.to_string());
-    }
-    sqlx::query("DELETE FROM user_model_groups WHERE user_id = ?")
-        .bind(user_id)
-        .execute(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    for name in &unique {
-        sqlx::query("INSERT INTO user_model_groups (user_id, group_name) VALUES (?, ?)")
-            .bind(user_id)
-            .bind(name)
-            .execute(&mut *conn)
-            .await
-            .map_err(StoreError::Query)?;
-    }
-    unique.sort();
-    Ok(unique)
 }
 
 async fn get_user_by_email_on_conn(
@@ -607,7 +584,7 @@ async fn get_user_by_email_on_conn(
     email: &str,
 ) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE email = ? AND deleted_at IS NULL",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, plan_id FROM users WHERE email = ? AND deleted_at IS NULL",
     )
     .bind(email)
     .fetch_optional(&mut *conn)
@@ -782,7 +759,7 @@ pub(crate) async fn get_user_on_conn(
     id: i64,
 ) -> Result<Option<UserRecord>, StoreError> {
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm FROM users WHERE id = ? AND deleted_at IS NULL",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, plan_id FROM users WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -814,7 +791,7 @@ pub async fn authenticate_password(
 ) -> Result<Option<UserRecord>, StoreError> {
     let email = normalize_email(email);
     let row = sqlx::query(
-        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, password_hash FROM users WHERE email = ? AND deleted_at IS NULL",
+        "SELECT id, email, display_name, role, enabled, avatar, rate_limit_rpm, plan_id, password_hash FROM users WHERE email = ? AND deleted_at IS NULL",
     )
     .bind(&email)
     .fetch_optional(pool)
@@ -995,7 +972,7 @@ pub async fn user_for_session(
     }
     let token_hash = hash_session_token(session_token);
     let row = sqlx::query(
-        "SELECT u.id, u.email, u.display_name, u.role, u.enabled, u.avatar, u.rate_limit_rpm, \
+        "SELECT u.id, u.email, u.display_name, u.role, u.enabled, u.avatar, u.rate_limit_rpm, u.plan_id, \
                 u.deleted_at, s.expires_at, s.revoked \
          FROM management_sessions s \
          JOIN users u ON u.id = s.user_id \
@@ -1078,7 +1055,11 @@ pub async fn run_session_cleanup_loop(pool: SqlitePool) {
             crate::store::record_system_error(
                 &pool,
                 "auth",
-                &format!("管理会话定时清理失败: {err}"),
+                &crate::store::SystemLogEvent::new(
+                    "auth.session_cleanup_failed",
+                    serde_json::json!({ "error": err.to_string() }),
+                    format!("管理会话定时清理失败: {err}"),
+                ),
             )
             .await;
         }

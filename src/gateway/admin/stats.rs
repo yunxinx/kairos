@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::store;
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::{AdminDeps, AdminError};
 
 pub(super) fn routes() -> Router<AdminDeps> {
@@ -34,7 +34,12 @@ struct StatsSummaryView {
     success_count: u64,
     input_tokens: u64,
     output_tokens: u64,
+    /// 实收（折后）合计。
     cost_usd_micros: i64,
+    /// 渠道原价合计（成本）。
+    base_cost_usd_micros: i64,
+    /// 毛利：实收 - 渠道原价。
+    gross_profit_usd_micros: i64,
     /// 令牌数：全局视图为全部，归属视图只数本人的。
     token_count: u64,
     /// 出站渠道数；归属视图整键省略（渠道属运营视角，普通用户不可见）。
@@ -50,6 +55,8 @@ struct DailyPointView {
     input_tokens: u64,
     output_tokens: u64,
     cost_usd_micros: i64,
+    base_cost_usd_micros: i64,
+    gross_profit_usd_micros: i64,
 }
 
 /// 按模型的费用/请求分布。
@@ -58,6 +65,8 @@ struct ModelShareView {
     model: String,
     request_count: u64,
     cost_usd_micros: i64,
+    base_cost_usd_micros: i64,
+    gross_profit_usd_micros: i64,
 }
 
 /// 按渠道的费用/请求分布。
@@ -66,6 +75,8 @@ struct ChannelShareView {
     channel: String,
     request_count: u64,
     cost_usd_micros: i64,
+    base_cost_usd_micros: i64,
+    gross_profit_usd_micros: i64,
 }
 
 /// `/stats` 响应：汇总 + 趋势序列 + 模型/渠道分布。
@@ -83,6 +94,7 @@ async fn get_stats(
     Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<StatsQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<StatsView>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
@@ -97,6 +109,8 @@ async fn get_stats(
             input_tokens: stats.summary.input_tokens,
             output_tokens: stats.summary.output_tokens,
             cost_usd_micros: stats.summary.cost_usd_micros,
+            base_cost_usd_micros: stats.summary.base_cost_usd_micros,
+            gross_profit_usd_micros: stats.summary.gross_profit_usd_micros,
             token_count: stats.summary.token_count,
             channel_count: stats.summary.channel_count,
         },
@@ -109,6 +123,8 @@ async fn get_stats(
                 input_tokens: bucket.input_tokens,
                 output_tokens: bucket.output_tokens,
                 cost_usd_micros: bucket.cost_usd_micros,
+                base_cost_usd_micros: bucket.base_cost_usd_micros,
+                gross_profit_usd_micros: bucket.gross_profit_usd_micros,
             })
             .collect(),
         by_model: stats
@@ -118,6 +134,8 @@ async fn get_stats(
                 model: share.name,
                 request_count: share.request_count,
                 cost_usd_micros: share.cost_usd_micros,
+                base_cost_usd_micros: share.base_cost_usd_micros,
+                gross_profit_usd_micros: share.gross_profit_usd_micros,
             })
             .collect(),
         by_channel: stats
@@ -127,6 +145,8 @@ async fn get_stats(
                 channel: share.name,
                 request_count: share.request_count,
                 cost_usd_micros: share.cost_usd_micros,
+                base_cost_usd_micros: share.base_cost_usd_micros,
+                gross_profit_usd_micros: share.gross_profit_usd_micros,
             })
             .collect(),
     }))
@@ -139,8 +159,12 @@ async fn get_stats(
 #[derive(Debug, Serialize)]
 struct LifetimeStatsView {
     request_count: u64,
-    /// 已结算的成功请求费用合计（micro-USD）。
+    /// 已结算的成功请求实收合计（micro-USD）。
     cost_usd_micros: i64,
+    /// 已结算的成功请求渠道原价合计（成本）。
+    base_cost_usd_micros: i64,
+    /// 毛利：实收 - 渠道原价。
+    gross_profit_usd_micros: i64,
     /// 全部请求日志的四分量 token 合计（含未结算行）。
     total_tokens: u64,
 }
@@ -150,12 +174,15 @@ async fn get_lifetime_stats(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<LifetimeStatsView>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let stats = store::query_lifetime_stats(&deps.pool, identity.owner_scope())
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(LifetimeStatsView {
         request_count: stats.request_count,
         cost_usd_micros: stats.cost_usd_micros,
+        base_cost_usd_micros: stats.base_cost_usd_micros,
+        gross_profit_usd_micros: stats.gross_profit_usd_micros,
         total_tokens: stats.total_tokens,
     }))
 }

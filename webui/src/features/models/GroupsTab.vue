@@ -23,6 +23,11 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
+import {
+  CHANNEL_SUMMARY_KEY,
+  invalidateChannelCaches,
+  useChannelDirectory,
+} from '@/composables/useChannelDirectory';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -30,6 +35,8 @@ import GroupEditorWindow from '@/features/models/GroupEditorWindow.vue';
 import ModelSourceLines from '@/features/models/ModelSourceLines.vue';
 import { groupModelDisplayLines } from '@/lib/group-models';
 import { DEFAULT_MODEL_GROUP } from '@/lib/visible-models';
+import { hasCapability } from '@/lib/capabilities';
+import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
 type GroupWindowPayload =
@@ -40,6 +47,16 @@ type GroupWindowPayload =
 const { t } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
+const me = useCurrentUser();
+const canEditGroups = computed(() => hasCapability(me.value, 'edit_model_groups'));
+
+/**
+ * 组名 + 组内模型两列恒在；勾选列与操作列只在可编辑时出现。
+ *
+ * 表头与行必须同时增删这两列：曾经表头无条件渲染操作列、行里按能力隐藏，
+ * 只读管理员因此看到一个底下没有单元格的空列。
+ */
+const tableColumnCount = computed(() => (canEditGroups.value ? 4 : 2));
 const searchText = ref('');
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
@@ -68,12 +85,8 @@ const unifiedQuery = useQuery({
   queryKey: ['unified-models'],
   queryFn: () => apiClient.listUnifiedModels(),
 });
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
-
-const channels = computed(() => channelsQuery.data.value ?? []);
+// 组表只渲染「某个名挂在哪条渠道」，用名录投影即可；admin 无权读完整渠道定义。
+const { channels, channelsKnown } = useChannelDirectory();
 const unifiedModels = computed(() => unifiedQuery.data.value ?? []);
 
 const groups = computed(() =>
@@ -84,7 +97,15 @@ const showTableSkeleton = computed(() => groupsQuery.isPending.value && !groupsQ
 const memberLinesByGroup = computed(() => {
   const map = new Map<string, ReturnType<typeof groupModelDisplayLines>>();
   for (const group of groups.value) {
-    map.set(group.name, groupModelDisplayLines(group.models, channels.value, unifiedModels.value));
+    map.set(
+      group.name,
+      groupModelDisplayLines(
+        group.models,
+        channels.value,
+        unifiedModels.value,
+        channelsKnown.value,
+      ),
+    );
   }
   return map;
 });
@@ -121,7 +142,8 @@ const bulkDelete = useBulkDelete<string>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['model-groups'],
-  deleteOne: (name) => apiClient.deleteModelGroup(name),
+  alsoInvalidate: [['tokens'], ['channels'], CHANNEL_SUMMARY_KEY],
+  deleteMany: (names) => apiClient.deleteModelGroups(names),
 });
 
 const deleteMutation = useMutation({
@@ -134,7 +156,7 @@ const deleteMutation = useMutation({
     if (entry) closeWindow(entry.id);
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
-    await queryClient.invalidateQueries({ queryKey: ['channels'] });
+    await invalidateChannelCaches(queryClient);
   },
   onError: (err, name) => {
     const message = extractApiError(err).message;
@@ -209,6 +231,7 @@ function openBulkDelete() {
             />
             <template #actions>
               <button
+                v-if="canEditGroups"
                 type="button"
                 class="btn btn-primary"
                 data-testid="group-create"
@@ -221,14 +244,14 @@ function openBulkDelete() {
         </template>
         <!-- table-fixed 下百分比列若加满，剩余宽度会摊到复选框列；成员列不设宽以吃掉余量。 -->
         <colgroup>
-          <col class="w-10" />
+          <col v-if="canEditGroups" class="w-10" />
           <col class="w-[28%]" />
           <col />
-          <col class="w-24" />
+          <col v-if="canEditGroups" class="w-24" />
         </colgroup>
         <TableHeader>
           <TableRow>
-            <TableHead class="w-10">
+            <TableHead v-if="canEditGroups" class="w-10">
               <div class="flex items-center justify-center">
                 <Checkbox
                   v-model="allVisibleSelected"
@@ -240,11 +263,17 @@ function openBulkDelete() {
             </TableHead>
             <TableHead class="w-[28%]">{{ t('models.groupName') }}</TableHead>
             <TableHead class="min-w-0">{{ t('models.groupMembers') }}</TableHead>
-            <TableHead align="center" class="w-24">{{ t('common.actions') }}</TableHead>
+            <TableHead v-if="canEditGroups" align="center" class="w-24">
+              {{ t('common.actions') }}
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="4" />
+          <TableRowsSkeleton
+            v-if="showTableSkeleton"
+            :has-select-column="canEditGroups"
+            :columns="tableColumnCount"
+          />
           <template v-else>
             <TableRow
               v-for="group in filtered"
@@ -254,6 +283,7 @@ function openBulkDelete() {
               :data-state="selection.isSelected(group.name) ? 'selected' : undefined"
             >
               <SelectCell
+                v-if="canEditGroups"
                 :checked="selection.isSelected(group.name)"
                 test-id="group-select"
                 @toggle="selection.toggle(group.name)"
@@ -267,7 +297,7 @@ function openBulkDelete() {
                   chip-test-id="group-source-channel"
                 />
               </TableCell>
-              <TableCell align="center">
+              <TableCell v-if="canEditGroups" align="center">
                 <span class="inline-flex items-center justify-center gap-1">
                   <button
                     type="button"
@@ -294,9 +324,14 @@ function openBulkDelete() {
               </TableCell>
             </TableRow>
             <TableRow v-if="filtered.length === 0">
-              <TableCell :colspan="4" class="h-24 whitespace-normal">
+              <TableCell :colspan="tableColumnCount" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.groupEmpty')">
-                  <button type="button" class="btn btn-primary" @click="openCreate">
+                  <button
+                    v-if="canEditGroups"
+                    type="button"
+                    class="btn btn-primary"
+                    @click="openCreate"
+                  >
                     {{ t('models.groupCreate') }}
                   </button>
                 </EmptyState>
@@ -306,6 +341,7 @@ function openBulkDelete() {
         </TableBody>
       </DataTable>
       <DataTableBulkBar
+        v-if="canEditGroups"
         :count="selection.count.value"
         data-testid="groups-bulk-bar"
         @clear="selection.clear"
@@ -326,7 +362,8 @@ function openBulkDelete() {
       <GroupEditorWindow
         v-if="win.payload.kind === 'editor'"
         :initial="win.payload.group"
-        :channels="channelsQuery.data.value ?? []"
+        :channels="channels"
+        :channels-known="channelsKnown"
         :unified-models="unifiedQuery.data.value ?? []"
         :anchor="win.anchor"
         :stack-order="win.z"

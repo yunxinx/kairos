@@ -43,7 +43,11 @@ async fn update_settings(
             &mut tx,
             identity.actor(),
             "settings",
-            &format!("修改设置：{}", changes.join("；")),
+            &store::SystemLogEvent::new(
+                "settings.updated",
+                serde_json::json!({ "changes": changes }),
+                format!("修改设置：{}", changes.join("；")),
+            ),
         )
         .await
         .map_err(AdminError::Store)?;

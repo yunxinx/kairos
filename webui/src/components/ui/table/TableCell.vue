@@ -36,6 +36,12 @@ const cellAttrs = computed(() => {
   }
   return rest;
 });
+
+const tooltipAlign = computed(() => {
+  if (props.align === 'right') return 'end';
+  if (props.align === 'center') return 'center';
+  return 'start';
+});
 </script>
 
 <template>
@@ -51,8 +57,8 @@ const cellAttrs = computed(() => {
       )
     "
   >
-    <Tooltip v-if="props.truncate" :text="overflowHint">
-      <span class="block min-w-0 truncate">
+    <Tooltip v-if="props.truncate" :text="overflowHint" :align="tooltipAlign">
+      <span class="inline-block max-w-full min-w-0 truncate align-middle">
         <slot />
       </span>
     </Tooltip>

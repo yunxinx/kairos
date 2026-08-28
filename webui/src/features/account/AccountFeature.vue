@@ -15,10 +15,10 @@ import UiIcon from '@/components/ui/UiIcon.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
 import { downscaleAvatar, isAcceptedAvatarType } from '@/lib/avatar';
-import { formatUsdMicros } from '@/lib/format';
+import { formatDiscountBp, formatUsdMicros } from '@/lib/format';
 import type { FieldValidationSpec } from '@/lib/form-validation';
-import { useNavAvatarPreference } from '@/lib/preferences';
-import { setMe, useCurrentUser } from '@/lib/session';
+import { useNavAvatarPreference, useNavNamePreference } from '@/lib/preferences';
+import { captureSessionGeneration, setMeForSession, useCurrentUser } from '@/lib/session';
 
 const { t } = useI18n();
 const { error, success } = useToast();
@@ -26,6 +26,7 @@ const profileValidation = useFormValidation();
 const passwordValidation = useFormValidation();
 const me = useCurrentUser();
 const { showNavAvatar } = useNavAvatarPreference();
+const { showNavName } = useNavNamePreference();
 
 const email = ref('');
 const displayName = ref('');
@@ -77,7 +78,8 @@ const roleBadgeClass = computed(() => {
 const profileMutation = useMutation({
   mutationFn: (body: MeUpdate) => apiClient.updateMe(body),
   onSuccess: async () => {
-    setMe(await apiClient.getMe());
+    const generation = captureSessionGeneration();
+    setMeForSession(await apiClient.getMe(), generation);
     profileCurrentPassword.value = '';
     success(t('account.saveSuccess'));
   },
@@ -89,7 +91,8 @@ const profileMutation = useMutation({
 const passwordMutation = useMutation({
   mutationFn: (body: MeUpdate) => apiClient.updateMe(body),
   onSuccess: async () => {
-    setMe(await apiClient.getMe());
+    const generation = captureSessionGeneration();
+    setMeForSession(await apiClient.getMe(), generation);
     currentPassword.value = '';
     newPassword.value = '';
     confirmPassword.value = '';
@@ -137,11 +140,17 @@ function handleSaveProfile() {
     { name: 'displayName', value: displayName.value, rules: [{ kind: 'required' }] },
   ];
   if (emailChanged.value) {
-    specs.push({ name: 'profileCurrentPassword', value: profileCurrentPassword.value, rules: [{ kind: 'required' }] });
+    specs.push({
+      name: 'profileCurrentPassword',
+      value: profileCurrentPassword.value,
+      rules: [{ kind: 'required' }],
+    });
   }
   if (!profileValidation.validate(specs, t)) return;
   profileMutation.mutate({
-    ...(emailChanged.value ? { email: email.value.trim(), current_password: profileCurrentPassword.value } : {}),
+    ...(emailChanged.value
+      ? { email: email.value.trim(), current_password: profileCurrentPassword.value }
+      : {}),
     display_name: displayName.value.trim(),
   });
 }
@@ -193,15 +202,15 @@ function handleChangePassword() {
                 />
                 <UiIcon v-else name="user" class="size-7" />
               </div>
-        <input
-          ref="fileInputRef"
-          type="file"
-          accept="image/png,image/jpeg,image/webp,image/gif"
-          aria-label="Upload avatar"
-          class="hidden"
-          data-testid="account-avatar-input"
-          @change="handleAvatarFileChange"
-        />
+              <input
+                ref="fileInputRef"
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                aria-label="Upload avatar"
+                class="hidden"
+                data-testid="account-avatar-input"
+                @change="handleAvatarFileChange"
+              />
               <button
                 type="button"
                 class="absolute inset-0 flex cursor-pointer items-center justify-center rounded-full bg-black/50 text-white opacity-0 transition-opacity group-hover:opacity-100"
@@ -219,7 +228,6 @@ function handleChangePassword() {
                   {{ me.display_name || t('nav.account') }}
                 </h2>
                 <span class="badge" :class="roleBadgeClass">{{ roleLabel }}</span>
-                <span class="badge badge-success text-[11px]">{{ t('users.statusEnabled') }}</span>
               </div>
               <p class="text-fg-muted mt-0.5 truncate font-mono text-xs">{{ me.email }}</p>
               <div v-if="avatarData" class="mt-2 flex items-center gap-2">
@@ -235,7 +243,7 @@ function handleChangePassword() {
             </div>
           </div>
 
-          <!-- 余额总览与模型组指标 -->
+          <!-- 余额总览与套餐/模型组指标 -->
           <div
             class="bg-surface-elevated border-seed flex shrink-0 items-center justify-between gap-6 rounded-md border px-5 py-3 sm:min-w-64"
           >
@@ -245,7 +253,21 @@ function handleChangePassword() {
                 {{ formatUsdMicros(me.balance_usd_micros) }}
               </p>
             </div>
-            <div v-if="me.role === 'user'" class="text-right">
+            <div v-if="me.role !== 'root'" class="text-right">
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.plan') }}</p>
+              <p class="font-mono text-base font-semibold" data-testid="account-plan-name">
+                {{ me.plan_display_name || '—' }}
+              </p>
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.discount') }}</p>
+              <p class="font-mono text-base font-semibold" data-testid="account-discount">
+                {{ formatDiscountBp(me.discount_bp) }}
+              </p>
+            </div>
+            <div v-else class="text-right">
+              <p class="text-fg-muted text-xs font-medium">{{ t('account.plan') }}</p>
+              <p class="font-mono text-base font-semibold">{{ t('common.unlimited') }}</p>
+            </div>
+            <div v-if="me.role !== 'root'" class="text-right">
               <p class="text-fg-muted text-xs font-medium">{{ t('account.assignedGroups') }}</p>
               <p class="font-mono text-base font-semibold">
                 {{ me.assigned_groups.length }}
@@ -254,9 +276,14 @@ function handleChangePassword() {
           </div>
         </div>
 
-        <div v-if="me.role === 'user' && me.assigned_groups.length > 0" class="border-seed mt-4 border-t pt-3">
+        <div
+          v-if="me.role !== 'root' && me.assigned_groups.length > 0"
+          class="border-seed mt-4 border-t pt-3"
+        >
           <div class="flex flex-wrap items-center gap-2">
-            <span class="text-fg-muted text-xs font-medium">{{ t('account.assignedGroups') }}:</span>
+            <span class="text-fg-muted text-xs font-medium"
+              >{{ t('account.assignedGroups') }}:</span
+            >
             <div class="min-w-0 flex-1">
               <OverflowChips :items="me.assigned_groups" :threshold="6" class="inline-flex" />
             </div>
@@ -268,7 +295,7 @@ function handleChangePassword() {
       <div class="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
         <!-- 基本资料卡片 -->
         <form novalidate class="card flex flex-col" @submit.prevent="handleSaveProfile">
-          <div class="card-body space-y-4 flex-1">
+          <div class="card-body flex-1 space-y-4">
             <div class="border-seed border-b pb-3">
               <h3 class="text-sm font-semibold tracking-tight">{{ t('account.profile') }}</h3>
               <p class="text-fg-muted text-xs">{{ t('account.profileGuide') }}</p>
@@ -348,6 +375,20 @@ function handleChangePassword() {
                 data-testid="account-show-nav-avatar"
               />
             </FormField>
+
+            <FormField
+              field-name="showNavName"
+              layout="inline"
+              :label="t('account.showNavName')"
+              :guide="t('account.showNavNameGuide')"
+              input-id="account-show-nav-name"
+            >
+              <FormSwitch
+                id="account-show-nav-name"
+                v-model="showNavName"
+                data-testid="account-show-nav-name"
+              />
+            </FormField>
           </div>
 
           <div class="card-footer card-body flex justify-end">
@@ -364,7 +405,7 @@ function handleChangePassword() {
 
         <!-- 安全与修改密码卡片 -->
         <form novalidate class="card flex flex-col" @submit.prevent="handleChangePassword">
-          <div class="card-body space-y-4 flex-1">
+          <div class="card-body flex-1 space-y-4">
             <div class="border-seed border-b pb-3">
               <h3 class="text-sm font-semibold tracking-tight">{{ t('account.security') }}</h3>
               <p class="text-fg-muted text-xs">{{ t('account.securityGuide') }}</p>

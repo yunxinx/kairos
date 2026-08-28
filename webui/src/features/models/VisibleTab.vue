@@ -18,6 +18,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import ChannelSourceMark from '@/features/models/ChannelSourceMark.vue';
 import UnifiedJumpOrder from '@/features/models/UnifiedJumpOrder.vue';
+import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { callableRouteMembers } from '@/lib/unified-sources';
 import {
   DEFAULT_MODEL_GROUP,
@@ -37,27 +38,26 @@ const unifiedQuery = useQuery({
   queryKey: ['unified-models'],
   queryFn: () => apiClient.listUnifiedModels(),
 });
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
+// 只读预览：走名录投影，admin 无渠道写权限也能正确渲染来源。
+const { query: channelsQuery, channels, channelsKnown } = useChannelDirectory();
 const pricesQuery = useQuery({
   queryKey: ['prices'],
   queryFn: () => apiClient.listPrices(),
+});
+const ordersQuery = useQuery({
+  queryKey: ['channel-model-orders'],
+  queryFn: () => apiClient.listChannelModelOrders(),
 });
 
 const groupOptions = computed(() => {
   const groups = groupsQuery.data.value ?? [];
   const unified = unifiedQuery.data.value ?? [];
-  const channelList = channelsQuery.data.value ?? [];
   return groups.map((group) => ({
     value: group.name,
     label: group.name === DEFAULT_MODEL_GROUP ? t('models.ungrouped') : group.name,
-    count: previewVisibleModels(groups, unified, channelList, group.name).visibleIds.length,
+    count: previewVisibleModels(groups, unified, channels.value, group.name).visibleIds.length,
   }));
 });
-
-const channels = computed(() => channelsQuery.data.value ?? []);
 
 const sections = computed(() => {
   const q = searchText.value.trim().toLowerCase();
@@ -76,7 +76,9 @@ const sections = computed(() => {
           return {
             id,
             unified,
-            callableRoute: unified ? [] : callableRouteMembers(id, channels.value),
+            callableRoute: unified
+              ? []
+              : callableRouteMembers(id, channels.value, ordersQuery.data.value ?? []),
           };
         });
       return {
@@ -102,7 +104,8 @@ const showTableSkeleton = computed(
     (groupsQuery.isPending.value && !groupsQuery.data.value) ||
     (unifiedQuery.isPending.value && !unifiedQuery.data.value) ||
     (channelsQuery.isPending.value && !channelsQuery.data.value) ||
-    (pricesQuery.isPending.value && !pricesQuery.data.value),
+    (pricesQuery.isPending.value && !pricesQuery.data.value) ||
+    (ordersQuery.isPending.value && !ordersQuery.data.value),
 );
 
 const loadError = computed(
@@ -110,14 +113,16 @@ const loadError = computed(
     groupsQuery.isError.value ||
     unifiedQuery.isError.value ||
     channelsQuery.isError.value ||
-    pricesQuery.isError.value,
+    pricesQuery.isError.value ||
+    ordersQuery.isError.value,
 );
 
 function loadErrorMessage(): string {
   if (groupsQuery.isError.value) return extractApiError(groupsQuery.error.value).message;
   if (unifiedQuery.isError.value) return extractApiError(unifiedQuery.error.value).message;
   if (channelsQuery.isError.value) return extractApiError(channelsQuery.error.value).message;
-  return extractApiError(pricesQuery.error.value).message;
+  if (pricesQuery.isError.value) return extractApiError(pricesQuery.error.value).message;
+  return extractApiError(ordersQuery.error.value).message;
 }
 
 function refetchAll() {
@@ -125,6 +130,7 @@ function refetchAll() {
   void unifiedQuery.refetch();
   void channelsQuery.refetch();
   void pricesQuery.refetch();
+  void ordersQuery.refetch();
 }
 </script>
 
@@ -161,9 +167,8 @@ function refetchAll() {
         </template>
         <!-- 自动布局会把宽度让给双栏路由网格；固定后模型列吃到约三分之一，余量给请求路由。 -->
         <colgroup>
-          <col class="w-[32%]" />
+          <col class="w-[36%]" />
           <col />
-          <col class="w-[30%]" />
         </colgroup>
         <TableHeader>
           <TableRow>
@@ -180,11 +185,10 @@ function refetchAll() {
               </span>
             </TableHead>
             <TableHead>{{ t('models.visibleOrder') }}</TableHead>
-            <TableHead>{{ t('models.visibleHidden') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="3" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="2" />
           <template v-else>
             <template v-for="section in sections" :key="section.groupName">
               <TableRow
@@ -192,7 +196,7 @@ function refetchAll() {
                 data-testid="visible-section"
                 :data-group="section.groupName"
               >
-                <TableCell :colspan="3" class="inventory-section-cell">
+                <TableCell :colspan="2" class="inventory-section-cell">
                   {{ section.label }}
                 </TableCell>
               </TableRow>
@@ -208,36 +212,29 @@ function refetchAll() {
                 </TableCell>
                 <TableCell class="min-w-0 whitespace-normal">
                   <div v-if="row.unified" data-testid="visible-unified-order">
-                    <UnifiedJumpOrder :members="row.unified.models" :channels="channels" />
+                    <UnifiedJumpOrder
+                      :members="row.unified.models"
+                      :channels="channels"
+                      :channels-known="channelsKnown"
+                    />
                   </div>
                   <div
                     v-else-if="row.callableRoute.length > 0"
                     data-testid="visible-callable-order"
                   >
-                    <UnifiedJumpOrder :members="row.callableRoute" :channels="channels" />
+                    <UnifiedJumpOrder
+                      :members="row.callableRoute"
+                      :channels="channels"
+                      :channels-known="channelsKnown"
+                    />
                   </div>
-                  <ChannelSourceMark v-else kind="unlisted" />
-                </TableCell>
-                <TableCell
-                  class="min-w-0 whitespace-normal"
-                  :data-testid="
-                    row.unified && row.unified.hiddenMembers.length > 0
-                      ? 'visible-hidden-members'
-                      : undefined
-                  "
-                >
-                  <UnifiedJumpOrder
-                    v-if="row.unified && row.unified.hiddenMembers.length > 0"
-                    :members="row.unified.hiddenMembers"
-                    :channels="channels"
-                    :hide-index="true"
-                  />
-                  <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
+                  <!-- 渠道表未到手时不敢断言「未登记」：那时路由本来就算不出来。 -->
+                  <ChannelSourceMark v-else :kind="channelsKnown ? 'unlisted' : 'unknown'" />
                 </TableCell>
               </TableRow>
             </template>
             <TableRow v-if="sections.length === 0">
-              <TableCell :colspan="3" class="h-24 whitespace-normal">
+              <TableCell :colspan="2" class="h-24 whitespace-normal">
                 <EmptyState :title="t('models.visibleEmpty')" />
               </TableCell>
             </TableRow>

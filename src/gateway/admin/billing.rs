@@ -12,7 +12,7 @@ use axum::{
 use crate::store;
 use crate::store::users::{self, ManagementRole};
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::logs::{LogEntry, parse_log_id};
 use super::{
     AdminDeps, AdminError, begin_write, db_err, format_usd_micros, reject_user_management,
@@ -53,6 +53,7 @@ async fn close_unsettled_log(
     raw: &str,
     charge: bool,
 ) -> Result<Json<LogEntry>, AdminError> {
+    identity.require_capability(ManagementCapability::SettleWaive)?;
     let id = parse_log_id(raw)?;
     let mut tx = begin_write(deps).await?;
     let log = store::get_request_log_on_conn(&mut tx, id)
@@ -90,12 +91,24 @@ async fn close_unsettled_log(
         &mut tx,
         identity.actor(),
         "billing",
-        &format!(
-            "{}未结算日志 {}（用户 {}，{} USD）",
-            if charge { "补扣" } else { "豁免" },
-            id,
-            log.user_id,
-            format_usd_micros(log.cost_usd_micros)
+        &store::SystemLogEvent::new(
+            if charge {
+                "billing.log_charged"
+            } else {
+                "billing.log_waived"
+            },
+            serde_json::json!({
+                "log_id": id,
+                "user_id": log.user_id,
+                "cost_usd_micros": log.cost_usd_micros,
+            }),
+            format!(
+                "{}未结算日志 {}（用户 {}，{} USD）",
+                if charge { "补扣" } else { "豁免" },
+                id,
+                log.user_id,
+                format_usd_micros(log.cost_usd_micros)
+            ),
         ),
     )
     .await

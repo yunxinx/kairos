@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useId, computed, ref, watch } from 'vue';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import { roleAtLeast, type ManagementRole, type UserAdminView } from '@/api/types';
@@ -9,12 +9,16 @@ import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
+import ListboxSelect from '@/components/ui/ListboxSelect.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
+import type { ListboxSelectOption } from '@/lib/listbox-option';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
+import { toPlanSelectOptions } from '@/lib/plan-select-options';
 
 const props = withDefaults(
   defineProps<{
@@ -40,8 +44,14 @@ const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
 const me = useCurrentUser();
 
+const plansQuery = useQuery({
+  queryKey: ['plans'],
+  queryFn: () => apiClient.listPlans(),
+});
+
 const uid = useId();
 const emailId = `user-editor-email-${uid}`;
+const planId = `user-editor-plan-${uid}`;
 const nameId = `user-editor-name-${uid}`;
 const passwordId = `user-editor-password-${uid}`;
 const roleId = `user-editor-role-${uid}`;
@@ -53,9 +63,12 @@ const initialName = props.initial ? props.initial.display_name : '';
 const initialRole = props.initial ? props.initial.role : 'user';
 const initialEnabled = props.initial ? props.initial.enabled : true;
 const initialRpm =
-  props.initial && props.initial.rate_limit_rpm !== null && props.initial.rate_limit_rpm !== undefined
+  props.initial &&
+  props.initial.rate_limit_rpm !== null &&
+  props.initial.rate_limit_rpm !== undefined
     ? String(props.initial.rate_limit_rpm)
     : '';
+const initialPlanId = props.initial?.plan_id != null ? String(props.initial.plan_id) : '';
 
 const email = ref(initialEmail);
 const displayName = ref(initialName);
@@ -63,6 +76,7 @@ const password = ref('');
 const role = ref<ManagementRole>(initialRole);
 const rateLimitRpm = ref(initialRpm);
 const enabled = ref(initialEnabled);
+const selectedPlanId = ref(initialPlanId);
 
 const isCreate = computed(() => props.initial === null);
 
@@ -85,6 +99,38 @@ const roleOptions = computed(() => [
   { value: 'admin', label: t('users.roleAdmin') },
 ]);
 
+function defaultPlanForRole(role: ManagementRole): string {
+  if (role === 'root') return '';
+  const audience = role === 'admin' ? 'admin' : 'user';
+  const plan = (plansQuery.data.value ?? []).find(
+    (candidate) => candidate.audience === audience && candidate.is_default,
+  );
+  return plan ? String(plan.id) : '';
+}
+
+const planOptions = computed((): ListboxSelectOption[] => {
+  const audience = role.value === 'admin' ? 'admin' : 'user';
+  const selected = selectedPlanId.value;
+  return toPlanSelectOptions(
+    plansQuery.data.value ?? [],
+    audience,
+    t('plans.defaultBadge'),
+    selected ? { value: selected, label: props.initial?.plan_display_name || selected } : undefined,
+  );
+});
+
+watch(
+  [role, plansQuery.data],
+  ([value]) => {
+    if (isCreate.value || value !== initialRole) {
+      selectedPlanId.value = defaultPlanForRole(value);
+    } else {
+      selectedPlanId.value = initialPlanId;
+    }
+  },
+  { immediate: true },
+);
+
 const dirty = computed(() => {
   if (isCreate.value) {
     return (
@@ -92,7 +138,8 @@ const dirty = computed(() => {
       displayName.value.trim() !== '' ||
       password.value !== '' ||
       role.value !== 'user' ||
-      rateLimitRpm.value.trim() !== ''
+      rateLimitRpm.value.trim() !== '' ||
+      (selectedPlanId.value !== '' && selectedPlanId.value !== defaultPlanForRole(role.value))
     );
   }
   return (
@@ -100,7 +147,8 @@ const dirty = computed(() => {
     password.value !== '' ||
     role.value !== initialRole ||
     enabled.value !== initialEnabled ||
-    rateLimitRpm.value.trim() !== initialRpm
+    rateLimitRpm.value.trim() !== initialRpm ||
+    selectedPlanId.value !== initialPlanId
   );
 });
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
@@ -109,13 +157,18 @@ const saveMutation = useMutation({
   mutationFn: async () => {
     const parsedRpm = rateLimitRpm.value.trim() === '' ? null : Number(rateLimitRpm.value);
     if (isCreate.value) {
-      return apiClient.createUser({
+      const body: import('@/api/types').UserCreate = {
         email: email.value.trim(),
         display_name: displayName.value.trim(),
         password: password.value,
         role: canPickRole.value ? role.value : 'user',
         rate_limit_rpm: parsedRpm,
-      });
+      };
+      const defaultPlanId = defaultPlanForRole(role.value);
+      if (selectedPlanId.value && selectedPlanId.value !== defaultPlanId) {
+        body.plan_id = Number(selectedPlanId.value);
+      }
+      return apiClient.createUser(body);
     } else if (props.initial) {
       const body: {
         display_name?: string;
@@ -134,7 +187,16 @@ const saveMutation = useMutation({
       if (password.value) {
         body.password = password.value;
       }
-      return apiClient.updateUser(props.initial.id, body);
+      const updated = await apiClient.updateUser(props.initial.id, body);
+      if (
+        selectedPlanId.value &&
+        role.value === initialRole &&
+        selectedPlanId.value !== initialPlanId &&
+        hasCapability(me.value, 'assign_plan')
+      ) {
+        await apiClient.assignUserPlan(props.initial.id, Number(selectedPlanId.value));
+      }
+      return updated;
     }
   },
   onSuccess: async () => {
@@ -166,13 +228,13 @@ function handleSave() {
       rules: [{ kind: 'minLength', min: 8 }],
     });
   }
-    if (rateLimitRpm.value.trim()) {
-      specs.push({
-        name: 'rateLimitRpm',
-        value: rateLimitRpm.value,
-        rules: [{ kind: 'uint' }],
-      });
-    }
+  if (rateLimitRpm.value.trim()) {
+    specs.push({
+      name: 'rateLimitRpm',
+      value: rateLimitRpm.value,
+      rules: [{ kind: 'uint' }],
+    });
+  }
 
   if (!validate(specs, t)) return;
   saveMutation.mutate();
@@ -259,6 +321,24 @@ function handleSave() {
             v-model="role"
             :options="roleOptions"
             data-testid="user-editor-role"
+          />
+        </FormField>
+
+        <FormField
+          field-name="plan"
+          :label="t('users.plan')"
+          :input-id="planId"
+          :guide="t('users.planGuide')"
+        >
+          <ListboxSelect
+            :id="planId"
+            v-model="selectedPlanId"
+            :options="planOptions"
+            :placeholder="t('common.none')"
+            :search-placeholder="t('users.plan')"
+            menu-class="listbox-select-menu-wide"
+            data-testid="user-editor-plan"
+            :disabled="!isCreate && role !== initialRole"
           />
         </FormField>
 

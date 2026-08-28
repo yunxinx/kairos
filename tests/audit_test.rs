@@ -76,8 +76,8 @@ async fn user_and_balance_mutations_are_audited() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 25_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "audit-balance-1", "delta_usd_micros": 25_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(charged.status(), StatusCode::OK);
@@ -166,13 +166,16 @@ async fn archive_groups_and_settings_are_audited() {
         .as_i64()
         .expect("应有 id");
 
-    // 撤掉全部可用组：会让该用户已绑组的令牌立即失效，值得留痕。
+    // 撤掉 standard 套餐的全部可用组：会让已绑组令牌立即失效，值得留痕。
     let withdrawn = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
-        &format!("/users/{user_id}/model-groups"),
-        json!({ "groups": [] }),
+        "/plans/1",
+        json!({
+            "display_name": "standard",
+            "groups": []
+        }),
     )
     .await;
     assert_eq!(withdrawn.status(), StatusCode::OK);
@@ -203,8 +206,8 @@ async fn archive_groups_and_settings_are_audited() {
         .join("\n");
 
     assert!(
-        joined.contains("可用模型组：[default] → []"),
-        "撤组应记前后名单，实际:\n{joined}"
+        joined.contains("plans|修改套餐 1 (standard)"),
+        "套餐撤组应留痕，实际:\n{joined}"
     );
     assert!(
         joined.contains("settings|修改设置") && joined.contains("rate_limit_rpm"),

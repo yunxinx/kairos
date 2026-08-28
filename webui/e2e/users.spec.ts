@@ -15,6 +15,13 @@ test.describe('users page', () => {
     await expect(page.getByRole('heading', { name: /users/i })).toBeVisible();
 
     await page.getByTestId('create-user').click();
+    await expect(page.getByTestId('user-editor-plan')).toHaveAttribute('tabindex', '0');
+    await expect(page.getByTestId('user-editor-plan')).toHaveAttribute('aria-label', 'Plan');
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'Administrator' }).click();
+    await expect(page.getByTestId('user-editor-plan')).toBeEnabled();
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'User', exact: true }).click();
     await page.getByTestId('user-editor-email').fill('e2e-user@example.com');
     await page.getByTestId('user-editor-display-name').fill('E2E User');
     await page.getByTestId('user-editor-password').fill('password1');
@@ -25,23 +32,31 @@ test.describe('users page', () => {
 
     // 编辑用户资料
     await row.getByTestId('user-edit').click();
+    const profilePlan = page.getByTestId('user-editor-plan');
+    await expect(profilePlan).toBeEnabled();
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'Administrator' }).click();
+    await expect(profilePlan).toBeDisabled();
+    await page.getByTestId('user-editor-role').click();
+    await page.getByRole('option', { name: 'User', exact: true }).click();
+    await expect(profilePlan).toBeEnabled();
     await page.getByTestId('user-editor-display-name').fill('E2E User Renamed');
     await page.getByTestId('user-save').click();
     await expect(row).toContainText('E2E User Renamed');
 
     await row.getByTestId('user-edit').click();
     await page.getByTestId('user-tab-recharge').click();
+    await expect(page.getByTestId('user-current-balance')).toBeVisible();
+    await expect(page.getByTestId('user-quick-add-5')).toBeVisible();
+    await expect(page.getByTestId('user-quick-sub-5')).toBeVisible();
     await page.getByTestId('user-recharge-amount').fill('3.5');
+    await expect(page.getByTestId('user-balance-result')).toHaveText('3.5');
     await page.getByTestId('user-recharge-save').click();
     await expect(row).toContainText('3.5');
 
     await row.getByTestId('user-edit').click();
-    await page.getByTestId('user-tab-groups').click();
-    await page.getByTestId('user-group-e2e-user-group').click();
-    await page.getByTestId('user-groups-save').click();
-    await expect(
-      row.getByTestId('user-group-chip').filter({ hasText: 'e2e-user-group' }),
-    ).toBeVisible();
+    await expect(page.getByTestId('user-editor-plan')).toBeVisible();
+    await page.keyboard.press('Escape');
 
     await row.getByTestId('user-toggle-enabled').click();
     await expect(row.getByTestId('user-toggle-enabled')).toHaveText(/disabled/i);
@@ -49,7 +64,7 @@ test.describe('users page', () => {
     const created = await seedUser(page, { email: 'e2e-tokens@example.com', role: 'user' });
     const tokenResp = await page.request.post('/api/tokens', {
       headers: await e2eRootHeaders(page.request),
-      data: { name: 'will-not-belong', limit_usd_micros: null, enabled: true },
+      data: { name: 'will-not-belong', balance_usd_micros: null, enabled: true },
     });
     expect(tokenResp.ok()).toBeTruthy();
 
@@ -60,7 +75,7 @@ test.describe('users page', () => {
     const sessionBody = (await session.json()) as { token: string };
     const own = await page.request.post('/api/tokens', {
       headers: { Authorization: `Bearer ${sessionBody.token}` },
-      data: { name: 'owned', limit_usd_micros: null, enabled: true },
+      data: { name: 'owned', balance_usd_micros: null, enabled: true },
     });
     expect(own.ok()).toBeTruthy();
     // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态。
@@ -73,6 +88,9 @@ test.describe('users page', () => {
     const tokenRow = page.locator(`[data-testid="user-token-row"][data-token-id="${owned.id}"]`);
     await expect(tokenRow).toBeVisible();
     await expect(tokenRow).not.toContainText(owned.token_key);
+    // 余额列与用户列表同款：纯 mono 数值，不再绘制额度进度条。
+    await expect(tokenRow.getByTestId('token-balance')).toHaveText('Unlimited');
+    await expect(tokenRow.locator('[data-testid="token-quota-track"]')).toHaveCount(0);
     await tokenRow.getByTestId('user-token-toggle-enabled').click();
     await expect(tokenRow).toContainText(/disabled/i);
     await tokenRow.getByTestId('user-token-toggle-enabled').click();
@@ -149,32 +167,6 @@ test.describe('users page', () => {
     await page.locator('[data-testid="users-role-filter-option"][data-value="user"]').click();
     await page.keyboard.press('Escape');
     await page.locator('#users-search').fill('');
-
-    // 给 Low RPM 用户分配模型组后测试模型组筛选（Root 用户不应出现在特定组筛选结果中）
-    const lowUserRow = page.locator('[data-testid="user-row"]', { hasText: 'Low RPM User' });
-    await lowUserRow.getByTestId('user-edit').click();
-    await page.getByTestId('user-tab-groups').click();
-    await page.getByTestId('user-group-e2e-user-group').click();
-    await page.getByTestId('user-groups-save').click();
-
-    await page.getByTestId('users-group-filter').click();
-    await page
-      .locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]')
-      .click();
-    await page.keyboard.press('Escape');
-    // 只有 Low RPM 用户匹配该组，Root 用户（不受组限制）不应混入特定组筛选
-    await expect(page.locator('[data-testid="user-row"]')).toHaveCount(1);
-    await expect(page.locator('[data-testid="user-row"]')).toContainText('Low RPM User');
-    await expect(
-      page.locator('[data-testid="user-row"]', { hasText: 'root@localhost' }),
-    ).toHaveCount(0);
-
-    // 清除模型组筛选
-    await page.getByTestId('users-group-filter').click();
-    await page
-      .locator('[data-testid="users-group-filter-option"][data-value="e2e-user-group"]')
-      .click();
-    await page.keyboard.press('Escape');
 
     // 查看 Root 用户
     const rootRow = page.locator('[data-testid="user-row"]', { hasText: 'root@localhost' });

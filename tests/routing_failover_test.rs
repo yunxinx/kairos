@@ -3,14 +3,14 @@
 //! 主接缝：测试内启动网关 + 多个可编程 mock 上游，按渠道注入 429/5xx/断连，
 //! 断言 failover 行为、下游收到的错误格式（含网关归因字段）。
 //!
-//! 覆盖：priority 升序优先、同级 weight 加权随机、别名重写、可重试错误自动
-//! 切换下一渠道、每渠道 max_retries、不可重试 4xx 直接返回。
+//! 覆盖：创建顺序默认选路、别名重写、可重试错误自动切换下一渠道、每渠道
+//! max_retries、不可重试 4xx 直接返回。
 
 mod common;
 
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
 use kairos::config;
-use kairos::store::resources::{Channel, Price};
+use kairos::store::resources::{Channel, GroupModel, ModelGroup, Price};
 use serde_json::{Value, json};
 
 fn ok_response() -> Value {
@@ -37,8 +37,8 @@ async fn send_completion(base: &str, model: &str) -> reqwest::Response {
         .expect("应能请求网关")
 }
 
-/// 构造两个渠道的 seed，分别指向两个 mock 上游。默认 ch-0 更高优先级（数值更小），
-/// 使 failover 顺序确定：ch-0 先试、ch-1 兜底。
+/// 构造两个渠道的 seed，分别指向两个 mock 上游。未设显式顺序时按创建先后：
+/// ch-0 先试、ch-1 兜底。
 fn two_channel_seed(bases: &[String]) -> common::Seed {
     let mut seed = common::test_seed(&bases[0]);
     seed.channels = vec![
@@ -46,11 +46,16 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             name: "ch-0".to_string(),
             protocol: config::Protocol::OpenAiChat,
             base_url: bases[0].clone(),
-            api_key: "sk-0".to_string(),
+            keys: vec![kairos::store::resources::ChannelKey {
+                name: "default".to_string(),
+                api_key: "sk-0".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }],
             models: vec![TEST_MODEL.to_string()],
             model_aliases: Default::default(),
-            priority: 1,
-            weight: 1,
             timeout_ms: 1000,
             max_retries: 0,
             enabled: true,
@@ -60,17 +65,47 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             name: "ch-1".to_string(),
             protocol: config::Protocol::OpenAiChat,
             base_url: bases[1].clone(),
-            api_key: "sk-1".to_string(),
+            keys: vec![kairos::store::resources::ChannelKey {
+                name: "default".to_string(),
+                api_key: "sk-1".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }],
             models: vec![TEST_MODEL.to_string()],
             model_aliases: Default::default(),
-            priority: 2,
-            weight: 1,
             timeout_ms: 1000,
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
         },
     ];
+    seed
+}
+
+/// 三条同名渠道：创建顺序与 mock 上游下标一致，便于验证显式顺序再过滤的结果。
+fn three_channel_seed(bases: &[String]) -> common::Seed {
+    let mut seed = two_channel_seed(bases);
+    seed.channels.push(Channel {
+        name: "ch-2".to_string(),
+        protocol: config::Protocol::OpenAiChat,
+        base_url: bases[2].clone(),
+        keys: vec![kairos::store::resources::ChannelKey {
+            name: "default".to_string(),
+            api_key: "sk-2".to_string(),
+            weight: 1,
+            enabled: true,
+            models: None,
+            blocked_models: None,
+        }],
+        models: vec![TEST_MODEL.to_string()],
+        model_aliases: Default::default(),
+        timeout_ms: 1000,
+        max_retries: 0,
+        enabled: true,
+        model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+    });
     seed
 }
 
@@ -95,6 +130,237 @@ async fn retryable_429_fails_over_to_next_channel() {
     // 两个渠道都被请求过（首渠道失败一次，次渠道成功一次）。
     assert_eq!(ups[0].received().len(), 1, "首渠道应收一次请求");
     assert_eq!(ups[1].received().len(), 1, "次渠道应收一次请求");
+}
+
+/// 渠道内启用密钥按模型名单筛选，并把选中的密钥用于出站认证。
+#[tokio::test]
+async fn channel_key_model_filter_selects_usable_auth_key() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels[0].keys = vec![
+            kairos::store::resources::ChannelKey {
+                name: "blocked".to_string(),
+                api_key: "sk-blocked".to_string(),
+                weight: 100,
+                enabled: true,
+                models: Some(vec!["other".to_string()]),
+                blocked_models: None,
+            },
+            kairos::store::resources::ChannelKey {
+                name: "usable".to_string(),
+                api_key: "sk-usable".to_string(),
+                weight: 1,
+                enabled: true,
+                models: Some(vec![TEST_MODEL.to_string()]),
+                blocked_models: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let response = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        ups[0].received_api_keys(),
+        vec![Some("Bearer sk-usable".to_string())]
+    );
+}
+
+/// 同一会话的首试、429 重试与后续请求均复用同一把渠道密钥。
+#[tokio::test]
+async fn session_stickiness_keeps_key_across_retry_and_requests() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels[0].max_retries = 1;
+        seed.channels[0].keys = vec![
+            kairos::store::resources::ChannelKey {
+                name: "a".to_string(),
+                api_key: "sk-a".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+            kairos::store::resources::ChannelKey {
+                name: "b".to_string(),
+                api_key: "sk-b".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Status429);
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let client = reqwest::Client::new();
+    let request = || {
+        client
+            .post(format!("{}/v1/chat/completions", gw.base_url()))
+            .bearer_auth(TEST_TOKEN_KEY)
+            .header("x-kairos-session-id", "session-1")
+            .json(&json!({
+                "model": TEST_MODEL,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+    };
+    assert_eq!(request().send().await.expect("首请求应成功").status(), 200);
+    assert_eq!(
+        request().send().await.expect("后续请求应成功").status(),
+        200
+    );
+
+    let keys = ups[0].received_api_keys();
+    assert_eq!(keys.len(), 3, "首试、429 重试与后续请求都应到达上游");
+    assert!(keys.iter().all(|key| key == &keys[0]));
+}
+
+/// 不带会话头时，IR 前缀相同的请求也复用同一把密钥。
+#[tokio::test]
+async fn session_prefix_stickiness_without_header() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels[0].keys = vec![
+            kairos::store::resources::ChannelKey {
+                name: "a".to_string(),
+                api_key: "sk-a".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+            kairos::store::resources::ChannelKey {
+                name: "b".to_string(),
+                api_key: "sk-b".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            },
+        ];
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let response = client
+            .post(format!("{}/v1/chat/completions", gw.base_url()))
+            .bearer_auth(TEST_TOKEN_KEY)
+            .json(&json!({
+                "model": TEST_MODEL,
+                "messages": [
+                    { "role": "system", "content": "be precise" },
+                    { "role": "user", "content": "hello" }
+                ]
+            }))
+            .send()
+            .await
+            .expect("请求应成功");
+        assert_eq!(response.status(), 200);
+    }
+    let keys = ups[0].received_api_keys();
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], keys[1]);
+}
+
+/// 顺序表先给全部候选排序；模型组钉渠道随后只做稳定过滤，不能让未钉渠道
+/// 的排位改变剩余候选的相对次序。
+#[tokio::test]
+async fn pinned_group_filters_after_ordering_without_reordering() {
+    let (gw, mut ups) = TestGateway::start_with_multi(3, three_channel_seed).await;
+    let mut conn = gw.pool.acquire().await.expect("应能获取连接");
+    kairos::store::resources::upsert_model_group(
+        &mut conn,
+        &ModelGroup {
+            name: "pinned".to_string(),
+            models: vec![
+                GroupModel::Source {
+                    channel_id: 1,
+                    model: TEST_MODEL.to_string(),
+                },
+                GroupModel::Source {
+                    channel_id: 2,
+                    model: TEST_MODEL.to_string(),
+                },
+            ],
+        },
+    )
+    .await
+    .expect("应能写模型组");
+    sqlx::query("UPDATE tokens SET model_group = 'pinned' WHERE token_key = ?")
+        .bind(TEST_TOKEN_KEY)
+        .execute(&mut *conn)
+        .await
+        .expect("应能改测试令牌模型组");
+    sqlx::query(
+        "INSERT INTO channel_model_order (model, channel_id, position) VALUES \
+         (?, 3, 0), (?, 2, 1), (?, 1, 2)",
+    )
+    .bind(TEST_MODEL)
+    .bind(TEST_MODEL)
+    .bind(TEST_MODEL)
+    .execute(&mut *conn)
+    .await
+    .expect("应能写顺序表");
+    drop(conn);
+
+    let base = gw.spawn_reloaded_protocol().await;
+    ups[1].set_behavior(UpstreamBehavior::Status429);
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+    ups[2].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let resp = send_completion(&base, TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(ups[2].received().len(), 0, "未钉渠道不得被调用");
+    assert_eq!(ups[1].received().len(), 1, "钉渠道中顺序靠前的应先试");
+    assert_eq!(
+        ups[0].received().len(),
+        1,
+        "可重试失败后应保序切到下一钉渠道"
+    );
+}
+
+/// 未定价渠道也只能在顺序表排序后稳定滤掉，不能使后续有价候选重排。
+#[tokio::test]
+async fn unpriced_channel_is_filtered_after_ordering_without_reordering() {
+    let (gw, mut ups) = TestGateway::start_with_multi(3, three_channel_seed).await;
+    let mut conn = gw.pool.acquire().await.expect("应能获取连接");
+    sqlx::query("DELETE FROM prices WHERE channel_id = 3 AND model = ?")
+        .bind(TEST_MODEL)
+        .execute(&mut *conn)
+        .await
+        .expect("应能删未定价渠道价格");
+    sqlx::query(
+        "INSERT INTO channel_model_order (model, channel_id, position) VALUES \
+         (?, 3, 0), (?, 2, 1), (?, 1, 2)",
+    )
+    .bind(TEST_MODEL)
+    .bind(TEST_MODEL)
+    .bind(TEST_MODEL)
+    .execute(&mut *conn)
+    .await
+    .expect("应能写顺序表");
+    drop(conn);
+
+    let base = gw.spawn_reloaded_protocol().await;
+    ups[1].set_behavior(UpstreamBehavior::Status429);
+    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+    ups[2].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let resp = send_completion(&base, TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(ups[2].received().len(), 0, "未定价渠道不得出站");
+    assert_eq!(ups[1].received().len(), 1, "有价候选应保持原顺序先试");
+    assert_eq!(ups[0].received().len(), 1, "可重试失败后应保序切换");
 }
 
 /// 首渠道 429、次渠道成功：只按成功渠道单价结算一次。
@@ -312,29 +578,27 @@ async fn alias_rewrites_outbound_and_response_model() {
 
 /// 别名按渠道改写：各候选用自己的表，不共用切片里第一个候选的出站名。
 ///
-/// 别名渠道排在切片最前（旧实现会拿它的出站名给全体），但优先级让无别名
-/// 渠道先试。无别名渠道应原样发送入站名；failover 后别名渠道发给自己的真名。
+/// 首渠道的别名不得泄露给后续渠道。无别名渠道应原样发送入站名；轮到别名渠道
+/// 时才改写为该渠道自己的真名。
 #[tokio::test]
 async fn alias_rewrites_per_channel_not_shared_from_first_candidate() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
         let mut seed = two_channel_seed(bases);
-        // channels[0] → ups[0]：别名渠道，低优先级，切片最前。
+        // channels[0] → ups[0]：别名渠道，按默认创建顺序先试。
         seed.channels[0].name = "alias-ch".to_string();
-        seed.channels[0].priority = 2;
         seed.channels[0]
             .model_aliases
             .insert("fast".to_string(), "gpt-4o-mini".to_string());
-        // channels[1] → ups[1]：无别名，清单含短名，高优先级。
+        // channels[1] → ups[1]：无别名，清单含短名，作为 failover 渠道。
         seed.channels[1].name = "plain-ch".to_string();
-        seed.channels[1].priority = 1;
         seed.channels[1].models = vec!["fast".to_string()];
         seed.channels[1].model_aliases.clear();
         seed
     })
     .await;
-    ups[1].set_behavior(UpstreamBehavior::Status429);
-    ups[0].set_behavior(UpstreamBehavior::Json(json!({
-        "id": "chatcmpl-per-ch", "object": "chat.completion", "model": "gpt-4o-mini",
+    ups[0].set_behavior(UpstreamBehavior::Status429);
+    ups[1].set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-per-ch", "object": "chat.completion", "model": "fast",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
                      "logprobs": null, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
@@ -344,17 +608,17 @@ async fn alias_rewrites_per_channel_not_shared_from_first_candidate() {
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
-        "无别名渠道 429 后应 failover 到别名渠道"
+        "别名渠道 429 后应 failover 到无别名渠道"
+    );
+    assert_eq!(
+        ups[0].received()[0]["model"],
+        "gpt-4o-mini",
+        "别名渠道应按自己的表改写"
     );
     assert_eq!(
         ups[1].received()[0]["model"],
         "fast",
         "无别名渠道应按入站名出站，不得套用其它渠道的别名"
-    );
-    assert_eq!(
-        ups[0].received()[0]["model"],
-        "gpt-4o-mini",
-        "轮到别名渠道时用该渠道自己的表改写"
     );
     let body: Value = resp.json().await.expect("响应应可解析");
     assert_eq!(body["model"], "fast", "响应模型名应回显入站短名");

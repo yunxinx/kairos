@@ -1,4 +1,4 @@
-import type { ChannelView, GroupModel, UnifiedModel } from '@/api/types';
+import type { ChannelSummary, GroupModel, UnifiedModel } from '@/api/types';
 import {
   channelNameForMember,
   memberSourceKind,
@@ -43,7 +43,7 @@ export function pickRowIsMember(row: GroupPickRow, members: GroupModel[]): boole
 
 /** 已登记名按渠道分行，另加统一模型行。 */
 export function groupPickRows(
-  channels: ChannelView[],
+  channels: ChannelSummary[],
   unifiedModels: UnifiedModel[],
 ): GroupPickRow[] {
   const rows: GroupPickRow[] = [];
@@ -93,8 +93,9 @@ function sourceLine(
 
 export function groupMemberSourceLine(
   member: GroupModel,
-  channels: ChannelView[],
+  channels: ChannelSummary[],
   unifiedModels: UnifiedModel[],
+  channelsKnown = true,
 ): CallableSourceLine {
   if (member.kind === 'unified') {
     const unified = unifiedModels.find((model) => model.id === member.id);
@@ -106,7 +107,7 @@ export function groupMemberSourceLine(
       unifiedMembers: unified?.models ?? [],
     };
   }
-  const kind = memberSourceKind(member, channels);
+  const kind = memberSourceKind(member, channels, channelsKnown);
   const channelName = channelNameForMember(channels, member);
   return sourceLine(
     groupModelKey(member),
@@ -119,8 +120,11 @@ export function groupMemberSourceLine(
 /** 组表「组内模型」：一条名单对应一行。 */
 export function groupModelDisplayLines(
   models: GroupModel[],
-  channels: ChannelView[],
+  channels: ChannelSummary[],
   unifiedModels: UnifiedModel[],
+  channelsKnown = true,
 ): CallableSourceLine[] {
-  return models.map((member) => groupMemberSourceLine(member, channels, unifiedModels));
+  return models.map((member) =>
+    groupMemberSourceLine(member, channels, unifiedModels, channelsKnown),
+  );
 }

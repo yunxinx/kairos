@@ -98,7 +98,7 @@ async fn spend_once(gw: &TestGateway, session: &str, user_id: i64, name: &str) -
         session,
         reqwest::Method::POST,
         "/tokens",
-        json!({ "name": name, "limit_usd_micros": null, "enabled": true }),
+        json!({ "name": name, "balance_usd_micros": null, "enabled": true }),
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
@@ -107,13 +107,13 @@ async fn spend_once(gw: &TestGateway, session: &str, user_id: i64, name: &str) -
         .expect("应有 key")
         .to_string();
 
-    // 钱包在用户身上：充值走 /users/{id}/balance，root 对谁都能充。
+    // 钱包在用户身上：充值走余额调整命令，root 对谁都能充。
     let charged = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 5_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "log-scope-balance-1", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(charged.status(), StatusCode::OK);
@@ -231,9 +231,9 @@ async fn request_logs_and_stats_are_scoped_to_owner() {
     assert_eq!(root_lifetime["request_count"], 2);
 }
 
-/// 补扣/豁免与系统日志属运营面：普通用户一律 403，admin 不能动 root 的账。
+/// 补扣/豁免属运营面：普通用户一律 403，admin 不能动 root 的账。
 #[tokio::test]
-async fn settling_and_system_logs_require_admin() {
+async fn settling_requires_admin() {
     let mut gw = TestGateway::start_with_admin(common::test_seed).await;
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(completion_body()));
@@ -271,8 +271,6 @@ async fn settling_and_system_logs_require_admin() {
     .await;
     assert_eq!(settle.status(), StatusCode::FORBIDDEN);
 
-    let user_system_logs = admin_get(&gw, &alice, "/system-logs").await;
-    assert_eq!(user_system_logs.status(), StatusCode::FORBIDDEN);
     let admin_system_logs = admin_get(&gw, &admin, "/system-logs").await;
     assert_eq!(admin_system_logs.status(), StatusCode::OK);
 
@@ -319,4 +317,77 @@ async fn settling_and_system_logs_require_admin() {
         StatusCode::FORBIDDEN,
         "admin 不能结算 root 名下的行"
     );
+}
+
+/// 系统日志对普通用户开放，但只到「自己的审计行」这条线上。
+///
+/// 归属由身份注入：普通用户既看不到他人的审计行，也看不到 actor 为 NULL 的运维事件
+/// （失败登录、结算失败等含内部细节）。`actor_user_id` 参数不能用来把这条线挪开。
+#[tokio::test]
+async fn system_logs_show_users_only_their_own_audit_rows() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let (alice_id, alice) = create_role(&gw, "alice@example.com", "user").await;
+    let (bob_id, bob) = create_role(&gw, "bob@example.com", "user").await;
+
+    // 无 actor 的运维事件：登录失败只记邮箱，认不出是谁。
+    let failed = reqwest::Client::new()
+        .post(admin_url(&gw, "/login"))
+        .json(&json!({ "email": "alice@example.com", "password": "wrong-password" }))
+        .send()
+        .await
+        .expect("登录应可达");
+    assert_eq!(failed.status(), StatusCode::UNAUTHORIZED);
+
+    let page: Value = admin_get(&gw, &alice, "/system-logs")
+        .await
+        .json()
+        .await
+        .expect("系统日志页应可解析");
+    let rows = page["items"].as_array().expect("items 应为数组");
+    assert!(!rows.is_empty(), "alice 至少应看到自己的登录审计行");
+    for row in rows {
+        assert_eq!(
+            row["actor_user_id"].as_i64(),
+            Some(alice_id),
+            "只应出现 alice 自己的审计行，实际 {row}"
+        );
+    }
+
+    // 他人的审计行不可见：bob 登录过，alice 的视图里不应有 bob。
+    let bob_page: Value = admin_get(&gw, &bob, "/system-logs")
+        .await
+        .json()
+        .await
+        .expect("系统日志页应可解析");
+    for row in bob_page["items"].as_array().expect("items 应为数组") {
+        assert_eq!(row["actor_user_id"].as_i64(), Some(bob_id));
+    }
+
+    // 参数不能解除归属边界：指定他人 actor 仍只返回自己的行。
+    let forged: Value = admin_get(&gw, &alice, &format!("/system-logs?actor_user_id={bob_id}"))
+        .await
+        .json()
+        .await
+        .expect("系统日志页应可解析");
+    for row in forged["items"].as_array().expect("items 应为数组") {
+        assert_eq!(
+            row["actor_user_id"].as_i64(),
+            Some(alice_id),
+            "actor_user_id 参数不应让 alice 看到他人的行"
+        );
+    }
+
+    // root 仍看全量，包括那条没有 actor 的失败登录。
+    let root_page: Value = admin_get(&gw, &gw.session, "/system-logs")
+        .await
+        .json()
+        .await
+        .expect("系统日志页应可解析");
+    let has_systemic = root_page["items"]
+        .as_array()
+        .expect("items 应为数组")
+        .iter()
+        .any(|row| row["actor_user_id"].is_null());
+    assert!(has_systemic, "root 视图应包含无操作者的运维事件");
 }

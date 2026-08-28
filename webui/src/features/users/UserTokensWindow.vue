@@ -13,7 +13,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useToast } from '@/composables/useToast';
-import { formatUsdFixed2, formatUsdMicros } from '@/lib/format';
+import { formatUsdMicros } from '@/lib/format';
 import { groupDisplayName, tokenGroupUsable } from '@/lib/visible-models';
 
 const props = defineProps<{
@@ -35,32 +35,6 @@ const tokensQuery = useQuery({
 
 const tokens = computed(() => tokensQuery.data.value ?? []);
 const showSkeleton = computed(() => tokensQuery.isPending.value && !tokensQuery.data.value);
-
-const REMAINING_WARN_RATIO = 0.5;
-const REMAINING_DANGER_RATIO = 0.2;
-
-function quotaRatio(token: TokenView): number | null {
-  const limit = token.limit_usd_micros;
-  if (limit === null || limit <= 0) return null;
-  return Math.min(1, Math.max(0, token.settled_usd_micros / limit));
-}
-
-function quotaColorClass(ratio: number): string {
-  if (ratio >= 1 - REMAINING_DANGER_RATIO) return 'bg-[var(--danger)]';
-  if (ratio >= 1 - REMAINING_WARN_RATIO) return 'bg-[var(--warn)]';
-  return 'bg-[var(--success)]';
-}
-
-function quotaLabel(token: TokenView): string {
-  const settled = formatUsdMicros(token.settled_usd_micros);
-  if (token.limit_usd_micros === null) {
-    return t('tokens.quotaUnlimitedUsage', { settled });
-  }
-  return t('tokens.quotaUsage', {
-    settled,
-    limit: formatUsdMicros(token.limit_usd_micros),
-  });
-}
 
 const togglingId = ref<number | null>(null);
 const toggleMutation = useMutation({
@@ -93,17 +67,14 @@ const toggleMutation = useMutation({
         <TableRowsSkeleton :columns="5" />
       </div>
       <EmptyState v-else-if="tokens.length === 0" :title="t('users.tokensEmpty')" />
-      <div
-        v-else
-        class="border-seed seed-scrollbar max-h-80 overflow-y-auto rounded-md border"
-      >
+      <div v-else class="border-seed seed-scrollbar max-h-80 overflow-y-auto rounded-md border">
         <table class="w-full border-collapse text-left text-xs">
           <TableHeader>
             <TableRow>
               <TableHead>{{ t('tokens.name') }}</TableHead>
               <TableHead>{{ t('tokens.key') }}</TableHead>
               <TableHead>{{ t('tokens.modelGroup') }}</TableHead>
-              <TableHead class="w-32">{{ t('tokens.quota') }}</TableHead>
+              <TableHead>{{ t('tokens.quota') }}</TableHead>
               <TableHead align="center" class="w-20">{{ t('tokens.status') }}</TableHead>
             </TableRow>
           </TableHeader>
@@ -134,28 +105,12 @@ const toggleMutation = useMutation({
                   </span>
                 </span>
               </TableCell>
-              <TableCell>
-                <div class="w-28" :title="quotaLabel(token)">
-                  <div class="text-fg-muted mb-1 flex justify-between font-mono text-xs">
-                    <span data-testid="token-settled">{{
-                      formatUsdFixed2(token.settled_usd_micros)
-                    }}</span>
-                    <span v-if="token.limit_usd_micros !== null" data-testid="token-limit">
-                      / {{ formatUsdFixed2(token.limit_usd_micros) }}
-                    </span>
-                  </div>
-                  <div
-                    v-if="quotaRatio(token) !== null"
-                    class="bg-surface-alt h-1.5 w-full overflow-hidden rounded-full"
-                    data-testid="token-quota-track"
-                  >
-                    <div
-                      class="h-full rounded-full transition-[width]"
-                      :class="quotaColorClass(quotaRatio(token) ?? 0)"
-                      :style="{ width: `${(quotaRatio(token) ?? 0) * 100}%` }"
-                    />
-                  </div>
-                </div>
+              <TableCell class="font-mono" data-testid="token-balance">
+                {{
+                  token.balance_usd_micros === null
+                    ? t('common.unlimited')
+                    : formatUsdMicros(token.balance_usd_micros)
+                }}
               </TableCell>
               <TableCell align="center">
                 <button

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
+import { useNavigate } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { SortDir, UserAdminView } from '@/api/types';
@@ -10,7 +11,6 @@ import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import InlineError from '@/components/ui/InlineError.vue';
-import OverflowChips from '@/components/ui/OverflowChips.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import SelectCell from '@/components/ui/data-table/SelectCell.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
@@ -36,10 +36,9 @@ import UserEditorWindow from '@/features/users/UserEditorWindow.vue';
 import UserManageWindow from '@/features/users/UserManageWindow.vue';
 import { formatCount, formatTokensCount, formatUnixMillis, formatUsdMicros } from '@/lib/format';
 import { useCurrentUser } from '@/lib/session';
-import { groupDisplayName } from '@/lib/visible-models';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
 
-type UserManageTab = 'profile' | 'recharge' | 'groups' | 'tokens';
+type UserManageTab = 'profile' | 'recharge' | 'tokens';
 
 type UserWindowPayload =
   | { kind: 'create' }
@@ -56,16 +55,11 @@ type UserColumnId =
   | 'requestCount'
   | 'tokensUsage'
   | 'lastUsedAt'
-  | 'groups'
+  | 'plan'
   | 'status'
   | 'actions';
 
-type UserSortBy =
-  | 'balance'
-  | 'rateLimitRpm'
-  | 'requestCount'
-  | 'tokensUsage'
-  | 'lastUsedAt';
+type UserSortBy = 'balance' | 'rateLimitRpm' | 'requestCount' | 'tokensUsage' | 'lastUsedAt';
 
 const USER_COLUMNS: ColumnVisibilitySpec<UserColumnId>[] = [
   { id: 'email', locked: true },
@@ -76,7 +70,7 @@ const USER_COLUMNS: ColumnVisibilitySpec<UserColumnId>[] = [
   { id: 'requestCount' },
   { id: 'tokensUsage' },
   { id: 'lastUsedAt' },
-  { id: 'groups' },
+  { id: 'plan' },
   { id: 'status' },
   { id: 'actions', locked: true },
 ];
@@ -89,18 +83,19 @@ const USER_HIDEABLE: UserColumnId[] = [
   'requestCount',
   'tokensUsage',
   'lastUsedAt',
-  'groups',
+  'plan',
   'status',
 ];
 
 const { t, locale } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
+const navigate = useNavigate();
 const me = useCurrentUser();
 const searchText = ref('');
 const roleFilter = ref<string[]>([]);
 const statusFilter = ref<string[]>([]);
-const groupFilter = ref<string[]>([]);
+const planFilter = ref<string[]>([]);
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
 const sortBy = ref<UserSortBy | null>(null);
@@ -122,7 +117,7 @@ const columnLabels = computed((): Record<UserColumnId, string> => ({
   requestCount: t('users.requestCount'),
   tokensUsage: t('users.tokensUsage'),
   lastUsedAt: t('users.lastUsedAt'),
-  groups: t('users.groups'),
+  plan: t('users.plan'),
   status: t('users.status'),
   actions: t('common.actions'),
 }));
@@ -194,41 +189,51 @@ const statusOptions = computed(() => {
   ];
 });
 
-const groupOptions = computed(() => {
+const planOptions = computed(() => {
   const counts = new Map<string, number>();
   for (const user of users.value) {
-    if (user.role === 'root') continue;
-    for (const g of user.assigned_groups) {
-      counts.set(g, (counts.get(g) ?? 0) + 1);
-    }
+    const name =
+      user.plan_display_name || (user.role === 'root' ? t('common.unlimited') : t('common.none'));
+    counts.set(name, (counts.get(name) ?? 0) + 1);
   }
   return Array.from(counts.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([name, count]) => ({
       value: name,
-      label: groupDisplayName(name, t('models.ungrouped')),
+      label: name,
       count,
     }));
 });
+
+function goToPlan(planName: string) {
+  void navigate({
+    to: '/plans',
+    search: { q: planName },
+  });
+}
 
 const filtered = computed(() => {
   const q = searchText.value.trim().toLowerCase();
   const roles = new Set(roleFilter.value);
   const statuses = new Set(statusFilter.value);
-  const groups = new Set(groupFilter.value);
+  const plans = new Set(planFilter.value);
   return users.value.filter((user) => {
     if (roles.size > 0 && !roles.has(user.role)) return false;
     if (statuses.size > 0) {
       const flag = user.enabled ? 'enabled' : 'disabled';
       if (!statuses.has(flag)) return false;
     }
-    if (groups.size > 0) {
-      if (user.role === 'root') return false;
-      const matchesGroup = user.assigned_groups.some((g) => groups.has(g));
-      if (!matchesGroup) return false;
+    if (plans.size > 0) {
+      const name =
+        user.plan_display_name || (user.role === 'root' ? t('common.unlimited') : t('common.none'));
+      if (!plans.has(name)) return false;
     }
     if (!q) return true;
-    return user.email.toLowerCase().includes(q) || user.display_name.toLowerCase().includes(q);
+    return (
+      user.email.toLowerCase().includes(q) ||
+      user.display_name.toLowerCase().includes(q) ||
+      (user.plan_display_name ?? '').toLowerCase().includes(q)
+    );
   });
 });
 
@@ -340,7 +345,7 @@ const bulkDelete = useBulkDelete<number>({
   selection,
   windowStack: { windows, close: closeWindow },
   queryKey: ['users'],
-  deleteOne: (userId) => apiClient.deleteUser(userId),
+  deleteMany: (userIds) => apiClient.deleteUsers(userIds),
 });
 
 function openCreate(event: Event) {
@@ -431,11 +436,11 @@ watch(users, (rows) => {
               test-id="users-status-filter"
             />
             <FacetedFilter
-              v-if="groupOptions.length > 0"
-              v-model="groupFilter"
-              :title="t('users.groups')"
-              :options="groupOptions"
-              test-id="users-group-filter"
+              v-if="planOptions.length > 0"
+              v-model="planFilter"
+              :title="t('users.plan')"
+              :options="planOptions"
+              test-id="users-plan-filter"
             />
             <template #actions>
               <DataTableViewOptions
@@ -479,7 +484,11 @@ watch(users, (rows) => {
                 @clear="onClearSort"
               />
             </TableHead>
-            <TableHead v-if="visible.rateLimitRpm" class="w-36" :aria-sort="ariaSort('rateLimitRpm')">
+            <TableHead
+              v-if="visible.rateLimitRpm"
+              class="w-36"
+              :aria-sort="ariaSort('rateLimitRpm')"
+            >
               <DataTableColumnHeader
                 :label="t('users.rateLimitRpm')"
                 :sorted="sortedState('rateLimitRpm')"
@@ -488,7 +497,11 @@ watch(users, (rows) => {
                 @clear="onClearSort"
               />
             </TableHead>
-            <TableHead v-if="visible.requestCount" class="w-28" :aria-sort="ariaSort('requestCount')">
+            <TableHead
+              v-if="visible.requestCount"
+              class="w-28"
+              :aria-sort="ariaSort('requestCount')"
+            >
               <DataTableColumnHeader
                 :label="t('users.requestCount')"
                 :sorted="sortedState('requestCount')"
@@ -515,9 +528,13 @@ watch(users, (rows) => {
                 @clear="onClearSort"
               />
             </TableHead>
-            <TableHead v-if="visible.groups">{{ t('users.groups') }}</TableHead>
-            <TableHead v-if="visible.status" class="w-24" align="center">{{ t('users.status') }}</TableHead>
-            <TableHead v-if="visible.actions" class="w-24" align="center">{{ t('common.actions') }}</TableHead>
+            <TableHead v-if="visible.plan">{{ t('users.plan') }}</TableHead>
+            <TableHead v-if="visible.status" class="w-24" align="center">{{
+              t('users.status')
+            }}</TableHead>
+            <TableHead v-if="visible.actions" class="w-24" align="center">{{
+              t('common.actions')
+            }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -535,8 +552,12 @@ watch(users, (rows) => {
                 test-id="user-select"
                 @toggle="selection.toggle(user.id)"
               />
-              <TableCell v-if="visible.email" class="font-mono" truncate :title="user.email">{{ user.email }}</TableCell>
-              <TableCell v-if="visible.displayName" truncate :title="user.display_name">{{ user.display_name }}</TableCell>
+              <TableCell v-if="visible.email" class="font-mono" truncate :title="user.email">{{
+                user.email
+              }}</TableCell>
+              <TableCell v-if="visible.displayName" truncate :title="user.display_name">{{
+                user.display_name
+              }}</TableCell>
               <TableCell v-if="visible.role">
                 <span class="badge" :class="roleBadgeClass(user.role)">
                   {{ roleLabel(user.role) }}
@@ -549,7 +570,7 @@ watch(users, (rows) => {
                 <span v-if="user.rate_limit_rpm && user.rate_limit_rpm > 0">
                   {{ formatCount(user.rate_limit_rpm, locale) }}
                 </span>
-                <span v-else class="badge badge-neutral text-xs font-mono">
+                <span v-else class="badge badge-neutral font-mono text-xs">
                   {{ t('common.unlimited') }}
                 </span>
               </TableCell>
@@ -571,19 +592,23 @@ watch(users, (rows) => {
                   {{ t('users.neverUsed') }}
                 </span>
               </TableCell>
-              <TableCell v-if="visible.groups">
-                <span v-if="user.role === 'root'" class="badge badge-neutral font-mono text-xs">
+              <TableCell v-if="visible.plan">
+                <button
+                  v-if="user.plan_display_name"
+                  type="button"
+                  class="badge badge-neutral hover:text-fg cursor-pointer font-mono text-xs transition-colors"
+                  data-testid="user-plan-link"
+                  @click="goToPlan(user.plan_display_name)"
+                >
+                  {{ user.plan_display_name }}
+                </button>
+                <span
+                  v-else-if="user.role === 'root'"
+                  class="badge badge-neutral font-mono text-xs"
+                >
                   {{ t('common.unlimited') }}
                 </span>
-                <OverflowChips
-                  v-else
-                  :items="
-                    user.assigned_groups.map((name) =>
-                      groupDisplayName(name, t('models.ungrouped')),
-                    )
-                  "
-                  chip-test-id="user-group-chip"
-                />
+                <span v-else class="text-fg-muted font-mono text-xs"> — </span>
               </TableCell>
               <TableCell v-if="visible.status" align="center">
                 <button

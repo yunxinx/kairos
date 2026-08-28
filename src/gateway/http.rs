@@ -38,16 +38,16 @@ use crate::{
     config::Protocol,
     core::billing,
     core::billing::PriceSnapshot,
-    core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage},
+    core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage, prefix_hash},
     core::stream::{SseFrame, StreamAccumulator},
-    runtime::{RuntimeSnapshot, SnapshotHandle},
+    runtime::{PlanBinding, RuntimeSnapshot, SnapshotHandle},
     store,
-    store::resources::{Channel, ChannelRecord, Token},
+    store::resources::{Channel, ChannelRecord, StoredChannelKey, Token},
 };
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
 use super::logging::{Billing, log_request, new_request_id, unix_millis};
-use super::rate_limit::RequestRateLimiter;
+use super::rate_limit::{RequestRateLimiter, SessionStickyCache};
 use super::sse::{
     OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
     take_frame,
@@ -64,6 +64,7 @@ pub struct Deps {
     pub(super) snapshot: SnapshotHandle,
     pub(super) auth_throttle: AuthThrottle,
     pub(super) request_rate: RequestRateLimiter,
+    pub(super) sticky: SessionStickyCache,
 }
 
 /// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
@@ -81,6 +82,7 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         snapshot,
         auth_throttle: AuthThrottle::new(),
         request_rate: RequestRateLimiter::new(),
+        sticky: SessionStickyCache::new(),
     };
 
     // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
@@ -536,7 +538,15 @@ async fn handle_request(
     }
 
     // 4. 准入：解析出站跳（普通模型一条；统一模型按成员顺序，只收已定价可路由的）。
-    let hops = match resolve_route_hops(&snapshot, &request.model, &token.model_group) {
+    // IR 已解码，此处才能稳定计算无头请求的前缀亲和标识。
+    let session = request_session(&headers, &request);
+    let hops = match resolve_route_hops(
+        &snapshot,
+        &request.model,
+        &token.model_group,
+        &deps.sticky,
+        session,
+    ) {
         Ok(hops) => hops,
         Err((status, message)) => {
             return error_response(
@@ -556,6 +566,10 @@ async fn handle_request(
     };
 
     // 5. 计费准入：用户钱包与令牌累计上限须通过（单价按实际跳在出站时选用）。
+    //
+    // 折扣率在准入时从当前用户所挂套餐取出；免费档（bp=0）不要求余额为正，
+    // 粗估也按折后金额比对，避免被原价门槛挡住。
+    let discount_bp = snapshot.discount_bp_for_token(token);
     let mut conn = match deps.pool.acquire().await {
         Ok(conn) => conn,
         Err(err) => {
@@ -601,7 +615,7 @@ async fn handle_request(
             .await;
         }
     };
-    if balance.wallet.balance_usd_micros <= 0 {
+    if balance.wallet.balance_usd_micros <= 0 && discount_bp != 0 {
         let message = format!(
             "用户余额不足（当前 {:.2} USD）",
             balance.wallet.balance_usd_micros as f64 / 1_000_000.0
@@ -642,8 +656,25 @@ async fn handle_request(
         .await;
     }
     if let Some(max_tokens) = request.max_tokens.filter(|&n| n > 0) {
-        let estimate = estimate_admission_cost_micros(&hops, &snapshot, max_tokens);
-        if estimate > balance.wallet.balance_usd_micros {
+        let estimate =
+            match estimate_admission_cost_micros(&hops, &snapshot, discount_bp, max_tokens) {
+                Ok(estimate) => estimate,
+                Err(err) => {
+                    return billing_error_response(
+                        &deps,
+                        full_body,
+                        token,
+                        &request.model,
+                        started,
+                        err,
+                        inbound_protocol,
+                        request_body_for_log,
+                        &request_id,
+                    )
+                    .await;
+                }
+            };
+        if discount_bp != 0 && estimate > balance.wallet.balance_usd_micros {
             let message = format!(
                 "用户余额不足以覆盖预估费用（预估 {:.2} USD，当前 {:.2} USD）",
                 estimate as f64 / 1_000_000.0,
@@ -744,6 +775,8 @@ enum HopDeny {
 fn hop_for_member(
     snapshot: &RuntimeSnapshot,
     member: &crate::store::resources::UnifiedMember,
+    sticky: &SessionStickyCache,
+    session: u64,
 ) -> Result<RouteHop, HopDeny> {
     let Some(record) = snapshot
         .channels
@@ -763,10 +796,14 @@ fn hop_for_member(
     {
         return Err(HopDeny::NoPrice);
     }
+    let key = sticky
+        .select(record.id, &member.model, session, &record.keys)
+        .ok_or(HopDeny::NoRoute)?;
     Ok(RouteHop {
         routed_model: member.model.clone(),
         route: routing::Route {
             channels: vec![record.clone()],
+            selected_keys: std::collections::HashMap::from([(record.id, key)]),
         },
     })
 }
@@ -778,8 +815,11 @@ fn hop_for_callable(
     snapshot: &RuntimeSnapshot,
     model: &str,
     group_name: &str,
+    sticky: &SessionStickyCache,
+    session: u64,
 ) -> Result<RouteHop, HopDeny> {
-    let mut route = routing::route(&snapshot.channels, model).ok_or(HopDeny::NoRoute)?;
+    let mut route = routing::route(&snapshot.channels, &snapshot.channel_model_order, model)
+        .ok_or(HopDeny::NoRoute)?;
     if let Some(group) = snapshot.model_groups.get(group_name)
         && let Some(pinned) = store::resources::pinned_channel_ids(group, model)
     {
@@ -788,11 +828,26 @@ fn hop_for_callable(
             return Err(HopDeny::NoRoute);
         }
     }
-    route
+    let had_price = route
         .channels
-        .retain(|record| snapshot.price_for_channel(record.id, model).is_some());
+        .iter()
+        .any(|record| snapshot.price_for_channel(record.id, model).is_some());
+    route.channels.retain(|record| {
+        if snapshot.price_for_channel(record.id, model).is_none() {
+            return false;
+        }
+        let Some(key) = sticky.select(record.id, model, session, &record.keys) else {
+            return false;
+        };
+        route.selected_keys.insert(record.id, key.clone());
+        true
+    });
     if route.channels.is_empty() {
-        return Err(HopDeny::NoPrice);
+        return Err(if had_price {
+            HopDeny::NoRoute
+        } else {
+            HopDeny::NoPrice
+        });
     }
     Ok(RouteHop {
         routed_model: model.to_string(),
@@ -808,20 +863,25 @@ fn billed_price(snapshot: &RuntimeSnapshot, record: &ChannelRecord, model: &str)
         .expect("准入已过滤无价格渠道")
 }
 
-/// 候选跳里最高的 output 单价 × `max_tokens`，挡住极端输出上限。
+/// 候选跳里最高的 output 单价 × `max_tokens`，再按折扣率折成实收，挡住极端输出上限。
 fn estimate_admission_cost_micros(
     hops: &[RouteHop],
     snapshot: &RuntimeSnapshot,
+    discount_bp: i64,
     max_tokens: u32,
-) -> i64 {
+) -> Result<i64, billing::BillingError> {
     let mut max_output = 0i64;
     for hop in hops {
         for record in &hop.route.channels {
             let price = billed_price(snapshot, record, &hop.routed_model);
+            if price.output_micros < 0 {
+                return Err(billing::BillingError::NegativePrice);
+            }
             max_output = max_output.max(price.output_micros);
         }
     }
-    billing::estimate_max_output_cost_micros(max_tokens, max_output)
+    let base = billing::estimate_max_output_cost_micros(max_tokens, max_output)?;
+    billing::discounted_cost_micros(base, discount_bp)
 }
 
 /// 解析本次请求的出站跳序列。
@@ -832,12 +892,14 @@ fn resolve_route_hops(
     snapshot: &RuntimeSnapshot,
     model: &str,
     group_name: &str,
+    sticky: &SessionStickyCache,
+    session: u64,
 ) -> Result<Vec<RouteHop>, (StatusCode, String)> {
     if let Some(unified) = snapshot.unified_models.get(model) {
         let mut hops = Vec::new();
         let mut reasons = Vec::new();
         for member in &unified.models {
-            match hop_for_member(snapshot, member) {
+            match hop_for_member(snapshot, member, sticky, session) {
                 Ok(hop) => hops.push(hop),
                 Err(HopDeny::NoRoute) => {
                     reasons.push(format!("成员 {member} 没有可用渠道"));
@@ -860,7 +922,7 @@ fn resolve_route_hops(
         }
         return Ok(hops);
     }
-    match hop_for_callable(snapshot, model, group_name) {
+    match hop_for_callable(snapshot, model, group_name, sticky, session) {
         Ok(hop) => Ok(vec![hop]),
         Err(HopDeny::NoRoute) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -871,6 +933,21 @@ fn resolve_route_hops(
             format!("模型 {model} 未配置价格，无法计费"),
         )),
     }
+}
+
+/// 取请求级会话标识：显式头优先，缺失时使用解码后 IR 的稳定前缀哈希。
+fn request_session(headers: &HeaderMap, request: &ChatRequest) -> u64 {
+    headers
+        .get("x-kairos-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hasher::write(&mut hasher, value.as_bytes());
+            std::hash::Hasher::finish(&hasher)
+        })
+        .unwrap_or_else(|| prefix_hash(request))
 }
 
 /// 单次出站调用的请求侧上下文：入站请求、认证令牌与计费/日志所需的
@@ -986,10 +1063,13 @@ async fn outbound_with_failover(
                     inbound_headers,
                     request_id,
                 };
+                let key = route
+                    .selected_key(record.id)
+                    .expect("准入已为每个渠道选出密钥");
                 if request.stream {
-                    stream_completion(&mut ctx, &record.channel).await
+                    stream_completion(&mut ctx, &record.channel, key).await
                 } else {
-                    non_stream_completion(&mut ctx, &record.channel).await
+                    non_stream_completion(&mut ctx, &record.channel, key).await
                 }
             })
         },
@@ -997,19 +1077,28 @@ async fn outbound_with_failover(
             let outbound_model =
                 outbound_model_for_channel_name(route, channel, routed_model).map(str::to_string);
             let channel = channel.to_string();
+            let channel_key = route
+                .channels
+                .iter()
+                .find(|record| record.channel.name == channel)
+                .and_then(|record| route.selected_key(record.id))
+                .map(|key| key.name.clone());
             let request_body = request_body_for_log.clone();
             let response_body = snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = request_id.to_string();
             Box::pin(async move {
+                let discount_bp = snapshot.discount_bp_for_token(token);
                 log_request(
                     deps,
                     token,
                     &request.model,
                     outbound_model.as_deref(),
                     &channel,
+                    channel_key.as_deref(),
                     status,
                     started,
                     Billing {
+                        discount_bp,
                         request_body,
                         response_body,
                         ..Default::default()
@@ -1061,9 +1150,11 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             let record = record.clone();
             Box::pin(async move {
                 if ctx.request.stream {
-                    passthrough_stream_completion(ctx, &record).await
+                    let key = route.selected_key(record.id).expect("直通路由已选密钥");
+                    passthrough_stream_completion(ctx, &record, key).await
                 } else {
-                    passthrough_non_stream_completion(ctx, &record).await
+                    let key = route.selected_key(record.id).expect("直通路由已选密钥");
+                    passthrough_non_stream_completion(ctx, &record, key).await
                 }
             })
         },
@@ -1071,6 +1162,12 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             let outbound_model = outbound_model_for_channel_name(route, channel, ctx.routed_model)
                 .map(str::to_string);
             let channel = channel.to_string();
+            let channel_key = route
+                .channels
+                .iter()
+                .find(|record| record.channel.name == channel)
+                .and_then(|record| route.selected_key(record.id))
+                .map(|key| key.name.clone());
             let request_body = ctx.request_body.clone();
             let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = ctx.request_id.to_string();
@@ -1081,9 +1178,11 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                     &ctx.request.model,
                     outbound_model.as_deref(),
                     &channel,
+                    channel_key.as_deref(),
                     status,
                     ctx.started,
                     Billing {
+                        discount_bp: ctx.snapshot.discount_bp_for_token(ctx.token),
                         request_body,
                         response_body,
                         ..Default::default()
@@ -1108,6 +1207,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
 async fn passthrough_stream_completion(
     ctx: &PassthroughCtx<'_>,
     record: &ChannelRecord,
+    key: &StoredChannelKey,
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, true, channel.protocol);
@@ -1118,7 +1218,7 @@ async fn passthrough_stream_completion(
         ctx.deps
             .client
             .post(&upstream_url)
-            .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
+            .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
             .header("content-type", "application/json")
             .body(outbound)
@@ -1184,6 +1284,7 @@ async fn passthrough_stream_completion(
         request: ctx.request.clone(),
         routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
+        channel_key_name: key.name.clone(),
         status_code,
         started: ctx.started,
         price: billed_price(ctx.snapshot, record, ctx.routed_model),
@@ -1217,6 +1318,7 @@ async fn passthrough_stream_completion(
 async fn passthrough_non_stream_completion(
     ctx: &PassthroughCtx<'_>,
     record: &ChannelRecord,
+    key: &StoredChannelKey,
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, false, channel.protocol);
@@ -1227,7 +1329,7 @@ async fn passthrough_non_stream_completion(
         ctx.deps
             .client
             .post(&upstream_url)
-            .apply_outbound_auth_with_version(channel, ctx.inbound_anthropic_version)
+            .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
             .header("content-type", "application/json")
             .body(outbound)
@@ -1288,22 +1390,43 @@ async fn passthrough_non_stream_completion(
         // 响应体原样透传（字节级一致），从 JSON 嗅探 usage 计费。
         let usage = protocol::sniff_usage(&parsed, channel.protocol).unwrap_or_default();
         let price = billed_price(ctx.snapshot, record, ctx.routed_model);
-        let cost = billing::cost_micros(&usage, &price);
+        let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
+        let billing = match Billing::try_calculated(
+            usage,
+            price,
+            discount_bp,
+            ctx.request_body.clone(),
+            ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
+        ) {
+            Ok(billing) => billing,
+            Err(err) => {
+                store::record_system_error(
+                    &ctx.deps.pool,
+                    "billing",
+                    &store::SystemLogEvent::new(
+                        "billing.calculation_failed",
+                        serde_json::json!({ "mode": "non_stream", "error": err.to_string() }),
+                        format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                    ),
+                )
+                .await;
+                return Outbound::Fatal {
+                    channel: channel.name.clone(),
+                    status: 500,
+                    message: "费用超出支持范围，未完成结算".to_string(),
+                };
+            }
+        };
         log_request(
             ctx.deps,
             ctx.token,
             &ctx.request.model,
             outbound_model_for_log(channel, ctx.routed_model),
             &channel.name,
+            Some(&key.name),
             status_code,
             ctx.started,
-            Billing {
-                usage,
-                price,
-                cost_usd_micros: cost,
-                request_body: ctx.request_body.clone(),
-                response_body: ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
-            },
+            billing,
             ctx.inbound_protocol,
             ctx.request_id,
         )
@@ -1373,6 +1496,7 @@ struct PassthroughStreamTask {
     request: ChatRequest,
     routed_model: String,
     channel: Channel,
+    channel_key_name: String,
     status_code: u16,
     started: i64,
     price: PriceSnapshot,
@@ -1494,22 +1618,23 @@ async fn pipe_passthrough_stream<S>(
         );
     }
     // 流结束：按嗅探累积的 usage 结算并落日志。
-    let cost = billing::cost_micros(&usage, &ctx.price);
+    let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
     log_request(
         &ctx.deps,
         &ctx.token,
         &ctx.request.model,
         outbound_model_for_log(&ctx.channel, &ctx.routed_model),
         &ctx.channel.name,
+        Some(&ctx.channel_key_name),
         ctx.status_code,
         ctx.started,
-        Billing {
+        Billing::calculated(
             usage,
-            price: ctx.price,
-            cost_usd_micros: cost,
-            request_body: ctx.request_body.clone(),
-            response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
-        },
+            ctx.price,
+            discount_bp,
+            ctx.request_body.clone(),
+            ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
+        ),
         ctx.protocol,
         &ctx.request_id,
     )
@@ -1547,7 +1672,11 @@ async fn send_passthrough_chunk(
 ///
 /// 按渠道协议编码出站请求、调用上游、解码响应为 IR，再重编码为入站协议返回。
 /// 成功且 usage 非零才结算；失败或零输出不扣费。
-async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
+async fn non_stream_completion(
+    ctx: &mut CallCtx<'_>,
+    channel: &Channel,
+    key: &StoredChannelKey,
+) -> Outbound {
     let deps = ctx.deps;
     let snapshot = ctx.snapshot;
     let request = ctx.request;
@@ -1574,7 +1703,7 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
         .client
         .post(&upstream_url)
         .timeout(Duration::from_millis(channel.timeout_ms))
-        .apply_outbound_auth(channel)
+        .apply_outbound_auth(channel.protocol, key)
         .apply_feature_headers(ctx.inbound_headers)
         .json(&outbound_value)
         .send()
@@ -1619,28 +1748,49 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
                 // 请求侧转换的信息损失随响应回传，下游可感知而非莫名降级。
                 ir.warnings.extend(request_warnings);
                 let usage = &ir.usage;
-                let cost = billing::cost_micros(usage, &price);
+                let discount_bp = snapshot.discount_bp_for_token(token);
                 let inbound = protocol::encode_response(&ir, inbound_protocol);
                 // full_body 记录实际返回下游的入站响应字节（重编码结果）；
                 // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
                 let inbound_wire = snapshot
                     .full_body
                     .then(|| serde_json::to_vec(&inbound).unwrap_or_default());
+                let billing = match Billing::try_calculated(
+                    usage.clone(),
+                    price,
+                    discount_bp,
+                    ctx.request_body.clone(),
+                    inbound_wire,
+                ) {
+                    Ok(billing) => billing,
+                    Err(err) => {
+                        store::record_system_error(
+                            &deps.pool,
+                            "billing",
+                            &store::SystemLogEvent::new(
+                                "billing.calculation_failed",
+                                serde_json::json!({ "mode": "non_stream", "error": err.to_string() }),
+                                format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
+                            ),
+                        )
+                        .await;
+                        return Outbound::Fatal {
+                            channel: channel.name.clone(),
+                            status: 500,
+                            message: "费用超出支持范围，未完成结算".to_string(),
+                        };
+                    }
+                };
                 log_request(
                     deps,
                     token,
                     &request.model,
                     Some(outbound_model),
                     &channel.name,
+                    Some(&key.name),
                     status_code,
                     started,
-                    Billing {
-                        usage: usage.clone(),
-                        price,
-                        cost_usd_micros: cost,
-                        request_body: ctx.request_body.clone(),
-                        response_body: inbound_wire,
-                    },
+                    billing,
                     inbound_protocol,
                     ctx.request_id,
                 )
@@ -1679,7 +1829,11 @@ async fn non_stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outb
 /// 按渠道协议编码出站请求（强制流式，OpenAI 另注入 `stream_options.include_usage`
 /// 供计费），逐 SSE 帧解码为 IR 流事件，累积为 `ChatResponse` 以取 usage 计费，
 /// 同时重编码为入站协议 SSE 帧流回下游。流结束后按累积 usage 结算并落日志。
-async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound {
+async fn stream_completion(
+    ctx: &mut CallCtx<'_>,
+    channel: &Channel,
+    key: &StoredChannelKey,
+) -> Outbound {
     let deps = ctx.deps;
     let request = ctx.request;
     let token = ctx.token;
@@ -1713,7 +1867,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         Duration::from_millis(channel.timeout_ms),
         deps.client
             .post(&upstream_url)
-            .apply_outbound_auth(channel)
+            .apply_outbound_auth(channel.protocol, key)
             .apply_feature_headers(ctx.inbound_headers)
             .json(&outbound)
             .send(),
@@ -1783,6 +1937,7 @@ async fn stream_completion(ctx: &mut CallCtx<'_>, channel: &Channel) -> Outbound
         request: request.clone(),
         routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
+        channel_key_name: key.name.clone(),
         inbound_model: (request.model != outbound_model).then(|| request.model.clone()),
         request_warnings,
         status_code,
@@ -1810,6 +1965,7 @@ struct StreamTask {
     request: ChatRequest,
     routed_model: String,
     channel: Channel,
+    channel_key_name: String,
     /// 别名命中时入站模型名（用于重写响应模型名）；`None` 表示不覆盖。
     inbound_model: Option<String>,
     /// 请求侧转换的信息损失，以 `stream-start` 事件在流首下发。
@@ -1993,23 +2149,23 @@ fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
 
 /// 结算流式请求费用并落日志。
 async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
-    let usage = &response.usage;
-    let cost = billing::cost_micros(usage, &ctx.price);
+    let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
     log_request(
         &ctx.deps,
         &ctx.token,
         &ctx.request.model,
         outbound_model_for_log(&ctx.channel, &ctx.routed_model),
         &ctx.channel.name,
+        Some(&ctx.channel_key_name),
         ctx.status_code,
         ctx.started,
-        Billing {
-            usage: response.usage.clone(),
-            price: ctx.price,
-            cost_usd_micros: cost,
-            request_body: ctx.request_body.clone(),
-            response_body: ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
-        },
+        Billing::calculated(
+            response.usage.clone(),
+            ctx.price,
+            discount_bp,
+            ctx.request_body.clone(),
+            ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
+        ),
         ctx.inbound_protocol,
         &ctx.request_id,
     )
@@ -2137,28 +2293,32 @@ const FORWARDED_FEATURE_HEADERS: &[&str] =
 /// OpenAI 用 `Authorization: Bearer`；Anthropic 用 `x-api-key` 并带
 /// `anthropic-version`。直通路径转发下游版本头，避免强行降级；IR / 探测仍钉默认。
 pub(super) trait OutboundAuth {
-    fn apply_outbound_auth(self, channel: &Channel) -> Self;
+    fn apply_outbound_auth(self, protocol: Protocol, key: &StoredChannelKey) -> Self;
     fn apply_outbound_auth_with_version(
         self,
-        channel: &Channel,
+        protocol: Protocol,
+        key: &StoredChannelKey,
         inbound_version: Option<&HeaderValue>,
     ) -> Self;
     fn apply_feature_headers(self, inbound: &HeaderMap) -> Self;
 }
 
 impl OutboundAuth for reqwest::RequestBuilder {
-    fn apply_outbound_auth(self, channel: &Channel) -> Self {
-        self.apply_outbound_auth_with_version(channel, None)
+    fn apply_outbound_auth(self, protocol: Protocol, key: &StoredChannelKey) -> Self {
+        self.apply_outbound_auth_with_version(protocol, key, None)
     }
 
     fn apply_outbound_auth_with_version(
         self,
-        channel: &Channel,
+        protocol: Protocol,
+        key: &StoredChannelKey,
         inbound_version: Option<&HeaderValue>,
     ) -> Self {
-        match channel.protocol {
-            Protocol::OpenAiChat | Protocol::OpenAiResponses => self.bearer_auth(&channel.api_key),
-            Protocol::AnthropicMessages => self.header("x-api-key", &channel.api_key).header(
+        match protocol {
+            Protocol::OpenAiChat | Protocol::OpenAiResponses => {
+                self.bearer_auth(key.expose_api_key())
+            }
+            Protocol::AnthropicMessages => self.header("x-api-key", key.expose_api_key()).header(
                 "anthropic-version",
                 inbound_version
                     .cloned()
@@ -2209,18 +2369,23 @@ async fn error_response(
     let body = protocol::encode_error(status.as_u16(), message, inbound_protocol);
     if let (Some(token), Some(model)) = (token, model) {
         let response_wire = full_body.then(|| serde_json::to_vec(&body).unwrap_or_default());
+        let discount_bp = deps.snapshot.read().await.discount_bp_for_token(token);
         log_request(
             deps,
             token,
             model,
             None,
             "",
+            None,
             status.as_u16(),
             started,
             Billing {
                 usage: Usage::default(),
                 price: PriceSnapshot::default(),
+                base_cost_usd_micros: 0,
+                discount_bp,
                 cost_usd_micros: 0,
+                calculation_error: None,
                 request_body,
                 response_body: response_wire,
             },
@@ -2233,22 +2398,46 @@ async fn error_response(
 }
 
 /// 令牌生效 RPM：令牌桶上限 = 令牌 `rate_limit_rpm`（缺省跟随全局兜底，`0` 不限）；
-/// 所属用户配置了正数 RPM 时另开用户桶，跨该用户全部令牌共享（令牌写 `0` 也
-/// 压不过用户上限）。快照原子替换后，本函数每次调用重读两维上限，自动生效。
+/// 用户桶按「用户显式值 → 套餐默认值 → 系统兜底」取值，跨该用户全部令牌共享；
+/// 套餐桶上限 = 套餐 `shared_rpm` 的正数值，跨该档全部用户共享。用户/套餐字段的
+/// `0` 是显式不限该维度，不会继续回退。root 不挂套餐，只受令牌桶的系统兜底约束。
+/// 快照原子替换后，本函数每次调用重读三维上限，自动生效。
 fn token_rate_limited(
     deps: &Deps,
     token: &Token,
     snapshot: &RuntimeSnapshot,
 ) -> Result<(), Duration> {
     let token_limit = token.rate_limit_rpm.unwrap_or(snapshot.rate_limit_rpm);
-    let user_limit = snapshot
-        .users
-        .get(&token.user_id)
-        .and_then(|user| user.rate_limit_rpm)
-        .filter(|limit| *limit > 0)
-        .map(|limit| (token.user_id, limit));
+    let (user_limit, plan_limit) = match snapshot.users.get(&token.user_id) {
+        Some(user) => match user.plan {
+            PlanBinding::Unrestricted => (None, None),
+            PlanBinding::Plan(plan_id) => {
+                let plan = snapshot.plans.get(&plan_id);
+                let user_limit = match user.rate_limit_rpm {
+                    // 显式 0 与令牌 RPM 一样表示该维度不限速；它是已填写的值，
+                    // 因而不会因换档而改成套餐默认值。
+                    Some(limit) => limit,
+                    None => match plan.and_then(|plan| plan.default_rpm) {
+                        Some(limit) => limit,
+                        None => snapshot.rate_limit_rpm,
+                    },
+                };
+                let user_limit = if user_limit > 0 {
+                    Some((token.user_id, user_limit))
+                } else {
+                    None
+                };
+                let plan_limit = match plan.and_then(|plan| plan.shared_rpm) {
+                    Some(limit) if limit > 0 => Some((plan_id, limit)),
+                    _ => None,
+                };
+                (user_limit, plan_limit)
+            }
+        },
+        None => (None, None),
+    };
     deps.request_rate
-        .try_acquire(&token.token_key, token_limit, user_limit)
+        .try_acquire(&token.token_key, token_limit, user_limit, plan_limit)
 }
 
 /// 令牌 RPM 超限：429 + `Retry-After`。
@@ -2301,6 +2490,44 @@ async fn db_error_response(
     error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         &message,
+        deps,
+        full_body,
+        Some(token),
+        Some(model),
+        started,
+        inbound_protocol,
+        request_body,
+        request_id,
+    )
+    .await
+}
+
+/// 准入费用不可表示：拒绝出站、写系统错误，并按 500 记录本次请求。
+#[allow(clippy::too_many_arguments)]
+async fn billing_error_response(
+    deps: &Deps,
+    full_body: bool,
+    token: &Token,
+    model: &str,
+    started: i64,
+    err: billing::BillingError,
+    inbound_protocol: Protocol,
+    request_body: Option<Bytes>,
+    request_id: &str,
+) -> Response {
+    store::record_system_error(
+        &deps.pool,
+        "billing",
+        &store::SystemLogEvent::new(
+            "billing.admission_calculation_failed",
+            serde_json::json!({ "error": err.to_string() }),
+            format!("准入费用计算失败，已拒绝出站: {err}"),
+        ),
+    )
+    .await;
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "费用超出支持范围，未发起上游请求",
         deps,
         full_body,
         Some(token),

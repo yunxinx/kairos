@@ -6,6 +6,8 @@ export type ColumnVisibilitySpec<Id extends string> = {
   locked?: boolean;
   /** 缺省可见；锁定列始终可见。 */
   defaultVisible?: boolean;
+  /** 存量配置还没有本列时，继承拆分前的旧列偏好。 */
+  legacyFallbackId?: Id;
 };
 
 export type ColumnVisibilityItem<Id extends string> = {
@@ -59,6 +61,13 @@ export function useColumnVisibility<Id extends string>(
         const stored = rec[spec.id];
         if (typeof stored === 'boolean') {
           next[spec.id] = stored;
+          continue;
+        }
+        if (spec.legacyFallbackId) {
+          const legacyStored = rec[spec.legacyFallbackId];
+          if (typeof legacyStored === 'boolean') {
+            next[spec.id] = legacyStored;
+          }
         }
       }
     } catch {

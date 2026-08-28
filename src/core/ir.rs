@@ -6,6 +6,7 @@
 //! 适配器边界。
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hasher};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -274,6 +275,44 @@ pub struct ChatRequest {
     pub provider_options: ProviderOptions,
 }
 
+/// 为没有显式会话头的请求计算前缀亲和标识。
+///
+/// 只纳入 system 消息全文与前两条消息的角色/文本；这对应上游 prompt cache
+/// 的稳定前缀，同时避免把每轮新增内容纳入会话标识。`DefaultHasher` 只用于
+/// 进程内粘性分桶，不提供密码学性质。
+pub(crate) fn prefix_hash(request: &ChatRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(b"kairos-prefix-v1\0");
+    for message in request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+    {
+        write_message_prefix(&mut hasher, message);
+    }
+    for message in request.messages.iter().take(2) {
+        write_message_prefix(&mut hasher, message);
+    }
+    hasher.finish()
+}
+
+fn write_message_prefix(hasher: &mut DefaultHasher, message: &Message) {
+    hasher.write_u8(match message.role {
+        Role::System => 0,
+        Role::User => 1,
+        Role::Assistant => 2,
+        Role::Tool => 3,
+    });
+    for part in &message.content {
+        let text = match part {
+            ContentPart::Text { text, .. } | ContentPart::Reasoning { text, .. } => text,
+            _ => continue,
+        };
+        hasher.write_u64(text.len() as u64);
+        hasher.write(text.as_bytes());
+    }
+}
+
 /// 非流式聊天响应的 IR 中枢。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatResponse {
@@ -379,4 +418,51 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         provider_metadata: ProviderOptions,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_hash;
+    use serde_json::json;
+
+    fn request(messages: serde_json::Value) -> super::ChatRequest {
+        serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "messages": messages,
+        }))
+        .expect("测试请求应能解码")
+    }
+
+    #[test]
+    fn prefix_hash_ignores_messages_after_the_first_two() {
+        let first = request(json!([
+            {"role": "system", "content": [{"type": "text", "text": "be precise"}]},
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            {"role": "user", "content": [{"type": "text", "text": "turn one"}]}
+        ]));
+        let second = request(json!([
+            {"role": "system", "content": [{"type": "text", "text": "be precise"}]},
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            {"role": "user", "content": [{"type": "text", "text": "turn two"}]}
+        ]));
+        assert_eq!(prefix_hash(&first), prefix_hash(&second));
+    }
+
+    #[test]
+    fn prefix_hash_includes_system_prompt_and_message_role_text() {
+        let base = request(json!([
+            {"role": "system", "content": [{"type": "text", "text": "be precise"}]},
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ]));
+        let changed_system = request(json!([
+            {"role": "system", "content": [{"type": "text", "text": "be creative"}]},
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ]));
+        let changed_role = request(json!([
+            {"role": "system", "content": [{"type": "text", "text": "be precise"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+        ]));
+        assert_ne!(prefix_hash(&base), prefix_hash(&changed_system));
+        assert_ne!(prefix_hash(&base), prefix_hash(&changed_role));
+    }
 }

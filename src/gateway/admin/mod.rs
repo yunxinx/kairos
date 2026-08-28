@@ -9,7 +9,7 @@
 //!
 //! 资源 CRUD（令牌/渠道/价格/模型组/统一模型）：写库（事务）→ 原子替换内存快照 → 返回变更后
 //! 资源；写失败则库与快照都不动。非法输入返回结构化错误，写操作返回变更后资源。
-//! 另承载设置读写（`/settings`）、用户钱包相对调整（`/users/{id}/balance`）、
+//! 另承载设置读写、幂等余额命令、
 //! 请求日志分页查询（`/logs`）、只读聚合（`/stats`、`/stats/lifetime`）、渠道连通性探测
 //! （`/channels/{id}/test`）与按渠道草稿拉取上游模型列表（`/channels/models`）。
 
@@ -19,10 +19,14 @@ mod catalog;
 mod channels;
 mod logs;
 mod models;
+mod my_models;
+mod plans;
 mod probes;
 mod settings;
 mod stats;
+mod token_balance;
 mod tokens;
+mod user_balance;
 mod users;
 
 use axum::{
@@ -31,8 +35,11 @@ use axum::{
     middleware,
     response::{IntoResponse, Response},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::{
     gateway::http::extract_bearer,
@@ -44,6 +51,71 @@ use crate::{
 use self::auth::{AdminAuth, ManagementIdentity};
 use super::throttle::AuthThrottle;
 
+const MAX_BULK_TARGETS: usize = 500;
+
+/// 集合级批量删除契约；各资源统一使用 `targets`，避免前端按资源猜字段名。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BulkDeleteBody<T> {
+    targets: Vec<T>,
+}
+
+#[derive(Debug, Serialize)]
+struct BulkDeleteResult<T> {
+    deleted: Vec<T>,
+}
+
+/// 幂等余额命令的原始执行结果；`None` 表示令牌处于无限额模式。
+#[derive(Debug, Serialize)]
+pub(super) struct BalanceAdjustmentResult {
+    pub(super) operation_id: String,
+    pub(super) before_balance_usd_micros: Option<i64>,
+    pub(super) after_balance_usd_micros: Option<i64>,
+}
+
+/// 客户端操作 id 只接受短 ASCII 标识，避免不可见字符和无界幂等键进入持久层。
+pub(super) fn validate_operation_id(operation_id: &str) -> Result<(), AdminError> {
+    if operation_id.is_empty()
+        || operation_id.len() > 128
+        || !operation_id
+            .bytes()
+            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
+    {
+        return Err(AdminError::InvalidBody(
+            "operation_id 必须是 1 到 128 位 ASCII 字母、数字、连字符或下划线".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+impl<T> BulkDeleteResult<T> {
+    fn new(deleted: Vec<T>) -> Self {
+        Self { deleted }
+    }
+}
+
+/// 批量目标必须非空、数量有界且不重复；重复通常意味着前端选择状态已损坏。
+fn validate_bulk_targets<T>(targets: Vec<T>) -> Result<Vec<T>, AdminError>
+where
+    T: Eq + std::hash::Hash,
+{
+    if targets.is_empty() {
+        return Err(AdminError::InvalidBody("批量删除目标不能为空".to_string()));
+    }
+    if targets.len() > MAX_BULK_TARGETS {
+        return Err(AdminError::InvalidBody(format!(
+            "单次最多删除 {MAX_BULK_TARGETS} 项"
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(targets.len());
+    for target in &targets {
+        if !seen.insert(target) {
+            return Err(AdminError::InvalidBody("批量删除目标不能重复".to_string()));
+        }
+    }
+    Ok(targets)
+}
+
 /// 管理面依赖：存储连接池 + 运行时快照句柄（写后原子替换）+ 出站 HTTP 客户端。
 #[derive(Clone)]
 pub(super) struct AdminDeps {
@@ -54,6 +126,8 @@ pub(super) struct AdminDeps {
     /// 数据库文件路径：日志维护的磁盘占用统计需要读主库与 WAL 边车的实际大小，
     /// SQL 层拿不到 WAL 文件尺寸，只能走文件系统。
     pub(super) db_path: std::path::PathBuf,
+    /// 串行化「库提交后重载快照」，避免慢重载用旧库状态回退覆盖新快照。
+    pub(super) reload_lock: Arc<Mutex<()>>,
 }
 
 /// 开启 SQLite 写事务并立即取得写保留锁。
@@ -91,19 +165,25 @@ pub fn router(
         client,
         throttle: throttle.clone(),
         db_path,
+        reload_lock: Arc::new(Mutex::new(())),
     };
     let root_only = Router::new()
         .merge(channels::routes())
+        .merge(channels::model_routes())
+        .merge(models::order_routes())
         .merge(probes::routes())
         .merge(settings::routes())
+        .merge(plans::root_routes())
+        .merge(users::root_routes())
         .merge(logs::root_routes())
         .route_layer(middleware::from_fn(auth::require_root));
     let admin_plus = Router::new()
         .merge(models::routes())
+        .merge(channels::summary_routes())
         .merge(catalog::routes())
         .merge(users::admin_routes())
         .merge(billing::routes())
-        .merge(logs::admin_routes())
+        .merge(plans::admin_routes())
         .route_layer(middleware::from_fn(auth::require_admin));
     // 此层等于「所有登录用户可见」。在这里新增端点前必须先回答：它是否要按归属
     // 收窄？需要收窄的（日志、统计）由处理器用 `owner_scope` 注入 user_id；
@@ -112,7 +192,9 @@ pub fn router(
         .merge(tokens::routes())
         .merge(logs::signed_in_routes())
         .merge(stats::routes())
-        .merge(users::signed_in_routes());
+        .merge(users::signed_in_routes())
+        // 完全由调用者自己的套餐推导，天然按归属收窄：不接受任何「看别人」的参数。
+        .merge(my_models::routes());
     let protected = Router::new()
         .merge(root_only)
         .merge(admin_plus)
@@ -229,6 +311,7 @@ pub(super) fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&st
 /// 只有写事务提交成功才会走到这里；重载失败返回 500，此时库已提交而快照未换，
 /// 属极端存储错误，交由运营重试。
 pub(super) async fn reload_and_swap(deps: &AdminDeps) -> Result<(), AdminError> {
+    let _guard = deps.reload_lock.lock().await;
     let new_snapshot = runtime::load_snapshot(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -288,11 +371,14 @@ impl IntoResponse for AdminError {
                 "不能删除或降级最后一个 root".to_string(),
             ),
             AdminError::Upstream(msg) => (StatusCode::BAD_GATEWAY, "upstream_error", msg),
-            AdminError::Store(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "store_error",
-                err.to_string(),
-            ),
+            AdminError::Store(err) => {
+                tracing::error!(error = ?err, "管理 API 存储操作失败");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "store_error",
+                    "内部存储错误".to_string(),
+                )
+            }
         };
         (
             status,

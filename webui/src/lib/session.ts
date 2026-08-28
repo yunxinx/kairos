@@ -1,4 +1,5 @@
 import { computed, ref } from 'vue';
+import { queryClient } from '@/app/providers/query';
 import type { MeView } from '@/api/types';
 
 /** 历史键名未改，避免已登录浏览器被踢下线；值已是 `ksess_…` 会话，不是登录口令。 */
@@ -6,6 +7,7 @@ const STORAGE_KEY = 'kairos-admin-key';
 
 const adminKey = ref<string | null>(readStored());
 const currentUser = ref<MeView | null>(null);
+const sessionGeneration = ref(0);
 
 let onInvalidated: (() => void) | undefined;
 
@@ -25,15 +27,27 @@ export function hasAdminKey(): boolean {
 
 /** 登录成功后写入 localStorage。 */
 export function setAdminKey(key: string): void {
+  if (adminKey.value !== key) {
+    resetIdentityBoundary();
+  }
   localStorage.setItem(STORAGE_KEY, key);
   adminKey.value = key;
 }
 
 /** 退出：清除本地凭据与当前用户。 */
 export function clearAdminKey(): void {
+  resetIdentityBoundary();
   localStorage.removeItem(STORAGE_KEY);
   adminKey.value = null;
+}
+
+/**
+ * 身份切换边界：销毁所有旧主体查询与 mutation，并让旧异步结果失去写会话资格。
+ */
+function resetIdentityBoundary(): void {
+  queryClient.clear();
   currentUser.value = null;
+  sessionGeneration.value += 1;
 }
 
 /** 注册凭据失效回调（401 时跳转登录页）。 */
@@ -52,9 +66,21 @@ export function getMe(): MeView | null {
   return currentUser.value;
 }
 
-/** 写入 `/me` 结果，供导航与守卫同步。 */
-export function setMe(user: MeView | null): void {
+/** 捕获异步请求发起时的身份代次。 */
+export function captureSessionGeneration(): number {
+  return sessionGeneration.value;
+}
+
+/** 仅允许当前身份发起的异步请求回写用户投影。 */
+export function setMeForSession(user: MeView, generation: number): boolean {
+  if (generation !== sessionGeneration.value || !adminKey.value) return false;
   currentUser.value = user;
+  return true;
+}
+
+/** 响应式身份代次，供确实需要感知主体变化的组合式逻辑使用。 */
+export function useSessionGeneration() {
+  return computed(() => sessionGeneration.value);
 }
 
 /** 响应式当前用户，供导航按角色过滤。 */

@@ -1,9 +1,9 @@
 import { createFileRoute } from '@tanstack/vue-router';
 import ModelsFeature from '@/features/models/ModelsFeature.vue';
-import { requireRole } from '@/lib/router-guards';
+import { requireModelsPage } from '@/lib/router-guards';
 
 export const Route = createFileRoute('/models')({
-  beforeLoad: requireRole('admin'),
+  beforeLoad: requireModelsPage(),
   component: ModelsFeature,
   staticData: { titleKey: 'nav.models' },
 });

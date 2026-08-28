@@ -172,8 +172,16 @@ async fn sync_if_due(
 pub async fn run_sync_loop(pool: SqlitePool, client: reqwest::Client) {
     loop {
         if let Err(err) = sync_if_due(&pool, &client).await {
-            store::record_system_error(&pool, "catalog", &format!("价格目录定时同步失败: {err}"))
-                .await;
+            store::record_system_error(
+                &pool,
+                "catalog",
+                &store::SystemLogEvent::new(
+                    "catalog.sync_failed",
+                    serde_json::json!({ "error": err.to_string() }),
+                    format!("价格目录定时同步失败: {err}"),
+                ),
+            )
+            .await;
         }
         tokio::time::sleep(SYNC_CHECK_INTERVAL).await;
     }

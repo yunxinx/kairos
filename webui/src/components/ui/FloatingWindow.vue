@@ -26,6 +26,8 @@ const props = withDefaults(
     topmost?: boolean;
     /** 关闭按钮的可访问名称；缺省为「关闭」。子视图可改成「不保存并返回」等。 */
     closeAriaLabel?: string | null;
+    /** 异步写入进行中锁定窗口关闭，避免把未完成的命令误认为已取消。 */
+    closeDisabled?: boolean;
   }>(),
   {
     anchor: null,
@@ -36,6 +38,7 @@ const props = withDefaults(
     attention: false,
     topmost: true,
     closeAriaLabel: null,
+    closeDisabled: false,
   },
 );
 
@@ -120,6 +123,10 @@ function isEditable(el: Element): el is HTMLElement {
 
 function onKeydown(event: KeyboardEvent): void {
   if (event.key !== 'Escape') return;
+  if (props.closeDisabled) {
+    event.preventDefault();
+    return;
+  }
   const active = document.activeElement;
   if (active && active !== document.body && isEditable(active)) {
     if (windowEl.value?.contains(active)) {
@@ -224,6 +231,7 @@ onUnmounted(() => {
         type="button"
         class="btn btn-ghost btn-sm"
         :aria-label="closeAriaLabel ?? t('common.close')"
+        :disabled="closeDisabled"
         @click="emit('close')"
       >
         <UiIcon name="close" :size="16" />

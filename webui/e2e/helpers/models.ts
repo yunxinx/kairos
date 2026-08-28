@@ -3,6 +3,7 @@ import { e2eRootHeaders } from './session';
 import {
   channelWriteBody,
   type Channel,
+  type ChannelKey,
   type ChannelView,
   type ModelGroup,
   type Price,
@@ -12,22 +13,35 @@ import {
 /** 经管理 API 写入一条渠道，供模型页 e2e 绕过渠道编辑器。 */
 export async function seedChannel(
   page: Page,
-  body: Partial<Channel> & Pick<Channel, 'name' | 'models'>,
+  body: Partial<Channel> & Pick<Channel, 'name' | 'models'> & { api_key?: string },
 ): Promise<{ id: number }> {
   const headers = await e2eRootHeaders(page.request);
+  const { api_key, ...rest } = body;
+  const keys: ChannelKey[] =
+    body.keys ??
+    (api_key
+      ? [{ name: 'default', api_key, weight: 1, enabled: true, models: null, blocked_models: null }]
+      : [
+          {
+            name: 'default',
+            api_key: 'sk-e2e',
+            weight: 1,
+            enabled: true,
+            models: null,
+            blocked_models: null,
+          },
+        ]);
   const resp = await page.request.post('/api/channels', {
     headers,
     data: {
       protocol: 'openai_chat',
       base_url: 'http://127.0.0.1:9',
-      api_key: 'sk-e2e',
+      keys,
       model_aliases: {},
-      priority: 0,
-      weight: 1,
       timeout_ms: 5000,
       max_retries: 0,
       enabled: true,
-      ...body,
+      ...rest,
     },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -53,6 +67,19 @@ export async function seedUnifiedModel(page: Page, body: UnifiedModel): Promise<
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }
 
+/** 经管理 API 写入一条同名渠道顺序。 */
+export async function seedChannelModelOrder(
+  page: Page,
+  model: string,
+  channelIds: number[],
+): Promise<void> {
+  const resp = await page.request.put(`/api/channel-model-orders/${encodeURIComponent(model)}`, {
+    headers: await e2eRootHeaders(page.request),
+    data: { model, channel_ids: channelIds },
+  });
+  expect(resp.ok(), await resp.text()).toBeTruthy();
+}
+
 /** 经管理 API 写入一个模型组。 */
 export async function seedModelGroup(page: Page, body: ModelGroup): Promise<void> {
   const resp = await page.request.post('/api/model-groups', {
@@ -70,7 +97,7 @@ export async function seedToken(
   const resp = await page.request.post('/api/tokens', {
     headers: await e2eRootHeaders(page.request),
     data: {
-      limit_usd_micros: null,
+      balance_usd_micros: null,
       enabled: true,
       model_group: 'default',
       ...body,

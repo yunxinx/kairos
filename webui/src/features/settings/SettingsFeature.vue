@@ -785,18 +785,19 @@ const tabsAria = computed(() => t('settings.sections'));
                 input-id="settings-maintenance-window"
                 :guide="t('settings.maintenanceWindowGuide')"
               >
-                <div class="flex flex-wrap items-center gap-2">
+                <div class="flex items-center gap-2">
                   <UiSelect
                     id="settings-maintenance-window"
                     v-model="cleanupWindowDays"
                     :options="windowOptions"
                     :disabled="cleanupMutation.isPending.value"
+                    class="w-36"
                     data-testid="settings-maintenance-window"
                   />
                   <template v-if="!cleanupConfirming">
                     <button
                       type="button"
-                      class="btn btn-danger-filled"
+                      class="btn btn-danger-filled shrink-0"
                       data-testid="settings-maintenance-cleanup"
                       :disabled="cleanupMutation.isPending.value"
                       @click="handleCleanup"
@@ -806,14 +807,14 @@ const tabsAria = computed(() => t('settings.sections'));
                   </template>
                   <template v-else>
                     <p
-                      class="text-danger text-xs"
+                      class="text-danger text-xs whitespace-nowrap"
                       data-testid="settings-maintenance-warning"
                     >
                       {{ t('settings.maintenanceWarning', { days: Number(cleanupWindowDays) }) }}
                     </p>
                     <button
                       type="button"
-                      class="btn"
+                      class="btn shrink-0"
                       data-testid="settings-maintenance-cancel"
                       @click="cleanupConfirming = false"
                     >
@@ -821,7 +822,7 @@ const tabsAria = computed(() => t('settings.sections'));
                     </button>
                     <button
                       type="button"
-                      class="btn btn-danger-filled"
+                      class="btn btn-danger-filled shrink-0"
                       data-testid="settings-maintenance-confirm"
                       :disabled="cleanupMutation.isPending.value"
                       @click="handleCleanup"

@@ -6,7 +6,8 @@ use bytes::Bytes;
 
 use crate::{
     config::Protocol,
-    core::{billing::PriceSnapshot, ir::Usage},
+    core::billing::{self, BillingError, PriceSnapshot},
+    core::ir::Usage,
     store,
     store::resources::Token,
 };
@@ -16,13 +17,87 @@ use super::http::Deps;
 /// 一次请求的计费结果，供日志落库。
 ///
 /// 请求日志的 `settled` 由 [`log_request`] 按结算成败填写，调用方不必预置。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(super) struct Billing {
     pub(super) usage: Usage,
     pub(super) price: PriceSnapshot,
+    /// 渠道原价（折扣前），为零表示未产生计费/失败请求。
+    pub(super) base_cost_usd_micros: i64,
+    /// 本次使用的万分比折扣率（10000 = 原价）。
+    pub(super) discount_bp: i64,
+    /// 实收（折后），用于扣钱包、累计结算与日志。
     pub(super) cost_usd_micros: i64,
+    /// 费用不可表示时保留错误；该请求只能写成未结算，禁止用零费用掩盖。
+    pub(super) calculation_error: Option<BillingError>,
     pub(super) request_body: Option<Bytes>,
     pub(super) response_body: Option<Vec<u8>>,
+}
+
+impl Default for Billing {
+    fn default() -> Self {
+        Self {
+            usage: Usage::default(),
+            price: PriceSnapshot::default(),
+            base_cost_usd_micros: 0,
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            cost_usd_micros: 0,
+            calculation_error: None,
+            request_body: None,
+            response_body: None,
+        }
+    }
+}
+
+impl Billing {
+    /// 从 usage 与价格受检构造计费结果；失败时保留原始 usage/价格并标记未结算。
+    pub(super) fn try_calculated(
+        usage: Usage,
+        price: PriceSnapshot,
+        discount_bp: i64,
+        request_body: Option<Bytes>,
+        response_body: Option<Vec<u8>>,
+    ) -> Result<Self, BillingError> {
+        let charge = billing::charge_micros(&usage, &price, discount_bp)?;
+        Ok(Self {
+            usage,
+            price,
+            base_cost_usd_micros: charge.base_cost_usd_micros,
+            discount_bp,
+            cost_usd_micros: charge.cost_usd_micros,
+            calculation_error: None,
+            request_body,
+            response_body,
+        })
+    }
+
+    /// 从 usage 与价格受检构造计费结果；失败时保留原始 usage/价格并标记未结算。
+    pub(super) fn calculated(
+        usage: Usage,
+        price: PriceSnapshot,
+        discount_bp: i64,
+        request_body: Option<Bytes>,
+        response_body: Option<Vec<u8>>,
+    ) -> Self {
+        match Self::try_calculated(
+            usage.clone(),
+            price,
+            discount_bp,
+            request_body.clone(),
+            response_body.clone(),
+        ) {
+            Ok(billing) => billing,
+            Err(err) => Self {
+                usage,
+                price,
+                base_cost_usd_micros: 0,
+                discount_bp,
+                cost_usd_micros: 0,
+                calculation_error: Some(err),
+                request_body,
+                response_body,
+            },
+        }
+    }
 }
 
 /// 按独立的日志 body 上限截断落库字节，避免 full_body 把库撑爆。
@@ -68,6 +143,7 @@ pub(super) async fn log_request(
     model: &str,
     outbound_model: Option<&str>,
     channel: &str,
+    channel_key: Option<&str>,
     status: u16,
     started: i64,
     billing: Billing,
@@ -80,9 +156,17 @@ pub(super) async fn log_request(
         store::record_system_warn(
             &deps.pool,
             "billing",
-            &format!(
-                "上游未回报 usage，本次按零计费（token={} model={model} channel={channel}）",
-                token.name
+            &store::SystemLogEvent::new(
+                "billing.usage_missing",
+                serde_json::json!({
+                    "token_name": token.name,
+                    "model": model,
+                    "channel": channel,
+                }),
+                format!(
+                    "上游未回报 usage，本次按零计费（token={} model={model} channel={channel}）",
+                    token.name
+                ),
             ),
         )
         .await;
@@ -97,6 +181,7 @@ pub(super) async fn log_request(
         model: model.to_string(),
         outbound_model: outbound_model.map(str::to_string),
         channel: channel.to_string(),
+        channel_key: channel_key.map(str::to_string),
         status_code: status as i64,
         latency_ms: now - started,
         input_tokens: billing.usage.input_tokens,
@@ -104,12 +189,26 @@ pub(super) async fn log_request(
         cache_read_tokens: billing.usage.cache_read_tokens,
         cache_write_tokens: billing.usage.cache_write_tokens,
         price: billing.price,
+        base_cost_usd_micros: billing.base_cost_usd_micros,
+        discount_bp: billing.discount_bp,
         cost_usd_micros: billing.cost_usd_micros,
-        settled: billing.cost_usd_micros <= 0,
+        settled: billing.calculation_error.is_none() && billing.cost_usd_micros == 0,
         request_id: Some(request_id.to_string()),
         request_body: clip_logged_body(billing.request_body.map(|bytes| bytes.to_vec()), max_bytes),
         response_body: clip_logged_body(billing.response_body, max_bytes),
     };
+
+    if let Some(err) = billing.calculation_error {
+        log.settled = false;
+        write_unsettled_request_log(
+            deps,
+            log,
+            "billing",
+            &format!("费用计算失败，未执行结算: {err}"),
+        )
+        .await;
+        return;
+    }
 
     let mut tx = match deps.pool.begin().await {
         Ok(tx) => tx,
@@ -175,7 +274,11 @@ async fn touch_last_used_best_effort(pool: &sqlx::SqlitePool, log: &store::Reque
             store::record_system_warn(
                 pool,
                 "request_log",
-                &format!("刷新令牌最后使用时间失败: {err}"),
+                &store::SystemLogEvent::new(
+                    "request_log.token_last_used_update_failed",
+                    serde_json::json!({ "error": err.to_string() }),
+                    format!("刷新令牌最后使用时间失败: {err}"),
+                ),
             )
             .await;
             return;
@@ -187,7 +290,11 @@ async fn touch_last_used_best_effort(pool: &sqlx::SqlitePool, log: &store::Reque
         store::record_system_warn(
             pool,
             "request_log",
-            &format!("刷新令牌最后使用时间失败: {err}"),
+            &store::SystemLogEvent::new(
+                "request_log.token_last_used_update_failed",
+                serde_json::json!({ "error": err.to_string() }),
+                format!("刷新令牌最后使用时间失败: {err}"),
+            ),
         )
         .await;
     }
@@ -219,13 +326,26 @@ async fn write_unsettled_request_log(
     match store::insert_request_log(&deps.pool, &log).await {
         Ok(_) => {
             touch_last_used_best_effort(&deps.pool, &log).await;
-            store::record_system_error(&deps.pool, system_target, reason).await;
+            store::record_system_error(
+                &deps.pool,
+                system_target,
+                &store::SystemLogEvent::new(
+                    "request_log.unsettled",
+                    serde_json::json!({ "reason": reason }),
+                    reason.to_string(),
+                ),
+            )
+            .await;
         }
         Err(err) => {
             store::record_system_error(
                 &deps.pool,
                 "request_log",
-                &format!("{reason}；回退写入也失败: {err}"),
+                &store::SystemLogEvent::new(
+                    "request_log.fallback_write_failed",
+                    serde_json::json!({ "reason": reason, "error": err.to_string() }),
+                    format!("{reason}；回退写入也失败: {err}"),
+                ),
             )
             .await;
         }

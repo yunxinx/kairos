@@ -532,3 +532,178 @@ async fn omitted_max_tokens_does_not_use_estimate_gate() {
     let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
+
+/// 套餐折扣率按万分比作用于渠道原价：实收、日志三列和钱包保持一致。
+#[tokio::test]
+async fn plan_discount_applies_to_charge_and_log() {
+    let mut gw = TestGateway::start().await;
+    let mut conn = gw.pool.acquire().await.expect("应能获取连接");
+    let user = kairos::store::users::insert_user(
+        &mut conn,
+        kairos::store::users::NewUser {
+            email: "discount@example.com",
+            display_name: "Discount",
+            password: "password123",
+            role: kairos::store::users::ManagementRole::User,
+            rate_limit_rpm: None,
+        },
+        0,
+    )
+    .await
+    .expect("应能创建折扣用户");
+    sqlx::query("UPDATE plans SET discount_bp = 8000 WHERE id = 1")
+        .execute(&mut *conn)
+        .await
+        .expect("应能设置套餐折扣");
+    kairos::store::adjust_user_balance(&mut conn, user.id, 5_000_000)
+        .await
+        .expect("应能充值");
+    sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
+        .bind(user.id)
+        .bind(TEST_TOKEN_KEY)
+        .execute(&mut *conn)
+        .await
+        .expect("应能把测试令牌改挂折扣用户");
+    drop(conn);
+
+    let base = gw.spawn_reloaded_protocol().await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(json!({
+            "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
+            "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
+        }))));
+    let resp = send_completion(&base, TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let balance: i64 =
+        sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")
+            .bind(user.id)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能读折扣用户余额");
+    assert_eq!(balance, 5_000_000 - 3_400, "8000 bp 应只扣 80% 实收");
+
+    let (base_cost, charged, discount_bp): (i64, i64, i64) = sqlx::query_as(
+        "SELECT base_cost_usd_micros, cost_usd_micros, discount_bp FROM request_log",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应落折扣日志");
+    assert_eq!(base_cost, 4_250, "base_cost 应保持渠道原价");
+    assert_eq!(charged, 3_400, "cost 应为折后实收");
+    assert_eq!(discount_bp, 8_000);
+}
+
+/// 折扣率为 0：不扣费、日志直接 settled，零余额也能放行。
+#[tokio::test]
+async fn zero_discount_allows_zero_balance_and_logs_settled() {
+    let mut gw = TestGateway::start().await;
+    let mut conn = gw.pool.acquire().await.expect("应能获取连接");
+    let user = kairos::store::users::insert_user(
+        &mut conn,
+        kairos::store::users::NewUser {
+            email: "free@example.com",
+            display_name: "Free",
+            password: "password123",
+            role: kairos::store::users::ManagementRole::User,
+            rate_limit_rpm: None,
+        },
+        0,
+    )
+    .await
+    .expect("应能创建免费用户");
+    sqlx::query("UPDATE plans SET discount_bp = 0 WHERE id = 1")
+        .execute(&mut *conn)
+        .await
+        .expect("应能设置免费套餐");
+    sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
+        .bind(user.id)
+        .bind(TEST_TOKEN_KEY)
+        .execute(&mut *conn)
+        .await
+        .expect("应能把测试令牌改挂免费用户");
+    drop(conn);
+
+    let base = gw.spawn_reloaded_protocol().await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(json!({
+            "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
+            "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
+        }))));
+    let resp = send_completion(&base, TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "免费档零余额应放行");
+
+    let balance: i64 =
+        sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")
+            .bind(user.id)
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能读免费用户余额");
+    assert_eq!(balance, 0, "免费档不应扣费");
+
+    let (base_cost, charged, discount_bp, settled): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT base_cost_usd_micros, cost_usd_micros, discount_bp, settled FROM request_log",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应落免费日志");
+    assert_eq!(base_cost, 4_250, "免费日志仍应记录渠道原价");
+    assert_eq!(charged, 0);
+    assert_eq!(discount_bp, 0);
+    assert_eq!(settled, 1, "免费档应直接标记已结算");
+}
+
+/// `max_tokens` 粗估按折后金额比对：原价超余额但折后足够时准入放行。
+#[tokio::test]
+async fn discounted_max_tokens_estimate_uses_discounted_amount() {
+    let mut gw = TestGateway::start().await;
+    let mut conn = gw.pool.acquire().await.expect("应能获取连接");
+    let user = kairos::store::users::insert_user(
+        &mut conn,
+        kairos::store::users::NewUser {
+            email: "estimate@example.com",
+            display_name: "Estimate",
+            password: "password123",
+            role: kairos::store::users::ManagementRole::User,
+            rate_limit_rpm: None,
+        },
+        0,
+    )
+    .await
+    .expect("应能创建粗估用户");
+    sqlx::query("UPDATE plans SET discount_bp = 8000 WHERE id = 1")
+        .execute(&mut *conn)
+        .await
+        .expect("应能设置折扣");
+    // 原价粗估为 10_000 微元，折后 8_000；余额 9_000 只够折后。
+    kairos::store::adjust_user_balance(&mut conn, user.id, 9_000)
+        .await
+        .expect("应能充值");
+    sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
+        .bind(user.id)
+        .bind(TEST_TOKEN_KEY)
+        .execute(&mut *conn)
+        .await
+        .expect("应能改挂令牌");
+    drop(conn);
+
+    let base = gw.spawn_reloaded_protocol().await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(ok_response(json!({
+            "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11
+        }))));
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 1000,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "折后粗估应放行");
+    assert_eq!(gw.upstream.received().len(), 1, "放行后应出站一次");
+}

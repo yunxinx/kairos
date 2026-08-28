@@ -10,7 +10,7 @@ import { useCurrentUser } from '@/lib/session';
 const { t } = useI18n();
 const me = useCurrentUser();
 
-const tabs = computed(() => navTabsFor(me.value?.role));
+const tabs = computed(() => navTabsFor(me.value));
 </script>
 
 <template>

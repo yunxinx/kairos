@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { useId, computed, ref, watch } from 'vue';
-import { useMutation, useQueryClient } from '@tanstack/vue-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import { roleAtLeast, type ManagementRole, type UserAdminView } from '@/api/types';
@@ -8,9 +8,13 @@ import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
+import ListboxSelect from '@/components/ui/ListboxSelect.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
+import type { ListboxSelectOption } from '@/lib/listbox-option';
+import { toPlanSelectOptions } from '@/lib/plan-select-options';
 import { useFormValidation } from '@/composables/useFormValidation';
 import { useToast } from '@/composables/useToast';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 
@@ -36,6 +40,7 @@ const roleId = `user-profile-role-${uid}`;
 const rpmId = `user-profile-rpm-${uid}`;
 const enabledId = `user-profile-enabled-${uid}`;
 const emailId = `user-profile-email-${uid}`;
+const planId = `user-profile-plan-${uid}`;
 
 const initialEmail = props.user.email;
 const initialName = props.user.display_name;
@@ -45,6 +50,12 @@ const initialRpm =
   props.user.rate_limit_rpm !== null && props.user.rate_limit_rpm !== undefined
     ? String(props.user.rate_limit_rpm)
     : '';
+const initialPlanId = props.user.plan_id != null ? String(props.user.plan_id) : '';
+
+const plansQuery = useQuery({
+  queryKey: ['plans'],
+  queryFn: () => apiClient.listPlans(),
+});
 
 const email = ref(initialEmail);
 const displayName = ref(initialName);
@@ -52,6 +63,7 @@ const password = ref('');
 const role = ref<ManagementRole>(initialRole);
 const rateLimitRpm = ref(initialRpm);
 const enabled = ref(initialEnabled);
+const selectedPlanId = ref(initialPlanId);
 
 const isRootUser = computed(() => props.user.role === 'root');
 
@@ -71,6 +83,38 @@ const roleOptions = computed(() => {
   ];
 });
 
+const canAssignPlan = computed(() => hasCapability(me.value, 'assign_plan'));
+
+function defaultPlanForRole(selectedRole: ManagementRole): string {
+  if (selectedRole === 'root') return '';
+  const audience = selectedRole === 'admin' ? 'admin' : 'user';
+  const plan = (plansQuery.data.value ?? []).find(
+    (candidate) => candidate.audience === audience && candidate.is_default,
+  );
+  return plan ? String(plan.id) : '';
+}
+
+const planOptions = computed((): ListboxSelectOption[] => {
+  const audience = role.value === 'admin' ? 'admin' : 'user';
+  return toPlanSelectOptions(
+    plansQuery.data.value ?? [],
+    audience,
+    t('plans.defaultBadge'),
+    initialPlanId && role.value === initialRole
+      ? { value: initialPlanId, label: props.user.plan_display_name || initialPlanId }
+      : undefined,
+  );
+});
+
+watch(
+  [role, plansQuery.data],
+  ([selectedRole]) => {
+    selectedPlanId.value =
+      selectedRole === initialRole ? initialPlanId : defaultPlanForRole(selectedRole);
+  },
+  { immediate: true },
+);
+
 /** 仅 ASCII 小写：与服务端 normalize_email（to_ascii_lowercase）同一算法，
  * 避免 Unicode 大写（如 Á）导致前端判「已变化」而服务端 normalize 后判「未变」。 */
 function asciiLowercase(value: string): string {
@@ -84,7 +128,8 @@ const dirty = computed(
     password.value !== '' ||
     role.value !== initialRole ||
     enabled.value !== initialEnabled ||
-    rateLimitRpm.value.trim() !== initialRpm,
+    rateLimitRpm.value.trim() !== initialRpm ||
+    selectedPlanId.value !== initialPlanId,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -98,6 +143,7 @@ const saveMutation = useMutation({
       enabled?: boolean;
       password?: string;
       rate_limit_rpm?: number | null;
+      plan_id?: number;
     } = {
       display_name: displayName.value.trim(),
       enabled: enabled.value,
@@ -113,7 +159,16 @@ const saveMutation = useMutation({
     if (password.value) {
       body.password = password.value;
     }
-    return apiClient.updateUser(props.user.id, body);
+    if (
+      canAssignPlan.value &&
+      selectedPlanId.value &&
+      role.value === initialRole &&
+      selectedPlanId.value !== initialPlanId
+    ) {
+      body.plan_id = Number(selectedPlanId.value);
+    }
+    const updated = await apiClient.updateUser(props.user.id, body);
+    return updated;
   },
   onSuccess: async () => {
     success(t('users.updateSuccess'));
@@ -241,7 +296,8 @@ function handleSave() {
 
       <div
         :class="{
-          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60': isRootUser,
+          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60':
+            isRootUser,
         }"
       >
         <FormField
@@ -260,9 +316,29 @@ function handleSave() {
         </FormField>
       </div>
 
+      <FormField
+        v-if="canAssignPlan && !isRootUser"
+        field-name="plan"
+        :label="t('users.plan')"
+        :input-id="planId"
+        :guide="t('users.planGuide')"
+      >
+        <ListboxSelect
+          :id="planId"
+          v-model="selectedPlanId"
+          :options="planOptions"
+          :placeholder="t('common.none')"
+          :search-placeholder="t('users.plan')"
+          menu-class="listbox-select-menu-wide"
+          :disabled="role !== initialRole"
+          data-testid="user-editor-plan"
+        />
+      </FormField>
+
       <div
         :class="{
-          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60': isRootUser,
+          'border-seed bg-surface-alt/40 rounded-md border border-dashed p-3 opacity-60':
+            isRootUser,
         }"
       >
         <FormField

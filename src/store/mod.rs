@@ -5,15 +5,19 @@
 //! （`token_balance`，只保存令牌累计结算）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats` 与
 //! `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
 
+pub mod balance_operations;
 pub mod catalog;
+pub mod channel_keys;
+mod ids;
+pub mod plans;
 pub mod resources;
 mod system_log;
 pub mod users;
 
 pub use system_log::{
-    Actor, SystemLog, SystemLogList, SystemLogQuery, SystemLogSortBy, insert_system_log,
-    purge_system_logs_before, query_system_log_page, record_audit, record_audit_detached,
-    record_system_error, record_system_warn,
+    Actor, SystemLog, SystemLogEvent, SystemLogList, SystemLogQuery, SystemLogSortBy,
+    insert_system_log, purge_system_logs_before, query_system_log_page, record_audit,
+    record_audit_detached, record_system_error, record_system_warn,
 };
 
 use std::collections::HashMap;
@@ -64,6 +68,10 @@ pub enum StoreError {
     EmailTaken,
     #[error("密码处理失败")]
     PasswordHash,
+    #[error("系统时钟早于资源 id 纪元")]
+    EntityIdClockBeforeEpoch,
+    #[error("资源 id 空间已耗尽")]
+    EntityIdExhausted,
 }
 
 /// 写锁等待上限：与 sqlx-sqlite 缺省一致，此处显式声明意图——SQLite 单写者下
@@ -98,24 +106,28 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
         .await
         .map_err(StoreError::Migrate)?;
 
+    ids::initialize(&pool).await?;
+
     Ok(pool)
 }
 
-/// 写一条冒烟记录，返回插入的自增 id。
+/// 写一条冒烟记录，返回时间有序 id。
 pub async fn insert_smoke(pool: &SqlitePool, note: &str) -> Result<i64, StoreError> {
-    let result = sqlx::query("INSERT INTO smoke_probe (note) VALUES (?)")
+    let id = ids::next_id()?;
+    sqlx::query("INSERT INTO smoke_probe (id, note) VALUES (?, ?)")
+        .bind(id)
         .bind(note)
         .execute(pool)
         .await
         .map_err(StoreError::Query)?;
 
-    Ok(result.last_insert_rowid())
+    Ok(id)
 }
 
 /// 一条请求日志的可持久化字段。
 #[derive(Debug, Clone)]
 pub struct RequestLog {
-    /// 自增主键：新增时由库分配，读回后才有效（插入构造时填 0）。
+    /// 时间有序主键：新增时由存储层分配，插入构造时填 0。
     pub id: i64,
     /// unix 毫秒时间戳。
     pub created_at: i64,
@@ -134,6 +146,8 @@ pub struct RequestLog {
     /// 存量行或尚未出站的失败请求为 `None`。
     pub outbound_model: Option<String>,
     pub channel: String,
+    /// 本次出站使用的密钥身份（名称或 id），绝不保存密钥明文。
+    pub channel_key: Option<String>,
     pub status_code: i64,
     pub latency_ms: i64,
     /// usage 四分量。
@@ -143,7 +157,13 @@ pub struct RequestLog {
     pub cache_write_tokens: u64,
     /// 计费时的四档价格快照（micro-USD / 1M tokens）。
     pub price: PriceSnapshot,
-    /// 本次费用（micro-USD）。
+    /// 渠道原价（micro-USD），不套用折扣。
+    pub base_cost_usd_micros: i64,
+    /// 本次使用的万分比折扣率（10000 = 原价）。
+    pub discount_bp: i64,
+    /// 本次实收（micro-USD，折后）。
+    ///
+    /// 补扣/豁免按此列入账；对账时由 `base_cost_usd_micros` 与 `discount_bp` 复核。
     pub cost_usd_micros: i64,
     /// 费用是否已完成所属用户钱包结算；结算失败时为 `false`，供对账补扣。
     pub settled: bool,
@@ -157,7 +177,7 @@ pub struct RequestLog {
     pub response_body: Option<Vec<u8>>,
 }
 
-/// 落一条请求日志，返回插入的自增 id。
+/// 落一条请求日志，返回时间有序 id。
 pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i64, StoreError> {
     let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
     insert_request_log_on(&mut conn, log).await
@@ -168,15 +188,18 @@ pub async fn insert_request_log_on(
     conn: &mut SqliteConnection,
     log: &RequestLog,
 ) -> Result<i64, StoreError> {
-    let result = sqlx::query(
+    let id = ids::next_id()?;
+    sqlx::query(
         "INSERT INTO request_log \
-         (created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-          channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         (id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
+          channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
           cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-          cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+          cache_read_price_usd_micros, cache_write_price_usd_micros, \
+          base_cost_usd_micros, discount_bp, cost_usd_micros, \
           settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
+    .bind(id)
     .bind(log.created_at)
     .bind(&log.token_name)
     .bind(&log.token_key)
@@ -185,6 +208,7 @@ pub async fn insert_request_log_on(
     .bind(&log.model)
     .bind(&log.outbound_model)
     .bind(&log.channel)
+    .bind(&log.channel_key)
     .bind(log.status_code)
     .bind(log.latency_ms)
     .bind(log.input_tokens as i64)
@@ -195,6 +219,8 @@ pub async fn insert_request_log_on(
     .bind(log.price.output_micros)
     .bind(log.price.cache_read_micros)
     .bind(log.price.cache_write_micros)
+    .bind(log.base_cost_usd_micros)
+    .bind(log.discount_bp)
     .bind(log.cost_usd_micros)
     .bind(log.settled as i64)
     .bind(&log.request_id)
@@ -204,7 +230,7 @@ pub async fn insert_request_log_on(
     .await
     .map_err(StoreError::Query)?;
 
-    Ok(result.last_insert_rowid())
+    Ok(id)
 }
 
 /// 所属用户的钱包余额。
@@ -525,6 +551,19 @@ pub async fn get_token_settled(pool: &SqlitePool, token_key: &str) -> Result<i64
         .map(|amount: Option<i64>| amount.unwrap_or(0))
 }
 
+/// 在调用方事务内读取单令牌累计结算额；无结算行视为 0。
+pub async fn get_token_settled_on_conn(
+    conn: &mut SqliteConnection,
+    token_key: &str,
+) -> Result<i64, StoreError> {
+    sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
+        .bind(token_key)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(StoreError::Query)
+        .map(|amount: Option<i64>| amount.unwrap_or(0))
+}
+
 /// 列表排序方向；缺省新→旧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -581,6 +620,8 @@ pub struct RequestLogQuery {
     pub to_created_at: Option<i64>,
     /// 按是否已完成所属用户钱包结算过滤；`None` 表示不限。
     pub settled: Option<bool>,
+    /// 按该次使用的万分比折扣率精确过滤；`None` 表示不限。
+    pub discount_bp: Option<i64>,
     /// 精确匹配的入站协议；空表示不限。
     pub inbound_protocols: Vec<String>,
     /// 排序列；缺省时间。
@@ -612,9 +653,10 @@ async fn query_request_logs_on(
 ) -> Result<Vec<RequestLog>, StoreError> {
     let mut qb = sqlx::QueryBuilder::new(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-         channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, \
+         base_cost_usd_micros, discount_bp, cost_usd_micros, \
          settled FROM request_log",
     );
     push_request_log_filters(&mut qb, filter);
@@ -647,9 +689,10 @@ pub async fn get_request_log_on_conn(
 ) -> Result<Option<RequestLog>, StoreError> {
     let row = sqlx::query(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-         channel, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
+         channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, cost_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, \
+         base_cost_usd_micros, discount_bp, cost_usd_micros, \
          settled, request_body, response_body FROM request_log WHERE id = ?",
     )
     .bind(id)
@@ -947,7 +990,12 @@ pub struct StatsSummary {
     pub success_count: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// 实收（折后）合计。
     pub cost_usd_micros: i64,
+    /// 渠道原价合计（成本）。
+    pub base_cost_usd_micros: i64,
+    /// 毛利：实收 - 渠道原价（折后合计减原价合计）。
+    pub gross_profit_usd_micros: i64,
     /// 令牌数：全局视图为全部令牌，归属视图只数该用户自己的。
     pub token_count: u64,
     /// 出站渠道数。归属视图为 `None`：渠道是运营视角的数字，普通用户不该看到。
@@ -962,6 +1010,8 @@ pub struct DailyBucket {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_usd_micros: i64,
+    pub base_cost_usd_micros: i64,
+    pub gross_profit_usd_micros: i64,
 }
 
 /// 按模型或按渠道的费用/请求分布。
@@ -970,6 +1020,8 @@ pub struct CostShare {
     pub name: String,
     pub request_count: u64,
     pub cost_usd_micros: i64,
+    pub base_cost_usd_micros: i64,
+    pub gross_profit_usd_micros: i64,
 }
 
 /// 全量累计：不受 `/stats` 时间窗影响。
@@ -982,6 +1034,8 @@ pub struct CostShare {
 pub struct LifetimeStats {
     pub request_count: u64,
     pub cost_usd_micros: i64,
+    pub base_cost_usd_micros: i64,
+    pub gross_profit_usd_micros: i64,
     pub total_tokens: u64,
 }
 
@@ -1008,7 +1062,12 @@ pub async fn query_stats(
          COALESCE(SUM(input_tokens), 0) AS input_tokens, \
          COALESCE(SUM(output_tokens), 0) AS output_tokens, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-           AS cost_usd_micros \
+           AS cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+           AS base_cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
+           AS gross_profit_usd_micros \
          FROM request_log WHERE created_at >= ?{}",
         user_scope_clause(user_id)
     );
@@ -1062,6 +1121,12 @@ pub async fn query_stats(
         cost_usd_micros: summary_row
             .try_get("cost_usd_micros")
             .map_err(StoreError::Query)?,
+        base_cost_usd_micros: summary_row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        gross_profit_usd_micros: summary_row
+            .try_get("gross_profit_usd_micros")
+            .map_err(StoreError::Query)?,
         token_count,
         channel_count,
     };
@@ -1094,6 +1159,11 @@ pub async fn query_lifetime_stats(
         "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+           AS base_cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
+           AS gross_profit_usd_micros, \
          COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
            AS total_tokens \
          FROM request_log{}",
@@ -1108,6 +1178,12 @@ pub async fn query_lifetime_stats(
     Ok(LifetimeStats {
         request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
         cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        base_cost_usd_micros: row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        gross_profit_usd_micros: row
+            .try_get("gross_profit_usd_micros")
+            .map_err(StoreError::Query)?,
         total_tokens: as_count(row.try_get("total_tokens").map_err(StoreError::Query)?),
     })
 }
@@ -1120,6 +1196,12 @@ fn trend_bucket(row: &sqlx::sqlite::SqliteRow) -> Result<DailyBucket, StoreError
         input_tokens: as_count(row.try_get("input_tokens").map_err(StoreError::Query)?),
         output_tokens: as_count(row.try_get("output_tokens").map_err(StoreError::Query)?),
         cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+        base_cost_usd_micros: row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        gross_profit_usd_micros: row
+            .try_get("gross_profit_usd_micros")
+            .map_err(StoreError::Query)?,
     })
 }
 
@@ -1139,7 +1221,9 @@ async fn query_hourly_buckets(
                 COALESCE(agg.request_count, 0) AS request_count, \
                 COALESCE(agg.input_tokens, 0) AS input_tokens, \
                 COALESCE(agg.output_tokens, 0) AS output_tokens, \
-                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros \
+                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros, \
+                COALESCE(agg.base_cost_usd_micros, 0) AS base_cost_usd_micros, \
+                COALESCE(agg.gross_profit_usd_micros, 0) AS gross_profit_usd_micros \
          FROM calendar \
          LEFT JOIN ( \
             SELECT strftime('%Y-%m-%dT%H:00:00Z', created_at / 1000, 'unixepoch') AS hour, \
@@ -1147,7 +1231,11 @@ async fn query_hourly_buckets(
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
+                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
             FROM request_log WHERE created_at >= ?{} \
             GROUP BY hour \
          ) agg ON agg.hour = strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) \
@@ -1183,7 +1271,9 @@ async fn query_daily_buckets(
                 COALESCE(agg.request_count, 0) AS request_count, \
                 COALESCE(agg.input_tokens, 0) AS input_tokens, \
                 COALESCE(agg.output_tokens, 0) AS output_tokens, \
-                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros \
+                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros, \
+                COALESCE(agg.base_cost_usd_micros, 0) AS base_cost_usd_micros, \
+                COALESCE(agg.gross_profit_usd_micros, 0) AS gross_profit_usd_micros \
          FROM calendar \
          LEFT JOIN ( \
             SELECT date(created_at / 1000, 'unixepoch') AS day, \
@@ -1191,7 +1281,11 @@ async fn query_daily_buckets(
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros \
+                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
+                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                        THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
             FROM request_log WHERE created_at >= ?{} \
             GROUP BY day \
          ) agg ON agg.day = calendar.day \
@@ -1230,7 +1324,12 @@ async fn query_cost_share(
     let sql = format!(
         "SELECT {column} AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-           AS cost_usd_micros \
+           AS cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+           AS base_cost_usd_micros, \
+         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
+           AS gross_profit_usd_micros \
          FROM request_log WHERE created_at >= ?{} \
          GROUP BY {column} \
          ORDER BY cost_usd_micros DESC, name ASC",
@@ -1248,6 +1347,12 @@ async fn query_cost_share(
             name: row.try_get("name").map_err(StoreError::Query)?,
             request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
             cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
+            base_cost_usd_micros: row
+                .try_get("base_cost_usd_micros")
+                .map_err(StoreError::Query)?,
+            gross_profit_usd_micros: row
+                .try_get("gross_profit_usd_micros")
+                .map_err(StoreError::Query)?,
         });
     }
     Ok(shares)
@@ -1404,6 +1509,10 @@ fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &
         push_where_cond(qb, &mut first, "settled = ");
         qb.push_bind(settled as i64);
     }
+    if let Some(discount_bp) = filter.discount_bp {
+        push_where_cond(qb, &mut first, "discount_bp = ");
+        qb.push_bind(discount_bp);
+    }
     push_column_in(
         qb,
         &mut first,
@@ -1481,6 +1590,7 @@ fn map_request_log_row(
         model: row.try_get("model").map_err(StoreError::Query)?,
         outbound_model: row.try_get("outbound_model").map_err(StoreError::Query)?,
         channel: row.try_get("channel").map_err(StoreError::Query)?,
+        channel_key: row.try_get("channel_key").map_err(StoreError::Query)?,
         status_code: row.try_get("status_code").map_err(StoreError::Query)?,
         latency_ms: row.try_get("latency_ms").map_err(StoreError::Query)?,
         input_tokens: row.try_get("input_tokens").map_err(StoreError::Query)?,
@@ -1492,6 +1602,10 @@ fn map_request_log_row(
             .try_get("cache_write_tokens")
             .map_err(StoreError::Query)?,
         price,
+        base_cost_usd_micros: row
+            .try_get("base_cost_usd_micros")
+            .map_err(StoreError::Query)?,
+        discount_bp: row.try_get("discount_bp").map_err(StoreError::Query)?,
         cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
         settled: row
             .try_get::<i64, _>("settled")
@@ -1515,6 +1629,7 @@ fn map_request_log_row(
 mod tests {
     use super::*;
     use crate::core::billing::PriceSnapshot;
+    use serde_json::json;
     use sqlx::Connection;
 
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
@@ -1563,12 +1678,24 @@ mod tests {
         .expect("应有用户钱包");
         assert_eq!(wallet, (0, 0));
 
-        let assigned: String =
-            sqlx::query_scalar("SELECT group_name FROM user_model_groups WHERE user_id = 1")
+        let root_plan: Option<i64> = sqlx::query_scalar("SELECT plan_id FROM users WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("应能读 root 套餐");
+        assert_eq!(root_plan, None, "root 不挂套餐");
+
+        let standard_group: String =
+            sqlx::query_scalar("SELECT group_name FROM plan_model_groups WHERE plan_id = 1")
                 .fetch_one(&pool)
                 .await
-                .expect("root 应有默认可用组");
-        assert_eq!(assigned, "default");
+                .expect("standard 应含 default 组");
+        assert_eq!(standard_group, "default");
+
+        let builtin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plans WHERE builtin = 1")
+            .fetch_one(&pool)
+            .await
+            .expect("应能数内置套餐");
+        assert_eq!(builtin_count, 2, "内置两档应已播种");
 
         let remaining_col: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pragma_table_info('token_balance') \
@@ -1692,11 +1819,16 @@ mod tests {
                 name: "strict-price".to_string(),
                 protocol: crate::config::Protocol::OpenAiChat,
                 base_url: "http://127.0.0.1:9".to_string(),
-                api_key: "sk".to_string(),
+                keys: vec![resources::ChannelKey {
+                    name: "default".to_string(),
+                    api_key: "sk".to_string(),
+                    weight: 1,
+                    enabled: true,
+                    models: None,
+                    blocked_models: None,
+                }],
                 models: vec![],
                 model_aliases: std::collections::HashMap::new(),
-                priority: 0,
-                weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,
@@ -1732,8 +1864,15 @@ mod tests {
                  VALUES ('not-a-number', 0, 0, 0)",
             ),
             (
-                "user_model_groups",
-                "INSERT INTO user_model_groups (user_id, group_name) VALUES ('not-a-number', 'default')",
+                "plans",
+                "INSERT INTO plans (id, internal_name, display_name, note, note_visible_to_admin, \
+                     discount_bp, default_rpm, shared_rpm, initial_grant_usd_micros, \
+                     capabilities_json, shared_with_admin, builtin, created_at) \
+                 VALUES ('not-a-number', 'x', 'X', '', 0, 10000, NULL, NULL, 0, '{}', 0, 0, 0)",
+            ),
+            (
+                "plan_model_groups",
+                "INSERT INTO plan_model_groups (plan_id, group_name) VALUES ('not-a-number', 'default')",
             ),
             (
                 "management_sessions",
@@ -1748,9 +1887,14 @@ mod tests {
             ),
             (
                 "channels",
-                "INSERT INTO channels (name, protocol, base_url, api_key, models_json, \
-                     model_aliases_json, priority, weight, timeout_ms, max_retries) \
-                 VALUES ('c', 'openai_chat', 'u', 'k', '[]', '{}', 'not-a-number', 1, 1000, 1)",
+                "INSERT INTO channels (name, protocol, base_url, models_json, \
+                     model_aliases_json, timeout_ms, max_retries) \
+                 VALUES ('c', 'openai_chat', 'u', '[]', '{}', 'not-a-number', 1)",
+            ),
+            (
+                "channel_keys",
+                "INSERT INTO channel_keys (channel_id, name, api_key, weight, enabled, created_at) \
+                 VALUES (?, 'k', 'secret', 'not-a-number', 1, 0)",
             ),
             (
                 "settings",
@@ -1771,7 +1915,11 @@ mod tests {
             ),
         ];
         for (table, sql) in probes {
-            let result = sqlx::query(sql).execute(&pool).await;
+            let result = if table == "channel_keys" {
+                sqlx::query(sql).bind(channel_id).execute(&pool).await
+            } else {
+                sqlx::query(sql).execute(&pool).await
+            };
             assert!(
                 result.is_err(),
                 "{table} 应仍是 STRICT 表，错类型写入须被拒"
@@ -1798,6 +1946,18 @@ mod tests {
         .execute(&pool)
         .await;
         assert!(result.is_err(), "INTEGER 列写 REAL 应被 STRICT 拒绝");
+
+        assert!(
+            sqlx::query(
+                "INSERT INTO channel_model_order (model, channel_id, position) \
+                 VALUES ('m', ?, 'not-a-number')",
+            )
+            .bind(channel_id)
+            .execute(&pool)
+            .await
+            .is_err(),
+            "channel_model_order 应仍是 STRICT 表，错类型写入须被拒"
+        );
     }
 
     /// token_balance 外键：无归属令牌的余额行被拒绝；删除令牌级联清理余额行，
@@ -2048,6 +2208,7 @@ mod tests {
                     inbound_protocol: "openai_chat".to_string(),
                     model: model.to_string(),
                     outbound_model: None,
+                    channel_key: None,
                     channel: "c1".to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -2057,6 +2218,8 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: i as i64,
+                    base_cost_usd_micros: 0,
+                    discount_bp: 10_000,
                     settled: true,
                     request_id: None,
                     request_body: None,
@@ -2164,6 +2327,7 @@ mod tests {
                     inbound_protocol: "openai_chat".to_string(),
                     model: (*model).to_string(),
                     outbound_model: None,
+                    channel_key: None,
                     channel: (*channel).to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -2173,6 +2337,8 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: 0,
+                    base_cost_usd_micros: 0,
+                    discount_bp: 10_000,
                     settled: true,
                     request_id: None,
                     request_body: None,
@@ -2247,6 +2413,7 @@ mod tests {
                     inbound_protocol: "openai_chat".to_string(),
                     model: (*model).to_string(),
                     outbound_model: None,
+                    channel_key: None,
                     channel: (*channel).to_string(),
                     status_code: 200,
                     latency_ms: 10,
@@ -2256,6 +2423,8 @@ mod tests {
                     cache_write_tokens: 0,
                     price,
                     cost_usd_micros: 0,
+                    base_cost_usd_micros: 0,
+                    discount_bp: 10_000,
                     settled: true,
                     request_id: None,
                     request_body: None,
@@ -2304,6 +2473,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "cached".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2313,6 +2483,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 0,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2332,6 +2504,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "heavy".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2341,6 +2514,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 0,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2386,6 +2561,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2395,6 +2571,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 12,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2449,6 +2627,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "fast".to_string(),
                 outbound_model: Some("gpt-4o-mini".to_string()),
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2458,6 +2637,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2508,6 +2689,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2517,6 +2699,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 9_999,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: false,
                 request_id: None,
                 request_body: None,
@@ -2536,6 +2720,7 @@ mod tests {
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
                 outbound_model: None,
+                channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
                 latency_ms: 10,
@@ -2545,6 +2730,8 @@ mod tests {
                 cache_write_tokens: 0,
                 price,
                 cost_usd_micros: 100,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
                 settled: true,
                 request_id: None,
                 request_body: None,
@@ -2568,6 +2755,7 @@ mod tests {
             inbound_protocol: "openai_chat".to_string(),
             model: "m".to_string(),
             outbound_model: None,
+            channel_key: None,
             channel: "c".to_string(),
             status_code: 200,
             latency_ms: 1,
@@ -2577,6 +2765,8 @@ mod tests {
             cache_write_tokens: 0,
             price: PriceSnapshot::default(),
             cost_usd_micros: 1,
+            base_cost_usd_micros: 0,
+            discount_bp: 10_000,
             settled,
             request_id: None,
             request_body: None,
@@ -2750,5 +2940,63 @@ mod tests {
             .expect("应能按目标过滤");
         assert_eq!(catalog.total, 1);
         assert_eq!(catalog.items[0].target, "catalog");
+    }
+
+    #[tokio::test]
+    async fn structured_system_log_event_roundtrips_and_legacy_rows_fallback() {
+        let (_dir, pool) = test_pool().await;
+        let event = SystemLogEvent::new(
+            "billing.user_balance_adjusted",
+            json!({ "user_id": 42, "delta_usd_micros": 1_000_000 }),
+            "用户 42 余额 +$1.00",
+        );
+        let mut tx = pool.begin().await.expect("应能开启事务");
+        record_audit(
+            &mut tx,
+            Actor {
+                user_id: 1,
+                email: "root@example.com",
+            },
+            "billing",
+            &event,
+        )
+        .await
+        .expect("结构化事件应能写入");
+        tx.commit().await.expect("应能提交事务");
+
+        insert_system_log(&pool, "error", "catalog", "旧式日志")
+            .await
+            .expect("旧式日志应能写入");
+        let page = query_system_log_page(&pool, &SystemLogQuery::new(1, 10))
+            .await
+            .expect("应能查询系统日志");
+        let structured = page
+            .items
+            .iter()
+            .find(|item| item.event_code.as_deref() == Some("billing.user_balance_adjusted"))
+            .expect("应取回事件编码");
+        assert_eq!(
+            structured.event_params,
+            Some(json!({
+                "user_id": 42,
+                "delta_usd_micros": 1_000_000
+            }))
+        );
+        let legacy = page
+            .items
+            .iter()
+            .find(|item| item.message == "旧式日志")
+            .expect("应取回旧式日志");
+        assert!(legacy.event_code.is_none());
+        assert!(legacy.event_params.is_none());
+
+        let malformed = sqlx::query(
+            "INSERT INTO system_log \
+             (created_at, level, target, message, event_code, event_params) \
+             VALUES (0, 'info', 'test', 'fallback', 'test.invalid', 'not-json')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(malformed.is_err(), "事件参数必须是合法 JSON");
     }
 }

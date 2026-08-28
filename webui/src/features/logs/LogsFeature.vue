@@ -2,23 +2,29 @@
 import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { TabsContent, TabsIndicator, TabsList, TabsRoot, TabsTrigger } from 'reka-ui';
-import { roleAtLeast } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import RequestLogsPanel from '@/features/logs/RequestLogsPanel.vue';
 import SystemLogsPanel from '@/features/logs/SystemLogsPanel.vue';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 
 const { t } = useI18n();
 const me = useCurrentUser();
 
 /**
- * 系统日志是运维与审计视图，后端要求 admin+。
- * 普通用户不渲染该 tab，避免点进去只拿到 403。
+ * 该 tab 对所有登录用户开放，但两种角色看到的是不同的东西：
+ * admin+ 看全量系统日志（含无操作者的运维事件），普通用户只看自己的审计行
+ * （后端按身份钉死 actor 维）。标题随之区分，避免普通用户以为自己在看运维视图。
+ *
+ * admin 仍受 `view_logs_stats` 收窄：套餐关掉该能力时后端返回 403，不渲染入口。
  */
-const canReadSystemLogs = computed(() => {
-  const role = me.value?.role;
-  return role !== undefined && roleAtLeast(role, 'admin');
-});
+const isPlainUser = computed(() => me.value?.role === 'user');
+const canReadSystemLogs = computed(
+  () => isPlainUser.value || hasCapability(me.value, 'view_logs_stats'),
+);
+const systemTabLabel = computed(() =>
+  isPlainUser.value ? t('logs.kind.ownAudit') : t('logs.kind.system'),
+);
 </script>
 
 <template>
@@ -36,7 +42,7 @@ const canReadSystemLogs = computed(() => {
             class="page-tab-switch-btn"
             data-testid="logs-tab-system"
           >
-            {{ t('logs.kind.system') }}
+            {{ systemTabLabel }}
           </TabsTrigger>
         </TabsList>
       </template>

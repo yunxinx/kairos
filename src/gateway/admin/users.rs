@@ -1,6 +1,6 @@
 //! 管理用户与会话端点：登录、自助账户、用户运营、钱包和模型组分配。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 
 use axum::{
@@ -15,28 +15,26 @@ use sqlx::SqlitePool;
 use crate::gateway::logging;
 use crate::store;
 use crate::store::StoreError;
+use crate::store::plans;
 use crate::store::users::{self, ManagementRole, NewUser, UserRecord};
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::tokens;
 use super::{
-    AdminDeps, AdminError, bearer_from_headers, begin_write, db_err, format_usd_micros,
-    map_user_store_err, reject_user_management, reload_and_swap,
+    AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, bearer_from_headers, begin_write,
+    db_err, format_usd_micros, map_user_store_err, reject_user_management, reload_and_swap,
+    validate_bulk_targets,
 };
 use crate::gateway::http::extract_bearer;
 
-/// 余额调整请求体：`delta_usd_micros` 为相对量（正数充值、负数扣减）。
-///
-/// 钱包记在用户上（ADR-0008），只经 `POST /users/{id}/balance` 调整。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BalanceAdjustment {
-    delta_usd_micros: i64,
-}
-
 pub(super) fn admin_routes() -> Router<AdminDeps> {
     Router::new()
-        .route("/users", get(list_management_users).post(create_user))
+        .route(
+            "/users",
+            get(list_management_users)
+                .post(create_user)
+                .delete(delete_users),
+        )
         .route(
             "/users/{id}",
             get(get_management_user)
@@ -44,11 +42,14 @@ pub(super) fn admin_routes() -> Router<AdminDeps> {
                 .delete(delete_user),
         )
         .route("/users/{id}/tokens", get(tokens::list_user_tokens))
-        .route("/users/{id}/balance", post(recharge_user))
         .route(
-            "/users/{id}/model-groups",
-            get(get_user_model_groups).put(replace_user_model_groups),
+            "/users/{id}/balance-adjustments",
+            post(super::user_balance::adjust_user_balance),
         )
+}
+
+pub(super) fn root_routes() -> Router<AdminDeps> {
+    Router::new()
 }
 
 pub(super) fn signed_in_routes() -> Router<AdminDeps> {
@@ -69,7 +70,7 @@ struct LoginBody {
 }
 
 #[derive(Debug, Serialize)]
-struct UserView {
+pub(super) struct UserView {
     id: i64,
     email: String,
     display_name: String,
@@ -77,10 +78,11 @@ struct UserView {
     enabled: bool,
     avatar: Option<String>,
     rate_limit_rpm: Option<u64>,
+    plan_id: Option<i64>,
 }
 
 impl UserView {
-    fn from_record(record: UserRecord) -> Self {
+    pub(super) fn from_record(record: UserRecord) -> Self {
         Self {
             id: record.id,
             email: record.email,
@@ -89,6 +91,7 @@ impl UserView {
             enabled: record.enabled,
             avatar: record.avatar,
             rate_limit_rpm: record.rate_limit_rpm,
+            plan_id: record.plan_id,
         }
     }
 }
@@ -129,7 +132,11 @@ async fn login(
             None,
             "warn",
             "auth",
-            &format!("登录失败：{} from {}", body.email, ip),
+            &store::SystemLogEvent::new(
+                "auth.login_failed",
+                serde_json::json!({ "email": body.email, "ip": ip.to_string() }),
+                format!("登录失败：{}（IP：{}）", body.email, ip),
+            ),
         )
         .await;
         return Err(AdminError::Unauthorized);
@@ -148,7 +155,11 @@ async fn login(
         }),
         "info",
         "auth",
-        &format!("登录成功 from {ip}"),
+        &store::SystemLogEvent::new(
+            "auth.login_succeeded",
+            serde_json::json!({ "ip": ip.to_string() }),
+            format!("登录成功（IP：{ip}）"),
+        ),
     )
     .await;
     Ok(Json(LoginView {
@@ -196,7 +207,11 @@ struct MeView {
     enabled: bool,
     avatar: Option<String>,
     rate_limit_rpm: Option<u64>,
+    plan_id: Option<i64>,
+    plan_display_name: Option<String>,
+    discount_bp: i64,
     assigned_groups: Vec<String>,
+    capabilities: plans::PlanCapabilities,
     balance_usd_micros: i64,
     settled_usd_micros: i64,
 }
@@ -209,9 +224,16 @@ async fn get_me(
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {} 不存在", identity.user_id())))?;
-    let assigned_groups = users::list_assigned_groups(&deps.pool, user.id)
-        .await
-        .map_err(AdminError::Store)?;
+    let plan = match user.plan_id {
+        Some(plan_id) => plans::get_plan(&deps.pool, plan_id)
+            .await
+            .map_err(AdminError::Store)?,
+        None => None,
+    };
+    let assigned_groups = plan
+        .as_ref()
+        .map(|plan| plan.groups.clone())
+        .unwrap_or_default();
     let wallet = store::get_user_wallet(&deps.pool, user.id)
         .await
         .map_err(AdminError::Store)?;
@@ -223,7 +245,11 @@ async fn get_me(
         enabled: user.enabled,
         avatar: user.avatar,
         rate_limit_rpm: user.rate_limit_rpm,
+        plan_id: user.plan_id,
+        plan_display_name: plan.as_ref().map(|plan| plan.display_name.clone()),
+        discount_bp: plan.as_ref().map_or(10_000, |plan| plan.discount_bp),
         assigned_groups,
+        capabilities: identity.capabilities_for_view(),
         balance_usd_micros: wallet.balance_usd_micros,
         settled_usd_micros: wallet.settled_usd_micros,
     }))
@@ -333,11 +359,19 @@ async fn update_me(
             &mut tx,
             identity.actor(),
             "users",
-            &format!(
-                "用户 {} ({}) 修改自己的账户：{}",
-                user_id,
-                identity.user.email,
-                changes.join("；")
+            &store::SystemLogEvent::new(
+                "users.self_updated",
+                serde_json::json!({
+                    "user_id": user_id,
+                    "email": identity.user.email,
+                    "changes": changes,
+                }),
+                format!(
+                    "用户 {} ({}) 修改自己的账户：{}",
+                    user_id,
+                    identity.user.email,
+                    changes.join("；")
+                ),
             ),
         )
         .await
@@ -360,6 +394,8 @@ struct UserCreate {
     role: ManagementRole,
     #[serde(default)]
     rate_limit_rpm: Option<u64>,
+    #[serde(default)]
+    plan_id: Option<i64>,
 }
 
 async fn create_user(
@@ -367,6 +403,7 @@ async fn create_user(
     Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<UserCreate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<(StatusCode, Json<UserView>), AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let create = body.map_err(AdminError::bad_body)?.0;
     match (identity.role(), create.role) {
         // root 全局唯一：创建接口不接受 root，内置账号是唯一来源。
@@ -376,7 +413,37 @@ async fn create_user(
     }
     let now = logging::unix_millis();
     let mut tx = begin_write(&deps).await?;
-    let user = users::insert_user(
+    // 默认档现在要查库（`plans.is_default`），故取默认与「是否算显式分配」都挪进事务：
+    // 显式指定的档若正好就是该角色的默认档，不算跨档分配，无需 AssignPlan。
+    let default_plan = users::default_plan_id_for_role(&mut tx, create.role)
+        .await
+        .map_err(AdminError::Store)?;
+    if create
+        .plan_id
+        .is_some_and(|plan_id| Some(plan_id) != default_plan)
+    {
+        identity.require_capability(ManagementCapability::AssignPlan)?;
+    }
+    let selected_plan = create.plan_id.or(default_plan);
+    let selected_plan = selected_plan
+        .ok_or_else(|| AdminError::InvalidBody("root 不能作为新建用户角色".to_string()))?;
+    let plan = plans::get_plan_on_conn(&mut tx, selected_plan)
+        .await
+        .map_err(AdminError::Store)?
+        .ok_or_else(|| AdminError::InvalidBody(format!("套餐 {selected_plan} 不存在")))?;
+    let expected_audience = users::plan_audience_for_role(create.role)
+        .ok_or_else(|| AdminError::InvalidBody("root 不能作为新建用户角色".to_string()))?;
+    if plan.audience != expected_audience {
+        return Err(AdminError::InvalidBody(format!(
+            "角色 {} 不能绑定 {} 受众套餐",
+            create.role.as_str(),
+            plan.audience.as_str()
+        )));
+    }
+    if identity.role() == ManagementRole::Admin && !plan.shared_with_admin {
+        return Err(AdminError::Forbidden);
+    }
+    let user = users::insert_user_with_plan(
         &mut tx,
         NewUser {
             email: &create.email,
@@ -386,6 +453,7 @@ async fn create_user(
             rate_limit_rpm: create.rate_limit_rpm,
         },
         now,
+        Some(selected_plan),
     )
     .await
     .map_err(map_user_store_err)?;
@@ -393,11 +461,42 @@ async fn create_user(
         &mut tx,
         identity.actor(),
         "users",
-        &format!(
-            "创建用户 {} ({}) role={}",
-            user.id,
-            user.email,
-            user.role.as_str()
+        &store::SystemLogEvent::new(
+            "users.created",
+            serde_json::json!({
+                "user_id": user.id,
+                "email": user.email,
+                "role": user.role.as_str(),
+            }),
+            format!(
+                "创建用户 {} ({})，角色 {}",
+                user.id,
+                user.email,
+                user.role.as_str()
+            ),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "billing",
+        &store::SystemLogEvent::new(
+            "billing.initial_grant_credited",
+            serde_json::json!({
+                "user_id": user.id,
+                "email": user.email,
+                "plan_name": plan.display_name,
+                "amount_usd_micros": plan.initial_grant_usd_micros,
+            }),
+            format!(
+                "新建用户 {} ({}) 按套餐 {} 入账起步金 {} USD",
+                user.id,
+                user.email,
+                plan.display_name,
+                format_usd_micros(plan.initial_grant_usd_micros)
+            ),
         ),
     )
     .await
@@ -417,6 +516,8 @@ pub(super) struct UserUpdate {
     password: Option<String>,
     display_name: Option<String>,
     avatar: Option<String>,
+    /// 与资料字段在同一事务中换套餐；只允许在角色不变时提交。
+    plan_id: Option<i64>,
     /// 三态：字段缺省 = 不改，`null` = 清空（跟随全局兜底），数值 = 设为该值。
     #[serde(default, deserialize_with = "deserialize_double_option")]
     rate_limit_rpm: Option<Option<u64>>,
@@ -464,6 +565,7 @@ async fn update_user(
     headers: axum::http::HeaderMap,
     body: Result<Json<UserUpdate>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UserView>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let update = body.map_err(AdminError::bad_body)?.0;
     let mut tx = begin_write(&deps).await?;
     let target = users::get_user_on_conn(&mut tx, id)
@@ -514,6 +616,64 @@ async fn update_user(
         None => false,
     };
     let password_changed = update.password.is_some();
+    let role_plan = if role_changed {
+        let role = update.role.ok_or_else(|| {
+            AdminError::Store(StoreError::InvalidResource(
+                "角色变化缺少目标角色".to_string(),
+            ))
+        })?;
+        let plan_id = users::default_plan_id_for_role(&mut tx, role)
+            .await
+            .map_err(AdminError::Store)?
+            .ok_or_else(|| {
+                AdminError::Store(StoreError::InvalidResource(
+                    "非 root 角色缺少默认套餐".to_string(),
+                ))
+            })?;
+        let plan = plans::get_plan_on_conn(&mut tx, plan_id)
+            .await
+            .map_err(AdminError::Store)?
+            .ok_or_else(|| {
+                AdminError::Store(StoreError::InvalidResource(format!(
+                    "默认套餐 {plan_id} 不存在"
+                )))
+            })?;
+        if users::plan_audience_for_role(role) != Some(plan.audience) {
+            return Err(AdminError::Store(StoreError::InvalidResource(format!(
+                "角色 {} 的默认套餐受众不匹配",
+                role.as_str()
+            ))));
+        }
+        Some((role, plan_id, plan.display_name))
+    } else {
+        None
+    };
+
+    let explicit_plan = if let Some(plan_id) = update.plan_id {
+        if role_changed {
+            return Err(AdminError::InvalidBody(
+                "角色变化时不能同时指定套餐，请使用目标受众默认套餐".to_string(),
+            ));
+        }
+        identity.require_capability(ManagementCapability::AssignPlan)?;
+        let plan = plans::get_plan_on_conn(&mut tx, plan_id)
+            .await
+            .map_err(AdminError::Store)?
+            .ok_or_else(|| AdminError::NotFound(format!("套餐 {plan_id} 不存在")))?;
+        if identity.role() == ManagementRole::Admin && !plan.shared_with_admin {
+            return Err(AdminError::Forbidden);
+        }
+        if users::plan_audience_for_role(target.role) != Some(plan.audience) {
+            return Err(AdminError::InvalidBody(format!(
+                "角色 {} 不能绑定 {} 受众套餐",
+                target.role.as_str(),
+                plan.audience.as_str()
+            )));
+        }
+        (target.plan_id != Some(plan_id)).then_some((plan_id, plan.display_name))
+    } else {
+        None
+    };
 
     // 规范化后的目标值与当前记录相同时，直接返回，避免无意义的写入、审计和快照替换。
     if !role_changed
@@ -523,6 +683,7 @@ async fn update_user(
         && display_name_changed.is_none()
         && !avatar_changed
         && !rpm_changed
+        && explicit_plan.is_none()
     {
         return Ok(Json(UserView::from_record(target)));
     }
@@ -539,8 +700,16 @@ async fn update_user(
             .await
             .map_err(map_user_store_err)?;
     }
-    if role_changed && let Some(role) = update.role {
-        users::set_user_role(&mut tx, id, role)
+    if let Some((role, plan_id, _)) = role_plan.as_ref() {
+        users::set_user_role(&mut tx, id, *role)
+            .await
+            .map_err(map_user_store_err)?;
+        users::set_user_plan(&mut tx, id, *plan_id)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    if let Some((plan_id, _)) = explicit_plan.as_ref() {
+        users::set_user_plan(&mut tx, id, *plan_id)
             .await
             .map_err(map_user_store_err)?;
     }
@@ -590,8 +759,17 @@ async fn update_user(
             email_after.as_deref().unwrap_or(&target.email)
         ));
     }
-    if role_changed && let Some(role) = update.role {
-        changes.push(format!("role {} → {}", target.role.as_str(), role.as_str()));
+    if let Some((role, plan_id, plan_name)) = role_plan.as_ref() {
+        changes.push(format!(
+            "role {} → {}，套餐 → {} ({})",
+            target.role.as_str(),
+            role.as_str(),
+            plan_id,
+            plan_name
+        ));
+    }
+    if let Some((plan_id, plan_name)) = explicit_plan.as_ref() {
+        changes.push(format!("套餐 → {} ({})", plan_id, plan_name));
     }
     if enabled_changed && let Some(enabled) = update.enabled {
         changes.push(format!("enabled {} → {}", target.enabled, enabled));
@@ -613,14 +791,22 @@ async fn update_user(
             .rate_limit_rpm
             .map_or_else(|| "跟随全局".to_string(), |n| n.to_string());
         let after = rpm_update.map_or_else(|| "跟随全局".to_string(), |n| n.to_string());
-        changes.push(format!("rate_limit_rpm {before} → {after}"));
+        changes.push(format!("RPM 限流 {before} → {after}"));
     }
     if !changes.is_empty() {
         store::record_audit(
             &mut tx,
             identity.actor(),
             "users",
-            &format!("修改用户 {} ({})：{}", id, target.email, changes.join("；")),
+            &store::SystemLogEvent::new(
+                "users.updated",
+                serde_json::json!({
+                    "user_id": id,
+                    "email": target.email,
+                    "changes": changes,
+                }),
+                format!("修改用户 {} ({})：{}", id, target.email, changes.join("；")),
+            ),
         )
         .await
         .map_err(AdminError::Store)?;
@@ -639,6 +825,7 @@ async fn delete_user(
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let mut tx = begin_write(&deps).await?;
     let target = users::get_user_on_conn(&mut tx, id)
         .await
@@ -652,9 +839,13 @@ async fn delete_user(
         &mut tx,
         identity.actor(),
         "users",
-        &format!(
-            "归档用户 {} ({})：停用、令牌失效、会话吊销",
-            id, target.email
+        &store::SystemLogEvent::new(
+            "users.archived",
+            serde_json::json!({ "user_id": id, "email": target.email }),
+            format!(
+                "归档用户 {} ({})：停用、令牌失效、会话吊销",
+                id, target.email
+            ),
         ),
     )
     .await
@@ -664,72 +855,44 @@ async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AssignedGroupsBody {
-    groups: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AssignedGroupsView {
-    groups: Vec<String>,
-}
-
-async fn get_user_model_groups(
+async fn delete_users(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
-    Path(id): Path<i64>,
-) -> Result<Json<AssignedGroupsView>, AdminError> {
-    let target = users::get_user(&deps.pool, id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
-    reject_user_management(&identity, &target, None)?;
-    let groups = users::list_assigned_groups(&deps.pool, id)
-        .await
-        .map_err(AdminError::Store)?;
-    Ok(Json(AssignedGroupsView { groups }))
-}
-
-async fn replace_user_model_groups(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(id): Path<i64>,
-    body: Result<Json<AssignedGroupsBody>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<AssignedGroupsView>, AdminError> {
-    let body = body.map_err(AdminError::bad_body)?.0;
+    body: Result<Json<BulkDeleteBody<i64>>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<BulkDeleteResult<i64>>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
+    let targets = validate_bulk_targets(body.map_err(AdminError::bad_body)?.0.targets)?;
     let mut tx = begin_write(&deps).await?;
-    let target = users::get_user_on_conn(&mut tx, id)
-        .await
-        .map_err(AdminError::Store)?
-        .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
-    reject_user_management(&identity, &target, None)?;
-    let before = users::list_assigned_groups_on_conn(&mut tx, id)
-        .await
-        .map_err(AdminError::Store)?;
-    let groups = users::replace_assigned_groups(&mut tx, id, &body.groups)
-        .await
-        .map_err(map_user_store_err)?;
-    if before != groups {
-        // 撤组会让已绑该组的令牌立即失效（ADR-0010），值得留痕。
-        store::record_audit(
-            &mut tx,
-            identity.actor(),
-            "users",
-            &format!(
-                "调整用户 {} ({}) 可用模型组：[{}] → [{}]",
-                id,
-                target.email,
-                before.join(", "),
-                groups.join(", ")
-            ),
-        )
-        .await
-        .map_err(AdminError::Store)?;
+    let mut records = Vec::with_capacity(targets.len());
+    for id in &targets {
+        let target = users::get_user_on_conn(&mut tx, *id)
+            .await
+            .map_err(AdminError::Store)?
+            .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
+        reject_user_management(&identity, &target, None)?;
+        records.push(target);
     }
+    let now = logging::unix_millis();
+    for target in &records {
+        users::delete_user(&mut tx, target.id, now)
+            .await
+            .map_err(map_user_store_err)?;
+    }
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "users",
+        &store::SystemLogEvent::new(
+            "users.bulk_archived",
+            serde_json::json!({ "count": records.len() }),
+            format!("批量归档 {} 个用户", records.len()),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    Ok(Json(AssignedGroupsView { groups }))
+    Ok(Json(BulkDeleteResult::new(targets)))
 }
 
 #[derive(Debug, Serialize)]
@@ -742,6 +905,9 @@ struct UserAdminView {
     // 不带 avatar：运营列表与详情都不渲染头像，而它可能是 MB 级 base64 data URL，
     // 逐个用户带上等于给 /users 平白挂几 MB。自己的头像走 /me。
     rate_limit_rpm: Option<u64>,
+    plan_id: Option<i64>,
+    plan_display_name: Option<String>,
+    discount_bp: i64,
     assigned_groups: Vec<String>,
     balance_usd_micros: i64,
     settled_usd_micros: i64,
@@ -753,12 +919,17 @@ struct UserAdminView {
 
 async fn user_admin_view(
     pool: &SqlitePool,
+    identity: &ManagementIdentity,
     record: UserRecord,
     stats: Option<users::UserStatsRecord>,
 ) -> Result<UserAdminView, AdminError> {
-    let groups = users::list_assigned_groups(pool, record.id)
-        .await
-        .map_err(AdminError::Store)?;
+    let plan = match record.plan_id {
+        Some(plan_id) => plans::get_plan(pool, plan_id)
+            .await
+            .map_err(AdminError::Store)?,
+        None => None,
+    };
+    let groups = visible_plan_groups(pool, identity, record.plan_id).await?;
     let wallet = store::get_user_wallet(pool, record.id)
         .await
         .map_err(AdminError::Store)?;
@@ -775,6 +946,9 @@ async fn user_admin_view(
         role: record.role,
         enabled: record.enabled,
         rate_limit_rpm: record.rate_limit_rpm,
+        plan_id: record.plan_id,
+        plan_display_name: plan.as_ref().map(|plan| plan.display_name.clone()),
+        discount_bp: plan.as_ref().map_or(10_000, |plan| plan.discount_bp),
         assigned_groups: groups,
         balance_usd_micros: wallet.balance_usd_micros,
         settled_usd_micros: wallet.settled_usd_micros,
@@ -793,6 +967,7 @@ async fn list_management_users(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<UserAdminView>>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let mut records = users::list_users(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
@@ -805,13 +980,34 @@ async fn list_management_users(
     let wallets = store::list_user_wallets(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
-    let mut groups_by_user: HashMap<i64, Vec<String>> = HashMap::new();
-    for (user_id, group) in users::list_all_assigned_groups(&deps.pool)
+    let mut groups_by_plan: HashMap<i64, Vec<String>> = HashMap::new();
+    for (plan_id, group) in plans::list_all_plan_groups(&deps.pool)
         .await
         .map_err(AdminError::Store)?
     {
-        groups_by_user.entry(user_id).or_default().push(group);
+        groups_by_plan.entry(plan_id).or_default().push(group);
     }
+    let plan_meta: HashMap<i64, (String, i64)> = plans::list_plans(&deps.pool)
+        .await
+        .map_err(AdminError::Store)?
+        .into_iter()
+        .map(|plan| (plan.id, (plan.display_name, plan.discount_bp)))
+        .collect();
+    let visible_groups = if identity.role() == ManagementRole::Root
+        || identity.has_capability(ManagementCapability::ViewOtherGroups)
+    {
+        None
+    } else if identity.has_capability(ManagementCapability::ViewOwnPlanGroups) {
+        let own_plan_groups = match identity.plan_id() {
+            Some(plan_id) => plans::list_plan_groups(&deps.pool, plan_id)
+                .await
+                .map_err(AdminError::Store)?,
+            None => Vec::new(),
+        };
+        Some(own_plan_groups.into_iter().collect::<HashSet<String>>())
+    } else {
+        Some(HashSet::new())
+    };
     let views = records
         .into_iter()
         .map(|record| -> Result<UserAdminView, AdminError> {
@@ -820,8 +1016,18 @@ async fn list_management_users(
                 .get(&record.id)
                 .copied()
                 .ok_or_else(|| AdminError::Store(StoreError::MissingWallet(record.id)))?;
-            let mut assigned_groups = groups_by_user.remove(&record.id).unwrap_or_default();
+            let mut assigned_groups = record
+                .plan_id
+                .and_then(|plan_id| groups_by_plan.get(&plan_id).cloned())
+                .unwrap_or_default();
+            if let Some(visible_groups) = &visible_groups {
+                assigned_groups.retain(|group| visible_groups.contains(group));
+            }
             assigned_groups.sort();
+            let (plan_display_name, discount_bp) = record
+                .plan_id
+                .and_then(|plan_id| plan_meta.get(&plan_id).cloned())
+                .map_or((None, 10_000), |(name, discount)| (Some(name), discount));
             Ok(UserAdminView {
                 id: record.id,
                 email: record.email,
@@ -829,6 +1035,9 @@ async fn list_management_users(
                 role: record.role,
                 enabled: record.enabled,
                 rate_limit_rpm: record.rate_limit_rpm,
+                plan_id: record.plan_id,
+                plan_display_name,
+                discount_bp,
                 assigned_groups,
                 balance_usd_micros: wallet.balance_usd_micros,
                 settled_usd_micros: wallet.settled_usd_micros,
@@ -847,65 +1056,49 @@ async fn get_management_user(
     Extension(identity): Extension<ManagementIdentity>,
     Path(id): Path<i64>,
 ) -> Result<Json<UserAdminView>, AdminError> {
+    identity.require_capability(ManagementCapability::ManageUsers)?;
     let target = users::get_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("用户 {id} 不存在")))?;
     reject_user_management(&identity, &target, None)?;
-    user_admin_view(&deps.pool, target, None).await.map(Json)
+    user_admin_view(&deps.pool, &identity, target, None)
+        .await
+        .map(Json)
 }
 
-async fn recharge_user(
-    State(deps): State<AdminDeps>,
-    Extension(identity): Extension<ManagementIdentity>,
-    Path(id): Path<i64>,
-    body: Result<Json<BalanceAdjustment>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<UserAdminView>, AdminError> {
-    let delta = body.map_err(AdminError::bad_body)?.0.delta_usd_micros;
-    let mut tx = begin_write(&deps).await?;
-    // 归档用户的钱包仍须可对账：补扣路径（结算/豁免）已允许 root 触碰归档账户，
-    // 充值走同一语义。非 root 视角归档与不存在同响应（404）——归档账户不可见是
-    // 全库原则，不因充值端点泄漏「该 id 曾存在」。「非归档读不到、含归档读得到」
-    // 即归档判定，无需给 UserRecord 增加 deleted_at。
-    let (target, archived) = match users::get_user_on_conn(&mut tx, id)
-        .await
-        .map_err(AdminError::Store)?
-    {
-        Some(target) => (target, false),
-        None => match users::get_user_including_archived_on_conn(&mut tx, id)
-            .await
-            .map_err(AdminError::Store)?
-        {
-            Some(target) if identity.role() == ManagementRole::Root => (target, true),
-            _ => {
-                return Err(AdminError::NotFound(format!("用户 {id} 不存在")));
-            }
-        },
+/// 按当前管理员的模型组可见能力裁剪目标用户的套餐名单。
+async fn visible_plan_groups(
+    pool: &SqlitePool,
+    identity: &ManagementIdentity,
+    target_plan_id: Option<i64>,
+) -> Result<Vec<String>, AdminError> {
+    let Some(target_plan_id) = target_plan_id else {
+        return Ok(Vec::new());
     };
-    reject_user_management(&identity, &target, None)?;
-    let change = store::adjust_user_balance(&mut tx, id, delta)
-        .await
-        .map_err(map_user_store_err)?;
-    if delta != 0 {
-        // 钱是最需要留痕的一类改动：记 delta 与前后余额，别只记「被改过」。
-        store::record_audit(
-            &mut tx,
-            identity.actor(),
-            "billing",
-            &format!(
-                "用户 {} ({}) 余额 {}{} USD（{} → {}）{}",
-                id,
-                target.email,
-                if delta > 0 { "+" } else { "" },
-                format_usd_micros(delta),
-                format_usd_micros(change.before_usd_micros),
-                format_usd_micros(change.after_usd_micros),
-                if archived { "（已归档）" } else { "" }
-            ),
-        )
+    let groups = plans::list_plan_groups(pool, target_plan_id)
         .await
         .map_err(AdminError::Store)?;
+    if identity.role() == ManagementRole::Root
+        || identity.has_capability(ManagementCapability::ViewOtherGroups)
+    {
+        return Ok(groups);
     }
-    tx.commit().await.map_err(db_err)?;
-    user_admin_view(&deps.pool, target, None).await.map(Json)
+    if !identity.has_capability(ManagementCapability::ViewOwnPlanGroups) {
+        return Ok(Vec::new());
+    }
+    let Some(own_plan_id) = identity.plan_id() else {
+        return Ok(Vec::new());
+    };
+    if own_plan_id == target_plan_id {
+        return Ok(groups);
+    }
+    let own_groups = plans::list_plan_groups(pool, own_plan_id)
+        .await
+        .map_err(AdminError::Store)?;
+    let own_groups: HashSet<String> = own_groups.into_iter().collect();
+    Ok(groups
+        .into_iter()
+        .filter(|group| own_groups.contains(group))
+        .collect())
 }

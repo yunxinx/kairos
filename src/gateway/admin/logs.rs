@@ -10,21 +10,21 @@ use axum::{
 };
 use base64::prelude::{BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::store;
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::tokens::mask_token_key;
 use super::{AdminDeps, AdminError, parse_comma_list};
 
+/// 归属收窄后对所有登录用户开放：请求日志按 `owner_scope`，系统日志按
+/// `own_audit_only`（普通用户只看自己的审计行，看不到运维事件）。
 pub(super) fn signed_in_routes() -> Router<AdminDeps> {
     Router::new()
         .route("/logs", get(query_logs))
         .route("/logs/{id}", get(get_log))
-}
-
-pub(super) fn admin_routes() -> Router<AdminDeps> {
-    Router::new().route("/system-logs", get(query_system_logs))
+        .route("/system-logs", get(query_system_logs))
 }
 
 /// 日志维护端点：只读体积统计与按时间窗清理，均要求 root（挂 `root_only` 层）。
@@ -45,6 +45,7 @@ pub(super) struct LogEntry {
     model: String,
     outbound_model: Option<String>,
     channel: String,
+    channel_key: Option<String>,
     status_code: i64,
     latency_ms: i64,
     input_tokens: u64,
@@ -55,6 +56,11 @@ pub(super) struct LogEntry {
     output_price_usd_micros: i64,
     cache_read_price_usd_micros: i64,
     cache_write_price_usd_micros: i64,
+    /// 渠道原价（折扣前）。
+    base_cost_usd_micros: i64,
+    /// 万分比折扣率（10000 = 原价）。
+    discount_bp: i64,
+    /// 实收（折后），补扣/豁免按此列处理。
     cost_usd_micros: i64,
     /// 费用是否已完成所属用户钱包结算。
     settled: bool,
@@ -74,6 +80,7 @@ impl LogEntry {
             model: log.model,
             outbound_model: log.outbound_model,
             channel: log.channel,
+            channel_key: log.channel_key,
             status_code: log.status_code,
             latency_ms: log.latency_ms,
             input_tokens: log.input_tokens,
@@ -84,6 +91,8 @@ impl LogEntry {
             output_price_usd_micros: log.price.output_micros,
             cache_read_price_usd_micros: log.price.cache_read_micros,
             cache_write_price_usd_micros: log.price.cache_write_micros,
+            base_cost_usd_micros: log.base_cost_usd_micros,
+            discount_bp: log.discount_bp,
             cost_usd_micros: log.cost_usd_micros,
             settled: log.settled,
             request_body: log.request_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
@@ -103,6 +112,7 @@ pub(super) struct LogQueryParams {
     from_created_at: Option<i64>,
     to_created_at: Option<i64>,
     settled: Option<bool>,
+    discount_bp: Option<i64>,
     inbound_protocol: Option<String>,
     sort_by: Option<store::RequestLogSortBy>,
     sort_dir: Option<store::SortDir>,
@@ -125,6 +135,7 @@ pub(super) async fn query_logs(
     Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<LogQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<LogPage>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
@@ -139,6 +150,7 @@ pub(super) async fn query_logs(
     filter.from_created_at = params.from_created_at;
     filter.to_created_at = params.to_created_at;
     filter.settled = params.settled;
+    filter.discount_bp = params.discount_bp;
     filter.inbound_protocols = parse_comma_list(params.inbound_protocol.as_deref());
     filter.sort_by = params.sort_by.unwrap_or_default();
     filter.sort_dir = params.sort_dir.unwrap_or_default();
@@ -161,6 +173,7 @@ pub(super) async fn get_log(
     Extension(identity): Extension<ManagementIdentity>,
     Path(raw): Path<String>,
 ) -> Result<Json<LogEntry>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let id = parse_log_id(&raw)?;
     let log = store::get_request_log(&deps.pool, id)
         .await
@@ -253,9 +266,17 @@ async fn cleanup_logs(
         Some(identity.actor()),
         "info",
         "logs",
-        &format!(
-            "清理日志：删除 {removed_request_logs} 条已结算请求日志与 \
-             {removed_system_logs} 条系统日志（早于 {days} 天）"
+        &store::SystemLogEvent::new(
+            "logs.cleaned",
+            serde_json::json!({
+                "removed_request_logs": removed_request_logs,
+                "removed_system_logs": removed_system_logs,
+                "older_than_days": days,
+            }),
+            format!(
+                "清理日志：删除 {removed_request_logs} 条已结算请求日志与 \
+                 {removed_system_logs} 条系统日志（早于 {days} 天）"
+            ),
         ),
     )
     .await;
@@ -263,7 +284,16 @@ async fn cleanup_logs(
     // 行已删掉、审计已留痕，截断失败只记系统日志，不让清理整体报错；该告警
     // 本身会产生少量 WAL，但避免把未完成的收尾伪报为成功。
     if let Err(err) = store::checkpoint_wal_truncate(&deps.pool).await {
-        store::record_system_warn(&deps.pool, "logs", &format!("清理后 WAL 收尾失败: {err}")).await;
+        store::record_system_warn(
+            &deps.pool,
+            "logs",
+            &store::SystemLogEvent::new(
+                "logs.wal_checkpoint_failed",
+                serde_json::json!({ "error": err.to_string() }),
+                format!("清理后 WAL 收尾失败: {err}"),
+            ),
+        )
+        .await;
     }
     Ok(Json(CleanupResultView {
         removed_request_logs,
@@ -293,6 +323,8 @@ struct SystemLogEntry {
     level: String,
     target: String,
     message: String,
+    event_code: Option<String>,
+    event_params: Option<Value>,
     actor_user_id: Option<i64>,
     actor_email: Option<String>,
 }
@@ -306,11 +338,17 @@ pub(super) struct SystemLogPage {
     targets: Vec<String>,
 }
 
-/// 分页查询系统日志；该端点已经由路由层限制为 admin+。
+/// 分页查询系统日志。
+///
+/// 普通用户看得到自己的操作记录（改密码、建令牌等审计行），这是「我做过什么」的
+/// 自助视图；运维事件（actor 为 NULL 的告警，含上游地址与失败堆栈）只对 admin+
+/// 开放。归属由身份注入到 `own_audit_only`，客户端参数无法解除。
 pub(super) async fn query_system_logs(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
     query: Result<Query<SystemLogQueryParams>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<SystemLogPage>, AdminError> {
+    identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
@@ -321,7 +359,13 @@ pub(super) async fn query_system_logs(
     filter.to_created_at = params.to_created_at;
     filter.levels = parse_comma_list(params.level.as_deref());
     filter.targets = parse_comma_list(params.target.as_deref());
-    filter.actor_user_id = params.actor_user_id;
+    // 归属边界先于调用方参数：普通用户的 actor 维被钉死为自己。
+    filter.own_audit_only = identity.owner_scope();
+    filter.actor_user_id = if filter.own_audit_only.is_some() {
+        None
+    } else {
+        params.actor_user_id
+    };
     filter.sort_by = params.sort_by.unwrap_or_default();
     filter.sort_dir = params.sort_dir.unwrap_or_default();
     let page = store::query_system_log_page(&deps.pool, &filter)
@@ -337,6 +381,8 @@ pub(super) async fn query_system_logs(
                 level: log.level,
                 target: log.target,
                 message: log.message,
+                event_code: log.event_code,
+                event_params: log.event_params,
                 actor_user_id: log.actor_user_id,
                 actor_email: log.actor_email,
             })

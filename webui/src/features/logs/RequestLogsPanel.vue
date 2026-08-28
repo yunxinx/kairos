@@ -5,7 +5,6 @@ import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import {
   PROTOCOLS,
-  roleAtLeast,
   type LogEntry,
   type LogQuery,
   type RequestLogSortBy,
@@ -31,14 +30,21 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import LogTableRow, { type RequestLogVisibleColumns } from '@/features/logs/LogTableRow.vue';
 import RequestLogDetailWindow from '@/features/logs/RequestLogDetailWindow.vue';
+import RequestLogBodyWindow from '@/features/logs/RequestLogBodyWindow.vue';
 import { useLogListControls } from '@/features/logs/useLogListControls';
+import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
+import { formatDiscountBp } from '@/lib/format';
+import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent } from '@/lib/window-anchor';
 
+type RequestLogWindowType = 'billing' | 'body';
+
 type RequestLogWindowPayload = {
+  type: RequestLogWindowType;
   entry: LogEntry;
 };
 
@@ -51,8 +57,11 @@ type RequestLogColumnId =
   | 'tokens'
   | 'latency'
   | 'cache'
+  | 'cacheHit'
   | 'cost'
-  | 'actions';
+  | 'settled'
+  | 'billing'
+  | 'body';
 
 const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
   { id: 'created', locked: true },
@@ -63,8 +72,11 @@ const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
   { id: 'tokens' },
   { id: 'latency' },
   { id: 'cache', defaultVisible: false },
+  { id: 'cacheHit', defaultVisible: false },
   { id: 'cost' },
-  { id: 'actions', locked: true },
+  { id: 'settled', legacyFallbackId: 'cost' },
+  { id: 'billing', locked: true },
+  { id: 'body' },
 ];
 
 const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
@@ -75,18 +87,18 @@ const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
   'tokens',
   'latency',
   'cache',
+  'cacheHit',
   'cost',
+  'settled',
+  'body',
 ];
 
 const { t } = useI18n();
 const { error, success } = useToast();
 const me = useCurrentUser();
 
-/** 补扣/豁免是计费操作，后端要求 admin+；普通用户不渲染入口。 */
-const canSettleLogs = computed(() => {
-  const role = me.value?.role;
-  return role !== undefined && roleAtLeast(role, 'admin');
-});
+/** 补扣/豁免是计费操作，要求生效能力 `settle_waive`；普通用户不渲染入口。 */
+const canSettleLogs = computed(() => hasCapability(me.value, 'settle_waive'));
 const queryClient = useQueryClient();
 
 const {
@@ -114,6 +126,7 @@ const {
 } = useWindowStack<RequestLogWindowPayload>();
 
 const appliedSettled = ref<string[]>([]);
+const appliedDiscountBp = ref<string[]>([]);
 const appliedProtocols = ref<string[]>([]);
 const appliedModel = ref<string | null>(null);
 const appliedChannel = ref<string | null>(null);
@@ -136,7 +149,10 @@ const rowVisible = computed((): RequestLogVisibleColumns => ({
   tokens: visible.value.tokens,
   latency: visible.value.latency,
   cache: visible.value.cache,
+  cacheHit: visible.value.cacheHit,
   cost: visible.value.cost,
+  settled: visible.value.settled,
+  body: visible.value.body,
 }));
 
 const columnMenuItems = computed(() => menuItems(REQUEST_LOG_HIDEABLE));
@@ -181,12 +197,15 @@ const columnLabels = computed((): Record<RequestLogColumnId, string> => ({
   token: t('logs.token'),
   model: t('logs.model'),
   channel: t('logs.channel'),
-  inboundProtocol: t('logs.inboundProtocol'),
+  inboundProtocol: t('logs.requestProtocol'),
   tokens: t('logs.tokens'),
   latency: t('logs.latencyAndSpeed'),
   cache: t('logs.cache'),
+  cacheHit: t('logs.cacheHitRate'),
   cost: t('logs.cost'),
-  actions: t('common.actions'),
+  settled: t('logs.settled'),
+  billing: t('logs.billingDetail'),
+  body: t('logs.bodyDetail'),
 }));
 
 const activeLogIds = computed(() => new Set(windows.value.map((win) => win.payload.entry.id)));
@@ -203,6 +222,20 @@ const protocolOptions = computed(() =>
   })),
 );
 
+const discountOptions = computed(() => {
+  const counts = new Map<number, number>();
+  for (const item of items.value) {
+    counts.set(item.discount_bp, (counts.get(item.discount_bp) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([bp, count]) => ({
+      value: String(bp),
+      label: formatDiscountBp(bp),
+      count,
+    }));
+});
+
 const refreshOptions = computed(() => [
   { value: '0', label: t('logs.autoRefreshOff') },
   { value: '5', label: t('logs.autoRefreshSeconds', { seconds: 5 }) },
@@ -210,21 +243,25 @@ const refreshOptions = computed(() => [
   { value: '30', label: t('logs.autoRefreshSeconds', { seconds: 30 }) },
 ]);
 
-const channelsQuery = useQuery({
-  queryKey: ['channels'],
-  queryFn: () => apiClient.listChannels(),
-});
+// 协议映射只需要「渠道名 → 协议」，故走名录投影；完整定义是 root-only，
+// 用它会让 admin 吃 403。普通用户连名录也无权读，此时 map 保持 null。
+const { channels, channelsKnown } = useChannelDirectory();
 
+/**
+ * 渠道表未到手时返回 null，让详情只显示入站协议。
+ *
+ * 不能退化成空 Map：那会让 `resolveOutboundProtocol` 对每一行都判 `unknown`，
+ * 于是「我看不到渠道表」被显示成「这条渠道不在表里」。
+ */
 const channelProtocolMap = computed((): Map<string, string> | null => {
-  if (channelsQuery.isPending.value) {
+  if (!channelsKnown.value) {
     return null;
   }
-  return new Map<string, string>(
-    (channelsQuery.data.value ?? []).map((channel) => [channel.name, channel.protocol]),
-  );
+  return new Map<string, string>(channels.value.map((channel) => [channel.name, channel.protocol]));
 });
 
 watch(appliedSettled, resetResults);
+watch(appliedDiscountBp, resetResults);
 watch(appliedProtocols, resetResults);
 watch([appliedModel, appliedChannel, appliedTokenName], resetResults);
 
@@ -255,6 +292,9 @@ function buildQuery(): LogQuery {
   if (appliedSettled.value.length === 1) {
     query.settled = appliedSettled.value[0] === 'true';
   }
+  if (appliedDiscountBp.value.length === 1) {
+    query.discount_bp = Number(appliedDiscountBp.value[0]);
+  }
   if (appliedProtocols.value.length > 0) {
     query.inbound_protocol = appliedProtocols.value;
   }
@@ -277,6 +317,7 @@ const logsQuery = useQuery({
     appliedFrom,
     appliedTo,
     appliedSettled,
+    appliedDiscountBp,
     appliedProtocols,
     appliedModel,
     appliedChannel,
@@ -322,6 +363,7 @@ const paging = computed(() => pagination(total.value));
 
 function clearFilters() {
   appliedSettled.value = [];
+  appliedDiscountBp.value = [];
   appliedProtocols.value = [];
   appliedModel.value = null;
   appliedChannel.value = null;
@@ -355,12 +397,25 @@ async function loadDetail(id: number) {
   }
 }
 
-function openDetailWindow(event: MouseEvent, entry: LogEntry) {
-  const existing = windows.value.find((win) => win.payload.entry.id === entry.id);
+function openBillingWindow(event: MouseEvent, entry: LogEntry) {
+  const existing = windows.value.find(
+    (win) => win.payload.type === 'billing' && win.payload.entry.id === entry.id,
+  );
   if (existing) {
     bringToFront(existing.id);
   } else {
-    openWindow(anchorFromEvent(event), { entry });
+    openWindow(anchorFromEvent(event), { type: 'billing', entry });
+  }
+}
+
+function openBodyWindow(event: MouseEvent, entry: LogEntry) {
+  const existing = windows.value.find(
+    (win) => win.payload.type === 'body' && win.payload.entry.id === entry.id,
+  );
+  if (existing) {
+    bringToFront(existing.id);
+  } else {
+    openWindow(anchorFromEvent(event), { type: 'body', entry });
   }
   if (!details.value.has(entry.id)) {
     void loadDetail(entry.id);
@@ -413,6 +468,13 @@ function onFilterToken(tokenName: string) {
             :title="t('logs.settledFilter')"
             :options="settledOptions"
             test-id="logs-settled-filter"
+          />
+          <FacetedFilter
+            v-if="discountOptions.length > 0"
+            v-model="appliedDiscountBp"
+            :title="t('logs.discountFilter')"
+            :options="discountOptions"
+            test-id="logs-discount-filter"
           />
           <FacetedFilter
             v-model="appliedProtocols"
@@ -531,7 +593,7 @@ function onFilterToken(tokenName: string) {
           <TableHead v-if="visible.token">{{ t('logs.token') }}</TableHead>
           <TableHead v-if="visible.model">{{ t('logs.model') }}</TableHead>
           <TableHead v-if="visible.channel">{{ t('logs.channel') }}</TableHead>
-          <TableHead v-if="visible.inboundProtocol">{{ t('logs.inboundProtocol') }}</TableHead>
+          <TableHead v-if="visible.inboundProtocol">{{ t('logs.requestProtocol') }}</TableHead>
           <TableHead v-if="visible.tokens" class="w-28" :aria-sort="ariaSort('tokens')">
             <DataTableColumnHeader
               :label="t('logs.tokens')"
@@ -559,6 +621,9 @@ function onFilterToken(tokenName: string) {
               @clear="onClearSort"
             />
           </TableHead>
+          <TableHead v-if="visible.cacheHit" class="w-24">
+            {{ t('logs.cacheHitShort') }}
+          </TableHead>
           <TableHead v-if="visible.cost" class="w-28" :aria-sort="ariaSort('cost')">
             <DataTableColumnHeader
               :label="t('logs.cost')"
@@ -568,7 +633,13 @@ function onFilterToken(tokenName: string) {
               @clear="onClearSort"
             />
           </TableHead>
-          <TableHead align="center">{{ t('common.actions') }}</TableHead>
+          <TableHead v-if="visible.settled" class="w-20">
+            {{ t('logs.settled') }}
+          </TableHead>
+          <TableHead align="center" class="w-20">{{ t('logs.billingDetail') }}</TableHead>
+          <TableHead v-if="visible.body" align="center" class="w-20">{{
+            t('logs.bodyDetail')
+          }}</TableHead>
         </TableRow>
       </TableHeader>
 
@@ -582,7 +653,8 @@ function onFilterToken(tokenName: string) {
             :visible="rowVisible"
             :active="activeLogIds.has(entry.id)"
             :channel-protocol-map="channelProtocolMap"
-            @open-detail="openDetailWindow"
+            @open-billing="openBillingWindow"
+            @open-body="openBodyWindow"
             @filter-model="onFilterModel"
             @filter-channel="onFilterChannel"
             @filter-token="onFilterToken"
@@ -614,10 +686,8 @@ function onFilterToken(tokenName: string) {
 
     <template v-for="(win, index) in windows" :key="win.id">
       <RequestLogDetailWindow
+        v-if="win.payload.type === 'billing'"
         :entry="win.payload.entry"
-        :detail="details.get(win.payload.entry.id) ?? null"
-        :detail-loading="detailLoading.has(win.payload.entry.id)"
-        :detail-error="detailErrors.get(win.payload.entry.id) ?? ''"
         :closing="closingId === win.payload.entry.id"
         :can-settle="canSettleLogs"
         :channel-protocol-map="channelProtocolMap"
@@ -633,6 +703,21 @@ function onFilterToken(tokenName: string) {
         @filter-model="onFilterModel"
         @filter-channel="onFilterChannel"
         @filter-token="onFilterToken"
+      />
+      <RequestLogBodyWindow
+        v-else-if="win.payload.type === 'body'"
+        :entry="win.payload.entry"
+        :detail="details.get(win.payload.entry.id) ?? null"
+        :detail-loading="detailLoading.has(win.payload.entry.id)"
+        :detail-error="detailErrors.get(win.payload.entry.id) ?? ''"
+        :channel-protocol-map="channelProtocolMap"
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
         @retry-detail="loadDetail(win.payload.entry.id)"
       />
     </template>

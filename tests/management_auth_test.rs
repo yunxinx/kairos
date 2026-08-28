@@ -37,6 +37,71 @@ async fn bearer_json(
         .expect("管理请求应可达")
 }
 
+async fn create_user(gw: &TestGateway, email: &str, rate_limit_rpm: Option<u64>) -> i64 {
+    let response = bearer_json(
+        gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": email,
+            "display_name": email,
+            "password": "password1",
+            "role": "user",
+            "rate_limit_rpm": rate_limit_rpm
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response.json::<Value>().await.expect("用户响应应可解析")["id"]
+        .as_i64()
+        .expect("应有用户 id")
+}
+
+async fn login_user(gw: &TestGateway, email: &str) -> String {
+    let response = reqwest::Client::new()
+        .post(admin_url(gw, "/login"))
+        .json(&json!({ "email": email, "password": "password1" }))
+        .send()
+        .await
+        .expect("用户登录应可达");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json::<Value>().await.expect("登录响应应可解析")["token"]
+        .as_str()
+        .expect("应有会话令牌")
+        .to_string()
+}
+
+async fn create_user_token(gw: &TestGateway, session: &str, name: &str) -> String {
+    let response = bearer_json(
+        gw,
+        session,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({
+            "name": name,
+            "model_group": "default",
+            "rate_limit_rpm": 0,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    response.json::<Value>().await.expect("令牌响应应可解析")["token_key"]
+        .as_str()
+        .expect("应有令牌 key")
+        .to_string()
+}
+
+async fn list_models(base_url: &str, token_key: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(format!("{base_url}/v1/models"))
+        .bearer_auth(token_key)
+        .send()
+        .await
+        .expect("模型列表请求应可达")
+}
+
 /// 播种后的 root 可用邮箱密码换会话；错密码失败；登出后会话失效。
 #[tokio::test]
 async fn seeded_root_can_login_and_logout() {
@@ -478,8 +543,8 @@ async fn user_rate_limit_and_stats_roundtrip() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 10_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "management-balance-1", "delta_usd_micros": 10_000_000, "reason": "manual_adjustment" }),
     )
     .await;
     assert_eq!(recharge.status(), StatusCode::OK);
@@ -713,8 +778,8 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
         &gw,
         &gw.session,
         reqwest::Method::POST,
-        &format!("/users/{user_id}/balance"),
-        json!({ "delta_usd_micros": 10_000_000 }),
+        &format!("/users/{user_id}/balance-adjustments"),
+        json!({ "operation_id": "management-balance-2", "delta_usd_micros": 10_000_000, "reason": "manual_adjustment" }),
     )
     .await;
 
@@ -775,4 +840,367 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
         StatusCode::TOO_MANY_REQUESTS,
         "用户级 RPM 是名下所有令牌合计的硬性上限"
     );
+}
+
+/// 用户未填 RPM 时跟随套餐默认值；套餐共享桶跨用户生效，且用户桶拒绝不偷占套餐额度。
+#[tokio::test]
+async fn plan_default_and_shared_rpm_apply_to_protocol_requests() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let default_user_email = "plan-default-rpm@example.com";
+    let explicit_user_email = "plan-explicit-rpm@example.com";
+    let cross_user_email = "plan-cross-user-rpm@example.com";
+    let _default_user_id = create_user(&gw, default_user_email, None).await;
+    let _explicit_user_id = create_user(&gw, explicit_user_email, Some(10)).await;
+    let _cross_user_id = create_user(&gw, cross_user_email, Some(10)).await;
+
+    let default_session = login_user(&gw, default_user_email).await;
+    let explicit_session = login_user(&gw, explicit_user_email).await;
+    let cross_session = login_user(&gw, cross_user_email).await;
+    let default_token_a = create_user_token(&gw, &default_session, "default-a").await;
+    let default_token_b = create_user_token(&gw, &default_session, "default-b").await;
+    let explicit_token_a = create_user_token(&gw, &explicit_session, "explicit-a").await;
+    let cross_user_token = create_user_token(&gw, &cross_session, "cross-user").await;
+
+    // 默认用户桶为 1，套餐共享桶为 3；系统兜底保持默认的 0。
+    sqlx::query("UPDATE plans SET default_rpm = 1, shared_rpm = 3 WHERE id = 1")
+        .execute(&gw.pool)
+        .await
+        .expect("应能设置测试套餐 RPM");
+    let protocol_base = gw.spawn_reloaded_protocol().await;
+
+    assert_eq!(
+        list_models(&protocol_base, &default_token_a).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_models(&protocol_base, &default_token_b).await.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "用户未填值时应跟随套餐默认 RPM"
+    );
+
+    // 上一个用户级拒绝不能记入套餐桶，否则这里第二次请求会被共享桶提前拒绝。
+    assert_eq!(
+        list_models(&protocol_base, &explicit_token_a)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        list_models(&protocol_base, &explicit_token_a)
+            .await
+            .status(),
+        StatusCode::OK,
+        "用户显式 RPM 应覆盖套餐默认值"
+    );
+    let plan_limited = list_models(&protocol_base, &cross_user_token).await;
+    assert_eq!(
+        plan_limited.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "同档用户合计达到共享 RPM 后应返回 429"
+    );
+    assert!(
+        plan_limited.headers().get("retry-after").is_some(),
+        "套餐桶超限应带 Retry-After"
+    );
+}
+
+/// 套餐能力按请求从库解析：开关只能收窄 admin，不能突破 root-only 路由或角色层级。
+#[tokio::test]
+async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let created = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "capability-admin@example.com",
+            "display_name": "能力管理员",
+            "password": "password1",
+            "role": "admin"
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let admin_id = created.json::<Value>().await.expect("管理员应可解析")["id"]
+        .as_i64()
+        .expect("应有管理员 id");
+    let admin_token = login_user(&gw, "capability-admin@example.com").await;
+
+    // 内置 admin 档默认开启六项能力；同一会话不需要重新登录。
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/logs").await.status(),
+        StatusCode::OK
+    );
+
+    // 创建用户时显式挂载非默认套餐也属于套餐分配，不能只凭 ManageUsers 绕过 AssignPlan。
+    let custom_plan = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/plans",
+        json!({
+            "display_name": "显式分配校验",
+            "shared_with_admin": true
+        }),
+    )
+    .await;
+    assert_eq!(custom_plan.status(), StatusCode::CREATED);
+    let custom_plan_id = custom_plan.json::<Value>().await.expect("套餐应可解析")["id"]
+        .as_i64()
+        .expect("套餐应有 id");
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind("{\"manage_users\":true}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能只打开用户管理能力");
+    let explicit_assignment = bearer_json(
+        &gw,
+        &admin_token,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "explicit-assignment-check@example.com",
+            "display_name": "显式分配校验",
+            "password": "password1",
+            "role": "user",
+            "plan_id": custom_plan_id
+        }),
+    )
+    .await;
+    assert_eq!(explicit_assignment.status(), StatusCode::FORBIDDEN);
+
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind("{}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能关闭能力");
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::FORBIDDEN,
+        "关闭能力后已有会话也应立即失效"
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/logs").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/stats").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    for path in [
+        "/channels/summary",
+        "/prices",
+        "/model-groups",
+        "/unified-models",
+        "/channel-model-orders",
+    ] {
+        assert_eq!(
+            bearer_get(&gw, &admin_token, path).await.status(),
+            StatusCode::OK,
+            "零能力管理员仍应可读模型运营资源: {path}"
+        );
+    }
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::POST,
+            "/model-groups",
+            json!({"name": "forbidden-write", "models": []}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::DELETE,
+            "/model-groups",
+            json!({"targets": ["default"]}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::PUT,
+            "/channel-model-orders/gpt-4o",
+            json!({"model": "gpt-4o", "channel_ids": []}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::DELETE,
+            "/channel-models",
+            json!({"targets": [{"channel_id": 1, "model": "gpt-4o"}]}),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // 只打开改价时，admin 能写价格，但完整模型资源仍按管理员角色只读可见。
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind("{\"edit_prices\":true}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能打开改价");
+    let prices = bearer_get(&gw, &admin_token, "/prices").await;
+    assert_eq!(prices.status(), StatusCode::OK);
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/model-groups")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let prices_body: Value = prices.json().await.expect("价格列表应可解析");
+    let price = prices_body[0].clone();
+    let channel_id = price["channel_id"].as_i64().expect("应有渠道 id");
+    let model = price["model"].as_str().expect("应有模型名");
+    let changed_price = bearer_json(
+        &gw,
+        &admin_token,
+        reqwest::Method::PUT,
+        &format!("/prices/{channel_id}/{model}"),
+        json!({
+            "channel_id": channel_id,
+            "model": model,
+            "input_micros": price["input_micros"].as_i64().expect("input"),
+            "output_micros": price["output_micros"].as_i64().expect("output"),
+            "cache_read_micros": price["cache_read_micros"],
+            "cache_write_micros": price["cache_write_micros"]
+        }),
+    )
+    .await;
+    assert_eq!(changed_price.status(), StatusCode::OK);
+
+    // 即使把所有套餐开关打开，admin 仍不能碰 root-only 资源或管理 root/admin。
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
+        .bind(
+            "{\"manage_users\":true,\"assign_plan\":true,\"view_logs_stats\":true,\
+             \"settle_waive\":true,\"toggle_user_tokens\":true,\"view_own_plan_groups\":true,\
+             \"view_other_groups\":true,\"edit_prices\":true,\"edit_model_groups\":true,\
+             \"edit_unified_models\":true,\"edit_price_catalog\":true}",
+        )
+        .execute(&gw.pool)
+        .await
+        .expect("应能打开全部开关");
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/channels").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    // 完整定义仍 root-only，但名录必须可读：模型页要靠它判断某个已登记名挂在哪条
+    // 渠道、渠道还在不在。缺这一条时前端渠道表为空，会把「看不到」画成「已失效」。
+    let summary = bearer_get(&gw, &admin_token, "/channels/summary").await;
+    assert_eq!(summary.status(), StatusCode::OK);
+    let listed: Value = summary.json().await.expect("名录应可解析");
+    let first = &listed.as_array().expect("名录应为数组")[0];
+    assert!(first["name"].is_string(), "名录应给出渠道名");
+    assert!(first["models"].is_array(), "名录应给出可调用名");
+    assert!(
+        first.get("keys").is_none() && first.get("base_url").is_none(),
+        "名录不得泄露密钥与出站地址，实际 {first}"
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/settings").await.status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        bearer_get(&gw, &admin_token, &format!("/users/{admin_id}"))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "能力开关不能让 admin 读取 admin 账号"
+    );
+    assert_eq!(
+        bearer_json(
+            &gw,
+            &admin_token,
+            reqwest::Method::PUT,
+            "/plans/2",
+            json!({
+                "display_name": "admin",
+                "groups": []
+            }),
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN,
+        "套餐目录写入仍应由 root-only 路由守住"
+    );
+    assert_eq!(
+        bearer_get(&gw, &gw.session, "/channels").await.status(),
+        StatusCode::OK,
+        "root 不受套餐开关约束"
+    );
+    assert_eq!(
+        bearer_get(&gw, &gw.session, "/settings").await.status(),
+        StatusCode::OK
+    );
+}
+
+/// 旁路写入造成跨受众脏绑定时，认证层按最小权限运行，不能采纳错误套餐的管理员能力。
+#[tokio::test]
+async fn cross_audience_plan_binding_cannot_grant_management_capabilities() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let created = bearer_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "cross-audience-admin@example.com",
+            "display_name": "跨受众管理员",
+            "password": "password1",
+            "role": "admin"
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let admin_id = created.json::<Value>().await.expect("管理员应可解析")["id"]
+        .as_i64()
+        .expect("应有管理员 id");
+    let admin_token = login_user(&gw, "cross-audience-admin@example.com").await;
+
+    sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 1")
+        .bind("{\"manage_users\":true}")
+        .execute(&gw.pool)
+        .await
+        .expect("应能构造带管理能力的 user 受众套餐");
+    sqlx::query("UPDATE users SET plan_id = 1 WHERE id = ?")
+        .bind(admin_id)
+        .execute(&gw.pool)
+        .await
+        .expect("应能构造跨受众脏绑定");
+
+    assert_eq!(
+        bearer_get(&gw, &admin_token, "/users").await.status(),
+        StatusCode::FORBIDDEN,
+        "admin 不能继承 user 受众套餐中的 manage_users"
+    );
+    let me = bearer_get(&gw, &admin_token, "/me").await;
+    assert_eq!(me.status(), StatusCode::OK);
+    let me: Value = me.json().await.expect("me 应可解析");
+    assert_eq!(me["capabilities"]["manage_users"], false);
 }

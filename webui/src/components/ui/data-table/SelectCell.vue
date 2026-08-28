@@ -4,10 +4,15 @@ import { useI18n } from 'vue-i18n';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import TableCell from '@/components/ui/table/TableCell.vue';
 
-defineProps<{
-  checked: boolean;
-  testId: string;
-}>();
+withDefaults(
+  defineProps<{
+    checked: boolean;
+    testId: string;
+    /** 该行不可选（如内置档不可删）：复选框置灰且不响应点击。 */
+    disabled?: boolean;
+  }>(),
+  { disabled: false },
+);
 
 const emit = defineEmits<{
   toggle: [];
@@ -21,6 +26,7 @@ const { t } = useI18n();
     <div class="flex items-center justify-center">
       <Checkbox
         :model-value="checked"
+        :disabled="disabled"
         :data-testid="testId"
         :aria-label="t('common.selectRow')"
         @update:model-value="() => emit('toggle')"

@@ -21,7 +21,8 @@
     "logs": "日志",
     "users": "用户",
     "account": "账户",
-    "logout": "退出"
+    "logout": "退出",
+    "plans": "套餐"
   },
   "auth": {
     "loginTitle": "Kairos",
@@ -115,7 +116,10 @@
     "filterEmpty": "没有匹配项",
     "emptyCell": "—",
     "increment": "增加",
-    "decrement": "减少"
+    "decrement": "减少",
+    "yes": "是",
+    "no": "否",
+    "saving": "保存中..."
   },
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
@@ -132,21 +136,27 @@
     "namePlaceholder": "例如：移动端",
     "enabled": "启用",
     "enabledGuide": "禁用后，使用该 key 的请求会被立即拒绝。",
-    "limit": "累计结算上限（美元）",
-    "limitGuide": "留空表示无累计上限。金额最多六位小数。",
+    "initialBalance": "初始余额",
+    "initialBalanceGuide": "留空表示无限额；创建后请从令牌行单独调整余额。",
+    "adjustBalance": "调整余额",
+    "balanceTitle": "调整「{name}」的余额",
+    "balanceMode": "余额模式",
+    "finite": "有限额",
+    "currentBalance": "当前余额",
+    "adjustmentAmount": "本次调整额",
+    "expectedBalance": "预计余额",
+    "balanceUpdated": "令牌余额已更新",
     "rateLimitRpm": "每分钟请求上限",
     "rateLimitRpmGuide": "留空跟随全局兜底。0 表示该令牌不限速；填正数可以高于全局上限。",
-    "quota": "累计结算",
-    "quotaUsage": "已结算 {settled} / 上限 {limit}",
-    "quotaUnlimitedUsage": "已结算 {settled} · 无累计上限",
+    "quota": "余额",
+    "quotaUsage": "已用 {settled} / 上限 {limit}",
+    "quotaUnlimitedUsage": "已用 {settled} · 不设上限",
     "status": "状态",
     "statusEnabled": "启用",
     "statusDisabled": "禁用",
     "createdAt": "创建时间",
     "lastUsedAt": "最后使用时间",
     "neverUsed": "从未使用",
-    "amountGuide": "填要调整的金额，可为负；也可点快捷档位累加。右侧显示调整后的预计余额。允许调成负数（透支）。",
-    "balanceSection": "余额调整（差额）",
     "quickIncrease": "充值 {amount}",
     "quickDecrease": "扣减 {amount}",
     "quickCancel": "取消",
@@ -159,9 +169,7 @@
     "deleteTitle": "删除令牌",
     "deleteMessage": "确定删除令牌「{name}」？删除后不可恢复。",
     "bulkDeleteTitle": "删除令牌",
-    "bulkDeleteMessage": "确定删除选中的 {count} 枚令牌？删除后不可恢复。",
-    "wallet": "钱包",
-    "walletGuide": "钱包记在所属用户上，该用户名下所有令牌共用这一笔余额。充值在用户管理页。"
+    "bulkDeleteMessage": "确定删除选中的 {count} 枚令牌？删除后不可恢复。"
   },
   "users": {
     "profile": "基本资料",
@@ -193,10 +201,12 @@
     "statusDisabled": "停用",
     "balance": "余额",
     "groups": "模型组",
-    "recharge": "充值",
-    "rechargeTitle": "给 {name} 充值",
-    "rechargeAmount": "金额（美元）",
-    "rechargeGuide": "正数入账，负数扣减。最多六位小数。",
+    "recharge": "余额",
+    "rechargeTitle": "调整 {name} 的余额",
+    "rechargeAmount": "调整额（美元）",
+    "rechargeSection": "余额调整",
+    "rechargeGuide": "输入本次增加或扣减的金额；负数表示扣减。",
+    "rechargeReset": "清空",
     "currentBalance": "当前余额",
     "quickIncrease": "+{amount} 美元",
     "quickDecrease": "-{amount} 美元",
@@ -213,7 +223,7 @@
     "manageTitle": "{name}",
     "manageTabs": "用户管理",
     "updateSuccess": "用户资料已更新",
-    "rechargeSuccess": "充值成功",
+    "rechargeSuccess": "余额调整成功",
     "delete": "归档",
     "deleteTitle": "归档用户",
     "deleteMessage": "确定归档用户「{name}」？账号停用、名下令牌立即失效；历史消费记录保留，原邮箱可重新注册。",
@@ -223,7 +233,10 @@
     "groupsUnrestricted": "不受可用组限制",
     "groupsUnrestrictedHint": "root 与 admin 的令牌可调用全部模型组，可用组名单仅对普通用户生效。",
     "groupsRemoveWarning": "将移除 {groups} 个可用组，绑定在这些组上的 {tokens} 把令牌将立即失效。",
-    "groupsRemoveUnknown": "将移除 {groups} 个可用组；绑定令牌数未知，相关令牌可能立即失效。"
+    "groupsRemoveUnknown": "将移除 {groups} 个可用组；绑定令牌数未知，相关令牌可能立即失效。",
+    "plan": "套餐",
+    "planGuide": "新用户会获得该套餐的模型组、折扣率、默认限速与起步金。",
+    "currentPlan": "当前套餐"
   },
   "account": {
     "profile": "基本资料",
@@ -235,6 +248,8 @@
     "displayName": "名称",
     "showNavAvatar": "显示右上角头像",
     "showNavAvatarGuide": "在顶部导航栏右上角的用户徽标中显示头像缩略图。",
+    "showNavName": "显示右上角名称",
+    "showNavNameGuide": "在顶部导航栏右上角的用户菜单按钮中显示名称。",
     "changeAvatar": "更换头像",
     "removeAvatar": "移除头像",
     "invalidImage": "请选择有效的图片文件",
@@ -257,7 +272,9 @@
     "registeredAt": "注册时间",
     "lastLoginAt": "上次登录",
     "emailChangePassword": "当前密码",
-    "emailChangePasswordGuide": "邮箱是登录标识，修改时需要提供当前密码验证身份。"
+    "emailChangePasswordGuide": "邮箱是登录标识，修改时需要提供当前密码验证身份。",
+    "plan": "套餐",
+    "discount": "折扣率"
   },
   "time": {
     "secondsAgo": "{seconds} 秒前",
@@ -363,7 +380,21 @@
     "deleteTitle": "删除渠道",
     "deleteMessage": "确定删除渠道「{name}」？删除后不可恢复。",
     "bulkDeleteTitle": "删除渠道",
-    "bulkDeleteMessage": "确定删除选中的 {count} 条渠道？删除后不可恢复。"
+    "bulkDeleteMessage": "确定删除选中的 {count} 条渠道？删除后不可恢复。",
+    "keyCount": "密钥",
+    "keysTitle": "上游密钥",
+    "addKey": "添加密钥",
+    "removeKey": "移除密钥 {name}",
+    "keyLabel": "密钥 {n}",
+    "keyName": "名称",
+    "keyNameDuplicate": "同一渠道内的密钥名称必须唯一",
+    "keyWeight": "权重",
+    "keyModels": "模型白名单",
+    "keyModelsGuide": "可选。该密钥允许服务的模型 ID，英文逗号分隔。",
+    "keyModelsPlaceholder": "例如：gpt-4o, claude-sonnet-4",
+    "keyBlockedModels": "模型黑名单",
+    "keyBlockedModelsGuide": "可选。该密钥禁止服务的模型 ID，英文逗号分隔。",
+    "keyBlockedModelsPlaceholder": "例如：expensive-model"
   },
   "pricing": {
     "createEntry": "添加价格",
@@ -486,7 +517,25 @@
     "visibleEmpty": "该组当前列表为空。",
     "visibleOrder": "请求路由",
     "visibleHidden": "已从列表隐藏",
-    "visibleUnbound": "default（未绑定）"
+    "visibleUnbound": "default（未绑定）",
+    "myLead": "你的令牌能调用的模型，按可用模型组分段。请求里的 model 直接填这里的名字。",
+    "myEmpty": "当前没有可调用的模型",
+    "myEmptyHint": "你的套餐还没有可用的模型组，或组里暂时没有已定价的模型。可以联系管理员。",
+    "mySearchEmpty": "没有匹配的模型",
+    "myPriceUnit": "每 1M tokens",
+    "myPriceInput": "输入",
+    "myPriceOutput": "输出",
+    "myPriceCacheRead": "缓存读",
+    "myPriceCacheWrite": "缓存写",
+    "myDiscount": "折后 {rate}",
+    "myDiscountHint": "下表单价均为你的套餐折扣（{rate}）后的实收价。",
+    "myUncallable": "暂不可用",
+    "myUncallableHint": "该名字当前没有已启用且已定价的渠道，请求会被拒绝。",
+    "tabOrder": "同名渠道顺序",
+    "orderChannels": "路由顺序",
+    "orderSave": "保存顺序",
+    "orderDragHandle": "拖拽调整渠道顺序",
+    "orderEmpty": "还没有同时出现在至少两条渠道上的可调用名。"
   },
   "settings": {
     "sections": "设置分类",
@@ -558,11 +607,12 @@
     "kinds": "日志类型",
     "kind": {
       "request": "请求日志",
-      "system": "系统日志"
+      "system": "系统日志",
+      "ownAudit": "我的操作记录"
     },
     "search": "搜索",
     "searchPlaceholder": "令牌 / 名称 / 模型 / 渠道",
-    "systemSearchPlaceholder": "目标 / 消息",
+    "systemSearchPlaceholder": "操作行为 / 消息",
     "settledFilter": "结算",
     "settledYes": "已结算",
     "settledNo": "未结算",
@@ -576,14 +626,14 @@
     "settleGuide": "按该行费用扣减所属用户钱包，允许透支。",
     "waiveGuide": "只把该行标为已结算，不改余额。",
     "levelFilter": "级别",
-    "targetFilter": "目标",
+    "targetFilter": "操作行为",
     "levels": {
       "error": "错误",
       "warn": "警告",
       "info": "信息"
     },
     "level": "级别",
-    "target": "目标",
+    "target": "操作行为",
     "message": "消息",
     "model": "模型",
     "outboundModel": "出站模型",
@@ -591,19 +641,42 @@
     "created": "时间",
     "token": "令牌",
     "channel": "渠道",
-    "inboundProtocol": "入站协议",
+    "inboundProtocol": "请求协议",
+    "requestProtocol": "请求协议",
+    "protoIn": "入",
+    "protoOut": "出",
     "status": "状态码",
     "latency": "耗时",
     "latencyAndSpeed": "耗时与速率",
     "cache": "缓存",
+    "cacheHit": "缓存命中率",
+    "cacheHitRate": "缓存命中率",
+    "cacheHitShort": "命中率",
     "cacheReadShort": "读",
     "cacheWriteShort": "写",
     "cost": "费用",
     "expand": "详情",
     "expandDetails": "查看请求与响应 body",
     "collapseDetails": "收起请求与响应 body",
+    "billingDetail": "计费详情",
+    "viewBilling": "查看计费详情",
+    "billingTitle": "计费详情",
+    "basicInfo": "基础信息",
+    "bodyDetail": "报文",
+    "viewBody": "查看请求与响应报文",
+    "bodyTitle": "请求与响应报文",
     "requestBody": "请求",
     "responseBody": "响应",
+    "assistantResponse": "模型响应",
+    "sseStream": "流式响应",
+    "finishReason": "结束原因",
+    "callId": "调用标识",
+    "roles": {
+      "system": "系统",
+      "user": "用户",
+      "assistant": "模型",
+      "tool": "工具"
+    },
     "bodyEmpty": "未记录 body。",
     "bodyLoading": "正在加载 body…",
     "bodyBinary": "二进制内容（{bytes} 字节）已隐藏，避免不安全展示。",
@@ -651,7 +724,79 @@
     "routeFlow": "路由映射",
     "actor": "操作者",
     "actorSystem": "系统",
-    "actorFilter": "只看该操作者"
+    "actorFilter": "只看该操作者",
+    "discountFilter": "折扣率",
+    "baseTotal": "原价合计",
+    "discountRate": "折扣率",
+    "chargedTotal": "实收合计",
+    "eventValues": {
+      "archivedSuffix": "（已归档）",
+      "changeSeparator": "；"
+    },
+    "events": {
+      "auth": {
+        "login_failed": "登录失败：{email}（IP：{ip}）",
+        "login_succeeded": "登录成功（IP：{ip}）",
+        "session_cleanup_failed": "管理会话定时清理失败：{error}"
+      },
+      "billing": {
+        "log_charged": "补扣未结算日志 {log_id}（用户 {user_id}，{cost_usd_micros}）",
+        "log_waived": "豁免未结算日志 {log_id}（用户 {user_id}，{cost_usd_micros}）",
+        "user_balance_adjusted": "调整用户 {user_id}（{email}）余额 {delta_usd_micros}（{before_usd_micros} → {after_usd_micros}）{archived_suffix}",
+        "token_balance_adjusted": "调整令牌 {token_id}（{token_name}）余额 {delta_usd_micros}（{before_usd_micros} → {after_usd_micros}）",
+        "token_balance_set_finite": "令牌 {token_id}（{token_name}）从无限额切换为有限额，初始余额 {delta_usd_micros}",
+        "token_balance_set_unlimited": "令牌 {token_id}（{token_name}）切换为无限额",
+        "initial_grant_credited": "按套餐 {plan_name} 向用户 {user_id}（{email}）入账起步金 {amount_usd_micros}",
+        "usage_missing": "上游未回报 usage，本次按零计费（token={token_name}，model={model}，channel={channel}）",
+        "calculation_failed": "费用计算失败，已拒绝返回成功响应：{error}",
+        "admission_calculation_failed": "准入费用计算失败，已拒绝出站：{error}"
+      },
+      "catalog": {
+        "sync_failed": "价格目录定时同步失败：{error}"
+      },
+      "channel_model_orders": {
+        "updated": "调整可调用名 {model} 的渠道顺序：{channel_ids_label}"
+      },
+      "channels": {
+        "created": "创建渠道 {channel_id}（{name}），协议 {protocol}，地址 {base_url}",
+        "updated": "修改渠道 {channel_id}（{previous_name} → {name}），状态 {enabled_label}，地址 {base_url}",
+        "deleted": "删除渠道 {channel_id}（{name}）",
+        "bulk_deleted": "批量删除 {count} 条渠道",
+        "models_bulk_removed": "批量移除 {count} 条渠道模型清单项"
+      },
+      "logs": {
+        "cleaned": "清理日志：删除 {removed_request_logs} 条已结算请求日志与 {removed_system_logs} 条系统日志（早于 {older_than_days} 天）",
+        "wal_checkpoint_failed": "清理后 WAL 收尾失败：{error}"
+      },
+      "plans": {
+        "created": "创建套餐 {plan_id}（{name}）",
+        "updated": "修改套餐 {plan_id}（{name}）",
+        "default_set": "把套餐 {plan_id}（{name}）设为默认档",
+        "deleted": "删除套餐 {plan_id}（{name}）",
+        "force_deleted": "强制删除套餐 {plan_id}（{name}）",
+        "bulk_deleted": "批量删除 {count} 个套餐",
+        "bulk_force_deleted": "批量强制删除 {count} 个套餐"
+      },
+      "request_log": {
+        "token_last_used_update_failed": "刷新令牌最后使用时间失败：{error}",
+        "unsettled": "请求仍未结算：{reason}",
+        "fallback_write_failed": "请求仍未结算且回退日志写入失败：{reason}；{error}"
+      },
+      "settings": {
+        "updated": "修改运行时设置：{changes_label}"
+      },
+      "tokens": {
+        "enabled_changed": "修改用户 {user_id} 的令牌 {token_id}（{token_name}）状态：{before_enabled_label} → {enabled_label}"
+      },
+      "users": {
+        "self_updated": "用户 {user_id}（{email}）修改自己的账户",
+        "created": "创建用户 {user_id}（{email}），角色 {role}",
+        "updated": "修改用户 {user_id}（{email}）",
+        "archived": "归档用户 {user_id}（{email}）：停用账号、令牌与会话",
+        "bulk_archived": "批量归档 {count} 个用户",
+        "plan_assigned": "用户 {user_id}（{email}）换套餐 {plan_id}（{plan_name}）"
+      }
+    }
   },
   "a11y": {
     "skipToContent": "跳到主内容",
@@ -683,5 +828,67 @@
     "routeErrorTitle": "页面加载失败",
     "routeErrorDescription": "当前页面未能完成加载。你可以重试，或返回安全页面。",
     "goHome": "返回首页"
+  },
+  "plans": {
+    "create": "创建套餐",
+    "createUser": "创建用户套餐",
+    "createAdmin": "创建管理员套餐",
+    "editorCreate": "新建套餐",
+    "editorEdit": "编辑套餐",
+    "editorCreateOf": "新建{audience}",
+    "editorEditOf": "编辑{audience}",
+    "search": "搜索显示名、备注或模型组",
+    "attributes": "属性",
+    "audience": "受众",
+    "audienceUser": "用户套餐",
+    "audienceAdmin": "管理员套餐",
+    "isDefault": "设为默认档",
+    "isDefaultGuideUser": "新建普通用户时默认挂这一档；每种受众只能有一个默认档。",
+    "isDefaultGuideAdmin": "新建管理员时默认挂这一档；每种受众只能有一个默认档。",
+    "defaultBadge": "默认",
+    "setDefault": "设为默认档",
+    "groupSearch": "搜索模型组",
+    "groupSearchEmpty": "没有匹配的模型组。",
+    "groupsSelected": "已选 {count} 个",
+    "displayName": "显示名",
+    "note": "备注",
+    "noteVisible": "管理员可见备注",
+    "discount": "折扣率",
+    "discountPercent": "折扣率（%）",
+    "discountGuide": "100 表示原价，80 表示八折；也可填 0.8 表示八折，1.2 表示加价 20%。",
+    "defaultRpm": "默认 RPM",
+    "defaultRpmGuide": "留空表示跟随系统兜底。",
+    "sharedRpm": "共享 RPM",
+    "sharedRpmGuide": "挂在该档的所有用户合计上限；留空表示不限制。",
+    "initialGrant": "起步金（美元）",
+    "initialGrantGuide": "仅新建用户时按此金额入账一次。",
+    "modelGroups": "模型组名单",
+    "noModelGroups": "还没有模型组。",
+    "capabilities": {
+      "manage_users": "管理普通用户",
+      "assign_plan": "给用户换套餐",
+      "view_logs_stats": "查看日志与统计",
+      "settle_waive": "补扣与豁免",
+      "toggle_user_tokens": "启停普通用户令牌",
+      "view_own_plan_groups": "只读本档模型组",
+      "view_other_groups": "查看本档以外模型组",
+      "edit_prices": "改价",
+      "edit_model_groups": "编辑模型组",
+      "edit_unified_models": "编辑统一模型",
+      "edit_price_catalog": "编辑价格目录"
+    },
+    "sharedWithAdmin": "分享给管理员",
+    "sharedWithAdminGuide": "开启后管理员可把该档赋给普通用户；配方仍只由 root 编辑。",
+    "share": "分享",
+    "builtin": "内置",
+    "groupsCount": "模型组数",
+    "createdAt": "创建时间",
+    "currentPlan": "当前套餐",
+    "empty": "还没有套餐",
+    "deleteTitle": "删除套餐",
+    "deleteMessage": "确定删除套餐「{name}」？挂在该档的用户将自动改挂当前对应受众的默认套餐。",
+    "bulkDeleteTitle": "删除套餐",
+    "bulkDeleteMessage": "确定删除选中的 {count} 个套餐？挂在这些档的用户将自动改挂当前对应受众的默认套餐。",
+    "capabilitiesTitle": "管理面能力开关"
   }
 }

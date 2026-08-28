@@ -12,6 +12,9 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::config::Protocol;
 use crate::store::StoreError;
+pub use crate::store::channel_keys::{
+    ChannelKey, StoredChannelKey, channel_key_supports_model, select_channel_key,
+};
 
 /// 内置模型组名：未指定分组的令牌与未放入其他组的可调用名落在此组。
 pub const DEFAULT_MODEL_GROUP: &str = "default";
@@ -40,11 +43,10 @@ pub struct Channel {
     pub name: String,
     pub protocol: Protocol,
     pub base_url: String,
-    pub api_key: String,
+    /// 该上游端点可用的账户密钥。
+    pub keys: Vec<ChannelKey>,
     pub models: Vec<String>,
     pub model_aliases: HashMap<String, String>,
-    pub priority: u32,
-    pub weight: u32,
     pub timeout_ms: u64,
     pub max_retries: u32,
     /// 是否启用：禁用的渠道不参与路由候选与失败切换。
@@ -62,6 +64,17 @@ pub struct ChannelRecord {
     /// 库生成的稳定身份；管理 API 以此定位渠道，改名不改变 id。
     pub id: i64,
     pub channel: Channel,
+    pub keys: Vec<StoredChannelKey>,
+}
+
+/// 某一可调用名的显式渠道尝试顺序。
+///
+/// 缺少行的渠道不从这里筛掉，而是在路由时排到全部显式行之后，按渠道 id 兜底。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelModelOrder {
+    pub model: String,
+    pub channel_id: i64,
+    pub position: i64,
 }
 
 /// 令牌：下游调用凭证。钱包在所属用户上；本行只保留定义与累计结算上限。
@@ -83,6 +96,15 @@ pub struct Token {
     /// 所属管理用户。缺省 [`ROOT_USER_ID`]。
     #[serde(default = "default_token_user_id")]
     pub user_id: i64,
+}
+
+/// 令牌可编辑属性；密钥、归属与累计消费上限不在通用更新契约中。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenAttributes {
+    pub name: String,
+    pub rate_limit_rpm: Option<u64>,
+    pub enabled: bool,
+    pub model_group: String,
 }
 
 /// 模型组：令牌的可调用名允许名单（渠道模型、别名 key、统一模型 ID）。
@@ -527,20 +549,69 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
 
 /// 读出全部渠道记录（含库生成的 `id`）。
 pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT id, name, protocol, base_url, api_key, models_json, model_aliases_json, \
-         priority, weight, timeout_ms, max_retries, enabled, model_group FROM channels",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(StoreError::Query)?;
+    let rows = sqlx::query(CHANNEL_RECORD_SELECT)
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
 
     let mut channels = Vec::with_capacity(rows.len());
     for row in rows {
         channels.push(map_channel_record(&row)?);
     }
-    Ok(channels)
+    attach_channel_keys(channels, list_channel_keys(pool).await?, true)
 }
+
+/// 在调用方已经开启的事务里读出全部渠道记录。
+///
+/// 管理写路径用它把「校验目前的登记候选」与后续替换保持在同一个写事务中，
+/// 避免快照读取和实际提交之间出现渠道定义竞争。
+pub async fn list_channel_records_on_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ChannelRecord>, StoreError> {
+    let rows = sqlx::query(CHANNEL_RECORD_SELECT)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+
+    let mut channels = Vec::with_capacity(rows.len());
+    for row in rows {
+        channels.push(map_channel_record(&row)?);
+    }
+    let key_rows = sqlx::query(
+        "SELECT id, channel_id, name, api_key, weight, enabled, models_json, \
+         blocked_models_json, created_at FROM channel_keys ORDER BY id ASC",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    let keys = key_rows
+        .iter()
+        .map(|row| {
+            let models_json: Option<String> =
+                row.try_get("models_json").map_err(StoreError::Query)?;
+            let blocked_json: Option<String> = row
+                .try_get("blocked_models_json")
+                .map_err(StoreError::Query)?;
+            Ok(StoredChannelKey::new(
+                row.try_get("id").map_err(StoreError::Query)?,
+                row.try_get("channel_id").map_err(StoreError::Query)?,
+                row.try_get("name").map_err(StoreError::Query)?,
+                row.try_get("api_key").map_err(StoreError::Query)?,
+                row.try_get("weight").map_err(StoreError::Query)?,
+                row.try_get::<i64, _>("enabled")
+                    .map_err(StoreError::Query)?
+                    != 0,
+                parse_optional_models(models_json)?,
+                parse_optional_models(blocked_json)?,
+                row.try_get("created_at").map_err(StoreError::Query)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    attach_channel_keys(channels, keys, true)
+}
+
+const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, models_json, \
+    model_aliases_json, timeout_ms, max_retries, enabled, model_group FROM channels";
 
 /// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
@@ -563,9 +634,7 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
         id: row.try_get("id").map_err(StoreError::Query)?,
         channel: Channel {
             base_url: row.try_get("base_url").map_err(StoreError::Query)?,
-            api_key: row.try_get("api_key").map_err(StoreError::Query)?,
-            priority: row.try_get("priority").map_err(StoreError::Query)?,
-            weight: row.try_get("weight").map_err(StoreError::Query)?,
+            keys: Vec::new(),
             timeout_ms: row.try_get("timeout_ms").map_err(StoreError::Query)?,
             max_retries: row.try_get("max_retries").map_err(StoreError::Query)?,
             enabled: enabled != 0,
@@ -575,7 +644,140 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             model_aliases,
             model_group: row.try_get("model_group").map_err(StoreError::Query)?,
         },
+        keys: Vec::new(),
     })
+}
+
+/// 读出全部渠道密钥。
+pub async fn list_channel_keys(pool: &SqlitePool) -> Result<Vec<StoredChannelKey>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, channel_id, name, api_key, weight, enabled, models_json, \
+         blocked_models_json, created_at FROM channel_keys ORDER BY id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    rows.iter()
+        .map(|row| {
+            let models_json: Option<String> =
+                row.try_get("models_json").map_err(StoreError::Query)?;
+            let blocked_json: Option<String> = row
+                .try_get("blocked_models_json")
+                .map_err(StoreError::Query)?;
+            Ok(StoredChannelKey::new(
+                row.try_get("id").map_err(StoreError::Query)?,
+                row.try_get("channel_id").map_err(StoreError::Query)?,
+                row.try_get("name").map_err(StoreError::Query)?,
+                row.try_get("api_key").map_err(StoreError::Query)?,
+                row.try_get("weight").map_err(StoreError::Query)?,
+                row.try_get::<i64, _>("enabled")
+                    .map_err(StoreError::Query)?
+                    != 0,
+                parse_optional_models(models_json)?,
+                parse_optional_models(blocked_json)?,
+                row.try_get("created_at").map_err(StoreError::Query)?,
+            ))
+        })
+        .collect()
+}
+
+fn attach_channel_keys(
+    mut records: Vec<ChannelRecord>,
+    keys: Vec<StoredChannelKey>,
+    include_wire: bool,
+) -> Result<Vec<ChannelRecord>, StoreError> {
+    for key in keys {
+        if let Some(record) = records
+            .iter_mut()
+            .find(|record| record.id == key.channel_id)
+        {
+            if include_wire {
+                record.channel.keys.push(key.to_wire());
+            }
+            record.keys.push(key);
+        }
+    }
+    Ok(records)
+}
+
+/// 运行时快照读取渠道时剥离 wire 明文，避免同一密钥在 `Channel` DTO 与受保护
+/// `StoredChannelKey` 中保留两份；管理面仍从 `ChannelRecord.keys` 按需构造 wire。
+pub async fn list_channel_records_without_secrets(
+    pool: &SqlitePool,
+) -> Result<Vec<ChannelRecord>, StoreError> {
+    let rows = sqlx::query(CHANNEL_RECORD_SELECT)
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    let mut channels = Vec::with_capacity(rows.len());
+    for row in rows {
+        channels.push(map_channel_record(&row)?);
+    }
+    attach_channel_keys(channels, list_channel_keys(pool).await?, false)
+}
+
+fn parse_optional_models(value: Option<String>) -> Result<Option<Vec<String>>, StoreError> {
+    value
+        .map(|json| {
+            serde_json::from_str(&json)
+                .map_err(|_| StoreError::InvalidResource("渠道密钥模型名单非法".to_string()))
+        })
+        .transpose()
+}
+
+/// 读出所有显式同名渠道顺序行，按可调用名、位置、渠道 id 保证稳定顺序。
+pub async fn list_channel_model_orders(
+    pool: &SqlitePool,
+) -> Result<Vec<ChannelModelOrder>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT model, channel_id, position FROM channel_model_order \
+         ORDER BY model ASC, position ASC, channel_id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    rows.iter()
+        .map(|row| {
+            Ok(ChannelModelOrder {
+                model: row.try_get("model").map_err(StoreError::Query)?,
+                channel_id: row.try_get("channel_id").map_err(StoreError::Query)?,
+                position: row.try_get("position").map_err(StoreError::Query)?,
+            })
+        })
+        .collect()
+}
+
+/// 整体替换一个可调用名的渠道顺序。
+///
+/// 调用方应在同一写事务中校验渠道集合；这里只负责按给定顺序重写行，
+/// 位置从零开始。中途任一条 INSERT 失败都会由外层事务回滚。
+pub async fn replace_channel_model_order(
+    conn: &mut SqliteConnection,
+    model: &str,
+    channel_ids: &[i64],
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM channel_model_order WHERE model = ?")
+        .bind(model)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+
+    for (position, channel_id) in channel_ids.iter().copied().enumerate() {
+        let position = i64::try_from(position).map_err(|_| {
+            StoreError::InvalidResource("渠道顺序位置超出数据库整数范围".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO channel_model_order (model, channel_id, position) VALUES (?, ?, ?)",
+        )
+        .bind(model)
+        .bind(channel_id)
+        .bind(position)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    }
+    Ok(())
 }
 
 /// 新增一个渠道，返回库生成的 `id`。
@@ -591,18 +793,15 @@ pub async fn insert_channel(
 
     let result = sqlx::query(
         "INSERT INTO channels \
-         (name, protocol, base_url, api_key, models_json, model_aliases_json, \
-          priority, weight, timeout_ms, max_retries, enabled, model_group) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (name, protocol, base_url, models_json, model_aliases_json, \
+          timeout_ms, max_retries, enabled, model_group) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
     .bind(&channel.base_url)
-    .bind(&channel.api_key)
     .bind(&models_json)
     .bind(&aliases_json)
-    .bind(channel.priority)
-    .bind(channel.weight)
     .bind(channel.timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
@@ -611,7 +810,37 @@ pub async fn insert_channel(
     .await
     .map_err(StoreError::Query)?;
 
-    Ok(result.last_insert_rowid())
+    let channel_id = result.last_insert_rowid();
+    for key in &channel.keys {
+        let models_json = key
+            .models
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(serde_error)?;
+        let blocked_models_json = key
+            .blocked_models
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(serde_error)?;
+        sqlx::query(
+            "INSERT INTO channel_keys \
+             (channel_id, name, api_key, weight, enabled, models_json, blocked_models_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+        )
+            .bind(channel_id)
+            .bind(&key.name)
+            .bind(&key.api_key)
+            .bind(key.weight)
+            .bind(key.enabled)
+            .bind(models_json)
+            .bind(blocked_models_json)
+            .execute(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+    }
+    Ok(channel_id)
 }
 
 /// 按 `id` 整体替换渠道定义；`name` 变化即改名，`id` 保持不变。
@@ -625,20 +854,17 @@ pub async fn update_channel(
 
     sqlx::query(
         "UPDATE channels SET \
-           name = ?, protocol = ?, base_url = ?, api_key = ?, \
+           name = ?, protocol = ?, base_url = ?, \
            models_json = ?, model_aliases_json = ?, \
-           priority = ?, weight = ?, timeout_ms = ?, max_retries = ?, enabled = ?, \
+           timeout_ms = ?, max_retries = ?, enabled = ?, \
            model_group = ? \
          WHERE id = ?",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
     .bind(&channel.base_url)
-    .bind(&channel.api_key)
     .bind(&models_json)
     .bind(&aliases_json)
-    .bind(channel.priority)
-    .bind(channel.weight)
     .bind(channel.timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
@@ -647,6 +873,41 @@ pub async fn update_channel(
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
+
+    sqlx::query("DELETE FROM channel_keys WHERE channel_id = ?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    for key in &channel.keys {
+        let models_json = key
+            .models
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(serde_error)?;
+        let blocked_models_json = key
+            .blocked_models
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(serde_error)?;
+        sqlx::query(
+            "INSERT INTO channel_keys \
+             (channel_id, name, api_key, weight, enabled, models_json, blocked_models_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, CAST(strftime('%s','now') AS INTEGER) * 1000)",
+        )
+            .bind(id)
+            .bind(&key.name)
+            .bind(&key.api_key)
+            .bind(key.weight)
+            .bind(key.enabled)
+            .bind(models_json)
+            .bind(blocked_models_json)
+            .execute(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+    }
 
     Ok(())
 }
@@ -776,22 +1037,15 @@ fn map_token_record(row: &sqlx::sqlite::SqliteRow) -> Result<TokenRecord, StoreE
     })
 }
 
-/// 新增或整体替换一个令牌（按 `token_key`），同一事务内幂等。
-///
-/// `created_at` 仅在首次插入时落库；冲突覆盖不改创建时间、`last_used_at`
-/// （编辑属性不算使用）与 `user_id`（归属只在插入时确定）。
-pub async fn upsert_token(
+/// 新增令牌；密钥冲突由唯一约束明确拒绝。
+pub async fn insert_token(
     conn: &mut SqliteConnection,
     token: &Token,
     created_at: i64,
 ) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO tokens (token_key, name, limit_usd_micros, rate_limit_rpm, enabled, created_at, model_group, user_id) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(token_key) DO UPDATE SET \
-           name = excluded.name, limit_usd_micros = excluded.limit_usd_micros, \
-           rate_limit_rpm = excluded.rate_limit_rpm, \
-           enabled = excluded.enabled, model_group = excluded.model_group",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&token.token_key)
     .bind(&token.name)
@@ -804,6 +1058,48 @@ pub async fn upsert_token(
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 按库生成 id 更新令牌属性；不会改密钥、归属、累计消费上限或生命周期。
+pub async fn update_token_attributes(
+    conn: &mut SqliteConnection,
+    id: i64,
+    attributes: &TokenAttributes,
+) -> Result<(), StoreError> {
+    let updated = sqlx::query(
+        "UPDATE tokens SET name = ?, rate_limit_rpm = ?, enabled = ?, model_group = ? \
+         WHERE id = ?",
+    )
+    .bind(&attributes.name)
+    .bind(bind_rate_limit_rpm(attributes.rate_limit_rpm)?)
+    .bind(attributes.enabled)
+    .bind(bind_token_model_group(&attributes.model_group))
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::InvalidResource(format!("令牌 {id} 不存在")));
+    }
+    Ok(())
+}
+
+/// 余额命令专用的累计消费上限写入口；通用属性更新不能调用。
+pub async fn set_token_limit(
+    conn: &mut SqliteConnection,
+    id: i64,
+    limit_usd_micros: Option<i64>,
+) -> Result<(), StoreError> {
+    let updated = sqlx::query("UPDATE tokens SET limit_usd_micros = ? WHERE id = ?")
+        .bind(limit_usd_micros)
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    if updated.rows_affected() == 0 {
+        return Err(StoreError::InvalidResource(format!("令牌 {id} 不存在")));
+    }
     Ok(())
 }
 
@@ -918,12 +1214,33 @@ pub async fn delete_model_group(conn: &mut SqliteConnection, name: &str) -> Resu
 
 /// 读出全部统一模型。
 pub async fn list_unified_models(pool: &SqlitePool) -> Result<Vec<UnifiedModel>, StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    list_unified_models_on_conn(&mut conn).await
+}
+
+/// 在现有连接/事务上读出全部统一模型，供渠道校验与写入使用。
+pub async fn list_unified_models_on_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<UnifiedModel>, StoreError> {
     let rows = sqlx::query("SELECT id, models_json, hide FROM unified_models")
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
 
     rows.iter().map(map_unified_model).collect()
+}
+
+/// 在现有连接上按 id 读取统一模型。
+pub async fn get_unified_model(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Option<UnifiedModel>, StoreError> {
+    let row = sqlx::query("SELECT id, models_json, hide FROM unified_models WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    row.as_ref().map(map_unified_model).transpose()
 }
 
 /// 把统一模型行映射为 `UnifiedModel`；`hide` 以 0/1 整数落库，非 0 视为开启。
@@ -1213,6 +1530,7 @@ fn serde_error(err: serde_json::Error) -> StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::Connection;
     use std::collections::{HashMap, HashSet};
 
     /// 建一个内存外的临时 SQLite 连接池，并跑完全部迁移。
@@ -1222,6 +1540,78 @@ mod tests {
             .await
             .expect("应能打开临时库");
         (dir, pool)
+    }
+
+    /// 渠道密钥迁移保留存量密钥、价格和顺序，并把所有外键改指向最终父表。
+    #[tokio::test]
+    async fn migration_0032_moves_channel_key_and_preserves_children() {
+        let mut conn = SqliteConnection::connect("sqlite::memory:")
+            .await
+            .expect("应能建立迁移测试库");
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut conn)
+            .await
+            .expect("应能开启外键");
+        sqlx::raw_sql(
+            "CREATE TABLE model_groups (name TEXT PRIMARY KEY) STRICT; \
+             INSERT INTO model_groups VALUES ('default'); \
+             CREATE TABLE channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, protocol TEXT NOT NULL, base_url TEXT NOT NULL, api_key TEXT NOT NULL, models_json TEXT NOT NULL, model_aliases_json TEXT NOT NULL, timeout_ms INTEGER NOT NULL, max_retries INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, model_group TEXT NOT NULL DEFAULT 'default' REFERENCES model_groups(name)) STRICT; \
+             CREATE TABLE prices (channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE, model TEXT NOT NULL, input_micros INTEGER NOT NULL, output_micros INTEGER NOT NULL, cache_read_micros INTEGER, cache_write_micros INTEGER, PRIMARY KEY(channel_id, model)) STRICT; \
+             CREATE TABLE channel_model_order (model TEXT NOT NULL, channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE, position INTEGER NOT NULL, PRIMARY KEY(model, channel_id)) STRICT; \
+             INSERT INTO channels (id, name, protocol, base_url, api_key, models_json, model_aliases_json, timeout_ms, max_retries) VALUES (7, 'legacy', 'openai_chat', 'http://upstream', 'sk-legacy', '[\"m\"]', '{}', 1000, 1); \
+             INSERT INTO prices VALUES (7, 'm', 11, 22, NULL, NULL); \
+             INSERT INTO channel_model_order VALUES ('m', 7, 3);",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("应能建立旧渠道结构");
+
+        sqlx::raw_sql(include_str!("../../migrations/0032_channel_keys.sql"))
+            .execute(&mut conn)
+            .await
+            .expect("0032 应能执行");
+
+        let key: (i64, String, String) =
+            sqlx::query_as("SELECT channel_id, name, api_key FROM channel_keys")
+                .fetch_one(&mut conn)
+                .await
+                .expect("存量密钥应被搬迁");
+        assert_eq!(key, (7, "default".to_string(), "sk-legacy".to_string()));
+        let price: (i64, String, i64) =
+            sqlx::query_as("SELECT channel_id, model, input_micros FROM prices")
+                .fetch_one(&mut conn)
+                .await
+                .expect("价格应保留");
+        assert_eq!(price, (7, "m".to_string(), 11));
+        let position: (i64, i64) =
+            sqlx::query_as("SELECT channel_id, position FROM channel_model_order")
+                .fetch_one(&mut conn)
+                .await
+                .expect("顺序应保留");
+        assert_eq!(position, (7, 3));
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('channels')")
+                .fetch_all(&mut conn)
+                .await
+                .expect("应能检查渠道列");
+        assert!(!columns.iter().any(|name| name == "api_key"));
+        let fk_target: String = sqlx::query_scalar(
+            "SELECT \"table\" FROM pragma_foreign_key_list('channel_keys') WHERE \"from\" = 'channel_id'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("密钥应有渠道外键");
+        assert_eq!(fk_target, "channels");
+
+        sqlx::query("DELETE FROM channels WHERE id = 7")
+            .execute(&mut conn)
+            .await
+            .expect("应能删渠道");
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channel_keys")
+            .fetch_one(&mut conn)
+            .await
+            .expect("应能检查级联结果");
+        assert_eq!(remaining, 0);
     }
 
     fn pin(channel_id: i64, model: &str) -> GroupModel {
@@ -1242,16 +1632,173 @@ mod tests {
             name: "c1".to_string(),
             protocol: Protocol::OpenAiChat,
             base_url: "https://api.openai.com/v1".to_string(),
-            api_key: "sk-x".to_string(),
+            keys: vec![ChannelKey {
+                name: "default".to_string(),
+                api_key: "sk-x".to_string(),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }],
             models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
             model_aliases: aliases,
-            priority: 1,
-            weight: 2,
             timeout_ms: 120_000,
             max_retries: 2,
             enabled: true,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
         }
+    }
+
+    fn stored_key(
+        id: i64,
+        channel_id: i64,
+        name: &str,
+        weight: i64,
+        enabled: bool,
+        models: Option<Vec<&str>>,
+        blocked_models: Option<Vec<&str>>,
+    ) -> StoredChannelKey {
+        StoredChannelKey::new(
+            id,
+            channel_id,
+            name.to_string(),
+            format!("secret-{id}"),
+            weight,
+            enabled,
+            models.map(|items| items.into_iter().map(str::to_string).collect()),
+            blocked_models.map(|items| items.into_iter().map(str::to_string).collect()),
+            0,
+        )
+    }
+
+    /// 高权重密钥在大量独立选取中显著更常出现。
+    #[test]
+    fn higher_weight_channel_key_is_selected_more_often() {
+        let keys = vec![
+            stored_key(1, 1, "light", 1, true, None, None),
+            stored_key(2, 1, "heavy", 9, true, None, None),
+        ];
+        let heavy = (0..20_000)
+            .filter(|_| select_channel_key(&keys, "gpt-4o").expect("应有密钥").id == 2)
+            .count();
+        assert!(
+            heavy > 16_000,
+            "9:1 权重下高权重密钥应占明显多数，实际 {heavy}"
+        );
+    }
+
+    /// 权重全零时退化成近似等概率，不固定偏向首行。
+    #[test]
+    fn zero_weight_channel_keys_are_selected_uniformly() {
+        let keys = vec![
+            stored_key(1, 1, "a", 0, true, None, None),
+            stored_key(2, 1, "b", 0, true, None, None),
+        ];
+        let first = (0..20_000)
+            .filter(|_| select_channel_key(&keys, "gpt-4o").expect("应有密钥").id == 1)
+            .count();
+        assert!(
+            (8_500..=11_500).contains(&first),
+            "全零权重应近似等概率，实际 {first}"
+        );
+    }
+
+    /// 禁用、白名单未命中或黑名单命中的密钥不进入候选。
+    #[test]
+    fn channel_key_candidates_honor_enabled_allow_and_block_lists() {
+        let keys = vec![
+            stored_key(1, 1, "disabled", 100, false, None, None),
+            stored_key(2, 1, "wrong-allow", 100, true, Some(vec!["claude"]), None),
+            stored_key(
+                3,
+                1,
+                "blocked",
+                100,
+                true,
+                Some(vec!["gpt-4o"]),
+                Some(vec!["gpt-4o"]),
+            ),
+            stored_key(
+                4,
+                1,
+                "usable",
+                1,
+                true,
+                Some(vec!["gpt-4o"]),
+                Some(vec!["gpt-5"]),
+            ),
+        ];
+        assert_eq!(
+            select_channel_key(&keys, "gpt-4o")
+                .expect("应有唯一候选")
+                .id,
+            4
+        );
+        assert!(select_channel_key(&keys, "gemini").is_none());
+    }
+
+    /// 显式顺序行按位置读回；渠道删掉时仅级联摘掉该渠道，剩下一条时仍保留。
+    #[tokio::test]
+    async fn channel_model_order_retains_single_channel_and_cascades_deleted_channel() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let mut first = sample_channel();
+        first.name = "first".to_string();
+        let first_id = insert_channel(&mut conn, &first)
+            .await
+            .expect("应能写首渠道");
+        let mut second = sample_channel();
+        second.name = "second".to_string();
+        let second_id = insert_channel(&mut conn, &second)
+            .await
+            .expect("应能写次渠道");
+
+        sqlx::query(
+            "INSERT INTO channel_model_order (model, channel_id, position) VALUES \
+             ('gpt-4o', ?, 8), ('gpt-4o', ?, 3)",
+        )
+        .bind(first_id)
+        .bind(second_id)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写顺序行");
+        drop(conn);
+
+        assert_eq!(
+            list_channel_model_orders(&pool)
+                .await
+                .expect("应能读顺序行"),
+            vec![
+                ChannelModelOrder {
+                    model: "gpt-4o".to_string(),
+                    channel_id: second_id,
+                    position: 3,
+                },
+                ChannelModelOrder {
+                    model: "gpt-4o".to_string(),
+                    channel_id: first_id,
+                    position: 8,
+                },
+            ]
+        );
+
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        delete_channel(&mut conn, first_id)
+            .await
+            .expect("应能删渠道");
+        drop(conn);
+
+        assert_eq!(
+            list_channel_model_orders(&pool)
+                .await
+                .expect("应能读剩余顺序行"),
+            vec![ChannelModelOrder {
+                model: "gpt-4o".to_string(),
+                channel_id: second_id,
+                position: 3,
+            }],
+            "同名只剩一条渠道时顺序行仍须保留"
+        );
     }
 
     /// 新建渠道时全部可调用名算新增；更新只算相对上一版新出现的名字。
@@ -1388,7 +1935,7 @@ mod tests {
 
     /// 令牌播种 → 读回往返一致；limit 为 NULL 表示无上限，enabled 缺省启用。
     #[tokio::test]
-    async fn token_upsert_then_list_roundtrip() {
+    async fn token_insert_then_list_roundtrip() {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
         let token = Token {
@@ -1400,7 +1947,7 @@ mod tests {
             model_group: DEFAULT_MODEL_GROUP.to_string(),
             user_id: ROOT_USER_ID,
         };
-        upsert_token(&mut conn, &token, 1_700_000_000_000)
+        insert_token(&mut conn, &token, 1_700_000_000_000)
             .await
             .expect("应能写令牌");
 
@@ -1422,7 +1969,7 @@ mod tests {
             model_group: DEFAULT_MODEL_GROUP.to_string(),
             user_id: ROOT_USER_ID,
         };
-        upsert_token(&mut conn, &token, 1_000)
+        insert_token(&mut conn, &token, 1_000)
             .await
             .expect("应能写令牌");
 
@@ -1434,13 +1981,19 @@ mod tests {
         assert_eq!(record.created_at, 1_000);
         assert_eq!(record.last_used_at, None, "未使用时为空");
 
-        // 覆盖更新（带不同的 created_at 入参）不改已有创建时间。
-        let mut renamed = token.clone();
-        renamed.name = "v2".to_string();
-        renamed.enabled = false;
-        upsert_token(&mut conn, &renamed, 9_999)
-            .await
-            .expect("应能覆盖令牌");
+        // 属性更新不接收 created_at，也就不可能改写生命周期。
+        update_token_attributes(
+            &mut conn,
+            id,
+            &TokenAttributes {
+                name: "v2".to_string(),
+                rate_limit_rpm: None,
+                enabled: false,
+                model_group: DEFAULT_MODEL_GROUP.to_string(),
+            },
+        )
+        .await
+        .expect("应能更新令牌属性");
         touch_token_used(&mut conn, "sk-a", 2_000)
             .await
             .expect("应能刷新最后使用时间");
@@ -1477,7 +2030,7 @@ mod tests {
         let (_dir, pool) = test_pool().await;
         let mut conn = pool.acquire().await.expect("应能获取连接");
 
-        upsert_token(
+        insert_token(
             &mut conn,
             &Token {
                 token_key: "sk-a".to_string(),
@@ -1498,18 +2051,20 @@ mod tests {
         let before = list_tokens(&pool).await.expect("应能读令牌");
         assert_eq!(before[0].limit_usd_micros, None);
 
-        upsert_token(
+        let id = get_token_record_by_key(&pool, "sk-a")
+            .await
+            .expect("应能读令牌")
+            .expect("令牌应存在")
+            .id;
+        update_token_attributes(
             &mut conn,
-            &Token {
-                token_key: "sk-a".to_string(),
+            id,
+            &TokenAttributes {
                 name: "v2".to_string(),
-                limit_usd_micros: Some(9_000_000),
                 enabled: true,
                 rate_limit_rpm: None,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
-                user_id: ROOT_USER_ID,
             },
-            2,
         )
         .await
         .expect("应能更新令牌");
@@ -1524,7 +2079,10 @@ mod tests {
         );
         let after = list_tokens(&pool).await.expect("应能读令牌");
         assert_eq!(after[0].name, "v2");
-        assert_eq!(after[0].limit_usd_micros, Some(9_000_000));
+        assert_eq!(
+            after[0].limit_usd_micros, None,
+            "通用属性更新不能改累计消费上限"
+        );
         assert_eq!(after[0].model_group, DEFAULT_MODEL_GROUP);
     }
 
@@ -1574,7 +2132,7 @@ mod tests {
         )
         .await
         .expect("应能写组");
-        upsert_token(
+        insert_token(
             &mut conn,
             &Token {
                 token_key: "sk-a".to_string(),
@@ -1867,11 +2425,16 @@ mod tests {
                 name: "p".to_string(),
                 protocol: crate::config::Protocol::OpenAiChat,
                 base_url: "http://127.0.0.1:9".to_string(),
-                api_key: "sk".to_string(),
+                keys: vec![ChannelKey {
+                    name: "default".to_string(),
+                    api_key: "sk".to_string(),
+                    weight: 1,
+                    enabled: true,
+                    models: None,
+                    blocked_models: None,
+                }],
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
-                priority: 0,
-                weight: 1,
                 timeout_ms: 1000,
                 max_retries: 0,
                 enabled: true,

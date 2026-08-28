@@ -4,6 +4,7 @@ import { e2eRootHeaders } from './helpers/session';
 import {
   seedCatalog,
   seedChannel,
+  seedChannelModelOrder,
   seedModelGroup,
   seedPrice,
   seedToken,
@@ -63,9 +64,7 @@ async function assertSourceKind(
 }
 
 test.describe('models page', () => {
-  test('four parallel tabs default to inventory; selection does not cross tabs', async ({
-    page,
-  }) => {
+  test('parallel tabs default to inventory; selection does not cross tabs', async ({ page }) => {
     await seedChannel(page, { name: 'e2e-tab-channel', models: ['e2e-tab-model'] });
     await page.goto('/models');
     await expect(page.getByTestId('models-tab-inventory')).toHaveAttribute('data-state', 'active');
@@ -86,6 +85,70 @@ test.describe('models page', () => {
     await page.reload();
     await expect(page.getByTestId('models-tab-inventory')).toHaveAttribute('data-state', 'active');
     await expect(page.getByTestId('models-tab-groups')).not.toHaveAttribute('data-state', 'active');
+  });
+
+  test('order tab lists only multi-channel names, lets dragging reorder, and persists', async ({
+    page,
+  }) => {
+    const first = await seedChannel(page, {
+      name: 'e2e-order-a',
+      models: ['e2e-order-shared', 'e2e-order-single'],
+    });
+    const second = await seedChannel(page, {
+      name: 'e2e-order-b',
+      models: ['e2e-order-shared'],
+    });
+    await page.goto('/models');
+    await page.getByTestId('models-tab-order').click();
+
+    await page.getByTestId('order-search').fill('e2e-order-shared');
+    await expect(page.locator('[data-testid="order-row"]')).toHaveCount(1);
+    await page.getByTestId('order-search').fill('e2e-order-single');
+    await expect(page.locator('[data-testid="order-row"]')).toHaveCount(0);
+    await page.getByTestId('order-search').fill('');
+
+    const sharedRow = page.locator('[data-testid="order-row"][data-model="e2e-order-shared"]');
+    await expect(sharedRow).toBeVisible();
+    await expect(
+      page.locator('[data-testid="order-row"][data-model="e2e-order-single"]'),
+    ).toHaveCount(0);
+    const channels = sharedRow.getByTestId('order-channel');
+    await expect(channels).toHaveCount(2);
+    await expect(channels.nth(0)).toHaveAttribute('data-channel', 'e2e-order-a');
+    await expect(channels.nth(1)).toHaveAttribute('data-channel', 'e2e-order-b');
+    await expect(sharedRow.getByTestId('order-save')).toBeDisabled();
+
+    const handle = channels.nth(0).getByTestId('order-drag-handle');
+    const target = channels.nth(1);
+    const targetBox = await target.boundingBox();
+    if (!targetBox) throw new Error('drag target has no box');
+    await handle.dragTo(target, {
+      targetPosition: { x: targetBox.width / 2, y: targetBox.height - 2 },
+    });
+
+    await expect(channels.nth(0)).toHaveAttribute('data-channel', 'e2e-order-b');
+    await expect(channels.nth(1)).toHaveAttribute('data-channel', 'e2e-order-a');
+    await expect(sharedRow.getByTestId('order-save')).toBeEnabled();
+    await sharedRow.getByTestId('order-save').click();
+    await expect(sharedRow.getByTestId('order-save')).toHaveText(/Save order/);
+    await expect(sharedRow.getByTestId('order-save')).toBeDisabled();
+
+    const listed = await page.request.get('/api/channel-model-orders', {
+      headers: await e2eRootHeaders(page.request),
+    });
+    const orders = (await listed.json()) as Array<{ model: string; channel_ids: number[] }>;
+    expect(orders.find((order) => order.model === 'e2e-order-shared')?.channel_ids).toEqual([
+      second.id,
+      first.id,
+    ]);
+
+    await page.reload();
+    await page.getByTestId('models-tab-order').click();
+    const persisted = page.locator('[data-testid="order-row"][data-model="e2e-order-shared"]');
+    await expect(persisted.getByTestId('order-channel').nth(0)).toHaveAttribute(
+      'data-channel',
+      'e2e-order-b',
+    );
   });
 
   test('inventory is derived from channels; unpriced is highlighted; prices edit without typing a new row', async ({
@@ -390,16 +453,6 @@ test.describe('models page', () => {
     await expect(visibleRow).toBeVisible();
     await visibleRow.getByTestId('visible-model-name').click();
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('coding');
-    await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-haiku');
-    await expect(page.getByTestId('visible-hidden-members')).toContainText('e2e-code-mini');
-    await expect(
-      page
-        .getByTestId('visible-hidden-members')
-        .locator('[data-testid="unified-member-line"][data-member="e2e-code-haiku"]'),
-    ).toHaveAttribute('data-channel', 'e2e-coding-channel');
-    await expect(
-      page.getByTestId('visible-hidden-members').getByTestId('unified-member-index'),
-    ).toHaveCount(0);
 
     await page.getByTestId('models-tab-groups').click();
     await page.getByTestId('group-create').click();
@@ -483,16 +536,15 @@ test.describe('models page', () => {
   });
 
   test('inventory groups a shared model under every member channel', async ({ page }) => {
-    await seedChannel(page, {
+    const layoutA = await seedChannel(page, {
       name: 'e2e-layout-a',
       models: ['e2e-shared', 'e2e-only-a'],
-      priority: 2,
     });
-    await seedChannel(page, {
+    const layoutB = await seedChannel(page, {
       name: 'e2e-layout-b',
       models: ['e2e-shared', 'e2e-only-b'],
-      priority: 1,
     });
+    await seedChannelModelOrder(page, 'e2e-shared', [layoutB.id, layoutA.id]);
     await page.goto('/models');
     await expect(page.getByTestId('inventory-channels-head')).toHaveCount(0);
     await expect(page.getByTestId('inventory-channel-chip')).toHaveCount(0);

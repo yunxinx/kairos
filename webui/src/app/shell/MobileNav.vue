@@ -19,7 +19,7 @@ const isDark = useResolvedDarkTheme();
 const fabNavEl = ref<HTMLElement | null>(null);
 
 const me = useCurrentUser();
-const tabs = computed(() => navTabsFor(me.value?.role));
+const tabs = computed(() => navTabsFor(me.value));
 
 /** 与桌面 NavBar 左→右顺序对应，移动端面板内为下→上（概览贴近 FAB）。 */
 const tabsBottomUp = computed(() => [...tabs.value].reverse());
@@ -61,12 +61,13 @@ watch(menuOpen, (open) => {
 
 async function handleLogout() {
   closeMenu();
+  const revoke = apiClient.logout();
+  clearAdminKey();
   try {
-    await apiClient.logout();
+    await revoke;
   } catch {
     // 会话可能已失效；本地清凭据即可。
   }
-  clearAdminKey();
   await navigate({ to: '/login' });
 }
 

@@ -24,11 +24,9 @@ export function channelOutboundUrl(protocol: Protocol, baseUrl: string): string 
   return `${baseUrl.replace(/\/+$/, '')}${UPSTREAM_PATH[protocol]}`;
 }
 
-/** 令牌写契约；余额与生命周期元数据不在其中。 */
-export interface Token {
-  token_key: string;
+/** 令牌属性字段；密钥、余额与生命周期元数据不在其中。 */
+interface TokenAttributes {
   name: string;
-  limit_usd_micros: number | null;
   /** 每分钟请求上限；`null` 跟随全局兜底，`0` 表示该令牌不限速。 */
   rate_limit_rpm: number | null;
   enabled: boolean;
@@ -36,13 +34,36 @@ export interface Token {
   model_group: string;
 }
 
-/** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */
-export type TokenCreate = Omit<Token, 'token_key'>;
+/** 令牌属性与可选余额命令构成一个原子更新。 */
+export interface TokenUpdate extends TokenAttributes {
+  /** 与属性更新同一事务提交的可选余额命令。 */
+  balance_change?: TokenBalanceCommand;
+}
 
-/** 令牌读响应：库生成身份 + 写契约字段 + 生命周期元数据 + 该令牌累计结算。 */
-export interface TokenView extends Token {
+/** 令牌创建契约：不接受指定 key，key 由系统生成并随响应返回。 */
+export interface TokenCreate extends TokenAttributes {
+  /** 初始可用余额；`null` 表示无限额。 */
+  balance_usd_micros: number | null;
+}
+
+export interface BulkDeleteResult<T> {
+  deleted: T[];
+}
+
+export interface ChannelModelTarget {
+  channel_id: number;
+  model: string;
+}
+
+/** 令牌读响应：属性 + 身份 + 额度与生命周期事实。 */
+export interface TokenView extends TokenAttributes {
   /** 库生成的稳定身份；管理面按它定位令牌。 */
   id: number;
+  token_key: string;
+  /** 累计消费上限；`null` 表示无限额。 */
+  limit_usd_micros: number | null;
+  /** 派生可用余额 = 累计消费上限 - 累计已结算；`null` 表示无限额。 */
+  balance_usd_micros: number | null;
   /** 创建时刻（unix 毫秒）。 */
   created_at: number;
   /** 最后使用时刻（unix 毫秒）；null 表示从未使用。 */
@@ -51,28 +72,15 @@ export interface TokenView extends Token {
   settled_usd_micros: number;
 }
 
-/** PUT 令牌：剥离只读字段。 */
-export function tokenWriteBody(view: Token): Token {
-  return {
-    token_key: view.token_key,
-    name: view.name,
-    limit_usd_micros: view.limit_usd_micros,
-    rate_limit_rpm: view.rate_limit_rpm,
-    enabled: view.enabled,
-    model_group: view.model_group,
-  };
-}
-
 /** 渠道：出站接入单元（写契约，不含库生成身份）。 */
 export interface Channel {
   name: string;
   protocol: Protocol;
   base_url: string;
-  api_key: string;
+  /** 该上游端点可用的多把账号密钥。 */
+  keys: ChannelKey[];
   models: string[];
   model_aliases: Record<string, string>;
-  priority: number;
-  weight: number;
   timeout_ms: number;
   max_retries: number;
   /** 是否启用：禁用的渠道不参与路由与失败切换。 */
@@ -81,9 +89,39 @@ export interface Channel {
   model_group: string;
 }
 
+/** 渠道上的一把上游密钥；模型白/黑名单为可选的逗号名单。 */
+export interface ChannelKey {
+  name: string;
+  api_key: string;
+  /** 加权随机权重；全部为 0 时退化为等概率。 */
+  weight: number;
+  /** 是否启用：禁用的密钥不参与选取。 */
+  enabled: boolean;
+  /** 模型白名单；`null`/缺省表示不限。 */
+  models?: string[] | null;
+  /** 模型黑名单；`null`/缺省表示不限。 */
+  blocked_models?: string[] | null;
+}
+
 /** 渠道读响应：库生成的稳定身份 + 写契约字段。 */
 export interface ChannelView extends Channel {
   id: number;
+}
+
+/**
+ * 渠道名录条目：`GET /channels/summary` 的 admin+ 只读投影。
+ *
+ * 够回答「某个已登记名挂在哪条渠道、那条渠道还在不在、协议是什么」，不含密钥与
+ * 出站地址（仍是 root-only 的运营机密）。`ChannelView` 结构上是它的超集，因此
+ * 只读渲染的辅助函数一律以此为参数类型，root 传完整视图也成立。
+ */
+export interface ChannelSummary {
+  id: number;
+  name: string;
+  protocol: Protocol;
+  enabled: boolean;
+  models: string[];
+  model_aliases: Record<string, string>;
 }
 
 /** 读视图 → 写契约：剥离只读 id（后端 `deny_unknown_fields` 拒收未知字段）。 */
@@ -92,16 +130,20 @@ export function channelWriteBody(view: ChannelView): Channel {
     name: view.name,
     protocol: view.protocol,
     base_url: view.base_url,
-    api_key: view.api_key,
+    keys: view.keys.map((key) => ({ ...key })),
     models: view.models,
     model_aliases: view.model_aliases,
-    priority: view.priority,
-    weight: view.weight,
     timeout_ms: view.timeout_ms,
     max_retries: view.max_retries,
     enabled: view.enabled,
     model_group: view.model_group,
   };
+}
+
+/** 同名渠道顺序表里的一行：某个可调用名在多条渠道上的完整尝试顺序。 */
+export interface ChannelModelOrder {
+  model: string;
+  channel_ids: number[];
 }
 
 /** 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）。 */
@@ -210,9 +252,87 @@ export interface CatalogQuery {
   provider_id?: string | string[];
 }
 
-/** 余额相对调整请求。 */
-export interface BalanceAdjustment {
+/** 人工调整用户钱包的幂等命令。 */
+export interface UserBalanceAdjustment {
+  operation_id: string;
   delta_usd_micros: number;
+  reason: 'manual_adjustment';
+}
+
+/** 钱包或令牌余额命令的原始执行结果。 */
+export interface BalanceAdjustmentResult {
+  operation_id: string;
+  before_balance_usd_micros: number | null;
+  after_balance_usd_micros: number | null;
+}
+
+/** 令牌余额相对调整或显式模式切换命令。 */
+export type TokenBalanceCommand =
+  | { action: 'adjust'; operation_id: string; delta_usd_micros: number }
+  | { action: 'set_finite'; operation_id: string; balance_usd_micros: number }
+  | { action: 'set_unlimited'; operation_id: string };
+
+/** 套餐管理面能力开关。 */
+export interface PlanCapabilities {
+  manage_users: boolean;
+  assign_plan: boolean;
+  view_logs_stats: boolean;
+  settle_waive: boolean;
+  toggle_user_tokens: boolean;
+  view_own_plan_groups: boolean;
+  view_other_groups: boolean;
+  edit_prices: boolean;
+  edit_model_groups: boolean;
+  edit_unified_models: boolean;
+  edit_price_catalog: boolean;
+}
+
+/**
+ * 套餐受众：这一档是给普通用户还是给管理员用的。
+ *
+ * 决定能力开关是否有意义——用户档不展示它们（后端也不让它们生效）。创建后不可改：
+ * 中途切换会让已挂载的用户悄悄获得或失去管理能力。
+ */
+export type PlanAudience = 'user' | 'admin';
+
+/** 套餐读视图。内部名由系统按 `plan-{id}` 生成，不对外暴露。 */
+export interface PlanView {
+  id: number;
+  display_name: string;
+  note: string;
+  note_visible_to_admin: boolean;
+  discount_bp: number;
+  default_rpm: number | null;
+  shared_rpm: number | null;
+  initial_grant_usd_micros: number;
+  capabilities: PlanCapabilities;
+  shared_with_admin: boolean;
+  audience: PlanAudience;
+  /** 是否为本受众新用户的默认档；每个受众至多一档。 */
+  is_default: boolean;
+  builtin: boolean;
+  created_at: number;
+  groups: string[];
+}
+
+/** 套餐可编辑属性；受众、默认身份与内部名（系统托管）不在更新契约中。 */
+export interface PlanUpdate {
+  display_name: string;
+  note: string;
+  note_visible_to_admin: boolean;
+  discount_bp: number;
+  default_rpm: number | null;
+  shared_rpm: number | null;
+  initial_grant_usd_micros: number;
+  capabilities: PlanCapabilities;
+  shared_with_admin: boolean;
+  groups: string[];
+}
+
+/** 套餐创建契约；受众创建后不可变，默认身份随后只能通过转移命令修改。 */
+export interface PlanCreate extends PlanUpdate {
+  audience: PlanAudience;
+  is_default: boolean;
 }
 
 /** 管理角色：上级含下级权限。 */
@@ -236,9 +356,13 @@ export interface UserView {
   rate_limit_rpm?: number | null;
 }
 
-/** 当前用户：身份 + 可用组 + 钱包 + 统计。 */
+/** 当前用户：身份 + 套餐 + 可用组 + 钱包 + 统计。 */
 export interface MeView extends UserView {
+  plan_id: number | null;
+  plan_display_name: string | null;
+  discount_bp: number;
   assigned_groups: string[];
+  capabilities: PlanCapabilities;
   balance_usd_micros: number;
   settled_usd_micros: number;
   request_count?: number;
@@ -247,8 +371,48 @@ export interface MeView extends UserView {
   last_used_at?: number | null;
 }
 
+/**
+ * 折后单价区间（micro-USD / 1M tokens）。
+ *
+ * 价格按渠道定，同一个可调用名挂在多条渠道上就可能有多个单价；单渠道时两端相等。
+ */
+export interface PriceRange {
+  min_micros: number;
+  max_micros: number;
+}
+
+/**
+ * `/me/models` 里的一个可调用名。
+ *
+ * 刻意不含任何渠道字段：这一投影存在的理由就是不向普通用户暴露渠道拓扑。
+ */
+export interface MyModelView {
+  /** 请求 body 的 `model` 直接填它。 */
+  id: string;
+  /** 统一模型（内部按序 failover），成员渠道不暴露。 */
+  unified: boolean;
+  /** 当前是否真能调用：有启用且已定价的渠道。 */
+  callable: boolean;
+  input?: PriceRange;
+  output?: PriceRange;
+  cache_read?: PriceRange;
+  cache_write?: PriceRange;
+}
+
+/** 一个模型组一段；同一个名字可以出现在多段里（组是允许名单，不是分区）。 */
+export interface MyGroupView {
+  name: string;
+  models: MyModelView[];
+}
+
+/** 调用者自己能用的模型。单价已折过，`discount_bp` 只用于界面标注。 */
+export interface MyModelsView {
+  discount_bp: number;
+  groups: MyGroupView[];
+}
+
 /** 用户管理列表/详情。不含 avatar：运营视图不渲染头像，自己的走 `/me`。 */
-export interface UserAdminView extends Omit<MeView, 'avatar'> {
+export interface UserAdminView extends Omit<MeView, 'avatar' | 'capabilities'> {
   request_count: number;
   input_tokens: number;
   output_tokens: number;
@@ -273,6 +437,7 @@ export interface UserCreate {
   role: ManagementRole;
   avatar?: string;
   rate_limit_rpm?: number | null;
+  plan_id?: number;
 }
 
 /** 当前用户改自己的资料。改密码或改邮箱时必须带 `current_password`。 */
@@ -292,11 +457,9 @@ export interface UserUpdate {
   password?: string;
   display_name?: string;
   avatar?: string;
+  /** 与资料字段同一事务中换套餐。 */
+  plan_id?: number;
   rate_limit_rpm?: number | null;
-}
-
-export interface AssignedGroupsView {
-  groups: string[];
 }
 
 /** 请求日志条目；完整 body 为 base64。 */
@@ -320,6 +483,11 @@ export interface LogEntry {
   output_price_usd_micros: number;
   cache_read_price_usd_micros: number;
   cache_write_price_usd_micros: number;
+  /** 渠道原价（折扣前）。 */
+  base_cost_usd_micros: number;
+  /** 万分比折扣率；10000 表示原价。 */
+  discount_bp: number;
+  /** 实收（折后）。 */
   cost_usd_micros: number;
   /** 费用是否已完成所属用户钱包结算。 */
   settled: boolean;
@@ -364,6 +532,8 @@ export interface LogQuery {
   from_created_at?: number;
   to_created_at?: number;
   settled?: boolean;
+  /** 按该次使用的万分比折扣率精确过滤。 */
+  discount_bp?: number;
   /** 入站协议分面多选，请求时拼成逗号列表。 */
   inbound_protocol?: string[];
   sort_by?: RequestLogSortBy;
@@ -379,6 +549,10 @@ export interface SystemLogEntry {
   level: string;
   target: string;
   message: string;
+  /** 稳定事件编码；旧式自由文本日志为空。 */
+  event_code?: string | null;
+  /** 事件模板参数；旧式自由文本日志为空。 */
+  event_params?: Record<string, unknown> | null;
   /** 操作者；系统自身产生的运维事件为 null。 */
   actor_user_id?: number | null;
   actor_email?: string | null;

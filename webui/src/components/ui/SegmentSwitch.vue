@@ -15,6 +15,8 @@ export type SegmentPair<T extends string> = [SegmentOption<T>, SegmentOption<T>]
 const props = defineProps<{
   modelValue: T;
   options: SegmentPair<T>;
+  /** 提交中的表单锁定选择，避免改变已发出的命令。 */
+  disabled?: boolean;
   /** 开关组的可访问名称；vue-tsc 不把模板 :aria-label 映射为驼峰 prop，故按原名声明。 */
   // eslint-disable-next-line vue/prop-name-casing
   'aria-label': string;
@@ -33,6 +35,7 @@ const knobRight = computed(() => props.modelValue === props.options[1].value);
     :data-knob="knobRight ? 'right' : 'left'"
     role="group"
     :aria-label="props['aria-label']"
+    :aria-disabled="props.disabled ? 'true' : undefined"
   >
     <button
       v-for="option in options"
@@ -41,6 +44,7 @@ const knobRight = computed(() => props.modelValue === props.options[1].value);
       class="segment-switch-btn"
       :data-testid="option.testId"
       :aria-pressed="modelValue === option.value"
+      :disabled="props.disabled"
       @click="emit('update:modelValue', option.value)"
     >
       {{ option.label }}
