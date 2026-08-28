@@ -249,6 +249,88 @@ pub enum ToolChoice {
     Tool { name: String },
 }
 
+/// reasoning 请求旋钮的档位。
+///
+/// OpenAI 官方档位为 none 到 max（realtime 封顶 xhigh，支持度随模型）；
+/// `ultra` 是 Codex 客户端的扩展档位（官方 API 参考未列出），IR 收入以
+/// 保真，跨族映射时钳到 [`ReasoningEffort::Max`]。Anthropic 侧
+/// 原生档位为 `output_config.effort` 的 low/medium/high/xhigh/max（无
+/// none/minimal），legacy 模型走 budget_tokens 阶梯
+/// （[`ReasoningEffort::budget_tokens`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    /// 解析 wire 侧 effort 字符串；未知值返回 `None`，由调用方决定拒绝方式。
+    pub fn parse_effort(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    /// wire 侧 effort 字符串（chat 与 responses 面板共用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    /// Anthropic budget 阶梯：effort → `budget_tokens`（legacy budget 路径）；
+    /// `None` 档对应 `thinking: disabled`，无预算。阶梯为网关规范换算表
+    /// （512/1024/8192/24576/32768/128000）；`Ultra` 钳到 `Max` 同档，
+    /// 避免选最深思考时映射落空。
+    pub fn budget_tokens(self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::Minimal => Some(512),
+            Self::Low => Some(1024),
+            Self::Medium => Some(8192),
+            Self::High => Some(24576),
+            Self::XHigh => Some(32768),
+            Self::Max | Self::Ultra => Some(128_000),
+        }
+    }
+
+    /// Anthropic budget → effort 的有损反向映射，阈值与正向阶梯一致；
+    /// 超过 32768 归 `Max`（budget 路径上见不到 `Ultra`）。`disabled`/`adaptive`
+    /// 与缺 budget 由调用方另行处理，不经本函数。
+    pub fn from_budget(tokens: u32) -> Self {
+        match tokens {
+            0..=512 => Self::Minimal,
+            513..=1024 => Self::Low,
+            1025..=8192 => Self::Medium,
+            8193..=24576 => Self::High,
+            24577..=32768 => Self::XHigh,
+            _ => Self::Max,
+        }
+    }
+}
+
 /// 非流式聊天请求的 IR 中枢。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -282,6 +364,11 @@ pub struct ChatRequest {
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// reasoning 请求旋钮（effort 档位）。Anthropic 原始 `thinking` 配置经
+    /// `provider_options["anthropic"]["thinking"]` 逃生舱无损往返，本字段
+    /// 只承载可枚举的 effort 语义；本族逃生舱缺席时按协议形状兜底出站。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningEffort>,
     /// 请求级逃生舱：入站解析留存的 provider 特有请求设置。
     ///
     /// Anthropic 的 `thinking`（budget_tokens/display）是请求级而非消息级配置：

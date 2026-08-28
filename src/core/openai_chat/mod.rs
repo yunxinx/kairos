@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
-    Message, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
+    Message, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
 };
 use crate::core::stream::SseFrame;
 
@@ -47,6 +47,8 @@ pub enum DecodeError {
     ToolCallArgumentsNotString { index: usize },
     #[error("tool_choice 形状无法识别: {detail}")]
     InvalidToolChoice { detail: String },
+    #[error("reasoning_effort 取值无法识别: {detail}")]
+    InvalidReasoningEffort { detail: String },
     #[error("响应缺少 choices")]
     MissingChoices,
     #[error("响应的 choice 缺少 message")]
@@ -85,6 +87,8 @@ struct WireChatRequest {
     tools: Option<Vec<WireTool>>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -315,6 +319,17 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             .tool_choice
             .as_ref()
             .map(decode_tool_choice)
+            .transpose()?,
+        reasoning: wire
+            .reasoning_effort
+            .as_deref()
+            .map(|value| {
+                ReasoningEffort::parse_effort(value).ok_or_else(|| {
+                    DecodeError::InvalidReasoningEffort {
+                        detail: format!("未知档位 {value:?}"),
+                    }
+                })
+            })
             .transpose()?,
         provider_options: HashMap::new(),
     })
@@ -630,6 +645,9 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     }
     if let Some(choice) = &request.tool_choice {
         obj.insert("tool_choice".into(), encode_tool_choice(choice));
+    }
+    if let Some(effort) = request.reasoning {
+        obj.insert("reasoning_effort".into(), json!(effort.as_str()));
     }
     Value::Object(obj)
 }
@@ -1862,6 +1880,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();
@@ -1954,6 +1973,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();

@@ -24,8 +24,8 @@ use similar_asserts::assert_eq;
 use super::{anthropic_messages, openai_chat, openai_responses};
 use crate::config::Protocol;
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role, Tool,
-    ToolChoice, Usage, Warning,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
+    ReasoningEffort, Role, Tool, ToolChoice, Usage, Warning,
 };
 
 /// 全部有向协议对（a 自往返后经 b 中转再回 a）。
@@ -183,6 +183,7 @@ fn project_request(request: &ChatRequest) -> Value {
         "temperature": request.temperature,
         "top_p": request.top_p,
         "tool_choice": request.tool_choice,
+        "reasoning": request.reasoning,
     })
 }
 
@@ -310,6 +311,7 @@ fn base_request() -> ChatRequest {
         top_p: Some(0.9),
         top_k: None,
         max_tokens: Some(512),
+        reasoning: None,
         n: None,
         stop: Vec::new(),
         presence_penalty: None,
@@ -611,5 +613,129 @@ fn unknown_tool_choice_shapes_are_rejected_at_ingress() {
             err.contains("tool_choice"),
             "{protocol:?} 错误应指明字段: {err}"
         );
+    }
+}
+
+/// 三协议 reasoning 旋钮：入站解码产出类型化档位，同族出站原样回传。
+/// anthropic 走原始 thinking 逃生舱（budget 数值无损），chat 直出 effort。
+#[test]
+fn reasoning_knob_decodes_and_survives_same_family() {
+    for value in [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ] {
+        let mut request = base_request();
+        request.reasoning = Some(ReasoningEffort::parse_effort(value).expect("档位应可解析"));
+        let (mut wire, _) = encode_request_wire(Protocol::OpenAiChat, &request);
+        wire["reasoning_effort"] = json!(value);
+        let back = decode_request_wire(Protocol::OpenAiChat, &wire);
+        assert_eq!(back.reasoning, request.reasoning, "chat 解码 {value}");
+        let (wire_back, warnings) = encode_request_wire(Protocol::OpenAiChat, &back);
+        assert!(warnings.is_empty());
+        assert_eq!(wire_back["reasoning_effort"], json!(value));
+    }
+
+    // anthropic：enabled + budget → 逃生舱逐位还原，typed 按阶梯区间派生。
+    let mut request = base_request();
+    request.provider_options = options(&[(
+        "anthropic",
+        json!({ "thinking": { "type": "enabled", "budget_tokens": 8000 } }),
+    )]);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert!(warnings.is_empty());
+    let back = decode_request_wire(Protocol::AnthropicMessages, &wire);
+    assert_eq!(back.reasoning, Some(ReasoningEffort::Medium));
+    assert_eq!(
+        back.provider_options["anthropic"]["thinking"]["budget_tokens"],
+        json!(8000)
+    );
+    let (wire_back, _) = encode_request_wire(Protocol::AnthropicMessages, &back);
+    assert_eq!(
+        wire_back["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 8000 })
+    );
+
+    // disabled → typed None 档；adaptive → typed 缺席，均由逃生舱无损回传。
+    for (thinking, expected) in [
+        (json!({ "type": "disabled" }), Some(ReasoningEffort::None)),
+        (json!({ "type": "adaptive" }), None),
+    ] {
+        let mut request = base_request();
+        request.provider_options = options(&[("anthropic", json!({ "thinking": thinking }))]);
+        let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
+        let back = decode_request_wire(Protocol::AnthropicMessages, &wire);
+        assert_eq!(back.reasoning, expected);
+        let (wire_back, _) = encode_request_wire(Protocol::AnthropicMessages, &back);
+        assert_eq!(wire_back["thinking"], thinking);
+    }
+}
+
+/// 类型化旋钮在本族逃生舱缺席时按协议形状兜底出站：anthropic 按阶梯出
+/// budget（None 档为 disabled），chat/responses 出 effort 字符串。
+#[test]
+fn reasoning_typed_knob_encodes_when_escape_hatch_absent() {
+    let mut request = base_request();
+    request.reasoning = Some(ReasoningEffort::High);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        wire["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 24576 })
+    );
+
+    let mut request = base_request();
+    request.reasoning = Some(ReasoningEffort::Ultra);
+    let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(
+        wire["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 128_000 })
+    );
+
+    let mut request = base_request();
+    request.reasoning = Some(ReasoningEffort::None);
+    let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(wire["thinking"], json!({ "type": "disabled" }));
+
+    let mut request = base_request();
+    request.reasoning = Some(ReasoningEffort::XHigh);
+    let (wire, _) = encode_request_wire(Protocol::OpenAiChat, &request);
+    assert_eq!(wire["reasoning_effort"], json!("xhigh"));
+    let (wire, _) = encode_request_wire(Protocol::OpenAiResponses, &request);
+    assert_eq!(wire["reasoning"], json!({ "effort": "xhigh" }));
+}
+
+/// responses 面板逃生舱优先：含 effort 之外字段（如 summary）的原始面板
+/// 出站原样回传，类型化字段零双写。
+#[test]
+fn responses_reasoning_escape_hatch_wins_over_typed_knob() {
+    let mut request = base_request();
+    request.reasoning = Some(ReasoningEffort::High);
+    request.provider_options = options(&[(
+        "openai",
+        json!({ "reasoning": { "effort": "low", "summary": "auto" } }),
+    )]);
+    let (wire, _) = encode_request_wire(Protocol::OpenAiResponses, &request);
+    assert_eq!(
+        wire["reasoning"],
+        json!({ "effort": "low", "summary": "auto" })
+    );
+}
+
+/// 未知 effort 档位在入站面拒绝（chat 与 responses 面板同规）。
+#[test]
+fn unknown_reasoning_effort_rejected_at_ingress() {
+    for (protocol, key, shape) in [
+        (Protocol::OpenAiChat, "reasoning_effort", json!("bogus")),
+        (
+            Protocol::OpenAiResponses,
+            "reasoning",
+            json!({ "effort": "bogus" }),
+        ),
+    ] {
+        let mut request = base_request();
+        request.reasoning = Some(ReasoningEffort::High);
+        let (mut wire, _) = encode_request_wire(protocol, &request);
+        wire[key] = shape;
+        let err = decode_request_result(protocol, &wire).expect_err("未知 effort 档位应被拒绝");
+        assert!(err.contains(key), "{protocol:?} 错误应指明字段: {err}");
     }
 }

@@ -22,8 +22,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
-    StreamEvent, Tool, ToolChoice, Usage, Warning,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
+    ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
 };
 use crate::core::stream::SseFrame;
 
@@ -347,7 +347,24 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     }
 
     let mut provider_options = HashMap::new();
-    if let Some(thinking) = wire.thinking {
+    // 类型化 effort 从 thinking 配置派生（有损，仅供跨族映射与观测）；
+    // 原始配置已进逃生舱，同族往返不受派生精度影响。
+    let reasoning = wire.thinking.as_ref().and_then(|thinking| {
+        match thinking.get("type").and_then(Value::as_str) {
+            Some("disabled") => Some(ReasoningEffort::None),
+            Some("enabled") => {
+                thinking
+                    .get("budget_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|budget| {
+                        ReasoningEffort::from_budget(u32::try_from(budget).unwrap_or(u32::MAX))
+                    })
+            }
+            // adaptive 等无法枚举量化的配置仅由逃生舱承载。
+            _ => None,
+        }
+    });
+    if let Some(thinking) = &wire.thinking {
         provider_options.insert("anthropic".to_string(), json!({ "thinking": thinking }));
     }
     let tool_choice = wire
@@ -381,6 +398,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             })
             .collect(),
         tool_choice,
+        reasoning,
         provider_options,
     })
 }
@@ -763,11 +781,20 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             encode_tool_choice(choice, &request.provider_options),
         );
     }
-    // 请求级逃生舱回传：Anthropic thinking 配置等。
-    if let Some(anthropic) = request.provider_options.get("anthropic")
-        && let Some(thinking) = anthropic.get("thinking")
+    // 请求级逃生舱回传：Anthropic thinking 原始配置优先（budget 数值、
+    // adaptive 等枚举外语义都在其中）；旋钮缺席时以类型化 effort 按阶梯兜底。
+    if let Some(thinking) = request
+        .provider_options
+        .get("anthropic")
+        .and_then(|anthropic| anthropic.get("thinking"))
     {
         obj.insert("thinking".into(), thinking.clone());
+    } else if let Some(effort) = request.reasoning {
+        let thinking = match effort.budget_tokens() {
+            Some(budget) => json!({ "type": "enabled", "budget_tokens": budget }),
+            None => json!({ "type": "disabled" }),
+        };
+        obj.insert("thinking".into(), thinking);
     }
     Value::Object(obj)
 }
@@ -2093,6 +2120,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();
@@ -2206,6 +2234,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();
@@ -2261,6 +2290,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();
@@ -2493,6 +2523,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();

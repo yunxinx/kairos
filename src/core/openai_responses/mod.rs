@@ -25,8 +25,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
-    StreamEvent, Tool, ToolChoice, Usage, Warning,
+    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
+    ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
 };
 use crate::core::stream::SseFrame;
 
@@ -59,6 +59,8 @@ pub enum DecodeError {
     ArgumentsNotString { index: usize },
     #[error("tool_choice 形状无法识别: {detail}")]
     InvalidToolChoice { detail: String },
+    #[error("reasoning.effort 取值无法识别: {detail}")]
+    InvalidReasoningEffort { detail: String },
     #[error("响应缺少 output")]
     MissingOutput,
 }
@@ -339,6 +341,19 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             .tool_choice
             .as_ref()
             .map(decode_tool_choice)
+            .transpose()?,
+        reasoning: wire
+            .reasoning
+            .as_ref()
+            .and_then(|panel| panel.get("effort"))
+            .and_then(Value::as_str)
+            .map(|value| {
+                ReasoningEffort::parse_effort(value).ok_or_else(|| {
+                    DecodeError::InvalidReasoningEffort {
+                        detail: format!("未知档位 {value:?}"),
+                    }
+                })
+            })
             .transpose()?,
         provider_options,
     })
@@ -783,12 +798,14 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     }
 
     // 请求级逃生舱回传；有状态特性出站丢弃并显式 warning。
+    let mut reasoning_emitted = false;
     if let Some(openai) = request.provider_options.get(OPENAI_PROVIDER) {
         if let Some(text) = openai.get("text") {
             obj.insert("text".into(), text.clone());
         }
         if let Some(reasoning) = openai.get("reasoning") {
             obj.insert("reasoning".into(), reasoning.clone());
+            reasoning_emitted = true;
         }
         for (key, label) in [
             (STATEFUL_STORE, "store"),
@@ -802,6 +819,10 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
                 ));
             }
         }
+    }
+    // 面板逃生舱缺席时以类型化 effort 兜底，保持「旋钮跨请求不丢失」。
+    if !reasoning_emitted && let Some(effort) = request.reasoning {
+        obj.insert("reasoning".into(), json!({ "effort": effort.as_str() }));
     }
     Value::Object(obj)
 }
@@ -2336,6 +2357,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();
@@ -2649,6 +2671,7 @@ mod tests {
             response_format: Some(json!({ "type": "json_object" })),
             tools: Vec::new(),
             tool_choice: None,
+            reasoning: None,
             provider_options: HashMap::new(),
         };
         let mut warnings = Vec::new();
