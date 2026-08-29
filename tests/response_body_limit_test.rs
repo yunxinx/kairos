@@ -95,6 +95,7 @@ async fn oversized_upstream_body_fails_over_to_next_channel() {
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
             },
             Channel {
                 name: "ch-1".to_string(),
@@ -115,6 +116,7 @@ async fn oversized_upstream_body_fails_over_to_next_channel() {
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
             },
         ];
         seed

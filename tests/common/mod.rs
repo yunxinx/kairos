@@ -416,6 +416,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             enabled: true,
             model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
             reasoning_output: Default::default(),
+            session_cache_key: Default::default(),
         }],
         tokens: vec![SeedToken {
             token_key: TEST_TOKEN_KEY.to_string(),

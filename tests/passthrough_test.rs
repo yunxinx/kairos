@@ -85,14 +85,14 @@ async fn non_stream_passthrough_forwards_body_and_response() {
     assert_eq!(received[0]["messages"][0]["role"], "user");
     assert_eq!(received[0]["messages"][0]["content"], "hi");
     // 非流式直通不加任何补丁：stream 保持下游原样（未发送即无此字段），也不注入
-    // stream_options（非流式响应自带顶层 usage，spec 仅授权流式注入）。
+    // stream_options（include_usage 是流式计费的注入面，非流式响应自带顶层 usage）。
     assert!(
         received[0].get("stream").is_none(),
         "非流式直通不应改写 stream 字段"
     );
     assert!(
         received[0].get("stream_options").is_none(),
-        "非流式直通不应注入 stream_options（spec 仅授权流式注入）"
+        "非流式直通不应注入 stream_options（include_usage 只为流式计费注入）"
     );
 }
 
@@ -463,6 +463,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
             },
             Channel {
                 name: "cross-protocol".to_string(),
@@ -483,6 +484,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
             },
         ];
         seed
@@ -544,6 +546,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
             },
             Channel {
                 name: "backup".to_string(),
@@ -564,6 +567,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
             },
         ];
         seed

@@ -312,6 +312,13 @@
       "always": "强制开启",
       "off": "关闭"
     },
+    "sessionCacheKey": {
+      "label": "会话缓存键回写",
+      "guide": "把解析出的会话标识（x-kairos-session-id 头优先，前缀哈希兜底）回写为上游 prompt_cache_key，仅对 OpenAI Chat 渠道生效。自动挡不覆盖下游显式携带的键。",
+      "auto": "自动",
+      "always": "强制回写",
+      "off": "关闭"
+    },
     "models": "模型清单",
     "modelsTitle": "模型清单",
     "modelsEmpty": "清单为空，可在下方添加 ID，或点「设置模型」从上游获取。",

@@ -19,6 +19,8 @@ import {
   type Protocol,
   REASONING_OUTPUT_MODES,
   type ReasoningOutputMode,
+  SESSION_CACHE_KEY_MODES,
+  type SessionCacheKeyMode,
 } from '@/api/types';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
@@ -199,6 +201,7 @@ const initialValues = {
   enabled: props.initial?.enabled ?? true,
   modelGroup: props.initial?.model_group ?? DEFAULT_MODEL_GROUP,
   reasoningOutput: props.initial?.reasoning_output ?? 'auto',
+  sessionCacheKey: props.initial?.session_cache_key ?? 'off',
 };
 
 const editorName = ref(initialValues.name);
@@ -215,6 +218,7 @@ const editorMaxRetries = ref(initialValues.maxRetries);
 const editorEnabled = ref(initialValues.enabled);
 const editorGroup = ref(initialValues.modelGroup);
 const editorReasoningOutput = ref<ReasoningOutputMode>(initialValues.reasoningOutput);
+const editorSessionCacheKey = ref<SessionCacheKeyMode>(initialValues.sessionCacheKey);
 /** 手动添加模型 ID 的输入草稿；点添加后 trim 写入 `editorModels`。 */
 const addModelDraft = ref('');
 
@@ -233,7 +237,8 @@ const dirty = computed(
     editorMaxRetries.value !== initialValues.maxRetries ||
     editorEnabled.value !== initialValues.enabled ||
     editorGroup.value !== initialValues.modelGroup ||
-    editorReasoningOutput.value !== initialValues.reasoningOutput,
+    editorReasoningOutput.value !== initialValues.reasoningOutput ||
+    editorSessionCacheKey.value !== initialValues.sessionCacheKey,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -251,6 +256,14 @@ const reasoningOutputOptions = computed(() =>
   REASONING_OUTPUT_MODES.map((value) => ({
     value,
     label: t(`channel.reasoningOutput.${value}`),
+  })),
+);
+
+const sessionCacheKeyInputId = `channel-editor-session-cache-key-${uid}`;
+const sessionCacheKeyOptions = computed(() =>
+  SESSION_CACHE_KEY_MODES.map((value) => ({
+    value,
+    label: t(`channel.sessionCacheKey.${value}`),
   })),
 );
 
@@ -501,6 +514,7 @@ function handleSave() {
       enabled: editorEnabled.value,
       model_group: editorGroup.value,
       reasoning_output: editorReasoningOutput.value,
+      session_cache_key: editorSessionCacheKey.value,
     });
     return;
   }
@@ -526,6 +540,7 @@ function handleSave() {
     enabled: editorEnabled.value,
     model_group: editorGroup.value,
     reasoning_output: editorReasoningOutput.value,
+    session_cache_key: editorSessionCacheKey.value,
   });
 }
 </script>
@@ -798,6 +813,20 @@ function handleSave() {
                 :options="reasoningOutputOptions"
                 :search-placeholder="t('channel.reasoningOutput.label')"
                 data-testid="channel-editor-reasoning-output"
+              />
+            </FormField>
+            <FormField
+              field-name="sessionCacheKey"
+              :label="t('channel.sessionCacheKey.label')"
+              :input-id="sessionCacheKeyInputId"
+              :guide="t('channel.sessionCacheKey.guide')"
+            >
+              <ListboxSelect
+                :id="sessionCacheKeyInputId"
+                v-model="editorSessionCacheKey"
+                :options="sessionCacheKeyOptions"
+                :search-placeholder="t('channel.sessionCacheKey.label')"
+                data-testid="channel-editor-session-cache-key"
               />
             </FormField>
             <fieldset class="border-seed rounded-md border p-3">

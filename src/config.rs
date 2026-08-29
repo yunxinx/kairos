@@ -113,6 +113,26 @@ fn is_reasoning_vendor_identifier(value: &str) -> bool {
         .any(|hint| value.contains(hint))
 }
 
+/// 渠道级会话缓存键回写模式。
+///
+/// 控制面向 OpenAI Chat 上游的 IR 出站请求是否把网关解析出的会话标识
+/// （显式 `x-kairos-session-id` 头优先，IR 稳定前缀哈希兜底）回写为
+/// `prompt_cache_key`，让跨协议族的多轮请求也获得上游自动缓存的会话亲和。
+/// 缺省 `off`：不改动出站请求，下游显式携带的缓存键照常透传。直通快路径
+/// 字节直搬，不经过本开关。
+#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCacheKeyMode {
+    /// 不回写。
+    #[default]
+    Off,
+    /// 下游未显式携带 `prompt_cache_key` 时回写会话标识。
+    Auto,
+    /// 无条件回写，覆盖下游显式携带的 `prompt_cache_key`（供统一会话亲和
+    /// 策略，如下游每轮发送随机键破坏亲和时）。
+    Always,
+}
+
 /// 配置解析错误，向上抛给应用边界。
 #[derive(Debug, Error)]
 pub enum ConfigError {

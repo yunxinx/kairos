@@ -312,6 +312,13 @@
       "always": "Always on",
       "off": "Off"
     },
+    "sessionCacheKey": {
+      "label": "Session cache key writeback",
+      "guide": "Write the resolved session identity (x-kairos-session-id header first, prefix hash fallback) as the upstream prompt_cache_key; only applies to OpenAI Chat channels. Auto never overrides a key provided by the downstream client.",
+      "auto": "Auto",
+      "always": "Always write",
+      "off": "Off"
+    },
     "models": "Models",
     "modelsTitle": "Models",
     "modelsEmpty": "No models yet. Add an ID below, or use “Set models” to fetch them.",

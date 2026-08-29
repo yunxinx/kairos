@@ -16,6 +16,15 @@ export const REASONING_OUTPUT_MODES: readonly ReasoningOutputMode[] = [
   'off',
 ];
 
+/** 渠道会话缓存键回写模式，与后端 `SessionCacheKeyMode` serde rename 一致。 */
+export type SessionCacheKeyMode = 'off' | 'auto' | 'always';
+
+export const SESSION_CACHE_KEY_MODES: readonly SessionCacheKeyMode[] = [
+  'off',
+  'auto',
+  'always',
+];
+
 /** 运行时收窄日志/表单里的协议字符串。 */
 export function isProtocol(value: string): value is Protocol {
   return (PROTOCOLS as readonly string[]).includes(value);
@@ -98,6 +107,8 @@ export interface Channel {
   model_group: string;
   /** reasoning 思维链兼容输出模式；缺省 auto（按厂商提示词表自动判定）。 */
   reasoning_output: ReasoningOutputMode;
+  /** 会话缓存键回写模式；缺省 off（不改动出站请求）。 */
+  session_cache_key: SessionCacheKeyMode;
 }
 
 /** 渠道上的一把上游密钥；模型白/黑名单为可选的逗号名单。 */
@@ -149,6 +160,7 @@ export function channelWriteBody(view: ChannelView): Channel {
     enabled: view.enabled,
     model_group: view.model_group,
     reasoning_output: view.reasoning_output,
+    session_cache_key: view.session_cache_key,
   };
 }
 

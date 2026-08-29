@@ -75,6 +75,18 @@ const KNOWN_REQUEST_FIELDS: &[&str] = &[
     "tool_choice",
     "parallel_tool_calls",
     "reasoning_effort",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+];
+
+/// 入站类型化捕获、存于 openai 逃生舱、出站按原字段名回写的字段记忆集。
+///
+/// 这些键是本协议可表达的字段名记忆而非逃生舱设置，出站不计入
+/// [`warning_feature::PROVIDER_OPTIONS`] 丢弃告警。
+const OPENAI_MEMORY_KEYS: &[&str] = &[
+    "max_completion_tokens",
+    "prompt_cache_key",
+    "prompt_cache_retention",
 ];
 
 /// OpenAI Chat Completions 出站/入站请求体（wire）。
@@ -115,6 +127,13 @@ struct WireChatRequest {
     parallel_tool_calls: Option<bool>,
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// OpenAI 自动缓存的会话亲和键（`user` 字段的事实标准继任者）：上游把
+    /// 同键请求路由到同一缓存分片。捕获进 IR `provider_options["openai"]`。
+    #[serde(default)]
+    prompt_cache_key: Option<String>,
+    /// OpenAI 自动缓存的保留档（如 `24h`），随值透传不做枚举校验。
+    #[serde(default)]
+    prompt_cache_retention: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -326,12 +345,24 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
 
     // 输出上限归一进 IR `max_tokens`；两字段并存（客户端冲突）取事实标准
     // 继任字段。原字段名经逃生舱记忆，同族出站按请求原字段回写。
+    // 缓存协同字段（prompt_cache_key/retention）同规：类型化捕获进 openai
+    // 逃生舱，不落入未知字段 extra。
     let mut provider_options = HashMap::new();
+    let mut openai_memory = serde_json::Map::new();
     if let Some(value) = wire.max_completion_tokens {
-        provider_options.insert(
-            "openai".to_string(),
-            json!({ "max_completion_tokens": value }),
+        openai_memory.insert("max_completion_tokens".to_string(), json!(value));
+    }
+    if let Some(key) = wire.prompt_cache_key {
+        openai_memory.insert("prompt_cache_key".to_string(), Value::String(key));
+    }
+    if let Some(retention) = wire.prompt_cache_retention {
+        openai_memory.insert(
+            "prompt_cache_retention".to_string(),
+            Value::String(retention),
         );
+    }
+    if !openai_memory.is_empty() {
+        provider_options.insert("openai".to_string(), Value::Object(openai_memory));
     }
     // 白名单外的顶层字段收进未知字段逃生舱，同族出站原样回写。
     let extra = capture_unknown_fields(value, KNOWN_REQUEST_FIELDS);
@@ -734,13 +765,13 @@ pub fn encode_request_with(
         ));
     }
     // 请求级逃生舱在 OpenAI Chat 无对应字段，显式丢弃；openai 逃生舱内的
-    // max_completion_tokens 字段名记忆已按原字段回写，未知字段（extra）由
-    // 专用逃生舱回写或告警，均不计丢弃。
+    // 字段名记忆已按原字段回写，未知字段（extra）由专用逃生舱回写或告警，
+    // 均不计丢弃。
     for (provider, options) in &request.provider_options {
         let unexpressed = match options.as_object() {
             Some(map) => map.keys().any(|key| {
                 key.as_str() != PROVIDER_EXTRA_KEY
-                    && (provider != "openai" || key.as_str() != "max_completion_tokens")
+                    && (provider != "openai" || !OPENAI_MEMORY_KEYS.contains(&key.as_str()))
             }),
             None => true,
         };
@@ -826,6 +857,15 @@ pub fn encode_request_with(
     }
     if let Some(effort) = request.reasoning {
         obj.insert("reasoning_effort".into(), json!(effort.as_str()));
+    }
+    // 缓存协同字段按原字段名回写：自动缓存的会话亲和键与保留档随值透传
+    // （保留档取值由上游校验，网关不做枚举钳制）。
+    let openai_memory = request.provider_options.get("openai");
+    if let Some(key) = openai_memory.and_then(|o| o.get("prompt_cache_key")) {
+        obj.insert("prompt_cache_key".into(), key.clone());
+    }
+    if let Some(retention) = openai_memory.and_then(|o| o.get("prompt_cache_retention")) {
+        obj.insert("prompt_cache_retention".into(), retention.clone());
     }
     // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
     apply_provider_extra(&mut obj, request, "openai", warnings);
@@ -2240,6 +2280,47 @@ mod tests {
         });
         let ir = decode_request(&conflict).expect("应可解码");
         assert_eq!(ir.max_tokens, Some(2048));
+    }
+
+    /// 缓存协同字段（prompt_cache_key/retention）经 openai 逃生舱类型化往返：
+    /// 同族出站按原字段回写且零告警，不落入未知字段 extra；缺席请求不产生
+    /// 空逃生舱与空键。
+    #[test]
+    fn prompt_cache_fields_roundtrip_via_openai_memory() {
+        let wire = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "prompt_cache_key": "conv-1",
+            "prompt_cache_retention": "24h"
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        assert_eq!(
+            ir.provider_options["openai"]["prompt_cache_key"],
+            json!("conv-1"),
+            "会话亲和键应类型化捕获而非落入 extra"
+        );
+        assert_eq!(
+            ir.provider_options["openai"]["prompt_cache_retention"],
+            json!("24h")
+        );
+
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(reencoded["prompt_cache_key"], json!("conv-1"));
+        assert_eq!(reencoded["prompt_cache_retention"], json!("24h"));
+
+        let plain = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let ir = decode_request(&plain).expect("应可解码");
+        assert!(!ir.provider_options.contains_key("openai"));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert!(reencoded.get("prompt_cache_key").is_none());
+        assert!(reencoded.get("prompt_cache_retention").is_none());
     }
 
     /// wire 形状错误指明出错字段的 JSON 路径，而非笼统的「不是合法 JSON 对象」。

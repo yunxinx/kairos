@@ -541,6 +541,7 @@ async fn handle_request(
     // 4. 准入：解析出站跳（普通模型一条；统一模型按成员顺序，只收已定价可路由的）。
     // IR 已解码，此处才能稳定计算无头请求的前缀亲和标识。
     let session = request_session(&headers, &request);
+    let session_identity = session_cache_identity(&headers, &request);
     let hops = match resolve_route_hops(
         &snapshot,
         &request.model,
@@ -743,6 +744,7 @@ async fn handle_request(
             inbound_anthropic_version,
             &headers,
             &request_id,
+            &session_identity,
         )
         .await;
         if response.status().is_success() {
@@ -950,6 +952,18 @@ fn request_session(headers: &HeaderMap, request: &ChatRequest) -> u64 {
         .unwrap_or_else(|| prefix_hash(request))
 }
 
+/// 解析会话标识原文，供会话缓存键回写：显式 `x-kairos-session-id` 头优先，
+/// 缺失时用 IR 稳定前缀哈希的十六进制兜底（与粘性路由同源，仅形态不同）。
+fn session_cache_identity(headers: &HeaderMap, request: &ChatRequest) -> String {
+    headers
+        .get("x-kairos-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:016x}", prefix_hash(request)))
+}
+
 /// 单次出站调用的请求侧上下文：入站请求、认证令牌与计费/日志所需的
 /// 请求级信息。作为 `*_completion` 的参数打包，避免过长参数列表。
 struct CallCtx<'a> {
@@ -968,6 +982,8 @@ struct CallCtx<'a> {
     request_body: Option<Bytes>,
     inbound_headers: &'a HeaderMap,
     request_id: &'a str,
+    /// 解析出的会话标识原文（显式头优先、前缀哈希兜底），供会话缓存键回写。
+    session_identity: &'a str,
 }
 
 /// 按一条跳的渠道路由发起出站：直通或 IR，遇可重试错误在该跳内 failover。
@@ -985,6 +1001,7 @@ async fn dispatch_hop(
     inbound_anthropic_version: Option<&HeaderValue>,
     inbound_headers: &HeaderMap,
     request_id: &str,
+    session_identity: &str,
 ) -> Response {
     // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
     // 任一渠道命中别名、或统一模型成员名与入站名不同时也回落 IR：直通无法改写请求体模型名。
@@ -1021,6 +1038,7 @@ async fn dispatch_hop(
         request_body_for_log,
         inbound_headers,
         request_id,
+        session_identity,
     )
     .await
 }
@@ -1043,6 +1061,7 @@ async fn outbound_with_failover(
     request_body_for_log: Option<Bytes>,
     inbound_headers: &HeaderMap,
     request_id: &str,
+    session_identity: &str,
 ) -> Response {
     run_failover(
         route,
@@ -1062,6 +1081,7 @@ async fn outbound_with_failover(
                     request_body: request_body_for_log.clone(),
                     inbound_headers,
                     request_id,
+                    session_identity,
                 };
                 let key = route
                     .selected_key(record.id)
@@ -1702,6 +1722,13 @@ async fn non_stream_completion(
     if let Value::Object(map) = &mut outbound_value {
         map.insert("model".into(), Value::String(outbound_model.to_string()));
     }
+    // 会话缓存键回写：按渠道开关把解析出的会话标识写为上游缓存亲和键。
+    protocol::write_session_cache_key(
+        &mut outbound_value,
+        channel.protocol,
+        channel.session_cache_key,
+        ctx.session_identity,
+    );
 
     let upstream_url = format!(
         "{}{}",
@@ -1867,6 +1894,13 @@ async fn stream_completion(
         }
         map.insert("model".into(), Value::String(outbound_model.to_string()));
     }
+    // 会话缓存键回写：与流式路径同规，多轮流式请求同样获得缓存亲和。
+    protocol::write_session_cache_key(
+        &mut outbound,
+        channel.protocol,
+        channel.session_cache_key,
+        ctx.session_identity,
+    );
     let upstream_url = format!(
         "{}{}",
         channel.base_url.trim_end_matches('/'),

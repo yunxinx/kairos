@@ -61,6 +61,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
             reasoning_output: Default::default(),
+            session_cache_key: Default::default(),
         },
         Channel {
             name: "ch-1".to_string(),
@@ -81,6 +82,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
             reasoning_output: Default::default(),
+            session_cache_key: Default::default(),
         },
     ];
     seed
@@ -108,6 +110,7 @@ fn three_channel_seed(bases: &[String]) -> common::Seed {
         enabled: true,
         model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
         reasoning_output: Default::default(),
+        session_cache_key: Default::default(),
     });
     seed
 }
@@ -702,8 +705,8 @@ async fn stream_fails_over_on_429() {
     assert_eq!(ups[1].received().len(), 1);
 }
 
-/// 流式首渠道中途断连（已发首字节）：不 failover（spec：failover 只在首字节前），
-/// 下游收到已累积的部分流后结束。
+/// 流式首渠道中途断连（已发首字节）：不 failover（failover 只保证首字节前的
+/// 请求完整性，首字节后重试会让下游收到重复内容），下游收到已累积的部分流后结束。
 #[tokio::test]
 async fn stream_disconnect_after_first_byte_does_not_failover() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {

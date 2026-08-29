@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 
-use crate::config::Protocol;
+use crate::config::{Protocol, SessionCacheKeyMode};
 use crate::core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage, Warning};
 use crate::core::stream::SseFrame;
 
@@ -61,6 +61,39 @@ pub fn encode_request_with_reasoning(
             crate::core::openai_responses::encode_request(request, warnings)
         }
     }
+}
+
+/// 会话缓存键回写：按渠道开关把网关解析出的会话标识写为出站请求的
+/// `prompt_cache_key`，让跨协议族的多轮请求也获得上游自动缓存的会话亲和。
+///
+/// 仅 OpenAI Chat 出站消费：`auto` 不覆盖下游显式携带的非空键，`always`
+/// 无条件覆盖，`off` 不写。对已编码出站对象做目标性补丁，与适配器的
+/// 类型化回写（下游显式值）正交。
+pub fn write_session_cache_key(
+    outbound: &mut Value,
+    protocol: Protocol,
+    mode: SessionCacheKeyMode,
+    identity: &str,
+) {
+    if protocol != Protocol::OpenAiChat || mode == SessionCacheKeyMode::Off || identity.is_empty() {
+        return;
+    }
+    let Some(map) = outbound.as_object_mut() else {
+        return;
+    };
+    if mode == SessionCacheKeyMode::Auto {
+        let explicit = map
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.trim().is_empty());
+        if explicit {
+            return;
+        }
+    }
+    map.insert(
+        "prompt_cache_key".to_string(),
+        Value::String(identity.to_string()),
+    );
 }
 
 /// 解码上游响应为 IR。
@@ -259,5 +292,82 @@ impl ChatStreamEncoder for ResponsesStreamEncoder {
     fn terminator(&self) -> Option<String> {
         // Responses 以 `response.completed` 事件收尾，无 `[DONE]` 哨兵。
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 回写三态：off 不写；auto 不覆盖下游显式键、缺席时写；always 无条件
+    /// 覆盖。非 chat 协议一概不写。
+    #[test]
+    fn session_cache_key_writeback_follows_mode() {
+        let identity = "sess-1";
+
+        let mut outbound = json!({ "model": "gpt-4o", "messages": [] });
+        write_session_cache_key(
+            &mut outbound,
+            Protocol::OpenAiChat,
+            SessionCacheKeyMode::Off,
+            identity,
+        );
+        assert!(outbound.get("prompt_cache_key").is_none(), "off 不应回写");
+
+        let mut outbound = json!({ "model": "gpt-4o", "messages": [] });
+        write_session_cache_key(
+            &mut outbound,
+            Protocol::OpenAiChat,
+            SessionCacheKeyMode::Auto,
+            identity,
+        );
+        assert_eq!(outbound["prompt_cache_key"], json!("sess-1"));
+
+        let mut outbound = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "prompt_cache_key": "downstream-key"
+        });
+        write_session_cache_key(
+            &mut outbound,
+            Protocol::OpenAiChat,
+            SessionCacheKeyMode::Auto,
+            identity,
+        );
+        assert_eq!(
+            outbound["prompt_cache_key"],
+            json!("downstream-key"),
+            "auto 不应覆盖下游显式键"
+        );
+
+        let mut outbound = json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "prompt_cache_key": "downstream-key"
+        });
+        write_session_cache_key(
+            &mut outbound,
+            Protocol::OpenAiChat,
+            SessionCacheKeyMode::Always,
+            identity,
+        );
+        assert_eq!(
+            outbound["prompt_cache_key"],
+            json!("sess-1"),
+            "always 应覆盖下游显式键"
+        );
+
+        let mut outbound = json!({ "model": "claude", "messages": [] });
+        write_session_cache_key(
+            &mut outbound,
+            Protocol::AnthropicMessages,
+            SessionCacheKeyMode::Always,
+            identity,
+        );
+        assert!(
+            outbound.get("prompt_cache_key").is_none(),
+            "非 chat 协议不写"
+        );
     }
 }
