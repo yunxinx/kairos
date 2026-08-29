@@ -166,10 +166,32 @@ fn project_response(ir: &ChatResponse) -> Value {
 }
 
 /// 请求的语义投影：同上，覆盖消息序列、工具定义与采样参数。
+///
+/// System 消息不进消息序列，按三协议出站统一的归并语义投影为合并文本
+/// （逐消息拼接、跨消息 `\n\n` 连接、空文本跳过）——散布的多条 System 与
+/// 合并后的单条投影相等，归并是协议整形而非语义损失。
 fn project_request(request: &ChatRequest) -> Value {
+    let system: String = request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .filter_map(|message| {
+            let text: String = message
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            (!text.is_empty()).then_some(text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     json!({
         "model": request.model,
-        "messages": request.messages.iter().map(|message| json!({
+        "system": system,
+        "messages": request.messages.iter().filter(|message| message.role != Role::System).map(|message| json!({
             "role": message.role,
             "content": message.content.iter().filter_map(project_content_part).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
@@ -1154,4 +1176,22 @@ fn root_union_input_schema_normalizes_only_for_anthropic() {
             .is_some()
     );
     assert!(warnings.is_empty());
+}
+
+/// 基线语义面：散布的多条 System 消息经全部有向对无损——三协议出站统一
+/// 归并（单条置顶 / 顶层 system / instructions），投影把 System 归一为
+/// 合并文本后往返相等，全程零告警。
+#[test]
+fn multiple_system_messages_survive_all_six_pairs() {
+    let mut request = base_request();
+    // 散布：中段再插一条 System 消息（第二段系统提示）。
+    let second = Message {
+        role: Role::System,
+        content: vec![text_part("输出一律使用 JSON")],
+        provider_options: HashMap::new(),
+    };
+    request.messages.insert(2, second);
+    for (a, b) in directed_pairs() {
+        request_survives(a, b, &request);
+    }
 }

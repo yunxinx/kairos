@@ -649,16 +649,46 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
 }
 
 /// 按渠道选项编码 IR 请求为出站 Chat Completions 请求体。
+///
+/// 多条/散布的 System 消息归并为单条置顶（`\n\n` 连接，空文本跳过）；
+/// reasoning 回写缺省开启，渠道级关闭用 [`encode_request_with`]。
 pub fn encode_request_with(
     request: &ChatRequest,
     options: ChatEncodeOptions,
     warnings: &mut Vec<Warning>,
 ) -> Value {
-    let messages: Vec<Value> = request
-        .messages
-        .iter()
-        .map(|message| encode_message(message, options, warnings))
-        .collect();
+    let mut messages: Vec<Value> = Vec::new();
+    let mut system_texts: Vec<String> = Vec::new();
+    for message in &request.messages {
+        match message.role {
+            Role::System => {
+                // System 消息仅承载文本；异常持有的 reasoning part 与其他
+                // 非助手角色同规显式丢弃并记 warning。
+                if message
+                    .content
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::Reasoning { .. }))
+                {
+                    warnings.push(Warning::unsupported(
+                        "reasoning",
+                        "OpenAI Chat Completions 无 reasoning 内容块，助手消息中的推理内容已丢弃",
+                    ));
+                }
+                if let Some(text) = text_parts(&message.content)
+                    && !text.is_empty()
+                {
+                    system_texts.push(text);
+                }
+            }
+            _ => messages.push(encode_message(message, options, warnings)),
+        }
+    }
+    if !system_texts.is_empty() {
+        messages.insert(
+            0,
+            json!({ "role": "system", "content": system_texts.join("\n\n") }),
+        );
+    }
 
     if request.top_k.is_some() {
         warnings.push(Warning::unsupported(
@@ -781,6 +811,7 @@ fn encode_message(
     options: ChatEncodeOptions,
     warnings: &mut Vec<Warning>,
 ) -> Value {
+    // System 消息已在请求级归并为单条置顶，不进入本函数。
     if message
         .content
         .iter()
@@ -793,10 +824,7 @@ fn encode_message(
         ));
     }
     match message.role {
-        Role::System => {
-            let text = text_parts(&message.content).unwrap_or_default();
-            json!({ "role": "system", "content": text })
-        }
+        Role::System => unreachable!("System 消息已在请求级归并"),
         Role::User => {
             // 单一纯文本 user 消息编码为字符串（OpenAI 惯例，保持既有往返形状）；
             // 否则按 content 顺序编码为数组，保持文本与媒体混排顺序。
@@ -1787,6 +1815,74 @@ mod tests {
             ContentPart::ToolCall { input, .. } if *input == json!({ "city": "SF" })
         ));
         assert!(ir.warnings.is_empty());
+    }
+
+    /// 多条/散布的 System 消息出站归并为单条置顶（`\n\n` 连接，空文本
+    /// 跳过）；其余消息保持原序。无 System 消息时形状不变（fixture 往返覆盖）。
+    #[test]
+    fn scattered_system_messages_merge_to_single_top() {
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Text {
+                        text: "你是天气助手".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "上海天气如何？".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Text {
+                        text: "输出一律使用 JSON".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Text {
+                        text: String::new(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        let messages = encoded["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0],
+            json!({ "role": "system", "content": "你是天气助手\n\n输出一律使用 JSON" })
+        );
+        assert_eq!(messages[1]["role"], "user");
     }
 
     /// 渠道级开关控制请求历史回放：关闭时丢弃 assistant 的 reasoning part

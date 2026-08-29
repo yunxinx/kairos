@@ -714,7 +714,8 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
         ));
     }
 
-    // System 消息聚合为 instructions；非文本 part 丢弃并记 warning。
+    // System 消息聚合为 instructions（空文本跳过，`\n\n` 连接，与 anthropic
+    // / chat 出站归并语义一致）；非文本 part 丢弃并记 warning。
     for message in request.messages.iter().filter(|m| m.role == Role::System) {
         for part in &message.content {
             match part {
@@ -739,8 +740,9 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
         .iter()
         .filter(|m| m.role == Role::System)
         .filter_map(|m| text_parts(&m.content))
+        .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
 
     let mut input = Vec::new();
     for message in request.messages.iter().filter(|m| m.role != Role::System) {
@@ -2275,6 +2277,66 @@ mod tests {
         let reencoded = encode_request(&ir, &mut warnings);
         assert_eq!(reencoded, wire, "往返应还原 wire 请求");
         assert!(warnings.is_empty(), "同协议往返不应产出 warning");
+    }
+
+    /// 多条 System 消息聚合为单条 instructions（空文本跳过，`\n\n` 连接，
+    /// 与 anthropic / chat 出站归并语义一致）。
+    #[test]
+    fn multiple_system_messages_aggregate_into_instructions() {
+        let request = ChatRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Text {
+                        text: "你是天气助手".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "上海天气如何？".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Text {
+                        text: "输出一律使用 JSON".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert_eq!(
+            encoded["instructions"],
+            json!("你是天气助手\n\n输出一律使用 JSON")
+        );
+        // System 消息不进入 input 序列。
+        let input = encoded["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
     }
 
     /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。

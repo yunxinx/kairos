@@ -747,11 +747,12 @@ fn decode_media_part(
 
 /// 编码 IR 请求为出站 Anthropic Messages 请求体。
 ///
-/// 首个 System 消息提升为顶层 `system`；请求级 `provider_options["anthropic"]`
-/// 原样回传（thinking 与 output_config 经 IR 路径不丢失）。thinking 请求面
-/// 按优先级解析：tool_choice 强制时整体剥离 > 本族逃生舱 > 类型化 effort 按
-/// 模型形态兜底；thinking 激活时整形采样参数（temperature=1、top_p≥0.95、
-/// 剥离 top_k）。目标协议无法表达或被约束整形的设置追加到 `warnings`。
+/// 全部 System 消息按序合并进顶层 `system`（`\n\n` 连接，空文本跳过）；请求级
+/// `provider_options["anthropic"]` 原样回传（thinking 与 output_config 经 IR
+/// 路径不丢失）。thinking 请求面按优先级解析：tool_choice 强制时整体剥离 >
+/// 本族逃生舱 > 类型化 effort 按模型形态兜底；thinking 激活时整形采样参数
+/// （temperature=1、top_p≥0.95、剥离 top_k）。目标协议无法表达或被约束整形
+/// 的设置追加到 `warnings`。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
     let (system, messages) = encode_messages(&request.messages, warnings);
 
@@ -1129,12 +1130,15 @@ fn encode_messages(
                     }
                 }
                 let text = text_parts(&message.content).unwrap_or_default();
-                if system_out.is_none() {
-                    system_out = Some(text);
-                } else {
-                    // 后续 System 消息以 user 文本夹入，避免丢失。
-                    push_user_text(&mut wire_messages, &text);
+                if text.is_empty() {
+                    continue;
                 }
+                // 全部 System 消息按序合并进顶层 system（\n\n 连接）；中段
+                // system 以消息形式夹入会扰动上游缓存前缀并改变消息序列。
+                system_out = Some(match system_out.take() {
+                    Some(existing) => format!("{existing}\n\n{text}"),
+                    None => text,
+                });
             }
             Role::User => {
                 let blocks = encode_user_blocks(&message.content, warnings);
@@ -2850,6 +2854,63 @@ mod tests {
         }
         assert_eq!(sanitize_tool_id("!!"), "__", "全非法字符清洗后仍为合法形状");
         assert_eq!(sanitize_tool_id(""), "", "空串清洗为空，生成由调用方兜底");
+    }
+
+    /// 请求编码：散布的多条 System 消息按序合并进顶层 `system`（`\n\n`
+    /// 连接），不再以 user 文本夹入消息流；空文本 System 跳过。
+    #[test]
+    fn multiple_system_messages_merge_into_top_system() {
+        let system_message = |text: &str| Message {
+            role: Role::System,
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+                provider_options: HashMap::new(),
+            }],
+            provider_options: HashMap::new(),
+        };
+        let request = ChatRequest {
+            model: "claude-sonnet".to_string(),
+            messages: vec![
+                system_message("你是天气助手"),
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "上海天气如何？".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                system_message("输出一律使用 JSON"),
+                system_message(""),
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: Some(1024),
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert_eq!(
+            encoded["system"],
+            json!("你是天气助手\n\n输出一律使用 JSON")
+        );
+        // 消息序列不含夹入的 system 文本：仅剩一条 user。
+        let messages = encoded["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "上海天气如何？");
     }
 
     /// 请求编码：tool 消息的 tool_result 还原为 user 消息，assistant 连续消息合并。
