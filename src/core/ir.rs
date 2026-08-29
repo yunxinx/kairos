@@ -389,6 +389,12 @@ pub struct ChatRequest {
     /// 预算设置丢失。跨协议族出站时丢弃并记 warning。
     #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
     pub provider_options: ProviderOptions,
+    /// 入站解码侧的兼容动作记录（拒绝改兜底的有损面），随响应面回传下游。
+    ///
+    /// 出站编码的转换损失由各适配器 `encode_request` 另行积累，两者在网关
+    /// 响应面合流；适配器编码不消费本字段。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
 }
 
 /// 为没有显式会话头的请求计算前缀亲和标识。

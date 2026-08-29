@@ -291,11 +291,12 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         }
     })?;
 
+    let mut warnings = Vec::new();
     let messages = wire
         .messages
         .iter()
         .enumerate()
-        .map(|(index, m)| decode_message(m, index))
+        .map(|(index, m)| decode_message(m, index, &mut warnings))
         .collect::<Result<Vec<_>, _>>()?;
 
     // 输出上限归一进 IR `max_tokens`；两字段并存（客户端冲突）取事实标准
@@ -350,6 +351,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             })
             .transpose()?,
         provider_options,
+        warnings,
     })
 }
 
@@ -397,7 +399,11 @@ fn decode_tool_choice(value: &Value) -> Result<ToolChoice, DecodeError> {
 ///
 /// `developer` role 是 `system` 的事实标准继任者（o 系客户端普遍使用），
 /// 与 Responses 适配器同规按 System 处理；角色名本身不做同族保留。
-fn decode_message(wire: &WireMessage, index: usize) -> Result<Message, DecodeError> {
+fn decode_message(
+    wire: &WireMessage,
+    index: usize,
+    warnings: &mut Vec<Warning>,
+) -> Result<Message, DecodeError> {
     let role = match wire.role.as_str() {
         "system" | "developer" => Role::System,
         "user" => Role::User,
@@ -436,7 +442,7 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Message, DecodeErr
                     .collect::<Result<Vec<_>, _>>()?,
             }
         }
-        Role::Assistant => decode_assistant(wire, index)?,
+        Role::Assistant => decode_assistant(wire, index, warnings)?,
         Role::Tool => {
             let tool_call_id = wire
                 .tool_call_id
@@ -466,7 +472,11 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Message, DecodeErr
 
 /// 助手消息：思维链归一为首个 Reasoning part（置于应答内容之前），text
 /// parts 聚合成一个 text part，tool-call parts 各自保留。
-fn decode_assistant(wire: &WireMessage, index: usize) -> Result<Vec<ContentPart>, DecodeError> {
+fn decode_assistant(
+    wire: &WireMessage,
+    index: usize,
+    warnings: &mut Vec<Warning>,
+) -> Result<Vec<ContentPart>, DecodeError> {
     let mut parts = Vec::new();
 
     // 双别名归一：`reasoning_content` 为主、`reasoning` 为别名，并存时取主；
@@ -509,8 +519,21 @@ fn decode_assistant(wire: &WireMessage, index: usize) -> Result<Vec<ContentPart>
 
     if let Some(tool_calls) = &wire.tool_calls {
         for tc in tool_calls {
-            let input = serde_json::from_str::<Value>(&tc.function.arguments)
-                .map_err(|_| DecodeError::ToolCallArgumentsNotString { index })?;
+            // 非法 arguments 拒绝会让整轮工具调用 400 卡死；对齐流式累积侧
+            // 兜底：合法 JSON 对象才透传，否则兜底空对象并记 warning。
+            let input = match serde_json::from_str::<Value>(&tc.function.arguments) {
+                Ok(input @ Value::Object(_)) => input,
+                _ => {
+                    warnings.push(Warning::compatibility(
+                        "tool_arguments",
+                        format!(
+                            "tool call {} 的 arguments 非合法 JSON 对象，已兜底为空对象",
+                            tc.function.name
+                        ),
+                    ));
+                    json!({})
+                }
+            };
             parts.push(ContentPart::ToolCall {
                 tool_call_id: tc.id.clone(),
                 tool_name: tc.function.name.clone(),
@@ -1696,6 +1719,76 @@ mod tests {
         ));
     }
 
+    /// 非法 tool arguments 不再拒绝整请求：解码成功、input 兜底空对象、
+    /// warning 记录在请求上；合法 JSON 对象透传且零告警。
+    #[test]
+    fn illegal_tool_arguments_fall_back_to_empty_object() {
+        let wire = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{oops" }
+                }]
+            }]
+        });
+        let ir = decode_request(&wire).expect("非法 arguments 应兜底解码而非拒绝");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::ToolCall { input, .. } if *input == json!({})
+        ));
+        assert_eq!(
+            ir.warnings,
+            vec![Warning::compatibility(
+                "tool_arguments",
+                "tool call get_weather 的 arguments 非合法 JSON 对象，已兜底为空对象",
+            )]
+        );
+
+        // 合法 JSON 但非对象（数组）同兜底。
+        let wire = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "[1, 2]" }
+                }]
+            }]
+        });
+        let ir = decode_request(&wire).expect("非对象 JSON 应兜底解码而非拒绝");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::ToolCall { input, .. } if *input == json!({})
+        ));
+        assert_eq!(ir.warnings.len(), 1);
+
+        // 合法 JSON 对象透传，零告警。
+        let wire = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"SF\"}" }
+                }]
+            }]
+        });
+        let ir = decode_request(&wire).expect("合法 arguments 应正常解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::ToolCall { input, .. } if *input == json!({ "city": "SF" })
+        ));
+        assert!(ir.warnings.is_empty());
+    }
+
     /// 渠道级开关控制请求历史回放：关闭时丢弃 assistant 的 reasoning part
     /// 并记 warning，开启时回写零告警（缺省开启由其余用例覆盖）。
     #[test]
@@ -1731,6 +1824,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             provider_options: HashMap::new(),
+            warnings: Vec::new(),
         };
 
         let mut warnings = Vec::new();
@@ -2308,6 +2402,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             provider_options: HashMap::new(),
+            warnings: Vec::new(),
         };
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);
@@ -2403,6 +2498,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             provider_options: HashMap::new(),
+            warnings: Vec::new(),
         };
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);

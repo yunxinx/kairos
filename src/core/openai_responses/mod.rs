@@ -355,6 +355,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             })
             .transpose()?,
         provider_options,
+        warnings: Vec::new(),
     })
 }
 
@@ -2358,6 +2359,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             provider_options: HashMap::new(),
+            warnings: Vec::new(),
         };
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);
@@ -2672,6 +2674,7 @@ mod tests {
             tool_choice: None,
             reasoning: None,
             provider_options: HashMap::new(),
+            warnings: Vec::new(),
         };
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);

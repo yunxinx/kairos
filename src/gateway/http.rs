@@ -1690,6 +1690,8 @@ async fn non_stream_completion(
         .reasoning_output
         .enables_reasoning_content(outbound_model, &channel.base_url);
     let mut request_warnings = Vec::new();
+    // 入站解码侧的兼容动作（如非法 arguments 兜底）随响应面回传，流式路径同。
+    request_warnings.extend(request.warnings.iter().cloned());
     let mut outbound_value = protocol::encode_request_with_reasoning(
         request,
         channel.protocol,
@@ -1848,6 +1850,8 @@ async fn stream_completion(
     let started = ctx.started;
     let inbound_protocol = ctx.inbound_protocol;
     let mut request_warnings = Vec::new();
+    // 入站解码侧的兼容动作随流首下发，非流式路径同。
+    request_warnings.extend(request.warnings.iter().cloned());
     let mut outbound = protocol::encode_request(request, channel.protocol, &mut request_warnings);
     let outbound_model = routing::outbound_model(channel, ctx.routed_model);
     // 目标性 JSON 补丁：强制流式；OpenAI 另注入 stream_options.include_usage

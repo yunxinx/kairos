@@ -329,6 +329,7 @@ fn base_request() -> ChatRequest {
         }],
         tool_choice: None,
         provider_options: HashMap::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -1079,5 +1080,78 @@ fn thinking_active_sampling_shaped_with_warning() {
     assert_eq!(wire["temperature"], json!(0.5));
     assert_eq!(wire["top_p"], json!(0.9));
     assert_eq!(wire["top_k"], json!(40));
+    assert!(warnings.is_empty());
+}
+
+/// chat 入站非法 tool arguments 的兜底是有损面，不进基线矩阵（矩阵要求
+/// 零告警的无损面）：解码成功、input 兜底空对象、warning 记录在请求上，
+/// 跨族出站全程无编码告警。
+#[test]
+fn illegal_tool_arguments_fallback_declared_lossy() {
+    let wire = json!({
+        "model": "matrix-model",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{oops" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "晴" },
+        ],
+    });
+    let request = decode_request_wire(Protocol::OpenAiChat, &wire);
+    assert_eq!(
+        request.warnings,
+        vec![Warning::compatibility(
+            "tool_arguments",
+            "tool call get_weather 的 arguments 非合法 JSON 对象，已兜底为空对象",
+        )]
+    );
+
+    // 兜底后的 tool_call 跨族出站为空 input，编码零告警。
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(wire["messages"][0]["content"][0]["type"], "tool_use");
+    assert_eq!(wire["messages"][0]["content"][0]["input"], json!({}));
+    assert!(warnings.is_empty());
+}
+
+/// tool 的根级 union schema 只在 anthropic 出站面归一化：摊平合并并记
+/// warning；chat 出站按原样透传（OpenAI 系接受根级 union），零告警。
+#[test]
+fn root_union_input_schema_normalizes_only_for_anthropic() {
+    let mut request = base_request();
+    request.tools[0].parameters = Some(json!({
+        "anyOf": [
+            { "type": "object", "properties": { "city": { "type": "string" } } },
+            { "type": "object", "properties": { "days": { "type": "number" } } },
+        ],
+    }));
+
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(
+        wire["tools"][0]["input_schema"],
+        json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string" },
+                "days": { "type": "number" },
+            },
+        })
+    );
+    assert!(matches!(
+        warnings.as_slice(),
+        [Warning::Compatibility { feature, .. }] if feature == "input_schema"
+    ));
+
+    let (wire, warnings) = encode_request_wire(Protocol::OpenAiChat, &request);
+    assert!(
+        wire["tools"][0]["function"]["parameters"]
+            .get("anyOf")
+            .is_some()
+    );
     assert!(warnings.is_empty());
 }

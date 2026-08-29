@@ -177,6 +177,7 @@ fn minimal_probe_request(model: &str) -> ChatRequest {
         tool_choice: None,
         reasoning: None,
         provider_options: HashMap::new(),
+        warnings: Vec::new(),
     }
 }
 
