@@ -817,6 +817,52 @@ fn max_completion_tokens_survives_three_outbound_directions() {
     assert!(chat_wire.get("max_tokens").is_none(), "不应双写旧字段");
 }
 
+/// chat 入站 `reasoning_content` 经 anthropic thinking 块中转后回 chat：
+/// 无 signature 的 reasoning 语义保留，全程零告警。
+#[test]
+fn chat_reasoning_content_survives_via_anthropic_thinking_block() {
+    let reasoning_text = "先算 900 ÷ 5 = 180，再算 25 ÷ 5 = 5。";
+    let wire = json!({
+        "model": "deepseek-reasoner",
+        "messages": [
+            { "role": "user", "content": "925 ÷ 5 等于多少？" },
+            {
+                "role": "assistant",
+                "content": "925 ÷ 5 = 185",
+                "reasoning_content": reasoning_text
+            }
+        ]
+    });
+    let ir = decode_request_wire(Protocol::OpenAiChat, &wire);
+    assert!(matches!(
+        &ir.messages[1].content[0],
+        ContentPart::Reasoning { text, .. } if text == reasoning_text
+    ));
+
+    // anthropic 出站：无 signature 的 reasoning 预置为无 signature 的 thinking 块。
+    let (anthropic_wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(warnings.is_empty());
+    let assistant = anthropic_wire["messages"]
+        .as_array()
+        .expect("应有消息数组")
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("应有 assistant 消息");
+    assert_eq!(
+        assistant["content"][0],
+        json!({ "type": "thinking", "thinking": reasoning_text })
+    );
+
+    // anthropic 入站解码回 Reasoning part，回 chat 面语义保留。
+    let via_anthropic = decode_request_wire(Protocol::AnthropicMessages, &anthropic_wire);
+    let (chat_wire, warnings) = encode_request_wire(Protocol::OpenAiChat, &via_anthropic);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        chat_wire["messages"][1]["reasoning_content"],
+        json!(reasoning_text)
+    );
+}
+
 /// reasoning 旋钮的跨族全链路：chat 入站 → anthropic 中转 → chat 回归，
 /// 类型化档位在投影面无损。anthropic 中转会在 IR 上固化 thinking 逃生舱，
 /// 回到 chat 面时该逃生舱显式丢弃并告警——属声明过的有损面，告警形状

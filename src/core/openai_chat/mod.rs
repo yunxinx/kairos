@@ -119,6 +119,13 @@ struct WireMessage {
     tool_call_id: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<WireToolCall>>,
+    /// 助手思维链（DeepSeek/OpenRouter/xAI 生态事实标准），`reasoning` 为
+    /// OpenRouter 别名；解码归一为 IR Reasoning part，`reasoning_content`
+    /// 优先。
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
 }
 
 /// user/assistant 的 content：字符串或有序 part 数组。
@@ -457,9 +464,24 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Message, DecodeErr
     })
 }
 
-/// 助手消息：text parts 聚合成一个 text part，tool-call parts 各自保留。
+/// 助手消息：思维链归一为首个 Reasoning part（置于应答内容之前），text
+/// parts 聚合成一个 text part，tool-call parts 各自保留。
 fn decode_assistant(wire: &WireMessage, index: usize) -> Result<Vec<ContentPart>, DecodeError> {
     let mut parts = Vec::new();
+
+    // 双别名归一：`reasoning_content` 为主、`reasoning` 为别名，并存时取主；
+    // 空串视同缺席，不产出空 part。
+    if let Some(reasoning) = wire
+        .reasoning_content
+        .as_ref()
+        .or(wire.reasoning.as_ref())
+        .filter(|text| !text.is_empty())
+    {
+        parts.push(ContentPart::Reasoning {
+            text: reasoning.clone(),
+            provider_options: HashMap::new(),
+        });
+    }
 
     if let Some(content) = &wire.content {
         match content {
@@ -701,13 +723,15 @@ fn encode_tool_choice(choice: &ToolChoice) -> Value {
 
 /// 编码单条 IR 消息为 wire 消息。
 ///
-/// `reasoning` part 在 Chat Completions 无对应字段：跨协议族转换时丢弃并记
-/// warning。
+/// assistant 消息的 `reasoning` part 经 `reasoning_content` 字段回写（生态
+/// 事实标准，多个 part 聚合为单字段、段间空行连接）；出现在其他角色的
+/// 消息中无法表达，丢弃并记 warning。
 fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
-    if message
-        .content
-        .iter()
-        .any(|p| matches!(p, ContentPart::Reasoning { .. }))
+    if message.role != Role::Assistant
+        && message
+            .content
+            .iter()
+            .any(|p| matches!(p, ContentPart::Reasoning { .. }))
     {
         warnings.push(Warning::unsupported(
             "reasoning",
@@ -740,6 +764,14 @@ fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
             json!({ "role": "user", "content": content })
         }
         Role::Assistant => {
+            let reasoning: Vec<&str> = message
+                .content
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Reasoning { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
             let text = text_parts(&message.content).unwrap_or_default();
             let tool_calls: Vec<Value> = message
                 .content
@@ -773,6 +805,9 @@ fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
                 Value::String(text)
             };
             wire.insert("content".into(), content_value);
+            if !reasoning.is_empty() {
+                wire.insert("reasoning_content".into(), json!(reasoning.join("\n\n")));
+            }
             if !tool_calls.is_empty() {
                 wire.insert("tool_calls".into(), Value::Array(tool_calls));
             }
@@ -1521,6 +1556,65 @@ mod tests {
         assert!(warnings.is_empty(), "同协议往返不应产出 warning");
     }
 
+    /// 黄金样例（思维链入站）decode → encode 往返还原 wire：Reasoning part
+    /// 经 `reasoning_content` 同名回写，同族逐位稳定。
+    #[test]
+    fn reasoning_content_fixture_roundtrip() {
+        let raw = include_str!("__fixtures__/request_reasoning_content.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let ir = decode_request(&wire).expect("fixture 应可解码为 IR");
+        assert!(matches!(
+            &ir.messages[1].content[0],
+            ContentPart::Reasoning { text, .. }
+                if text == "先算 900 ÷ 5 = 180，再算 25 ÷ 5 = 5，合起来 185。"
+        ));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "往返应还原 wire 请求");
+        assert!(warnings.is_empty(), "同协议往返不应产出 warning");
+    }
+
+    /// `reasoning` 别名与 `reasoning_content` 归一为同一 Reasoning part；
+    /// 并存时主字段优先。回写统一出规范字段名 `reasoning_content`。
+    #[test]
+    fn reasoning_alias_normalizes_to_reasoning_content() {
+        let alias = json!({
+            "model": "deepseek-reasoner",
+            "messages": [{
+                "role": "assistant",
+                "content": "答案",
+                "reasoning": "别名思维链"
+            }]
+        });
+        let ir = decode_request(&alias).expect("别名应可解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Reasoning { text, .. } if text == "别名思维链"
+        ));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            reencoded["messages"][0]["reasoning_content"],
+            json!("别名思维链")
+        );
+
+        let both = json!({
+            "model": "deepseek-reasoner",
+            "messages": [{
+                "role": "assistant",
+                "content": "答案",
+                "reasoning": "别名",
+                "reasoning_content": "主字段"
+            }]
+        });
+        let ir = decode_request(&both).expect("并存应可解码");
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Reasoning { text, .. } if text == "主字段"
+        ));
+    }
+
     /// 黄金样例响应 decode → encode 往返还原 wire。
     #[test]
     fn response_fixture_roundtrip() {
@@ -2052,10 +2146,12 @@ mod tests {
         );
     }
 
-    /// 出站编码时 IR 的 top_k 与 reasoning 无法表达：丢弃并记 warning。
+    /// 出站编码时 IR 的 top_k 无法表达：丢弃并记 warning；assistant 消息的
+    /// reasoning part 回写为 `reasoning_content`（零告警），非 assistant 角色
+    /// 的 reasoning part 仍丢弃并记 warning。
     #[test]
     fn unsupported_ir_features_produce_warnings() {
-        let request = ChatRequest {
+        let mut request = ChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![Message {
                 role: Role::Assistant,
@@ -2092,12 +2188,28 @@ mod tests {
                 .iter()
                 .any(|w| matches!(w, Warning::Unsupported { feature, .. } if feature == "top_k"))
         );
+        assert_eq!(
+            encoded["messages"][0]["reasoning_content"],
+            json!("思考"),
+            "assistant reasoning part 应回写为 reasoning_content"
+        );
+        assert!(
+            !warnings.iter().any(
+                |w| matches!(w, Warning::Unsupported { feature, .. } if feature == "reasoning")
+            )
+        );
+
+        // 非 assistant 角色携带 reasoning part：无法表达，丢弃并记 warning。
+        request.messages[0].role = Role::User;
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
         assert!(
             warnings.iter().any(
                 |w| matches!(w, Warning::Unsupported { feature, .. } if feature == "reasoning")
             ),
-            "reasoning part 丢弃应记 warning"
+            "非 assistant 角色的 reasoning part 丢弃应记 warning"
         );
+        assert!(encoded["messages"][0].get("reasoning_content").is_none());
     }
 
     /// 模型列表编码对齐官方 `GET /v1/models` 黄金样例。
