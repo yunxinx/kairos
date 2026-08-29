@@ -1039,6 +1039,16 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if !request.stop.is_empty() {
         obj.insert("stop_sequences".into(), json!(request.stop));
     }
+    // JSON 结构化输出在 Anthropic 无请求侧承载（官方走 tools 变体，未实现）；
+    // type=text 等价于缺省（无输出形状约束），不告警。
+    if let Some(response_format) = &request.response_format
+        && response_format.get("type").and_then(Value::as_str) != Some("text")
+    {
+        warnings.push(Warning::unsupported(
+            warning_feature::RESPONSE_FORMAT,
+            "Anthropic Messages 无 response_format 承载，JSON 结构化输出已丢弃",
+        ));
+    }
     if request.stream {
         obj.insert("stream".into(), Value::Bool(true));
     }
@@ -3105,6 +3115,62 @@ mod tests {
         let reencoded = encode_request(&ir, &mut warnings);
         assert_eq!(reencoded, wire, "document URL source 往返应还原 wire");
         assert!(warnings.is_empty(), "document URL 往返不应记 warning");
+    }
+
+    /// chat 的 response_format 在 Anthropic 出站无请求侧承载：非缺省形状
+    /// 记 warning；type=text 等价缺省不告警。
+    #[test]
+    fn response_format_without_carrier_warns() {
+        let mut request = {
+            use crate::core::ir::Message;
+            ChatRequest {
+                model: "claude-sonnet-4-5".to_string(),
+                messages: vec![Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "hi".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                }],
+                stream: false,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_tokens: Some(100),
+                n: None,
+                stop: Vec::new(),
+                presence_penalty: None,
+                frequency_penalty: None,
+                seed: None,
+                response_format: None,
+                tools: Vec::new(),
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                provider_options: HashMap::new(),
+                warnings: Vec::new(),
+            }
+        };
+
+        request.response_format = Some(json!({ "type": "json_object" }));
+        let mut warnings = Vec::new();
+        encode_request(&request, &mut warnings);
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                Warning::Unsupported { feature: f, .. } if f == warning_feature::RESPONSE_FORMAT
+            )),
+            "JSON 结构化输出无承载应记 response_format 告警"
+        );
+
+        request.response_format = Some(json!({ "type": "text" }));
+        let mut warnings = Vec::new();
+        encode_request(&request, &mut warnings);
+        assert!(
+            warnings.is_empty(),
+            "type=text 等价缺省，不应告警: {warnings:?}"
+        );
     }
 
     /// 目标协议不支持的媒体类型（非 image/application/text 顶层段）出站时丢弃并记 warning。

@@ -307,10 +307,16 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     }
 
     // 请求级逃生舱：`text`/`reasoning` 面板与有状态特性（留存，出站丢弃）。
+    // text.format 的可识别档位同时提升进类型化 response_format（chat 形状），
+    // 供跨族出站映射；面板原文照常留存，同族回写不受影响。
     let mut provider_options = HashMap::new();
     let mut openai = serde_json::Map::new();
+    let mut response_format: Option<Value> = None;
     if let Some(text) = &wire.text {
         openai.insert("text".into(), text.clone());
+        if let Some(format) = text.get("format") {
+            response_format = response_format_from_text_format(format);
+        }
     }
     if let Some(reasoning) = &wire.reasoning {
         openai.insert("reasoning".into(), reasoning.clone());
@@ -347,7 +353,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         presence_penalty: None,
         frequency_penalty: None,
         seed: None,
-        response_format: None,
+        response_format,
         tools: wire
             .tools
             .unwrap_or_default()
@@ -737,12 +743,19 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             "OpenAI Responses 无 frequency_penalty 参数，已丢弃",
         ));
     }
-    if request.response_format.is_some() {
-        warnings.push(Warning::unsupported(
-            warning_feature::RESPONSE_FORMAT,
-            "OpenAI Responses 无 response_format 字段（JSON 输出需以 text.format 表达），已丢弃",
-        ));
-    }
+    // JSON 结构化输出等价映射：text 面板逃生舱在场时面板原文回写（同族保真
+    // 优先），缺席时类型化 response_format 以 text.format 出站；无法表达的
+    // 形状在换算处记 warning。
+    let text_panel_present = request
+        .provider_options
+        .get(OPENAI_PROVIDER)
+        .and_then(|openai| openai.get("text"))
+        .is_some();
+    let text_format = if text_panel_present {
+        None
+    } else {
+        text_format_from_response_format(request.response_format.as_ref(), warnings)
+    };
 
     // System 消息聚合为 instructions（空文本跳过，`\n\n` 连接，与 anthropic
     // / chat 出站归并语义一致）；非文本 part 丢弃并记 warning。
@@ -855,6 +868,10 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             }
         }
     }
+    // 类型化 response_format 以 text.format 出站（text 面板在场时已让位原文）。
+    if let Some(format) = text_format {
+        obj.insert("text".into(), json!({ "format": format }));
+    }
     // 面板逃生舱缺席时以类型化 effort 兜底，保持「旋钮跨请求不丢失」。
     if !reasoning_emitted && let Some(effort) = request.reasoning {
         obj.insert("reasoning".into(), json!({ "effort": effort.as_str() }));
@@ -862,6 +879,67 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
     apply_provider_extra(&mut obj, request, OPENAI_PROVIDER, warnings);
     Value::Object(obj)
+}
+
+/// Responses `text.format` → IR `response_format`（chat wire 形状）。
+///
+/// `json_object` 同形；`json_schema` 的扁平字段收进 `json_schema` 子对象；
+/// `text` 等价缺省返回 `None`；未知形状不提升——text 面板逃生舱原文留存，
+/// 同族回写不受影响，跨族出站随面板整体告警。
+fn response_format_from_text_format(format: &Value) -> Option<Value> {
+    match format.get("type").and_then(Value::as_str) {
+        Some("json_object") => Some(json!({ "type": "json_object" })),
+        Some("json_schema") => {
+            let Value::Object(fields) = format else {
+                return None;
+            };
+            let mut inner = fields.clone();
+            inner.remove("type");
+            Some(json!({ "type": "json_schema", "json_schema": inner }))
+        }
+        _ => None,
+    }
+}
+
+/// IR `response_format`（chat 形状）→ Responses `text.format`。
+///
+/// `json_object` 同形；`json_schema` 子对象摊平为顶层字段；`type=text`
+/// 等价缺省不写；其余形状无法表达，记 warning 返回 `None`。
+fn text_format_from_response_format(
+    response_format: Option<&Value>,
+    warnings: &mut Vec<Warning>,
+) -> Option<Value> {
+    let response_format = response_format?;
+    match response_format.get("type").and_then(Value::as_str) {
+        Some("json_object") => Some(response_format.clone()),
+        Some("json_schema") => {
+            let Some(inner) = response_format
+                .get("json_schema")
+                .and_then(Value::as_object)
+            else {
+                warnings.push(Warning::unsupported(
+                    warning_feature::RESPONSE_FORMAT,
+                    format!(
+                        "response_format 的 json_schema 缺少子对象，无法以 text.format 表达: {response_format}"
+                    ),
+                ));
+                return None;
+            };
+            let mut format = inner.clone();
+            format.insert("type".to_string(), json!("json_schema"));
+            Some(Value::Object(format))
+        }
+        Some("text") => None,
+        _ => {
+            warnings.push(Warning::unsupported(
+                warning_feature::RESPONSE_FORMAT,
+                format!(
+                    "OpenAI Responses 无法表达该 response_format 形状，已丢弃: {response_format}"
+                ),
+            ));
+            None
+        }
+    }
 }
 
 /// 解码 wire `tool_choice` 为 IR 类型化枚举（Responses 的工具选择为扁平
@@ -2794,7 +2872,7 @@ mod tests {
             presence_penalty: Some(0.5),
             frequency_penalty: None,
             seed: Some(42),
-            response_format: Some(json!({ "type": "json_object" })),
+            response_format: None,
             tools: Vec::new(),
             tool_choice: None,
             parallel_tool_calls: None,
@@ -2807,20 +2885,122 @@ mod tests {
         assert!(encoded.get("top_k").is_none(), "Responses 无 top_k 字段");
         assert!(encoded.get("seed").is_none(), "Responses 无 seed 字段");
         assert!(encoded.get("stop").is_none(), "Responses 无 stop 字段");
-        for feature in [
-            "top_k",
-            "n",
-            "seed",
-            "stop",
-            "presence_penalty",
-            "response_format",
-        ] {
+        for feature in ["top_k", "n", "seed", "stop", "presence_penalty"] {
             assert!(
                 warnings.iter().any(|w| matches!(
                     w,
                     Warning::Unsupported { feature: f, .. } if f == feature
                 )),
                 "{feature} 丢弃应记 warning"
+            );
+        }
+    }
+
+    /// response_format ↔ text.format 等价双向映射：json_object 同形、
+    /// json_schema 摊平/收拢，同族出站面板原文优先不重复写 format，跨族到
+    /// chat 按类型化 response_format 回写。
+    #[test]
+    fn response_format_and_text_format_interop() {
+        // responses 入站 text.format json_schema：类型化提升（chat 形状收拢）。
+        let format = json!({
+            "type": "json_schema",
+            "name": "answer",
+            "schema": { "type": "object" },
+            "strict": true
+        });
+        let wire = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "text": { "format": format }
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        assert_eq!(
+            ir.response_format,
+            Some(json!({
+                "type": "json_schema",
+                "json_schema": { "name": "answer", "schema": { "type": "object" }, "strict": true }
+            })),
+            "json_schema 扁平字段应收拢进 json_schema 子对象"
+        );
+
+        // 同族出站：text 面板原文优先，不重复写 format。
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(encoded["text"], json!({ "format": format }));
+
+        // 跨族出站：类型化 response_format 回写 chat response_format；
+        // text 面板整体仍无承载，随 provider_options 告警（与 thinking 面板
+        // 跨族同规，format 之外的面板子键确有损失）。
+        let mut warnings = Vec::new();
+        let chat_encoded = crate::core::openai_chat::encode_request(&ir, &mut warnings);
+        assert_eq!(
+            chat_encoded["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": { "name": "answer", "schema": { "type": "object" }, "strict": true }
+            })
+        );
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                Warning::Unsupported { feature: f, .. } if f == warning_feature::PROVIDER_OPTIONS
+            )),
+            "text 面板整体跨族无承载应记 provider_options 告警"
+        );
+
+        // chat 入站 json_object 经 IR 到 responses 出站为 text.format。
+        let chat_wire = json!({
+            "model": "gpt-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": { "type": "json_object" }
+        });
+        let ir = crate::core::openai_chat::decode_request(&chat_wire).expect("chat 请求应可解码");
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            encoded["text"],
+            json!({ "format": { "type": "json_object" } })
+        );
+    }
+
+    /// 无法表达的 response_format 形状（未知 type、json_schema 缺子对象）出站
+    /// 记 warning；type=text 等价缺省不写不告警。
+    #[test]
+    fn inexpressible_response_format_warns_and_text_type_is_default() {
+        let chat_request = |response_format: Value| {
+            crate::core::openai_chat::decode_request(&json!({
+                "model": "gpt-5",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "response_format": response_format
+            }))
+            .expect("chat 请求应可解码")
+        };
+
+        let ir = chat_request(json!({ "type": "text" }));
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert!(
+            encoded.get("text").is_none(),
+            "type=text 等价缺省，不应写 text.format"
+        );
+
+        for shape in [
+            json!({ "type": "heat_map", "style": "warm" }),
+            json!({ "type": "json_schema" }),
+        ] {
+            let ir = chat_request(shape.clone());
+            let mut warnings = Vec::new();
+            let encoded = encode_request(&ir, &mut warnings);
+            assert!(encoded.get("text").is_none(), "无法表达不应写 text.format");
+            assert!(
+                warnings.iter().any(|w| matches!(
+                    w,
+                    Warning::Unsupported { feature: f, .. } if f == warning_feature::RESPONSE_FORMAT
+                )),
+                "形状 {shape} 出站应记 response_format 告警"
             );
         }
     }
