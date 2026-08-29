@@ -319,6 +319,10 @@
       "always": "Always write",
       "off": "Off"
     },
+    "injectsCacheBreakpoints": {
+      "label": "Auto cache breakpoint injection",
+      "guide": "When enabled, cache breakpoints are injected into outbound requests in order: last tool, last system block, tail block of the last injectable message (up to 4, existing breakpoints count against the budget). Only applies to Anthropic Messages channels."
+    },
     "models": "Models",
     "modelsTitle": "Models",
     "modelsEmpty": "No models yet. Add an ID below, or use “Set models” to fetch them.",
@@ -663,7 +667,7 @@
     "latency": "Latency",
     "latencyAndSpeed": "Latency & Speed",
     "cache": "Cache",
-    "cacheHit": "Cache Hit Rate",
+    "cacheHit": "Cache Hit",
     "cacheHitRate": "Cache Hit Rate",
     "cacheHitShort": "Hit Rate",
     "cacheReadShort": "R",
@@ -708,7 +712,6 @@
     "tokens": "Tokens",
     "tokensTotal": "Total Tokens",
     "tokensBreakdown": "Prompt / Completion",
-    "cacheHit": "Cache Hit",
     "costCalculation": "Cost Breakdown",
     "calculationFormula": "Calculation Formula",
     "directProtocol": "Direct",

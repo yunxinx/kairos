@@ -202,6 +202,7 @@ const initialValues = {
   modelGroup: props.initial?.model_group ?? DEFAULT_MODEL_GROUP,
   reasoningOutput: props.initial?.reasoning_output ?? 'auto',
   sessionCacheKey: props.initial?.session_cache_key ?? 'off',
+  injectsCacheBreakpoints: props.initial?.injects_cache_breakpoints ?? false,
 };
 
 const editorName = ref(initialValues.name);
@@ -219,6 +220,7 @@ const editorEnabled = ref(initialValues.enabled);
 const editorGroup = ref(initialValues.modelGroup);
 const editorReasoningOutput = ref<ReasoningOutputMode>(initialValues.reasoningOutput);
 const editorSessionCacheKey = ref<SessionCacheKeyMode>(initialValues.sessionCacheKey);
+const editorInjectsCacheBreakpoints = ref(initialValues.injectsCacheBreakpoints);
 /** 手动添加模型 ID 的输入草稿；点添加后 trim 写入 `editorModels`。 */
 const addModelDraft = ref('');
 
@@ -238,7 +240,8 @@ const dirty = computed(
     editorEnabled.value !== initialValues.enabled ||
     editorGroup.value !== initialValues.modelGroup ||
     editorReasoningOutput.value !== initialValues.reasoningOutput ||
-    editorSessionCacheKey.value !== initialValues.sessionCacheKey,
+    editorSessionCacheKey.value !== initialValues.sessionCacheKey ||
+    editorInjectsCacheBreakpoints.value !== initialValues.injectsCacheBreakpoints,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -260,6 +263,7 @@ const reasoningOutputOptions = computed(() =>
 );
 
 const sessionCacheKeyInputId = `channel-editor-session-cache-key-${uid}`;
+const injectsCacheBreakpointsInputId = `channel-editor-injects-cache-breakpoints-${uid}`;
 const sessionCacheKeyOptions = computed(() =>
   SESSION_CACHE_KEY_MODES.map((value) => ({
     value,
@@ -515,6 +519,7 @@ function handleSave() {
       model_group: editorGroup.value,
       reasoning_output: editorReasoningOutput.value,
       session_cache_key: editorSessionCacheKey.value,
+      injects_cache_breakpoints: editorInjectsCacheBreakpoints.value,
     });
     return;
   }
@@ -541,6 +546,7 @@ function handleSave() {
     model_group: editorGroup.value,
     reasoning_output: editorReasoningOutput.value,
     session_cache_key: editorSessionCacheKey.value,
+    injects_cache_breakpoints: editorInjectsCacheBreakpoints.value,
   });
 }
 </script>
@@ -827,6 +833,20 @@ function handleSave() {
                 :options="sessionCacheKeyOptions"
                 :search-placeholder="t('channel.sessionCacheKey.label')"
                 data-testid="channel-editor-session-cache-key"
+              />
+            </FormField>
+            <FormField
+              v-if="editorProtocol === 'anthropic_messages'"
+              field-name="injectsCacheBreakpoints"
+              layout="inline"
+              :label="t('channel.injectsCacheBreakpoints.label')"
+              :input-id="injectsCacheBreakpointsInputId"
+              :guide="t('channel.injectsCacheBreakpoints.guide')"
+            >
+              <FormSwitch
+                :id="injectsCacheBreakpointsInputId"
+                v-model="editorInjectsCacheBreakpoints"
+                data-testid="channel-editor-injects-cache-breakpoints"
               />
             </FormField>
             <fieldset class="border-seed rounded-md border p-3">

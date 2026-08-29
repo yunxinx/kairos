@@ -62,6 +62,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
+            injects_cache_breakpoints: false,
         },
         Channel {
             name: "ch-1".to_string(),
@@ -83,6 +84,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
+            injects_cache_breakpoints: false,
         },
     ];
     seed
@@ -111,6 +113,7 @@ fn three_channel_seed(bases: &[String]) -> common::Seed {
         model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
         reasoning_output: Default::default(),
         session_cache_key: Default::default(),
+        injects_cache_breakpoints: false,
     });
     seed
 }

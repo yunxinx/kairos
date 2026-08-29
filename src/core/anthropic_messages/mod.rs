@@ -1146,36 +1146,7 @@ enum BreakpointLocation {
 /// 纯函数，作用于已编码的 wire 对象；只剥 `cache_control` 键，不动块本体，
 /// 保留块形状（Anthropic 对无断点块数组同样接受）。
 fn clamp_cache_breakpoints(obj: &mut serde_json::Map<String, Value>) -> usize {
-    let mut locations = Vec::new();
-    if let Some(tools) = obj.get_mut("tools").and_then(Value::as_array_mut) {
-        for (index, tool) in tools.iter_mut().enumerate() {
-            if tool.get("cache_control").is_some() {
-                locations.push(BreakpointLocation::Tool(index));
-            }
-        }
-    }
-    if let Some(system) = obj.get_mut("system").and_then(Value::as_array_mut) {
-        for (index, block) in system.iter_mut().enumerate() {
-            if block.get("cache_control").is_some() {
-                locations.push(BreakpointLocation::SystemBlock(index));
-            }
-        }
-    }
-    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
-        for (message_index, message) in messages.iter_mut().enumerate() {
-            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
-                continue;
-            };
-            for (block_index, block) in blocks.iter_mut().enumerate() {
-                if block.get("cache_control").is_some() {
-                    locations.push(BreakpointLocation::MessageBlock {
-                        message: message_index,
-                        block: block_index,
-                    });
-                }
-            }
-        }
-    }
+    let locations = collect_breakpoint_locations(obj);
 
     let excess = locations.len().saturating_sub(MAX_CACHE_BREAKPOINTS);
     for location in locations.into_iter().take(excess) {
@@ -1201,6 +1172,143 @@ fn clamp_cache_breakpoints(obj: &mut serde_json::Map<String, Value>) -> usize {
         }
     }
     excess
+}
+
+/// 自动断点注入的默认标记：5 分钟 TTL 的 ephemeral。
+fn ephemeral_cache_control() -> Value {
+    json!({ "type": "ephemeral" })
+}
+
+/// 渲染顺序采集出站对象中已带断点的块位置（采集序同 render order）。
+fn collect_breakpoint_locations(obj: &serde_json::Map<String, Value>) -> Vec<BreakpointLocation> {
+    let mut locations = Vec::new();
+    if let Some(tools) = obj.get("tools").and_then(Value::as_array) {
+        for (index, tool) in tools.iter().enumerate() {
+            if tool.get("cache_control").is_some() {
+                locations.push(BreakpointLocation::Tool(index));
+            }
+        }
+    }
+    if let Some(system) = obj.get("system").and_then(Value::as_array) {
+        for (index, block) in system.iter().enumerate() {
+            if block.get("cache_control").is_some() {
+                locations.push(BreakpointLocation::SystemBlock(index));
+            }
+        }
+    }
+    if let Some(messages) = obj.get("messages").and_then(Value::as_array) {
+        for (message_index, message) in messages.iter().enumerate() {
+            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (block_index, block) in blocks.iter().enumerate() {
+                if block.get("cache_control").is_some() {
+                    locations.push(BreakpointLocation::MessageBlock {
+                        message: message_index,
+                        block: block_index,
+                    });
+                }
+            }
+        }
+    }
+    locations
+}
+
+/// 自动缓存断点注入：按 tools 尾 → system 尾 → 末条消息尾块的顺序为出站
+/// 对象补 `cache_control`，返回注入数量。
+///
+/// 预算为 [`MAX_CACHE_BREAKPOINTS`] 减已有断点数，预算用尽即止——超限不由
+/// 本函数扩张，已有断点超限由出站钳制统一告警；已带断点的位置跳过（含
+/// 「末条消息尾块已有断点时继续找更早消息」，显式标记视作调用方意图）。
+/// 消息侧只标非 thinking 块：思维链内容随轮次更替，标在其上会让缓存前缀
+/// 失去稳定前缘。纯函数，作用于已编码的 wire 对象。
+pub fn inject_cache_breakpoints(obj: &mut serde_json::Map<String, Value>) -> usize {
+    let existing = collect_breakpoint_locations(obj).len();
+    let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(existing);
+    if budget == 0 {
+        return 0;
+    }
+    let mut injected = 0usize;
+
+    // tools 尾：工具定义位于每个请求前缀的最前段，最先锚定。
+    if let Some(last_tool) = obj
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .and_then(|tools| tools.last_mut())
+        && last_tool.get("cache_control").is_none()
+        && last_tool.as_object_mut().is_some_and(|tool| {
+            tool.insert("cache_control".into(), ephemeral_cache_control());
+            true
+        })
+    {
+        budget -= 1;
+        injected += 1;
+    }
+    if budget == 0 {
+        return injected;
+    }
+
+    // system 尾：系统提示紧随工具定义，同为全请求稳定前缀。字符串 system
+    // 先转为块数组（该形状本就无块级断点），再标记尾块。
+    if let Some(text) = obj
+        .get("system")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        obj.insert("system".into(), json!([{ "type": "text", "text": text }]));
+    }
+    if let Some(last_block) = obj
+        .get_mut("system")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.last_mut())
+        && last_block.get("cache_control").is_none()
+        && last_block.as_object_mut().is_some_and(|block| {
+            block.insert("cache_control".into(), ephemeral_cache_control());
+            true
+        })
+    {
+        budget -= 1;
+        injected += 1;
+    }
+    if budget == 0 {
+        return injected;
+    }
+
+    // 末条可注入消息的尾块：从最新消息向前找第一个「尾块为非 thinking 且
+    // 未带断点」的消息。工具循环通常以 user/tool_result 收尾，标记该处即
+    // 把本轮工具结果纳入下一轮的稳定前缀。字符串 content（纯文本消息）先
+    // 转为块数组再标记。
+    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut().rev() {
+            if let Some(text) = message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                message["content"] = json!([{ "type": "text", "text": text }]);
+            }
+            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let Some(block) = blocks.iter_mut().rev().find(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            }) else {
+                continue;
+            };
+            if block.get("cache_control").is_some() {
+                continue;
+            }
+            if let Some(block) = block.as_object_mut() {
+                block.insert("cache_control".into(), ephemeral_cache_control());
+                injected += 1;
+            }
+            break;
+        }
+    }
+    injected
 }
 
 /// 请求模型是否支持 adaptive thinking 与原生 effort（`output_config.effort`）。
@@ -2948,6 +3056,148 @@ mod tests {
         let request = bare_request(vec![make("无断点", None)]);
         let wire = encode_request(&request, &mut Vec::new());
         assert_eq!(wire["system"], json!("无断点"), "无断点保持字符串形状");
+    }
+
+    /// 自动断点注入：按 tools 尾 → system 尾 → 末条消息尾块补 `cache_control`。
+    #[test]
+    fn auto_injection_marks_tool_system_and_message_tails_in_order() {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "tools".into(),
+            json!([
+                { "name": "a", "input_schema": {} },
+                { "name": "b", "input_schema": {} },
+            ]),
+        );
+        obj.insert("system".into(), json!([{ "type": "text", "text": "s" }]));
+        obj.insert(
+            "messages".into(),
+            json!([
+                { "role": "user", "content": [{ "type": "text", "text": "旧问" }] },
+                { "role": "assistant", "content": [{ "type": "text", "text": "旧答" }] },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "tool_result", "content": "r" },
+                        { "type": "text", "text": "新问" },
+                    ],
+                },
+            ]),
+        );
+
+        let injected = inject_cache_breakpoints(&mut obj);
+
+        assert_eq!(injected, 3);
+        let tools = obj["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none(), "只标 tools 尾");
+        assert_eq!(tools[1]["cache_control"], json!({ "type": "ephemeral" }));
+        let system = obj["system"].as_array().unwrap();
+        assert_eq!(system[0]["cache_control"], json!({ "type": "ephemeral" }));
+        let messages = obj["messages"].as_array().unwrap();
+        assert!(
+            messages[0]["content"][0].get("cache_control").is_none(),
+            "更早消息不应被标记"
+        );
+        assert!(
+            messages[1]["content"][0].get("cache_control").is_none(),
+            "assistant 消息不应被标记"
+        );
+        assert_eq!(
+            messages[2]["content"][1]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "末条消息的最后一个块被标记"
+        );
+    }
+
+    /// 尾块为 thinking 的消息跳过，向前找非 thinking 尾块的消息；尾块已带
+    /// 断点的消息同样跳过（显式标记视作调用方意图）。
+    #[test]
+    fn auto_injection_skips_thinking_and_marked_tails() {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "messages".into(),
+            json!([
+                { "role": "user", "content": [{ "type": "text", "text": "旧问" }] },
+                { "role": "assistant", "content": [
+                    { "type": "thinking", "thinking": "想", "signature": "s" },
+                ] },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "已标" },
+                    { "type": "text", "text": "尾块", "cache_control": { "type": "ephemeral" } },
+                ] },
+            ]),
+        );
+
+        let injected = inject_cache_breakpoints(&mut obj);
+
+        assert_eq!(injected, 1, "thinking 尾块与已标尾块都不可用，锚定更早消息");
+        assert_eq!(
+            obj["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(
+            obj["messages"][2]["content"][1]
+                .get("cache_control")
+                .is_some(),
+            "已标尾块保持原样"
+        );
+    }
+
+    /// 预算为 4 减已有断点：预算用尽即止；已有断点达上限时零注入。
+    #[test]
+    fn auto_injection_respects_budget_minus_existing() {
+        let marked_tool =
+            |name: &str| json!({ "name": name, "cache_control": { "type": "ephemeral" } });
+        let mut full = serde_json::Map::new();
+        full.insert(
+            "tools".into(),
+            json!([
+                marked_tool("a"),
+                marked_tool("b"),
+                marked_tool("c"),
+                marked_tool("d")
+            ]),
+        );
+        full.insert("system".into(), json!([{ "type": "text", "text": "s" }]));
+        full.insert(
+            "messages".into(),
+            json!([{ "role": "user", "content": [{ "type": "text", "text": "问" }] }]),
+        );
+        assert_eq!(
+            inject_cache_breakpoints(&mut full),
+            0,
+            "已有断点达上限时零注入"
+        );
+        assert!(
+            full["system"][0].get("cache_control").is_none(),
+            "预算用尽后 system 不被标记"
+        );
+
+        // 已有 3 个：预算剩 1，只注入 tools 尾。
+        let mut almost = serde_json::Map::new();
+        almost.insert(
+            "tools".into(),
+            json!([
+                marked_tool("a"),
+                marked_tool("b"),
+                marked_tool("c"),
+                { "name": "d", "input_schema": {} },
+            ]),
+        );
+        almost.insert("system".into(), json!([{ "type": "text", "text": "s" }]));
+        almost.insert(
+            "messages".into(),
+            json!([{ "role": "user", "content": [{ "type": "text", "text": "问" }] }]),
+        );
+        assert_eq!(inject_cache_breakpoints(&mut almost), 1);
+        assert_eq!(
+            almost["tools"][2]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(
+            almost["system"][0].get("cache_control").is_none(),
+            "预算用尽后 system 不被标记"
+        );
     }
 
     /// 断点预算钳制：超 4 上限时按 render order（tools → system → messages）

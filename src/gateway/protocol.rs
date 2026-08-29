@@ -96,6 +96,20 @@ pub fn write_session_cache_key(
     );
 }
 
+/// 渠道级自动缓存断点注入：对已编码出站对象按序补 `cache_control`。
+///
+/// 仅 Anthropic Messages 出站消费（断点是 Anthropic 语义），注入顺序与
+/// 预算语义见适配器同名函数。对已编码出站对象做目标性补丁，直通快路径
+/// 字节直搬，不经过本开关。
+pub fn inject_cache_breakpoints(outbound: &mut Value, protocol: Protocol, enabled: bool) {
+    if !enabled || protocol != Protocol::AnthropicMessages {
+        return;
+    }
+    if let Some(map) = outbound.as_object_mut() {
+        crate::core::anthropic_messages::inject_cache_breakpoints(map);
+    }
+}
+
 /// 解码上游响应为 IR。
 pub fn decode_response(value: &Value, protocol: Protocol) -> Result<ChatResponse, String> {
     match protocol {
@@ -299,6 +313,30 @@ impl ChatStreamEncoder for ResponsesStreamEncoder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 注入分派：仅 Anthropic 协议且开关开启时生效，其余一概不动出站对象。
+    #[test]
+    fn cache_breakpoint_injection_follows_protocol_and_switch() {
+        let base = || json!({ "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }] });
+
+        // 开关关闭：不动。
+        let mut outbound = base();
+        inject_cache_breakpoints(&mut outbound, Protocol::AnthropicMessages, false);
+        assert!(outbound["messages"][0].get("cache_control").is_none());
+
+        // 非 Anthropic 协议：不动（即使开关开启）。
+        let mut outbound = base();
+        inject_cache_breakpoints(&mut outbound, Protocol::OpenAiChat, true);
+        assert!(outbound["messages"][0].get("cache_control").is_none());
+
+        // Anthropic 协议且开启：末条消息尾块被标记。
+        let mut outbound = base();
+        inject_cache_breakpoints(&mut outbound, Protocol::AnthropicMessages, true);
+        assert_eq!(
+            outbound["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
 
     /// 回写三态：off 不写；auto 不覆盖下游显式键、缺席时写；always 无条件
     /// 覆盖。非 chat 协议一概不写。

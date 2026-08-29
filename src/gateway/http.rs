@@ -1729,6 +1729,12 @@ async fn non_stream_completion(
         channel.session_cache_key,
         ctx.session_identity,
     );
+    // 渠道级自动缓存断点注入：开启时按序为 Anthropic 出站请求补断点。
+    protocol::inject_cache_breakpoints(
+        &mut outbound_value,
+        channel.protocol,
+        channel.injects_cache_breakpoints,
+    );
 
     let upstream_url = format!(
         "{}{}",
@@ -1900,6 +1906,12 @@ async fn stream_completion(
         channel.protocol,
         channel.session_cache_key,
         ctx.session_identity,
+    );
+    // 渠道级自动缓存断点注入：与流式路径同规。
+    protocol::inject_cache_breakpoints(
+        &mut outbound,
+        channel.protocol,
+        channel.injects_cache_breakpoints,
     );
     let upstream_url = format!(
         "{}{}",

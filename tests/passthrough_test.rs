@@ -464,6 +464,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
             },
             Channel {
                 name: "cross-protocol".to_string(),
@@ -485,6 +486,7 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
             },
         ];
         seed
@@ -547,6 +549,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
             },
             Channel {
                 name: "backup".to_string(),
@@ -568,6 +571,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
             },
         ];
         seed

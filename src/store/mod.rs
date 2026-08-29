@@ -1835,6 +1835,7 @@ mod tests {
                 model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
             },
         )
         .await

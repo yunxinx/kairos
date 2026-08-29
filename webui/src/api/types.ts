@@ -109,6 +109,8 @@ export interface Channel {
   reasoning_output: ReasoningOutputMode;
   /** 会话缓存键回写模式；缺省 off（不改动出站请求）。 */
   session_cache_key: SessionCacheKeyMode;
+  /** 自动缓存断点注入；缺省 false，仅对 Anthropic Messages 渠道生效。 */
+  injects_cache_breakpoints: boolean;
 }
 
 /** 渠道上的一把上游密钥；模型白/黑名单为可选的逗号名单。 */
@@ -161,6 +163,7 @@ export function channelWriteBody(view: ChannelView): Channel {
     model_group: view.model_group,
     reasoning_output: view.reasoning_output,
     session_cache_key: view.session_cache_key,
+    injects_cache_breakpoints: view.injects_cache_breakpoints,
   };
 }
 

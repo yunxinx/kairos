@@ -62,6 +62,11 @@ pub struct Channel {
     /// 会话缓存键回写模式；缺省 [`SessionCacheKeyMode::Off`]。
     #[serde(default)]
     pub session_cache_key: SessionCacheKeyMode,
+    /// 是否自动注入缓存断点：开启时面向 Anthropic 渠道的出站请求按
+    /// tools 尾 → system 尾 → 末条消息尾块的顺序补 `cache_control`。
+    /// 缺省 `false`，存量渠道出站行为不变。
+    #[serde(default)]
+    pub injects_cache_breakpoints: bool,
 }
 
 /// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
@@ -661,7 +666,7 @@ pub async fn list_channel_records_on_conn(
 
 const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, models_json, \
     model_aliases_json, timeout_ms, max_retries, enabled, model_group, reasoning_output, \
-    session_cache_key FROM channels";
+    session_cache_key, injects_cache_breakpoints FROM channels";
 
 /// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
@@ -672,6 +677,9 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
         row.try_get("reasoning_output").map_err(StoreError::Query)?;
     let session_cache_key_wire: String = row
         .try_get("session_cache_key")
+        .map_err(StoreError::Query)?;
+    let injects_cache_breakpoints: i64 = row
+        .try_get("injects_cache_breakpoints")
         .map_err(StoreError::Query)?;
     // 先解析集合字段（错误信息需要引用 name），再构造结构体以避免移动后借用。
     let models: Vec<String> = serde_json::from_str(
@@ -700,6 +708,7 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             model_group: row.try_get("model_group").map_err(StoreError::Query)?,
             reasoning_output: reasoning_output_from_wire(&reasoning_output_wire)?,
             session_cache_key: session_cache_key_from_wire(&session_cache_key_wire)?,
+            injects_cache_breakpoints: injects_cache_breakpoints != 0,
         },
         keys: Vec::new(),
     })
@@ -851,8 +860,9 @@ pub async fn insert_channel(
     let result = sqlx::query(
         "INSERT INTO channels \
          (name, protocol, base_url, models_json, model_aliases_json, \
-          timeout_ms, max_retries, enabled, model_group, reasoning_output, session_cache_key) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          timeout_ms, max_retries, enabled, model_group, reasoning_output, session_cache_key, \
+          injects_cache_breakpoints) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -865,6 +875,7 @@ pub async fn insert_channel(
     .bind(&channel.model_group)
     .bind(reasoning_output_to_wire(channel.reasoning_output))
     .bind(session_cache_key_to_wire(channel.session_cache_key))
+    .bind(channel.injects_cache_breakpoints)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -916,7 +927,8 @@ pub async fn update_channel(
            name = ?, protocol = ?, base_url = ?, \
            models_json = ?, model_aliases_json = ?, \
            timeout_ms = ?, max_retries = ?, enabled = ?, \
-           model_group = ?, reasoning_output = ?, session_cache_key = ? \
+           model_group = ?, reasoning_output = ?, session_cache_key = ?, \
+           injects_cache_breakpoints = ? \
          WHERE id = ?",
     )
     .bind(&channel.name)
@@ -930,6 +942,7 @@ pub async fn update_channel(
     .bind(&channel.model_group)
     .bind(reasoning_output_to_wire(channel.reasoning_output))
     .bind(session_cache_key_to_wire(channel.session_cache_key))
+    .bind(channel.injects_cache_breakpoints)
     .bind(id)
     .execute(&mut *conn)
     .await
@@ -1709,6 +1722,7 @@ mod tests {
             model_group: DEFAULT_MODEL_GROUP.to_string(),
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
+            injects_cache_breakpoints: false,
         }
     }
 
@@ -1991,6 +2005,22 @@ mod tests {
                 .find(|record| record.id == mode_id)
                 .expect("应能读回该渠道");
             assert_eq!(record.channel.session_cache_key, mode);
+        }
+
+        // 自动缓存断点注入开关落库往返；缺省 false。
+        for on in [true, false] {
+            let mut channel = sample_channel();
+            channel.name = format!("cache-inject-{on}");
+            channel.injects_cache_breakpoints = on;
+            let flag_id = insert_channel(&mut conn, &channel)
+                .await
+                .expect("应能写渠道");
+            let records = list_channel_records(&pool).await.expect("应能读渠道");
+            let record = records
+                .iter()
+                .find(|record| record.id == flag_id)
+                .expect("应能读回该渠道");
+            assert_eq!(record.channel.injects_cache_breakpoints, on);
         }
     }
 
@@ -2543,6 +2573,7 @@ mod tests {
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
             },
         )
         .await

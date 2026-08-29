@@ -319,6 +319,10 @@
       "always": "强制回写",
       "off": "关闭"
     },
+    "injectsCacheBreakpoints": {
+      "label": "自动缓存断点注入",
+      "guide": "开启后按 tools 尾 → system 尾 → 末条消息尾块的顺序为出站请求自动补缓存断点（上限 4 个，已有断点计入预算）。仅对 Anthropic Messages 渠道生效。"
+    },
     "models": "模型清单",
     "modelsTitle": "模型清单",
     "modelsEmpty": "清单为空，可在下方添加 ID，或点「设置模型」从上游获取。",
@@ -663,7 +667,7 @@
     "latency": "耗时",
     "latencyAndSpeed": "耗时与速率",
     "cache": "缓存",
-    "cacheHit": "缓存命中率",
+    "cacheHit": "缓存命中",
     "cacheHitRate": "缓存命中率",
     "cacheHitShort": "命中率",
     "cacheReadShort": "读",
@@ -708,7 +712,6 @@
     "tokens": "Token 消耗",
     "tokensTotal": "总 Token",
     "tokensBreakdown": "Prompt / Completion",
-    "cacheHit": "缓存命中",
     "costCalculation": "计费核算",
     "calculationFormula": "计算过程",
     "directProtocol": "直连",
