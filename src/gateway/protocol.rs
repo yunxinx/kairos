@@ -108,6 +108,16 @@ pub fn encode_error(status: u16, message: &str, protocol: Protocol) -> Value {
     }
 }
 
+/// 流内错误的入站协议 SSE 帧（500 语义）。各适配器流式编码器消费 IR Error
+/// 事件走同一形状，网关兜底路径（缓冲超限等）复用本函数。
+pub fn stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
+    match protocol {
+        Protocol::OpenAiChat => crate::core::openai_chat::stream_error_frame(message),
+        Protocol::AnthropicMessages => crate::core::anthropic_messages::stream_error_frame(message),
+        Protocol::OpenAiResponses => crate::core::openai_responses::stream_error_frame(message),
+    }
+}
+
 /// 编码下游模型列表为入站协议的标准列出模型响应。
 pub fn encode_model_list(ids: &[String], protocol: Protocol) -> Value {
     match protocol {

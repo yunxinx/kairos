@@ -1593,6 +1593,9 @@ impl StreamEncoder {
                 }
                 vec![Value::Object(obj)]
             }
+            // 流内错误没有协议通道：以独立 `data:` 帧下发错误 JSON（与网关
+            // 兜底错误帧同形状），由调用方感知并终止流。
+            StreamEvent::Error { message } => vec![encode_error(500, message)],
         }
     }
 
@@ -1642,6 +1645,12 @@ pub fn encode_error(status: u16, message: &str) -> Value {
             "code": null,
         }
     })
+}
+
+/// 流内错误的入站 SSE 帧（`data:` 纯帧，500 语义）。流式编码器消费 IR
+/// Error 事件与网关兜底路径共用，保证形状一致。
+pub fn stream_error_frame(message: &str) -> SseFrame {
+    SseFrame::data(encode_error(500, message).to_string())
 }
 
 /// 编码为 OpenAI `GET /v1/models` 列表。`created` 未知时为 0。
@@ -2430,6 +2439,23 @@ mod tests {
         // 无 usage 字段的帧返回 None。
         let no_usage = json!({ "choices": [{ "index": 0, "delta": { "content": "hi" } }] });
         assert!(sniff_chat_usage(&no_usage).is_none());
+    }
+
+    /// 流内错误编码：chat 无协议内错误通道，以独立 `data:` 帧下发错误 JSON，
+    /// 与网关兜底错误帧（`stream_error_frame`）同形状。
+    #[test]
+    fn stream_error_event_encodes_to_data_error_frame() {
+        let mut encoder = StreamEncoder::default();
+        let frames = encoder.encode(&StreamEvent::Error {
+            message: "Overloaded".to_string(),
+        });
+        assert_eq!(frames, vec![stream_error_frame("Overloaded")]);
+        assert!(frames[0].event.is_none());
+        let body: Value = serde_json::from_str(&frames[0].data).expect("错误帧载荷应为 JSON");
+        assert_eq!(
+            body,
+            json!({ "error": { "message": "Overloaded", "type": "api_error", "code": null } })
+        );
     }
 
     /// IR 流事件编码为入站 chunk 帧。

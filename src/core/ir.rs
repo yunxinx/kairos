@@ -540,6 +540,10 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         provider_metadata: ProviderOptions,
     },
+    /// 生命周期：上游在 200 之后于流内报错（如 Anthropic `event: error` 的
+    /// overloaded_error）。可多次出现；网关消费到即向下游下发入站协议错误帧
+    /// 并按已累积 usage 结算后终止流。
+    Error { message: String },
 }
 
 #[cfg(test)]

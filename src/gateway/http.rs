@@ -2025,6 +2025,8 @@ async fn pipe_stream<S>(
     let mut saw_finish = false;
     let mut downstream_open = true;
     let mut truncated = false;
+    // 流内错误：已向下游下发错误帧，终止消费且不再合成 Finish。
+    let mut stream_errored = false;
     let idle = channel_idle(ctx.channel.timeout_ms);
     let mut byte_stream = Box::pin(byte_stream);
 
@@ -2074,6 +2076,13 @@ async fn pipe_stream<S>(
                         }
                     }
                 }
+                if matches!(event, StreamEvent::Error { .. }) {
+                    stream_errored = true;
+                    break;
+                }
+            }
+            if stream_errored {
+                break;
             }
             continue;
         }
@@ -2101,9 +2110,10 @@ async fn pipe_stream<S>(
     }
 
     // 流结束：若上游未发 finish 帧（异常中断），补发一个。
-    // 缓冲超限已向下游发过错误事件，不再合成 Finish，以免被当成完整成功。
+    // 缓冲超限已向下游发过错误事件，流内错误同理；两者都不再合成 Finish，
+    // 以免被当成完整成功。
     let response = accumulator.finish();
-    if !saw_finish && downstream_open && !truncated {
+    if !saw_finish && downstream_open && !truncated && !stream_errored {
         let finish_event = StreamEvent::Finish {
             finish_reason: response.finish_reason.clone(),
             usage: response.usage.clone(),
@@ -2160,13 +2170,10 @@ fn append_logged_body(buf: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) {
 }
 
 /// 流中途失败时的入站协议错误 SSE 帧，让下游能感知截断。
+///
+/// 委托到适配器统一形状：流式编码器消费 IR Error 事件产出同一帧。
 fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
-    let body = protocol::encode_error(500, message, protocol);
-    let data = serde_json::to_string(&body).unwrap_or_else(|_| message.to_string());
-    match protocol {
-        Protocol::OpenAiChat => SseFrame::data(data),
-        Protocol::OpenAiResponses | Protocol::AnthropicMessages => SseFrame::named("error", data),
-    }
+    protocol::stream_error_frame(protocol, message)
 }
 
 /// 结算流式请求费用并落日志。

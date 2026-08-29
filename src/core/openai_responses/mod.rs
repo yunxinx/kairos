@@ -2200,6 +2200,9 @@ impl StreamEncoder {
                 ));
                 frames
             }
+            // 流内错误以 `event: error` 下发（与网关兜底错误帧同形状），
+            // 由调用方感知并终止流。
+            StreamEvent::Error { message } => vec![stream_error_frame(message)],
         }
     }
 }
@@ -2228,6 +2231,12 @@ pub fn encode_error(status: u16, message: &str) -> Value {
             "code": null,
         }
     })
+}
+
+/// 流内错误的入站 SSE 帧（`event: error`，500 语义）。流式编码器消费 IR
+/// Error 事件与网关兜底路径共用，保证形状一致。
+pub fn stream_error_frame(message: &str) -> SseFrame {
+    SseFrame::named("error", encode_error(500, message).to_string())
 }
 
 /// 编码为 OpenAI `GET /v1/models` 列表（Responses 与 Chat Completions 共用 Models API）。
@@ -2337,6 +2346,23 @@ mod tests {
         // System 消息不进入 input 序列。
         let input = encoded["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
+    }
+
+    /// 流内错误编码：以 `event: error` 帧下发 OpenAI 错误 JSON，与网关兜底
+    /// 错误帧（`stream_error_frame`）同形状。
+    #[test]
+    fn stream_error_event_encodes_to_named_error_frame() {
+        let mut encoder = StreamEncoder::new(None);
+        let frames = encoder.encode(&StreamEvent::Error {
+            message: "Overloaded".to_string(),
+        });
+        assert_eq!(frames, vec![stream_error_frame("Overloaded")]);
+        assert_eq!(frames[0].event.as_deref(), Some("error"));
+        let body: Value = serde_json::from_str(&frames[0].data).expect("错误帧载荷应为 JSON");
+        assert_eq!(
+            body,
+            json!({ "error": { "message": "Overloaded", "type": "api_error", "code": null } })
+        );
     }
 
     /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。

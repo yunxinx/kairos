@@ -199,3 +199,72 @@ async fn streaming_upstream_error_is_passthrough_and_not_billed() {
     assert_eq!(row.0, 5_000_000, "流式失败不应扣费");
     assert_eq!(row.1, 0);
 }
+
+/// 流中途上游报错（Anthropic 200 后 `event: error`）：错误以入站协议错误帧
+/// 下发、不再合成 Finish，结算按已累积 usage 落账（此处为零）。
+///
+/// 走跨协议路由（chat 入站 → Anthropic 渠道）以经过 IR 流式面——同协议
+/// 直通路径原样转发字节。
+#[tokio::test]
+async fn midstream_error_delivers_error_frame_and_settles() {
+    fn anthropic_channel_seed(base: &str) -> common::Seed {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = kairos::config::Protocol::AnthropicMessages;
+        seed
+    }
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "type": "message_start",
+            "message": { "type": "message", "role": "assistant", "id": "msg_1", "model": "claude-sonnet", "content": [] }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "content_block_start", "index": 0, "content_block": { "type": "text" }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "你好" }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "error", "error": { "type": "overloaded_error", "message": "Overloaded" }
+        }))
+        .unwrap(),
+    ]));
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let frames = collect_sse_frames(resp).await;
+
+    // 错误前的内容增量正常下发。
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.data["choices"][0]["delta"]["content"] == json!("你好")),
+        "错误前的内容帧应照常透传"
+    );
+    // 末帧为入站协议错误帧（chat data 帧），全程无 finish 帧（不合成完整成功）。
+    let last = frames.last().expect("应有错误帧");
+    assert_eq!(last.data["error"]["message"], json!("Overloaded"));
+    assert!(
+        frames
+            .iter()
+            .all(|f| f.data["choices"][0]["finish_reason"].is_null())
+    );
+
+    // 结算按已累积 usage 落账（错误前无 usage 上报 → 零费用），日志落一行。
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT ub.balance_usd_micros, rl.cost_usd_micros \
+         FROM tokens t \
+         JOIN user_balance ub ON ub.user_id = t.user_id \
+         JOIN request_log rl ON rl.token_key = t.token_key \
+         WHERE t.token_key = ?",
+    )
+    .bind(TEST_TOKEN_KEY)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应有结算日志");
+    assert_eq!(row.0, 5_000_000, "零累积 usage 不扣费");
+    assert_eq!(row.1, 0, "日志按已累积 usage 落账（零费用）");
+}

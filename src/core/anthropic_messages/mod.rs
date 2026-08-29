@@ -264,7 +264,18 @@ enum WireStreamEvent {
     },
     #[serde(rename = "message_stop")]
     MessageStop,
+    #[serde(rename = "error")]
+    Error {
+        error: WireStreamError,
+    },
     Ping,
+}
+
+/// `event: error` 的错误体（`type` 为 `overloaded_error` 等判别名，不消费）。
+#[derive(Debug, Clone, Deserialize)]
+struct WireStreamError {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 /// `message_start` 的 message 首部：id/model（usage 为输入侧早期值，非最终，
@@ -1910,7 +1921,8 @@ fn encode_usage(usage: &Usage) -> Value {
 /// 流式事件处理：`content_block_start` 开启块，`content_block_delta`
 /// 产出增量（`signature_delta` 以零长增量携带 signature），`content_block_stop`
 /// 收尾（tool_use 在此解析出完整 input），`message_delta` 产出 Finish（最终
-/// usage + stop_reason）。
+/// usage + stop_reason），`error` 产出 IR Error 事件（overloaded_error 等
+/// 流内错误，不再静默吞掉）。
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     /// 按块 index 维护进行中的块状态。
@@ -1945,6 +1957,11 @@ impl StreamDecoder {
 
         match wire {
             WireStreamEvent::Ping => {}
+            WireStreamEvent::Error { error } => {
+                events.push(StreamEvent::Error {
+                    message: error.message.unwrap_or_default(),
+                });
+            }
             WireStreamEvent::MessageStart { message } => {
                 if let (Some(id), Some(model)) = (message.id, message.model) {
                     events.push(StreamEvent::ResponseMetadata { id, model });
@@ -2275,6 +2292,9 @@ impl StreamEncoder {
                     SseFrame::named("message_stop", message_stop.to_string()),
                 ]
             }
+            // 流内错误以 `event: error` 下发（与网关兜底错误帧同形状），
+            // 由调用方感知并终止流。
+            StreamEvent::Error { message } => vec![stream_error_frame(message)],
         }
     }
 
@@ -2356,6 +2376,12 @@ pub fn encode_error(status: u16, message: &str) -> Value {
             "message": message,
         }
     })
+}
+
+/// 流内错误的入站 SSE 帧（`event: error`，500 语义）。流式编码器消费 IR
+/// Error 事件与网关兜底路径共用，保证形状一致。
+pub fn stream_error_frame(message: &str) -> SseFrame {
+    SseFrame::named("error", encode_error(500, message).to_string())
 }
 
 /// 编码为 Anthropic `GET /v1/models` 列表。
@@ -3123,6 +3149,38 @@ mod tests {
             [Warning::Compatibility { feature: f1, .. }, Warning::Compatibility { feature: f2, .. }]
                 if f1 == "input_schema" && f2 == "input_schema"
         ));
+    }
+
+    /// `event: error`（200 后流内错误，如 overloaded_error）解码为 IR Error
+    /// 事件，不再静默吞掉；错误不贡献内容，累积器照常保留已累积 usage。
+    #[test]
+    fn stream_error_event_decodes_to_ir_error() {
+        let raw = include_str!("__fixtures__/stream_error.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let mut decoder = StreamDecoder::default();
+        let chunk = decoder.process(&wire);
+        assert!(matches!(
+            chunk.events.as_slice(),
+            [StreamEvent::Error { message }] if message == "Overloaded"
+        ));
+        assert!(!chunk.is_output);
+    }
+
+    /// 流内错误编码：以 `event: error` 帧下发，与网关兜底错误帧
+    /// （`stream_error_frame`）同形状。
+    #[test]
+    fn stream_error_event_encodes_to_named_error_frame() {
+        let mut encoder = StreamEncoder::new(None);
+        let frames = encoder.encode(&StreamEvent::Error {
+            message: "Overloaded".to_string(),
+        });
+        assert_eq!(frames, vec![stream_error_frame("Overloaded")]);
+        assert_eq!(frames[0].event.as_deref(), Some("error"));
+        let body: Value = serde_json::from_str(&frames[0].data).expect("错误帧载荷应为 JSON");
+        assert_eq!(
+            body,
+            json!({ "type": "error", "error": { "type": "api_error", "message": "Overloaded" } })
+        );
     }
 
     /// 黄金样例流式往返：解码流式事件 → 累积，与非流式 `response.json` 解码同构。

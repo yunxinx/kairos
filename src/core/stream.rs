@@ -273,6 +273,8 @@ impl StreamAccumulator {
                 self.response.usage = usage;
                 self.response.provider_metadata = provider_metadata;
             }
+            // 错误不贡献内容：网关消费到即终止流，已累积的 usage 照常结算。
+            StreamEvent::Error { .. } => {}
         }
     }
 
