@@ -70,6 +70,7 @@ const KNOWN_REQUEST_FIELDS: &[&str] = &[
     "stream",
     "tools",
     "tool_choice",
+    "cache_control",
     "thinking",
     "output_config",
 ];
@@ -85,6 +86,9 @@ struct WireRequest {
     /// `system` 可为字符串或文本块数组。
     #[serde(default)]
     system: Option<Value>,
+    /// 请求级缓存断点，捕获进请求级 `provider_options["anthropic"]["cache_control"]`。
+    #[serde(default)]
+    cache_control: Option<Value>,
     #[serde(default)]
     temperature: Option<f64>,
     #[serde(default)]
@@ -126,11 +130,16 @@ enum WireContent {
 }
 
 /// 内容块，按 `type` 判别。
+///
+/// 可缓存块（text/tool_use/tool_result/image/document）携带可选
+/// `cache_control` 断点；thinking 类块不可缓存，无该字段。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireBlock {
     Text {
         text: String,
+        #[serde(default)]
+        cache_control: Option<Value>,
     },
     Thinking {
         thinking: String,
@@ -145,6 +154,8 @@ enum WireBlock {
         name: String,
         #[serde(default)]
         input: Value,
+        #[serde(default)]
+        cache_control: Option<Value>,
     },
     ToolResult {
         tool_use_id: String,
@@ -152,16 +163,22 @@ enum WireBlock {
         content: Option<Value>,
         #[serde(default)]
         is_error: Option<bool>,
+        #[serde(default)]
+        cache_control: Option<Value>,
     },
     /// 媒体内容块：`image`（图片）或 `document`（文档）。source 可为
     /// base64 字节、URL 或 provider 托管引用（`file_id`/`text`）。
     Image {
         #[serde(default)]
         source: Option<WireMediaSource>,
+        #[serde(default)]
+        cache_control: Option<Value>,
     },
     Document {
         #[serde(default)]
         source: Option<WireMediaSource>,
+        #[serde(default)]
+        cache_control: Option<Value>,
     },
 }
 
@@ -200,6 +217,9 @@ struct WireTool {
     description: Option<String>,
     #[serde(default)]
     input_schema: Option<Value>,
+    /// 工具级缓存断点，捕获进 `Tool.provider_options["anthropic"]["cache_control"]`。
+    #[serde(default)]
+    cache_control: Option<Value>,
 }
 
 // ---- wire 响应类型 ----
@@ -361,7 +381,8 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     })?;
 
     let mut messages = Vec::new();
-    // 顶层 `system` 提升为首条 System 消息。
+    // 顶层 `system` 提升为首条 System 消息；块数组尾块的 cache_control 断点
+    // 进消息级逃生舱（出站挂到合并后 system 尾块）。
     if let Some(system) = &wire.system {
         let text = system_text(system);
         if let Some(text) = text {
@@ -371,7 +392,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                     text,
                     provider_options: HashMap::new(),
                 }],
-                provider_options: HashMap::new(),
+                provider_options: system_cache_options(system),
             });
         }
     }
@@ -431,6 +452,15 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             anthropic.insert(PROVIDER_EXTRA_KEY.to_string(), Value::Object(extra));
         }
     }
+    // 请求级缓存断点原样捕获（ttl/scope 等子字段随值透传）。
+    if let Some(cache_control) = &wire.cache_control {
+        let entry = provider_options
+            .entry("anthropic".to_string())
+            .or_insert_with(|| json!({}));
+        if let Value::Object(anthropic) = entry {
+            anthropic.insert("cache_control".into(), cache_control.clone());
+        }
+    }
     let tool_choice = wire
         .tool_choice
         .as_ref()
@@ -467,7 +497,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                 name: t.name,
                 description: t.description,
                 parameters: t.input_schema,
-                provider_options: HashMap::new(),
+                provider_options: cache_control_options(&t.cache_control),
             })
             .collect(),
         tool_choice,
@@ -493,6 +523,35 @@ fn system_text(system: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// 顶层 `system` 块数组的缓存断点为消息级逃生舱。
+///
+/// 断点约定挂合并后 system 的尾块，多块各带断点时取最后出现的（后者为
+/// 更靠后的前缘）；字符串 system 无块级断点，返回空集。
+fn system_cache_options(system: &Value) -> crate::core::ir::ProviderOptions {
+    let mut cache_control = None;
+    if let Value::Array(blocks) = system {
+        for block in blocks {
+            if let Some(cc) = block.get("cache_control") {
+                cache_control = Some(cc.clone());
+            }
+        }
+    }
+    cache_control_options(&cache_control)
+}
+
+/// 可选 cache_control 断点为 part/工具级逃生舱（约定键
+/// `provider_options["anthropic"]["cache_control"]`）；缺席时空集。
+fn cache_control_options(cache_control: &Option<Value>) -> crate::core::ir::ProviderOptions {
+    cache_control
+        .as_ref()
+        .map(|cc| {
+            [("anthropic".to_string(), json!({ "cache_control": cc }))]
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// 解码 wire `tool_choice` 为 IR 类型化枚举。
@@ -584,10 +643,15 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Vec<Message>, Deco
             let mut parts = Vec::new();
             for block in blocks {
                 match block {
-                    WireBlock::Text { text } => parts.push(ContentPart::Text {
-                        text: text.clone(),
-                        provider_options: HashMap::new(),
-                    }),
+                    WireBlock::Text {
+                        text,
+                        cache_control,
+                    } => {
+                        parts.push(ContentPart::Text {
+                            text: text.clone(),
+                            provider_options: cache_control_options(cache_control),
+                        });
+                    }
                     WireBlock::Thinking {
                         thinking,
                         signature,
@@ -614,12 +678,17 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Vec<Message>, Deco
                             .collect(),
                         });
                     }
-                    WireBlock::ToolUse { id, name, input } => {
+                    WireBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control,
+                    } => {
                         parts.push(ContentPart::ToolCall {
                             tool_call_id: id.clone(),
                             tool_name: name.clone(),
                             input: input.clone(),
-                            provider_options: HashMap::new(),
+                            provider_options: cache_control_options(cache_control),
                         });
                     }
                     WireBlock::ToolResult { .. } => {
@@ -665,39 +734,59 @@ fn decode_user(content: &WireContent, index: usize) -> Result<Vec<Message>, Deco
 
     for block in blocks {
         match block {
-            WireBlock::Text { text } => text_parts.push(ContentPart::Text {
-                text: text.clone(),
-                provider_options: HashMap::new(),
-            }),
+            WireBlock::Text {
+                text,
+                cache_control,
+            } => {
+                text_parts.push(ContentPart::Text {
+                    text: text.clone(),
+                    provider_options: cache_control_options(cache_control),
+                });
+            }
             WireBlock::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
+                cache_control,
             } => {
                 let output = match content {
                     Some(Value::String(s)) => Value::String(s.clone()),
                     Some(other) => other.clone(),
                     None => Value::Null,
                 };
+                let mut provider_options = HashMap::new();
+                if *is_error == Some(true) {
+                    provider_options.insert("anthropic".to_string(), json!({ "is_error": true }));
+                }
+                // 断点并入已有 anthropic 逃生舱（is_error 标记共存）。
+                if let Some(cc) = cache_control {
+                    let entry = provider_options
+                        .entry("anthropic".to_string())
+                        .or_insert_with(|| json!({}));
+                    if let Value::Object(anthropic) = entry {
+                        anthropic.insert("cache_control".into(), cc.clone());
+                    }
+                }
                 tool_results.push(ContentPart::ToolResult {
                     tool_call_id: tool_use_id.clone(),
                     tool_name: String::new(),
                     output,
-                    provider_options: if *is_error == Some(true) {
-                        [("anthropic".to_string(), json!({ "is_error": true }))]
-                            .into_iter()
-                            .collect()
-                    } else {
-                        HashMap::new()
-                    },
+                    provider_options,
                 });
             }
-            WireBlock::Image { source } | WireBlock::Document { source } => {
+            WireBlock::Image {
+                source,
+                cache_control,
+            }
+            | WireBlock::Document {
+                source,
+                cache_control,
+            } => {
                 let block_type = match block {
                     WireBlock::Image { .. } => "image",
                     _ => "document",
                 };
-                text_parts.push(decode_media_part(source, index, block_type)?);
+                text_parts.push(decode_media_part(source, index, block_type, cache_control)?);
             }
             _ => return Err(DecodeError::UnknownContentBlock { index }),
         }
@@ -741,13 +830,15 @@ impl WireContent {
 /// `base64` source → `MediaSource::Data`（media_type 缺省空串兜底）；`url` source →
 /// `MediaSource::Url`。`file`（provider 托管引用）与 `text`（纯文本文档）网关不
 /// 承载，以空 `MediaSource::Data` 占位跨协议族丢弃时记 warning（逃生舱哲学）。
-/// `block_type`（`image`/`document`）在缺省 media_type 时兜底为顶层段。
+/// `block_type`（`image`/`document`）在缺省 media_type 时兜底为顶层段；
+/// 块级 cache_control 断点并入 part 逃生舱。
 fn decode_media_part(
     source: &Option<WireMediaSource>,
     index: usize,
     block_type: &str,
+    cache_control: &Option<Value>,
 ) -> Result<ContentPart, DecodeError> {
-    let (media_type, data, provider_options) = match source {
+    let (media_type, data, mut provider_options) = match source {
         Some(WireMediaSource::Base64 {
             media_type,
             data: base64,
@@ -791,6 +882,15 @@ fn decode_media_part(
         ),
         None => return Err(DecodeError::UnknownContentBlock { index }),
     };
+    // 断点并入已有 anthropic 逃生舱（file/text source 的 media_source 等共存）。
+    if let Some(cc) = cache_control {
+        let entry = provider_options
+            .entry("anthropic".to_string())
+            .or_insert_with(|| json!({}));
+        if let Value::Object(anthropic) = entry {
+            anthropic.insert("cache_control".into(), cc.clone());
+        }
+    }
     Ok(ContentPart::Media {
         media_type,
         data,
@@ -814,7 +914,7 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     let mut obj = serde_json::Map::new();
     obj.insert("model".into(), json!(request.model));
     if let Some(system) = system {
-        obj.insert("system".into(), json!(system));
+        obj.insert("system".into(), system);
     }
     obj.insert("messages".into(), Value::Array(messages));
     // Anthropic 强制要求 max_tokens：缺省时补 4096，
@@ -963,6 +1063,14 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
                             ));
                         }
                         tool.insert("input_schema".into(), schema);
+                        // 工具级缓存断点原样回传。
+                        if let Some(cache_control) = t
+                            .provider_options
+                            .get("anthropic")
+                            .and_then(|a| a.get("cache_control"))
+                        {
+                            tool.insert("cache_control".into(), cache_control.clone());
+                        }
                         Value::Object(tool)
                     })
                     .collect(),
@@ -985,6 +1093,10 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             "tool_choice".into(),
             json!({ "type": "auto", "disable_parallel_tool_use": true }),
         );
+    }
+    // 请求级缓存断点原样回传（ttl/scope 等子字段随值透传）。
+    if let Some(cache_control) = anthropic_options.and_then(|o| o.get("cache_control")) {
+        obj.insert("cache_control".into(), cache_control.clone());
     }
     if let Some(thinking) = thinking {
         obj.insert("thinking".into(), thinking);
@@ -1180,12 +1292,15 @@ fn required_schema_names(required: Option<&Value>) -> Option<Vec<String>> {
 fn encode_messages(
     ir_messages: &[Message],
     warnings: &mut Vec<Warning>,
-) -> (Option<String>, Vec<Value>) {
+) -> (Option<Value>, Vec<Value>) {
     // tool 身份整形：Anthropic 要求 tool_use.id 合法且与 tool_result 一一
     // 配对；重复 tool 消息按原始 id 取最后一条、只产出一次。重排在编码后
     // 统一执行（align_tool_results），IR 保持中立。
     let mut alignment = ToolAlignment::scan(ir_messages);
     let mut system_out: Option<String> = None;
+    // System 缓存断点：合并后挂在 system 尾块；多条 System 各带断点时取
+    // 最后出现的（后者为更靠后的缓存前缘）。
+    let mut system_cache: Option<Value> = None;
     let mut wire_messages: Vec<Value> = Vec::new();
 
     for message in ir_messages {
@@ -1201,6 +1316,13 @@ fn encode_messages(
                             ),
                         ));
                     }
+                }
+                if let Some(cache_control) = message
+                    .provider_options
+                    .get("anthropic")
+                    .and_then(|a| a.get("cache_control"))
+                {
+                    system_cache = Some(cache_control.clone());
                 }
                 let text = text_parts(&message.content).unwrap_or_default();
                 if text.is_empty() {
@@ -1219,8 +1341,9 @@ fn encode_messages(
                     continue;
                 }
                 // 单一纯文本 user 消息编码为字符串（Anthropic 惯例，保持既有往返形状）；
-                // 含媒体等非文本 part 时按序编码为数组，保持文本与媒体混排顺序。
-                let single_text = (blocks.len() == 1)
+                // 含媒体等非文本 part 时按序编码为数组，保持文本与媒体混排顺序；
+                // 带 cache_control 断点的文本块必须保持块形状（字符串无处挂断点）。
+                let single_text = (blocks.len() == 1 && blocks[0].get("cache_control").is_none())
                     .then(|| blocks[0].get("type").and_then(Value::as_str))
                     .flatten()
                     .filter(|t| *t == "text")
@@ -1278,7 +1401,14 @@ fn encode_messages(
     align_tool_results(&mut wire_messages);
     // 末尾 assistant 文本块去除尾随空白（Anthropic 拒绝预置 assistant 的尾随空白）。
     trim_trailing_whitespace(&mut wire_messages);
-    (system_out, wire_messages)
+    // 有断点时 system 以单文本块数组出站，断点挂尾块；否则保持字符串形状。
+    let system = system_out.map(|text| match system_cache {
+        Some(cache_control) => {
+            json!([{ "type": "text", "text": text, "cache_control": cache_control }])
+        }
+        None => json!(text),
+    });
+    (system, wire_messages)
 }
 
 /// 单次出站请求的 tool 身份整形状态。
@@ -1396,6 +1526,17 @@ fn push_user_blocks(wire_messages: &mut Vec<Value>, blocks: Vec<Value>) {
     wire_messages.push(json!({ "role": "user", "content": Value::Array(blocks) }));
 }
 
+/// 把 part 级缓存断点写入 wire 内容块（约定键 anthropic.cache_control）。
+fn attach_cache_control(block: &mut Value, provider_options: &crate::core::ir::ProviderOptions) {
+    if let Some(cache_control) = provider_options
+        .get("anthropic")
+        .and_then(|a| a.get("cache_control"))
+        && let Value::Object(map) = block
+    {
+        map.insert("cache_control".into(), cache_control.clone());
+    }
+}
+
 /// 编码 user 消息的内容块序列（文本与媒体混排保持顺序）。
 ///
 /// 文本 → `text` 块；媒体 part → `image`/`document` 块（base64/URL source 按
@@ -1405,17 +1546,23 @@ fn encode_user_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -> Vec
     let mut blocks = Vec::new();
     for part in parts {
         match part {
-            ContentPart::Text { text, .. } => {
-                blocks.push(json!({ "type": "text", "text": text }));
+            ContentPart::Text {
+                text,
+                provider_options,
+            } => {
+                let mut block = json!({ "type": "text", "text": text });
+                attach_cache_control(&mut block, provider_options);
+                blocks.push(block);
             }
             ContentPart::Media {
                 media_type,
                 data,
                 provider_options,
             } => {
-                if let Some(block) =
+                if let Some(mut block) =
                     encode_media_block(media_type, data, provider_options, warnings)
                 {
+                    attach_cache_control(&mut block, provider_options);
                     blocks.push(block);
                 }
             }
@@ -1528,8 +1675,13 @@ fn encode_assistant_blocks(
     let mut blocks = Vec::new();
     for part in parts {
         match part {
-            ContentPart::Text { text, .. } => {
-                blocks.push(json!({ "type": "text", "text": text }));
+            ContentPart::Text {
+                text,
+                provider_options,
+            } => {
+                let mut block = json!({ "type": "text", "text": text });
+                attach_cache_control(&mut block, provider_options);
+                blocks.push(block);
             }
             ContentPart::Reasoning {
                 text,
@@ -1558,14 +1710,16 @@ fn encode_assistant_blocks(
                 tool_call_id,
                 tool_name,
                 input,
-                ..
+                provider_options,
             } => {
-                blocks.push(json!({
+                let mut block = json!({
                     "type": "tool_use",
                     "id": alignment.wire_id(tool_call_id),
                     "name": tool_name,
                     "input": input,
-                }));
+                });
+                attach_cache_control(&mut block, provider_options);
+                blocks.push(block);
             }
             ContentPart::Media { media_type, .. } => {
                 // Anthropic 媒体内容块仅允许出现在 user 消息；assistant 侧媒体
@@ -1607,7 +1761,7 @@ fn encode_tool_result_blocks(parts: &[ContentPart], alignment: &mut ToolAlignmen
                 return None;
             }
             // 内容与 is_error 取该 id 的最后一条 tool 消息。
-            let (output, is_error) = match alignment.last_result.get(&tool_call_id) {
+            let (output, is_error, cache_control) = match alignment.last_result.get(&tool_call_id) {
                 Some(ContentPart::ToolResult {
                     output,
                     provider_options,
@@ -1618,9 +1772,13 @@ fn encode_tool_result_blocks(parts: &[ContentPart], alignment: &mut ToolAlignmen
                         .and_then(|a| a.get("is_error"))
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    (output.clone(), is_error)
+                    let cache_control = provider_options
+                        .get("anthropic")
+                        .and_then(|a| a.get("cache_control"))
+                        .cloned();
+                    (output.clone(), is_error, cache_control)
                 }
-                _ => (part_output(part), false),
+                _ => (part_output(part), false, None),
             };
             // 输出为字符串时直接用；否则 JSON 序列化（tool_result content 是文本）。
             let content_value = match output {
@@ -1636,6 +1794,9 @@ fn encode_tool_result_blocks(parts: &[ContentPart], alignment: &mut ToolAlignmen
             block.insert("content".into(), content_value);
             if is_error {
                 block.insert("is_error".into(), Value::Bool(true));
+            }
+            if let Some(cache_control) = cache_control {
+                block.insert("cache_control".into(), cache_control);
             }
             Some(Value::Object(block))
         })
@@ -2549,6 +2710,114 @@ mod tests {
         let reencoded = encode_request(&ir, &mut warnings);
         assert_eq!(reencoded, wire, "往返应还原 wire 请求");
         assert!(warnings.is_empty(), "同协议往返不应产出 warning");
+    }
+
+    /// 缓存断点黄金样例：system 尾块（含 TTL）、工具、user 文本、tool_result
+    /// 与请求级五处断点解码捕获进约定键 `anthropic.cache_control`，出站逐位
+    /// 还原断点位置与 TTL，同族往返零告警。
+    #[test]
+    fn cache_control_fixture_roundtrip() {
+        let raw = include_str!("__fixtures__/request_cache_control.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let ir = decode_request(&wire).expect("fixture 应可解码为 IR");
+
+        // 解码捕获：各层级断点落在约定键，值原样（ttl 随值透传）。
+        let system = ir.messages.first().expect("应有 system 消息");
+        assert_eq!(
+            system.provider_options["anthropic"]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert_eq!(
+            ir.tools[0].provider_options["anthropic"]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        let user_text = &ir.messages[1].content[0];
+        assert!(matches!(
+            user_text,
+            ContentPart::Text { provider_options, .. }
+                if provider_options["anthropic"]["cache_control"] == json!({ "type": "ephemeral" })
+        ));
+        let tool_result = &ir.messages[3].content[0];
+        assert!(matches!(
+            tool_result,
+            ContentPart::ToolResult { provider_options, .. }
+                if provider_options["anthropic"]["cache_control"] == json!({ "type": "ephemeral" })
+        ));
+        assert_eq!(
+            ir.provider_options["anthropic"]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "请求级断点应捕获"
+        );
+
+        // 出站还原：断点位置与 TTL 逐位一致。
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty(), "同族断点往返不应产出 warning");
+        assert_eq!(reencoded, wire, "断点位置与 TTL 应逐位还原");
+    }
+
+    /// System 断点合并语义：多条 System 消息各带断点时取最后出现的（尾块
+    /// 前缘），断点在场时 system 以单文本块数组出站，缺席保持字符串形状。
+    #[test]
+    fn system_cache_control_merges_to_tail_block() {
+        fn bare_request(messages: Vec<Message>) -> ChatRequest {
+            ChatRequest {
+                model: "claude-sonnet-4-5".to_string(),
+                messages,
+                stream: false,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_tokens: Some(1024),
+                n: None,
+                stop: Vec::new(),
+                presence_penalty: None,
+                frequency_penalty: None,
+                seed: None,
+                response_format: None,
+                tools: Vec::new(),
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                provider_options: HashMap::new(),
+                warnings: Vec::new(),
+            }
+        }
+        let cached = json!({ "type": "ephemeral" });
+        let make = |text: &str, cc: Option<&Value>| Message {
+            role: Role::System,
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+                provider_options: HashMap::new(),
+            }],
+            provider_options: match cc {
+                Some(cc) => [("anthropic".to_string(), json!({ "cache_control": cc }))]
+                    .into_iter()
+                    .collect(),
+                None => HashMap::new(),
+            },
+        };
+
+        let request = bare_request(vec![
+            make("第一段", None),
+            make("第二段", Some(&cached)),
+            make("第三段", Some(&json!({ "type": "ephemeral", "ttl": "1h" }))),
+        ]);
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            wire["system"],
+            json!([{
+                "type": "text",
+                "text": "第一段\n\n第二段\n\n第三段",
+                "cache_control": { "type": "ephemeral", "ttl": "1h" }
+            }])
+        );
+
+        let request = bare_request(vec![make("无断点", None)]);
+        let wire = encode_request(&request, &mut Vec::new());
+        assert_eq!(wire["system"], json!("无断点"), "无断点保持字符串形状");
     }
 
     /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。
