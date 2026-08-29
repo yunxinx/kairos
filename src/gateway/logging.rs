@@ -153,18 +153,22 @@ pub(super) async fn log_request(
     let now = unix_millis();
     let max_bytes = deps.snapshot.read().await.log_body_max_bytes;
     if (200..300).contains(&status) && billing.usage.is_zero() {
+        let inbound = protocol_name(inbound_protocol);
         store::record_system_warn(
             &deps.pool,
             "billing",
             &store::SystemLogEvent::new(
                 "billing.usage_missing",
                 serde_json::json!({
+                    "request_id": request_id,
                     "token_name": token.name,
                     "model": model,
                     "channel": channel,
+                    "inbound_protocol": inbound,
                 }),
                 format!(
-                    "上游未回报 usage，本次按零计费（token={} model={model} channel={channel}）",
+                    "上游未回报 usage，本次按零计费（request_id={request_id} \
+                     token={} model={model} channel={channel} protocol={inbound}）",
                     token.name
                 ),
             ),

@@ -2763,8 +2763,26 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 2);
 
+        // 其余终端事件（incomplete/failed）同规：usage 挂在 response.usage 下。
+        for terminal in ["response.incomplete", "response.failed"] {
+            let frame = json!({
+                "type": terminal,
+                "response": {
+                    "usage": { "input_tokens": 7, "output_tokens": 3, "total_tokens": 10 }
+                }
+            });
+            let usage = sniff_usage(&frame).expect("终端帧应提取 usage");
+            assert_eq!(usage.input_tokens, 7, "{terminal} 应提取 input");
+            assert_eq!(usage.output_tokens, 3, "{terminal} 应提取 output");
+        }
+
         // 无 usage 字段的帧返回 None。
         assert!(sniff_usage(&json!({ "type": "response.output_text.delta" })).is_none());
+        assert!(
+            sniff_usage(&json!({ "type": "response.completed", "response": { "id": "r" } }))
+                .is_none(),
+            "终端帧缺 usage 时应返回 None"
+        );
     }
 
     /// 请求有状态特性（store/previous_response_id）出站时显式 warning 并丢弃。

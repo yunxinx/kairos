@@ -114,6 +114,9 @@ async fn zero_usage_is_not_charged() {
 }
 
 /// 成功 2xx 但上游不回报 usage：零计费，并落一条可观测的系统日志。
+///
+/// 告警携带对账三要素之外的完整定位信息：请求 id（关联请求日志）、渠道、
+/// 入站协议模式。
 #[tokio::test]
 async fn missing_usage_on_success_writes_system_warning() {
     let mut gw = TestGateway::start().await;
@@ -133,8 +136,15 @@ async fn missing_usage_on_success_writes_system_warning() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
 
-    let (level, target, message): (String, String, String) = sqlx::query_as(
-        "SELECT level, target, message FROM system_log WHERE target = 'billing' ORDER BY id DESC LIMIT 1",
+    let (level, target, message, event_code, raw_params): (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT level, target, message, event_code, event_params \
+         FROM system_log WHERE target = 'billing' ORDER BY id DESC LIMIT 1",
     )
     .fetch_one(&gw.pool)
     .await
@@ -144,6 +154,26 @@ async fn missing_usage_on_success_writes_system_warning() {
     assert!(
         message.contains("上游未回报 usage"),
         "系统日志应说明零计费原因，实际: {message}"
+    );
+    assert_eq!(event_code.as_deref(), Some("billing.usage_missing"));
+
+    // 请求 id 与模式落入结构化参数，且与请求日志的 request_id 可互相对上。
+    let logged_request_id: Option<String> =
+        sqlx::query_scalar("SELECT request_id FROM request_log")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应有一条请求日志");
+    let params: Value = serde_json::from_str(&raw_params.expect("告警应携带结构化参数"))
+        .expect("结构化参数应为合法 JSON");
+    assert_eq!(
+        params["request_id"],
+        logged_request_id.expect("日志应有请求 id")
+    );
+    assert_eq!(params["inbound_protocol"], "openai_chat");
+    assert_eq!(params["channel"], "test-channel");
+    assert!(
+        message.contains("request_id="),
+        "消息回退文本也应带请求 id: {message}"
     );
 }
 #[tokio::test]

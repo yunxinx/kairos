@@ -368,6 +368,22 @@ async fn responses_passthrough_streaming_bills() {
             .await
             .expect("应能查询计费");
     assert_eq!(row.0, 175);
+
+    // 终端嗅探回归：usage 只出现在 response.completed 的 response.usage 下，
+    // 请求日志应按嗅探结果落四分量；若嗅探失效退化为全零，将同时落一条
+    // billing 告警——此处断言告警缺席即反向锁定嗅探未失效。
+    let (input, output): (i64, i64) =
+        sqlx::query_as("SELECT input_tokens, output_tokens FROM request_log")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应有一条请求日志");
+    assert_eq!((input, output), (50, 5), "日志应按终端帧嗅探的 usage 落账");
+    let warned: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM system_log WHERE target = 'billing' LIMIT 1")
+            .fetch_optional(&gw.pool)
+            .await
+            .expect("应能查询系统日志");
+    assert!(warned.is_none(), "usage 嗅探成功不应触发零计费告警");
 }
 
 /// Responses 入站 → openai_chat 渠道：流式跨协议，下游收到 Responses SSE 帧。
