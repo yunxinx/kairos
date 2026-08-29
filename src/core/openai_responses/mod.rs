@@ -24,9 +24,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
-    PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
-    apply_provider_extra, capture_unknown_fields, warning_feature,
+    ChatRequest, ChatResponse, ContentPart, FILE_ID_KEY, FILE_NAME_KEY, FinishReason,
+    FinishReasonUnified, Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool,
+    ToolChoice, Usage, Warning, apply_provider_extra, capture_unknown_fields, warning_feature,
 };
 use crate::core::stream::SseFrame;
 
@@ -272,7 +272,6 @@ const OPENAI_PROVIDER: &str = "openai";
 const REASONING_ENCRYPTED: &str = "reasoning_encrypted_content";
 const ITEM_ID: &str = "item_id";
 const IMAGE_DETAIL: &str = "image_detail";
-const FILE_NAME: &str = "filename";
 /// 有状态特性（Out of Scope）的留存键，出站时显式警告并丢弃。
 const STATEFUL_STORE: &str = "store";
 const STATEFUL_PREVIOUS_RESPONSE_ID: &str = "previous_response_id";
@@ -517,7 +516,7 @@ fn decode_media_part(part: &Value, index: usize) -> Result<ContentPart, DecodeEr
         openai.insert(IMAGE_DETAIL.into(), json!(detail));
     }
     if let Some(filename) = part.get("filename").and_then(Value::as_str) {
-        openai.insert(FILE_NAME.into(), json!(filename));
+        openai.insert(FILE_NAME_KEY.into(), json!(filename));
     }
 
     let (media_type, data) = if let Some(url) = part.get("image_url").and_then(Value::as_str) {
@@ -557,7 +556,7 @@ fn decode_media_part(part: &Value, index: usize) -> Result<ContentPart, DecodeEr
         }
     } else if let Some(file_id) = part.get("file_id").and_then(Value::as_str) {
         // provider 托管引用：以空 Data 占位，逃生舱保留 file_id。
-        openai.insert("file_id".into(), json!(file_id));
+        openai.insert(FILE_ID_KEY.into(), json!(file_id));
         (
             if image {
                 "image".to_string()
@@ -1073,7 +1072,7 @@ fn encode_media_part(
                 }
             } else {
                 let filename = openai
-                    .and_then(|o| o.get(FILE_NAME))
+                    .and_then(|o| o.get(FILE_NAME_KEY))
                     .and_then(Value::as_str)
                     .unwrap_or("data");
                 part.insert("filename".into(), json!(filename));
@@ -2515,7 +2514,7 @@ mod tests {
                 data: crate::core::ir::MediaSource::Data { base64 },
                 provider_options,
             } if media_type == "application/pdf" && base64 == "JVBERi0xLjQK"
-                && provider_options.get("openai").and_then(|o| o.get(FILE_NAME))
+                && provider_options.get("openai").and_then(|o| o.get(FILE_NAME_KEY))
                     == Some(&Value::String("doc.pdf".to_string()))
         ));
         assert!(matches!(parts[4], ContentPart::Text { .. }));

@@ -5,7 +5,7 @@ expression: "json!({\n    \"upstream_request_content\": received[0][\"messages\"
 {
   "downstream_warnings": [
     {
-      "details": "OpenAI Chat Completions 仅支持图片媒体，application/pdf 已丢弃",
+      "details": "OpenAI Chat Completions 出站未承载 application/pdf，已丢弃",
       "feature": "media",
       "type": "unsupported"
     }

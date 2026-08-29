@@ -113,6 +113,18 @@ pub mod warning_feature {
 /// 跨族出站丢弃并记 [`warning_feature::UNKNOWN_FIELDS`] warning。
 pub const PROVIDER_EXTRA_KEY: &str = "extra";
 
+/// 媒体 part 逃生舱约定键：文件名。
+///
+/// chat `file.filename` 与 responses `input_file.filename` 共用
+/// `provider_options["openai"]["filename"]` 承载，跨协议转换不静默丢失。
+pub const FILE_NAME_KEY: &str = "filename";
+
+/// 媒体 part 逃生舱约定键：provider 托管文件引用（file_id）。
+///
+/// 网关不持有托管引用，以空 `MediaSource::Data` 占位、本键保留原值；
+/// 同协议族出站回传，跨协议族丢弃时记 warning。
+pub const FILE_ID_KEY: &str = "file_id";
+
 /// 消息角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -10,9 +10,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
-    Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage,
-    Warning, apply_provider_extra, capture_unknown_fields, warning_feature,
+    ChatRequest, ChatResponse, ContentPart, FILE_ID_KEY, FILE_NAME_KEY, FinishReason,
+    FinishReasonUnified, MediaSource, Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role,
+    StreamEvent, Tool, ToolChoice, Usage, Warning, apply_provider_extra, capture_unknown_fields,
+    warning_feature,
 };
 use crate::core::stream::SseFrame;
 
@@ -189,6 +190,31 @@ struct WireContentPart {
     text: Option<String>,
     #[serde(default)]
     image_url: Option<WireImageUrl>,
+    #[serde(default)]
+    input_audio: Option<WireInputAudio>,
+    #[serde(default)]
+    file: Option<WireFile>,
+}
+
+/// `input_audio` part 载荷：base64 音频字节 + 格式（官方必填 wav/mp3）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireInputAudio {
+    data: String,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// `file` part 载荷：文件名 / base64 文件数据 / provider 托管引用，三选一可用。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireFile {
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    file_data: Option<String>,
+    #[serde(default)]
+    file_id: Option<String>,
 }
 
 /// `image_url` part 的载体：`url` 为远程 URL 或 base64 data URL；
@@ -623,11 +649,13 @@ impl WireContent {
     }
 }
 
-/// 解码单个 user content part：`text` 与 `image_url`（远程 URL 或 base64 data URL）。
+/// 解码单个 user content part：`text`、`image_url`（远程 URL 或 base64 data URL）、
+/// `input_audio` 与 `file`。
 ///
-/// `image_url` part 映射为 IR 媒体 part：data URL 解析出 media_type + base64 字节
-/// 为 `MediaSource::Data`，远程 URL 为 `MediaSource::Url`。其余 part 类型拒绝
-/// （未知 user part），与 v1 一致。
+/// `image_url`/`input_audio`/`file` 均映射为 IR 媒体 part：data URL 解析出
+/// media_type + base64 字节为 `MediaSource::Data`，远程 URL 为
+/// `MediaSource::Url`。`detail`/`filename`/`file_id` 等 OpenAI 特有字段经
+/// 逃生舱保留。其余 part 类型拒绝（未知 user part），与 v1 一致。
 fn decode_user_part(part: &WireContentPart, index: usize) -> Result<ContentPart, DecodeError> {
     match part.part_type.as_str() {
         "text" => {
@@ -650,6 +678,65 @@ fn decode_user_part(part: &WireContentPart, index: usize) -> Result<ContentPart,
             let mut provider_options = HashMap::new();
             if let Some(detail) = &image.detail {
                 provider_options.insert("openai".to_string(), json!({ "detail": detail }));
+            }
+            Ok(ContentPart::Media {
+                media_type,
+                data,
+                provider_options,
+            })
+        }
+        "input_audio" => {
+            let audio = part
+                .input_audio
+                .as_ref()
+                .ok_or(DecodeError::UnknownUserContentPart { index })?;
+            // format 官方必填（wav/mp3）；缺省兜底 wav，与 responses 适配器同规。
+            let format = audio.format.as_deref().unwrap_or("wav");
+            Ok(ContentPart::Media {
+                media_type: format!("audio/{format}"),
+                data: MediaSource::Data {
+                    base64: audio.data.clone(),
+                },
+                provider_options: HashMap::new(),
+            })
+        }
+        "file" => {
+            let file = part
+                .file
+                .as_ref()
+                .ok_or(DecodeError::UnknownUserContentPart { index })?;
+            let mut provider_options = HashMap::new();
+            let mut openai = serde_json::Map::new();
+            // filename/file_id 供 responses 出站 input_file 回传（逃生舱约定键）。
+            if let Some(filename) = &file.filename {
+                openai.insert(FILE_NAME_KEY.to_string(), json!(filename));
+            }
+            let (media_type, data) = if let Some(file_id) = &file.file_id {
+                // provider 托管引用：空 Data 占位（responses 同规），跨协议族丢弃时记 warning。
+                openai.insert(FILE_ID_KEY.to_string(), json!(file_id));
+                (
+                    "file".to_string(),
+                    MediaSource::Data {
+                        base64: String::new(),
+                    },
+                )
+            } else if let Some(file_data) = &file.file_data {
+                // chat file 官方形状无 media_type 字段：data URL 标记可拆出真实
+                // 类型，裸 base64 按 chat file 官方承载的 PDF 兜底。
+                match crate::core::ir::split_data_url(file_data) {
+                    Some((media_type, base64)) => (media_type, MediaSource::Data { base64 }),
+                    None => (
+                        "application/pdf".to_string(),
+                        MediaSource::Data {
+                            base64: file_data.clone(),
+                        },
+                    ),
+                }
+            } else {
+                return Err(DecodeError::UnknownUserContentPart { index });
+            };
+            if !openai.is_empty() {
+                provider_options.insert("openai".to_string(), Value::Object(openai));
             }
             Ok(ContentPart::Media {
                 media_type,
@@ -1015,12 +1102,13 @@ fn encode_user_part(part: &ContentPart, warnings: &mut Vec<Warning>) -> Option<V
             data,
             provider_options,
         } => {
-            // OpenAI Chat Completions：仅 `image_url` 承载媒体，且数据源可为
-            // 远程 URL 或 base64 data URL。非图片媒体类型丢弃并记 warning。
+            // OpenAI Chat Completions：出站仅承载 `image_url`（音频/文件的
+            // 官方 input_audio/file 承载未实现），数据源可为远程 URL 或 base64
+            // data URL。非图片媒体类型丢弃并记 warning。
             if !is_image_media(media_type) {
                 warnings.push(Warning::unsupported(
                     warning_feature::MEDIA,
-                    format!("OpenAI Chat Completions 仅支持图片媒体，{media_type} 已丢弃"),
+                    format!("OpenAI Chat Completions 出站未承载 {media_type}，已丢弃"),
                 ));
                 return None;
             }
@@ -2194,6 +2282,108 @@ mod tests {
         let reencoded = encode_request(&ir, &mut warnings);
         assert_eq!(reencoded, wire, "往返应还原 detail");
         assert!(warnings.is_empty());
+    }
+
+    /// `input_audio` 与 `file` part 解码为 IR 媒体 part：音频按
+    /// `audio/<format>`（format 缺省兜底 wav），文件 data URL 拆出真实类型、
+    /// 裸 base64 按 PDF 兜底，file_id 以空 Data 占位并经逃生舱保留。
+    #[test]
+    fn audio_and_file_parts_decode_to_media() {
+        let ir = decode_request(&json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "mp3" } },
+                    { "type": "input_audio", "input_audio": { "data": "UklGRg==" } },
+                    {
+                        "type": "file",
+                        "file": { "filename": "doc.pdf", "file_data": "data:application/pdf;base64,JVBERi0=" }
+                    },
+                    { "type": "file", "file": { "file_data": "JVBERi0=" } },
+                    { "type": "file", "file": { "file_id": "file-123", "filename": "doc.pdf" } }
+                ]
+            }]
+        }))
+        .expect("音频与文件 part 应可解码");
+        let parts = &ir.messages[0].content;
+        assert_eq!(parts.len(), 5);
+
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Media { media_type, data: MediaSource::Data { base64 }, .. }
+                if media_type == "audio/mp3" && base64 == "UklGRg=="
+        ));
+        assert!(
+            matches!(&parts[1], ContentPart::Media { media_type, .. } if media_type == "audio/wav"),
+            "format 缺省应兜底 wav"
+        );
+        assert!(matches!(
+            &parts[2],
+            ContentPart::Media { media_type, data: MediaSource::Data { .. }, .. }
+                if media_type == "application/pdf"
+        ));
+        assert!(
+            matches!(&parts[3], ContentPart::Media { media_type, .. } if media_type == "application/pdf"),
+            "裸 base64 应按 PDF 兜底"
+        );
+        // file_id：空占位 + 逃生舱保留原值与文件名。
+        let ContentPart::Media {
+            media_type,
+            data: MediaSource::Data { base64 },
+            provider_options,
+        } = &parts[4]
+        else {
+            panic!("file_id part 应为媒体 part");
+        };
+        assert_eq!(media_type, "file");
+        assert!(base64.is_empty(), "托管引用应以空 Data 占位");
+        assert_eq!(
+            provider_options.get("openai"),
+            Some(&json!({ "file_id": "file-123", "filename": "doc.pdf" }))
+        );
+
+        // file 载荷缺失（无 file_data 也无 file_id）拒绝。
+        let broken = decode_request(&json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": [{ "type": "file", "file": {} }] }]
+        }));
+        assert!(matches!(
+            broken,
+            Err(DecodeError::UnknownUserContentPart { .. })
+        ));
+    }
+
+    /// 音频媒体在 chat 出站无承载（官方 input_audio/file 承载未实现）：丢弃并
+    /// 记 warning，同族经别名走 IR 路径的有损面专用声明。
+    #[test]
+    fn audio_media_chat_outbound_drops_with_warning() {
+        let ir = decode_request(&json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe" },
+                    { "type": "input_audio", "input_audio": { "data": "UklGRg==", "format": "wav" } }
+                ]
+            }]
+        }))
+        .expect("应可解码");
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        let content = &encoded["messages"][0]["content"];
+        assert_eq!(
+            content.as_array().map(Vec::len),
+            Some(1),
+            "音频 part 应丢弃，仅文本保留"
+        );
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                Warning::Unsupported { feature: f, .. } if f == warning_feature::MEDIA
+            )),
+            "音频丢弃应记 media warning"
+        );
     }
 
     /// 非文本/非 image_url 的 user content part 报错。
