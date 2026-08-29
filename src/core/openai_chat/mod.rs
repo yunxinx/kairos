@@ -326,6 +326,12 @@ struct WireStreamDelta {
     role: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// 助手思维链增量（`reasoning` 为 OpenRouter 别名），与消息级字段同规：
+    /// `reasoning_content` 为主、并存取主。
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<WireStreamToolCall>>,
 }
@@ -1403,7 +1409,8 @@ fn encode_usage(usage: &Usage) -> Value {
 ///
 /// 跨帧维护 tool-call 的 index→id
 /// 映射，后续只带 index 的增量帧能匹配到首帧记录的 id。text delta 产出
-/// text-start/delta/end，tool-call delta 按 index 累积为 tool-input-start/delta/end，
+/// text-start/delta/end，reasoning delta 产出 reasoning-start/delta/end，
+/// tool-call delta 按 index 累积为 tool-input-start/delta/end，
 /// usage 与 finish_reason 在出现时产出生命周期事件。
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
@@ -1414,6 +1421,12 @@ pub struct StreamDecoder {
     /// 是否已产出 `ResponseMetadata`：Chat Completions 每个 chunk 都重复携带
     /// id/model，而该事件在 IR 中是「一次响应一次」的生命周期事件。
     metadata_emitted: bool,
+    /// 推理块是否进行中：思维链增量无显式结束标记，切换到文本/工具或流收尾
+    /// 时收块，保证下游编码器「块切换先 stop 再 start」。
+    reasoning_open: bool,
+    /// 文本块是否已产出 TextStart：首帧 role 被思维链占用时（reasoning 先行），
+    /// 文本块延迟到首个 content 增量才开启。
+    text_started: bool,
 }
 
 impl StreamDecoder {
@@ -1447,8 +1460,37 @@ impl StreamDecoder {
         if let Some(choice) = choice
             && let Some(delta) = &choice.delta
         {
-            // role 只出现在文本流的首帧：以此开启文本块。
-            if delta.role.is_some() {
+            // reasoning 双别名归一（与非流式消息级字段同规）：键出现即视为
+            // 思维链信号。首帧的 role + 空 reasoning（DeepSeek 形状）开推理块
+            // 而不开文本块，避免下游产出只有 role 的空文本块。
+            let reasoning_present = delta.reasoning_content.is_some() || delta.reasoning.is_some();
+            if reasoning_present {
+                if !self.reasoning_open {
+                    self.reasoning_open = true;
+                    events.push(StreamEvent::ReasoningStart {
+                        id: "0".to_string(),
+                        provider_options: HashMap::new(),
+                    });
+                }
+                if let Some(reasoning) = delta
+                    .reasoning_content
+                    .as_ref()
+                    .or(delta.reasoning.as_ref())
+                    .filter(|text| !text.is_empty())
+                {
+                    is_output = true;
+                    events.push(StreamEvent::ReasoningDelta {
+                        id: "0".to_string(),
+                        delta: reasoning.clone(),
+                        provider_options: HashMap::new(),
+                    });
+                }
+            }
+
+            // role 只出现在文本流的首帧：以此开启文本块。首帧被思维链占用时，
+            // 文本块延迟到首个 content 增量才开启。
+            if delta.role.is_some() && !reasoning_present {
+                self.text_started = true;
                 events.push(StreamEvent::TextStart {
                     id: "0".to_string(),
                     provider_options: HashMap::new(),
@@ -1457,6 +1499,20 @@ impl StreamDecoder {
             if let Some(content) = &delta.content
                 && !content.is_empty()
             {
+                if self.reasoning_open {
+                    self.reasoning_open = false;
+                    events.push(StreamEvent::ReasoningEnd {
+                        id: "0".to_string(),
+                        provider_options: HashMap::new(),
+                    });
+                }
+                if !self.text_started {
+                    self.text_started = true;
+                    events.push(StreamEvent::TextStart {
+                        id: "0".to_string(),
+                        provider_options: HashMap::new(),
+                    });
+                }
                 is_output = true;
                 events.push(StreamEvent::TextDelta {
                     id: "0".to_string(),
@@ -1465,6 +1521,13 @@ impl StreamDecoder {
                 });
             }
             if let Some(tool_calls) = &delta.tool_calls {
+                if !tool_calls.is_empty() && self.reasoning_open {
+                    self.reasoning_open = false;
+                    events.push(StreamEvent::ReasoningEnd {
+                        id: "0".to_string(),
+                        provider_options: HashMap::new(),
+                    });
+                }
                 for tc in tool_calls {
                     let index = tc.index;
                     let id = match &tc.id {
@@ -1520,6 +1583,15 @@ impl StreamDecoder {
                 unified: FinishReasonUnified::Other,
                 raw: None,
             });
+            // 思维链无显式结束标记：流收尾仍开着则先收块，避免下游编码器
+            // 在未 stop 的推理块上收尾。
+            if self.reasoning_open {
+                self.reasoning_open = false;
+                events.push(StreamEvent::ReasoningEnd {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                });
+            }
             events.push(StreamEvent::Finish {
                 finish_reason,
                 usage: wire
@@ -2614,6 +2686,128 @@ mod tests {
             }
             other => panic!("应产出 Finish 事件，实际 {other:?}"),
         }
+    }
+
+    /// 思维链增量解码为 reasoning 成对事件（DeepSeek/OpenRouter 双别名）。
+    ///
+    /// 首帧 role + 空 reasoning 只开推理块不开文本块；首个 content 增量收推理块、
+    /// 开文本块；别名 `reasoning` 与主字段同规，并存时取主。
+    #[test]
+    fn reasoning_deltas_decode_to_reasoning_events() {
+        let chunk = |delta: Value| {
+            json!({
+                "id": "chatcmpl-r", "object": "chat.completion.chunk", "model": "deepseek-chat",
+                "choices": [{ "index": 0, "delta": delta }]
+            })
+        };
+        let mut decoder = StreamDecoder::default();
+
+        // 首帧：role + 空 reasoning_content（DeepSeek 形状）→ 只开推理块。
+        let decoded = decoder.process(&chunk(json!({
+            "role": "assistant", "reasoning_content": ""
+        })));
+        assert!(!decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![
+                StreamEvent::ResponseMetadata {
+                    id: "chatcmpl-r".to_string(),
+                    model: "deepseek-chat".to_string(),
+                },
+                StreamEvent::ReasoningStart {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+            ]
+        );
+
+        // 增量帧（OpenRouter 别名 `reasoning`）→ ReasoningDelta。
+        let decoded = decoder.process(&chunk(json!({ "reasoning": "先想一步。" })));
+        assert!(decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::ReasoningDelta {
+                id: "0".to_string(),
+                delta: "先想一步。".to_string(),
+                provider_options: HashMap::new(),
+            }]
+        );
+
+        // 双别名并存取主 `reasoning_content`。
+        let decoded = decoder.process(&chunk(json!({
+            "reasoning": "别名值。", "reasoning_content": "主字段值。"
+        })));
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::ReasoningDelta {
+                id: "0".to_string(),
+                delta: "主字段值。".to_string(),
+                provider_options: HashMap::new(),
+            }]
+        );
+
+        // 首个 content 增量：收推理块 → 开文本块 → 文本增量。
+        let decoded = decoder.process(&chunk(json!({
+            "content": "185", "reasoning_content": null
+        })));
+        assert!(decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![
+                StreamEvent::ReasoningEnd {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::TextStart {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::TextDelta {
+                    id: "0".to_string(),
+                    delta: "185".to_string(),
+                    provider_options: HashMap::new(),
+                },
+            ]
+        );
+
+        // 流收尾：推理块已收，Finish 前不再重复 ReasoningEnd。
+        let decoded = decoder.process(&json!({
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        }));
+        assert_eq!(decoded.events.len(), 1);
+        assert!(matches!(decoded.events[0], StreamEvent::Finish { .. }));
+    }
+
+    /// 思维链独占全流（无文本/工具输出）时，Finish 前收推理块。
+    #[test]
+    fn reasoning_only_stream_closes_block_before_finish() {
+        let mut decoder = StreamDecoder::default();
+        decoder.process(&json!({
+            "id": "chatcmpl-r", "object": "chat.completion.chunk", "model": "deepseek-chat",
+            "choices": [{ "index": 0, "delta": {
+                "role": "assistant", "reasoning_content": "只想不答。"
+            } }]
+        }));
+        let decoded = decoder.process(&json!({
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        }));
+        assert_eq!(
+            decoded.events,
+            vec![
+                StreamEvent::ReasoningEnd {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::Finish {
+                    finish_reason: FinishReason {
+                        unified: FinishReasonUnified::Stop,
+                        raw: Some("stop".to_string()),
+                    },
+                    usage: Usage::default(),
+                    provider_metadata: HashMap::new(),
+                },
+            ]
+        );
     }
 
     /// 同一解码器连续处理多个 chunk：`ResponseMetadata` 只产出一次。
