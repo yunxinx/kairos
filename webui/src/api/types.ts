@@ -7,6 +7,15 @@ export const PROTOCOLS: readonly Protocol[] = [
   'anthropic_messages',
 ];
 
+/** 渠道 reasoning 思维链兼容输出模式，与后端 `ReasoningOutputMode` serde rename 一致。 */
+export type ReasoningOutputMode = 'auto' | 'always' | 'off';
+
+export const REASONING_OUTPUT_MODES: readonly ReasoningOutputMode[] = [
+  'auto',
+  'always',
+  'off',
+];
+
 /** 运行时收窄日志/表单里的协议字符串。 */
 export function isProtocol(value: string): value is Protocol {
   return (PROTOCOLS as readonly string[]).includes(value);
@@ -87,6 +96,8 @@ export interface Channel {
   enabled: boolean;
   /** 保存时把新加入的可调用名并入该组；`default` 表示不自动入组。 */
   model_group: string;
+  /** reasoning 思维链兼容输出模式；缺省 auto（按厂商提示词表自动判定）。 */
+  reasoning_output: ReasoningOutputMode;
 }
 
 /** 渠道上的一把上游密钥；模型白/黑名单为可选的逗号名单。 */
@@ -137,6 +148,7 @@ export function channelWriteBody(view: ChannelView): Channel {
     max_retries: view.max_retries,
     enabled: view.enabled,
     model_group: view.model_group,
+    reasoning_output: view.reasoning_output,
   };
 }
 

@@ -11,6 +11,7 @@ use serde_json::Value;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::config::Protocol;
+use crate::config::ReasoningOutputMode;
 use crate::store::StoreError;
 pub use crate::store::channel_keys::{
     ChannelKey, StoredChannelKey, channel_key_supports_model, select_channel_key,
@@ -54,6 +55,9 @@ pub struct Channel {
     /// 添加可调用名时并入的模型组；[`DEFAULT_MODEL_GROUP`] 表示不自动入组。
     #[serde(default = "default_model_group")]
     pub model_group: String,
+    /// reasoning 思维链兼容输出模式；缺省 [`ReasoningOutputMode::Auto`]。
+    #[serde(default)]
+    pub reasoning_output: ReasoningOutputMode,
 }
 
 /// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
@@ -546,6 +550,27 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
     }
 }
 
+/// `ReasoningOutputMode` 落库用的 wire 字符串（与 serde rename 一致）。
+fn reasoning_output_to_wire(mode: ReasoningOutputMode) -> &'static str {
+    match mode {
+        ReasoningOutputMode::Auto => "auto",
+        ReasoningOutputMode::Always => "always",
+        ReasoningOutputMode::Off => "off",
+    }
+}
+
+/// 从库中读出 `ReasoningOutputMode`。
+fn reasoning_output_from_wire(s: &str) -> Result<ReasoningOutputMode, StoreError> {
+    match s {
+        "auto" => Ok(ReasoningOutputMode::Auto),
+        "always" => Ok(ReasoningOutputMode::Always),
+        "off" => Ok(ReasoningOutputMode::Off),
+        other => Err(StoreError::InvalidResource(format!(
+            "未知 reasoning 输出模式: {other}"
+        ))),
+    }
+}
+
 /// 读出全部渠道记录（含库生成的 `id`）。
 pub async fn list_channel_records(pool: &SqlitePool) -> Result<Vec<ChannelRecord>, StoreError> {
     let rows = sqlx::query(CHANNEL_RECORD_SELECT)
@@ -610,13 +635,16 @@ pub async fn list_channel_records_on_conn(
 }
 
 const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, models_json, \
-    model_aliases_json, timeout_ms, max_retries, enabled, model_group FROM channels";
+    model_aliases_json, timeout_ms, max_retries, enabled, model_group, reasoning_output \
+    FROM channels";
 
 /// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
     let name: String = row.try_get("name").map_err(StoreError::Query)?;
     let protocol_wire: String = row.try_get("protocol").map_err(StoreError::Query)?;
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
+    let reasoning_output_wire: String =
+        row.try_get("reasoning_output").map_err(StoreError::Query)?;
     // 先解析集合字段（错误信息需要引用 name），再构造结构体以避免移动后借用。
     let models: Vec<String> = serde_json::from_str(
         &row.try_get::<String, _>("models_json")
@@ -642,6 +670,7 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             models,
             model_aliases,
             model_group: row.try_get("model_group").map_err(StoreError::Query)?,
+            reasoning_output: reasoning_output_from_wire(&reasoning_output_wire)?,
         },
         keys: Vec::new(),
     })
@@ -793,8 +822,8 @@ pub async fn insert_channel(
     let result = sqlx::query(
         "INSERT INTO channels \
          (name, protocol, base_url, models_json, model_aliases_json, \
-          timeout_ms, max_retries, enabled, model_group) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          timeout_ms, max_retries, enabled, model_group, reasoning_output) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -805,6 +834,7 @@ pub async fn insert_channel(
     .bind(channel.max_retries)
     .bind(channel.enabled)
     .bind(&channel.model_group)
+    .bind(reasoning_output_to_wire(channel.reasoning_output))
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -856,7 +886,7 @@ pub async fn update_channel(
            name = ?, protocol = ?, base_url = ?, \
            models_json = ?, model_aliases_json = ?, \
            timeout_ms = ?, max_retries = ?, enabled = ?, \
-           model_group = ? \
+           model_group = ?, reasoning_output = ? \
          WHERE id = ?",
     )
     .bind(&channel.name)
@@ -868,6 +898,7 @@ pub async fn update_channel(
     .bind(channel.max_retries)
     .bind(channel.enabled)
     .bind(&channel.model_group)
+    .bind(reasoning_output_to_wire(channel.reasoning_output))
     .bind(id)
     .execute(&mut *conn)
     .await
@@ -1645,6 +1676,7 @@ mod tests {
             max_retries: 2,
             enabled: true,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
+            reasoning_output: Default::default(),
         }
     }
 
@@ -1889,6 +1921,26 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, id);
         assert_eq!(records[0].channel, sample_channel());
+
+        // reasoning 输出模式三态落库往返；缺省（未写 JSON 字段）为 auto。
+        for mode in [
+            ReasoningOutputMode::Auto,
+            ReasoningOutputMode::Always,
+            ReasoningOutputMode::Off,
+        ] {
+            let mut channel = sample_channel();
+            channel.name = format!("mode-{}", reasoning_output_to_wire(mode));
+            channel.reasoning_output = mode;
+            let mode_id = insert_channel(&mut conn, &channel)
+                .await
+                .expect("应能写渠道");
+            let records = list_channel_records(&pool).await.expect("应能读渠道");
+            let record = records
+                .iter()
+                .find(|record| record.id == mode_id)
+                .expect("应能读回该渠道");
+            assert_eq!(record.channel.reasoning_output, mode);
+        }
     }
 
     /// 按 id 整体替换：可改字段也可改名，id 保持不变，不产生重复行。
@@ -2438,6 +2490,7 @@ mod tests {
                 max_retries: 0,
                 enabled: true,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
             },
         )
         .await

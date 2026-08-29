@@ -460,6 +460,7 @@ mod tests {
                 max_retries: 0,
                 enabled: true,
                 model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
             },
         )
         .await

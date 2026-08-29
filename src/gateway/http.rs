@@ -1683,11 +1683,19 @@ async fn non_stream_completion(
     let price = ctx.price;
     let started = ctx.started;
     let inbound_protocol = ctx.inbound_protocol;
-    // 别名重写：请求模型用该渠道自己的出站名。
-    let mut request_warnings = Vec::new();
-    let mut outbound_value =
-        protocol::encode_request(request, channel.protocol, &mut request_warnings);
+    // 别名重写：请求模型用该渠道自己的出站名。reasoning 兼容输出的自动挡
+    // 按出站模型名判定，先于编码解析。
     let outbound_model = routing::outbound_model(channel, ctx.routed_model);
+    let reasoning_content = channel
+        .reasoning_output
+        .enables_reasoning_content(outbound_model, &channel.base_url);
+    let mut request_warnings = Vec::new();
+    let mut outbound_value = protocol::encode_request_with_reasoning(
+        request,
+        channel.protocol,
+        reasoning_content,
+        &mut request_warnings,
+    );
     if let Value::Object(map) = &mut outbound_value {
         map.insert("model".into(), Value::String(outbound_model.to_string()));
     }
@@ -1993,7 +2001,18 @@ async fn pipe_stream<S>(
     use futures_util::StreamExt as _;
 
     let mut decoder = protocol::make_decoder(ctx.channel.protocol);
-    let mut encoder = protocol::make_encoder(ctx.inbound_protocol, ctx.inbound_model.clone());
+    // reasoning 兼容输出的自动挡按出站模型名判定：上游回报的思维链是否
+    // 以 `delta.reasoning_content` 转发 chat 下游，由该渠道的开关决定。
+    let outbound_model = routing::outbound_model(&ctx.channel, &ctx.routed_model);
+    let reasoning_content = ctx
+        .channel
+        .reasoning_output
+        .enables_reasoning_content(outbound_model, &ctx.channel.base_url);
+    let mut encoder = protocol::make_encoder(
+        ctx.inbound_protocol,
+        ctx.inbound_model.clone(),
+        reasoning_content,
+    );
     let terminator = encoder.terminator();
     let mut accumulator = StreamAccumulator::new();
     // 以字节缓冲、帧边界后再转文本：多字节 UTF-8 可能被拆在两个字节块里，

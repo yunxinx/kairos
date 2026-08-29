@@ -599,15 +599,42 @@ fn is_image_media(media_type: &str) -> bool {
 
 // ---- 出站编码：IR → wire 请求 ----
 
+/// chat 出站编码选项：渠道级兼容输出开关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatEncodeOptions {
+    /// 把 assistant 消息的 IR Reasoning part 回写为 `reasoning_content`
+    /// （生态事实标准，DeepSeek 系工具轮要求思维链随历史回放）。关闭时
+    /// 丢弃并记 warning。缺省开启（同族保真优先）。
+    pub reasoning_content: bool,
+}
+
+impl Default for ChatEncodeOptions {
+    fn default() -> Self {
+        Self {
+            reasoning_content: true,
+        }
+    }
+}
+
 /// 编码 IR 请求为出站 Chat Completions 请求体。
 ///
 /// 目标协议无法表达的内容（`top_k`、reasoning part）追加到 `warnings`，由网关
-/// 随响应回传给下游。
+/// 随响应回传给下游。reasoning 回写缺省开启，渠道级关闭用
+/// [`encode_request_with`]。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
+    encode_request_with(request, ChatEncodeOptions::default(), warnings)
+}
+
+/// 按渠道选项编码 IR 请求为出站 Chat Completions 请求体。
+pub fn encode_request_with(
+    request: &ChatRequest,
+    options: ChatEncodeOptions,
+    warnings: &mut Vec<Warning>,
+) -> Value {
     let messages: Vec<Value> = request
         .messages
         .iter()
-        .map(|message| encode_message(message, warnings))
+        .map(|message| encode_message(message, options, warnings))
         .collect();
 
     if request.top_k.is_some() {
@@ -724,14 +751,18 @@ fn encode_tool_choice(choice: &ToolChoice) -> Value {
 /// 编码单条 IR 消息为 wire 消息。
 ///
 /// assistant 消息的 `reasoning` part 经 `reasoning_content` 字段回写（生态
-/// 事实标准，多个 part 聚合为单字段、段间空行连接）；出现在其他角色的
-/// 消息中无法表达，丢弃并记 warning。
-fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
-    if message.role != Role::Assistant
-        && message
-            .content
-            .iter()
-            .any(|p| matches!(p, ContentPart::Reasoning { .. }))
+/// 事实标准，多个 part 聚合为单字段、段间空行连接）；渠道开关关闭或出现
+/// 在其他角色的消息中无法表达，丢弃并记 warning。
+fn encode_message(
+    message: &Message,
+    options: ChatEncodeOptions,
+    warnings: &mut Vec<Warning>,
+) -> Value {
+    if message
+        .content
+        .iter()
+        .any(|p| matches!(p, ContentPart::Reasoning { .. }))
+        && (message.role != Role::Assistant || !options.reasoning_content)
     {
         warnings.push(Warning::unsupported(
             "reasoning",
@@ -805,7 +836,7 @@ fn encode_message(message: &Message, warnings: &mut Vec<Warning>) -> Value {
                 Value::String(text)
             };
             wire.insert("content".into(), content_value);
-            if !reasoning.is_empty() {
+            if options.reasoning_content && !reasoning.is_empty() {
                 wire.insert("reasoning_content".into(), json!(reasoning.join("\n\n")));
             }
             if !tool_calls.is_empty() {
@@ -1305,7 +1336,7 @@ impl DecodeStreamChunk {
 /// 维护进行中的 text/tool-input 块状态，把事件还原为 `chat.completion.chunk`
 /// wire 形状。`StreamStart` 的 warnings 以首帧 `gateway.warnings` 下发，
 /// 与非流式响应的 `gateway` 字段对称。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamEncoder {
     text_open: bool,
     tool_calls: Vec<OpenToolCall>,
@@ -1315,16 +1346,40 @@ pub struct StreamEncoder {
     /// 入站模型名覆盖：别名命中时，出站响应模型名须重写回入站短名。
     /// `Some` 时无视 ResponseMetadata 携带的上游模型名。
     inbound_model: Option<String>,
-    /// 流中是否出现过 reasoning 事件：Chat Completions 无 reasoning 内容块，
-    /// 丢弃后须在 finish 帧显式 warning。
+    /// 渠道级 reasoning 兼容输出开关：开启时 ReasoningDelta 以
+    /// `delta.reasoning_content` 增量下发；关闭时丢弃并在 finish 帧显式
+    /// warning。缺省开启（同族保真优先）。
+    reasoning_content: bool,
+    /// 流中是否出现过被丢弃的 reasoning 事件：关闭开关时在 finish 帧 warning。
     saw_reasoning: bool,
+    /// reasoning 增量是否进行中（ReasoningStart 后）：首个内容增量补 `role`。
+    reasoning_open: bool,
+    /// 是否已随任一内容增量下发过 `role`（整个流恰好一次）。
+    role_emitted: bool,
+}
+
+impl Default for StreamEncoder {
+    fn default() -> Self {
+        Self {
+            inbound_model: None,
+            text_open: false,
+            tool_calls: Vec::new(),
+            id: String::new(),
+            model: String::new(),
+            reasoning_content: true,
+            saw_reasoning: false,
+            reasoning_open: false,
+            role_emitted: false,
+        }
+    }
 }
 
 impl StreamEncoder {
-    /// 指定入站模型名覆盖（别名重写响应模型名）；`None` 表示不覆盖。
-    pub fn new(inbound_model: Option<String>) -> Self {
+    /// 指定入站模型名覆盖（别名重写响应模型名）与渠道级 reasoning 输出开关。
+    pub fn new(inbound_model: Option<String>, reasoning_content: bool) -> Self {
         Self {
             inbound_model,
+            reasoning_content,
             ..Self::default()
         }
     }
@@ -1377,7 +1432,10 @@ impl StreamEncoder {
                 let mut delta_obj = serde_json::Map::new();
                 delta_obj.insert("content".into(), json!(delta));
                 if self.text_open {
-                    delta_obj.insert("role".into(), json!("assistant"));
+                    if !self.role_emitted {
+                        delta_obj.insert("role".into(), json!("assistant"));
+                        self.role_emitted = true;
+                    }
                     self.text_open = false;
                 }
                 choice.insert("delta".into(), Value::Object(delta_obj));
@@ -1385,11 +1443,34 @@ impl StreamEncoder {
             }
             StreamEvent::TextEnd { .. } => Vec::new(),
             StreamEvent::ReasoningStart { .. } => {
-                // Chat Completions 无 reasoning 通道：丢弃并在 finish 帧记 warning。
-                self.saw_reasoning = true;
+                // 开关关闭时丢弃并在 finish 帧记 warning；开启时增量下发。
+                if self.reasoning_content {
+                    self.reasoning_open = true;
+                } else {
+                    self.saw_reasoning = true;
+                }
                 Vec::new()
             }
-            StreamEvent::ReasoningDelta { .. } | StreamEvent::ReasoningEnd { .. } => Vec::new(),
+            StreamEvent::ReasoningDelta { delta, .. } => {
+                // 空增量跳过（DeepSeek 系要求 reasoning_content 非空时才有意义）。
+                if !self.reasoning_content || delta.is_empty() {
+                    return Vec::new();
+                }
+                let mut choice = serde_json::Map::new();
+                choice.insert("index".into(), json!(0));
+                let mut delta_obj = serde_json::Map::new();
+                delta_obj.insert("reasoning_content".into(), json!(delta));
+                if (self.reasoning_open || self.text_open) && !self.role_emitted {
+                    delta_obj.insert("role".into(), json!("assistant"));
+                    self.role_emitted = true;
+                }
+                choice.insert("delta".into(), Value::Object(delta_obj));
+                vec![Value::Object(self.build_chunk(choice))]
+            }
+            StreamEvent::ReasoningEnd { .. } => {
+                self.reasoning_open = false;
+                Vec::new()
+            }
             StreamEvent::ToolInputStart { id, tool_name, .. } => {
                 let index = self.tool_calls.len();
                 self.tool_calls.push(OpenToolCall {
@@ -1613,6 +1694,152 @@ mod tests {
             &ir.messages[0].content[0],
             ContentPart::Reasoning { text, .. } if text == "主字段"
         ));
+    }
+
+    /// 渠道级开关控制请求历史回放：关闭时丢弃 assistant 的 reasoning part
+    /// 并记 warning，开启时回写零告警（缺省开启由其余用例覆盖）。
+    #[test]
+    fn channel_gate_controls_reasoning_replay() {
+        let request = ChatRequest {
+            model: "deepseek-chat".to_string(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentPart::Reasoning {
+                        text: "思考".to_string(),
+                        provider_options: HashMap::new(),
+                    },
+                    ContentPart::Text {
+                        text: "答案".to_string(),
+                        provider_options: HashMap::new(),
+                    },
+                ],
+                provider_options: HashMap::new(),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+        };
+
+        let mut warnings = Vec::new();
+        let encoded = encode_request_with(
+            &request,
+            ChatEncodeOptions {
+                reasoning_content: false,
+            },
+            &mut warnings,
+        );
+        assert!(encoded["messages"][0].get("reasoning_content").is_none());
+        assert!(
+            warnings.iter().any(
+                |w| matches!(w, Warning::Unsupported { feature, .. } if feature == "reasoning")
+            )
+        );
+
+        let mut warnings = Vec::new();
+        let encoded = encode_request_with(
+            &request,
+            ChatEncodeOptions {
+                reasoning_content: true,
+            },
+            &mut warnings,
+        );
+        assert_eq!(encoded["messages"][0]["reasoning_content"], json!("思考"));
+        assert!(warnings.is_empty());
+    }
+
+    /// 渠道级开关控制流式增量：开启时 ReasoningDelta 以
+    /// `delta.reasoning_content` 下发（首个内容增量补 role，空增量跳过，
+    /// finish 帧无告警）；关闭时丢弃并在 finish 帧记 warning。
+    #[test]
+    fn channel_gate_controls_reasoning_delta_streaming() {
+        let reasoning_start = || StreamEvent::ReasoningStart {
+            id: "0".to_string(),
+            provider_options: HashMap::new(),
+        };
+        let reasoning_delta = |delta: &str| StreamEvent::ReasoningDelta {
+            id: "0".to_string(),
+            delta: delta.to_string(),
+            provider_options: HashMap::new(),
+        };
+        let text_start = || StreamEvent::TextStart {
+            id: "1".to_string(),
+            provider_options: HashMap::new(),
+        };
+        let text_delta = || StreamEvent::TextDelta {
+            id: "1".to_string(),
+            delta: "答".to_string(),
+            provider_options: HashMap::new(),
+        };
+        let finish = StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: None,
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        };
+
+        // 开启：增量逐帧下发，首个内容增量补 role，finish 无告警。
+        let mut encoder = StreamEncoder::new(None, true);
+        assert!(encoder.encode(&reasoning_start()).is_empty());
+        let frames = encoder.encode(&reasoning_delta("思路"));
+        assert_eq!(frames.len(), 1);
+        let chunk = frame_payload(&frames[0]);
+        assert_eq!(
+            chunk["choices"][0]["delta"]["reasoning_content"],
+            json!("思路")
+        );
+        assert_eq!(chunk["choices"][0]["delta"]["role"], json!("assistant"));
+        assert!(
+            encoder.encode(&reasoning_delta("")).is_empty(),
+            "空增量不产帧"
+        );
+        assert!(
+            encoder
+                .encode(&StreamEvent::ReasoningEnd {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                })
+                .is_empty()
+        );
+        let frames = encoder.encode(&text_start());
+        assert!(frames.is_empty());
+        let frames = encoder.encode(&text_delta());
+        let chunk = frame_payload(&frames[0]);
+        assert_eq!(chunk["choices"][0]["delta"]["content"], json!("答"));
+        assert!(
+            chunk["choices"][0]["delta"].get("role").is_none(),
+            "role 已随首个 reasoning 增量下发"
+        );
+        let frames = encoder.encode(&finish);
+        assert!(
+            frame_payload(&frames[0]).get("gateway").is_none(),
+            "开启开关时 finish 帧不应有 reasoning 告警"
+        );
+
+        // 关闭：增量丢弃，finish 帧显式告警。
+        let mut encoder = StreamEncoder::new(None, false);
+        assert!(encoder.encode(&reasoning_start()).is_empty());
+        assert!(encoder.encode(&reasoning_delta("思路")).is_empty());
+        let frames = encoder.encode(&finish);
+        let chunk = frame_payload(&frames[0]);
+        assert_eq!(
+            chunk["gateway"]["warnings"][0]["feature"],
+            json!("reasoning")
+        );
     }
 
     /// 黄金样例响应 decode → encode 往返还原 wire。

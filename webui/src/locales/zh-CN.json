@@ -305,6 +305,13 @@
     "apiKey": "上游 API key",
     "modelGroup": "默认模型组",
     "modelGroupGuide": "保存时把新加入的可调用名并入该组。未分组表示不自动入组。",
+    "reasoningOutput": {
+      "label": "思维链兼容输出",
+      "guide": "把思维链以 reasoning_content 回放给上游，并在流式响应中增量转发。自动挡按出站模型名与 Base URL 判定，可强制开启或关闭。",
+      "auto": "自动",
+      "always": "强制开启",
+      "off": "关闭"
+    },
     "models": "模型清单",
     "modelsTitle": "模型清单",
     "modelsEmpty": "清单为空，可在下方添加 ID，或点「设置模型」从上游获取。",

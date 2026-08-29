@@ -305,6 +305,13 @@
     "apiKey": "Upstream API key",
     "modelGroup": "Default model group",
     "modelGroupGuide": "New callable names are added to this group on save. Ungrouped means they are not added automatically.",
+    "reasoningOutput": {
+      "label": "Reasoning content output",
+      "guide": "Replay chain-of-thought as reasoning_content to the upstream and forward it in streaming responses. Auto detects by outbound model name and Base URL; can be forced on or off.",
+      "auto": "Auto",
+      "always": "Always on",
+      "off": "Off"
+    },
     "models": "Models",
     "modelsTitle": "Models",
     "modelsEmpty": "No models yet. Add an ID below, or use “Set models” to fetch them.",

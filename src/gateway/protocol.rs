@@ -27,13 +27,33 @@ pub fn decode_request(value: &Value, protocol: Protocol) -> Result<ChatRequest, 
 }
 
 /// 编码 IR 请求为出站渠道协议，转换的信息损失追加到 `warnings`。
+///
+/// 渠道级 reasoning 兼容输出缺省开启；渠道关闭该开关时用
+/// [`encode_request_with_reasoning`]。
 pub fn encode_request(
     request: &ChatRequest,
     protocol: Protocol,
     warnings: &mut Vec<Warning>,
 ) -> Value {
+    encode_request_with_reasoning(request, protocol, true, warnings)
+}
+
+/// 按渠道 reasoning 输出开关编码 IR 请求为出站渠道协议。
+///
+/// 开关仅被 OpenAI Chat 协议消费（`reasoning_content` 是 chat 侧字段），
+/// 其余协议忽略。
+pub fn encode_request_with_reasoning(
+    request: &ChatRequest,
+    protocol: Protocol,
+    reasoning_content: bool,
+    warnings: &mut Vec<Warning>,
+) -> Value {
     match protocol {
-        Protocol::OpenAiChat => crate::core::openai_chat::encode_request(request, warnings),
+        Protocol::OpenAiChat => crate::core::openai_chat::encode_request_with(
+            request,
+            crate::core::openai_chat::ChatEncodeOptions { reasoning_content },
+            warnings,
+        ),
         Protocol::AnthropicMessages => {
             crate::core::anthropic_messages::encode_request(request, warnings)
         }
@@ -144,13 +164,17 @@ pub fn make_decoder(protocol: Protocol) -> Box<dyn ChatStreamDecoder + Send> {
 }
 
 /// 按协议构造流式编码器。
+///
+/// `reasoning_content` 为渠道级 reasoning 兼容输出开关，仅 OpenAI Chat
+/// 编码器消费（ReasoningDelta 以 `delta.reasoning_content` 增量下发）。
 pub fn make_encoder(
     protocol: Protocol,
     inbound_model: Option<String>,
+    reasoning_content: bool,
 ) -> Box<dyn ChatStreamEncoder + Send> {
     match protocol {
         Protocol::OpenAiChat => Box::new(OpenAiStreamEncoder(
-            crate::core::openai_chat::StreamEncoder::new(inbound_model),
+            crate::core::openai_chat::StreamEncoder::new(inbound_model, reasoning_content),
         )),
         Protocol::AnthropicMessages => Box::new(AnthropicStreamEncoder(
             crate::core::anthropic_messages::StreamEncoder::new(inbound_model),

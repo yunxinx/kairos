@@ -362,6 +362,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+            reasoning_output: Default::default(),
         },
         Channel {
             name: "ch-pricey".to_string(),
@@ -381,6 +382,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+            reasoning_output: Default::default(),
         },
     ];
     seed.prices = vec![

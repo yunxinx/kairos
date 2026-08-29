@@ -94,6 +94,7 @@ async fn oversized_upstream_body_fails_over_to_next_channel() {
                 max_retries: 0,
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
             },
             Channel {
                 name: "ch-1".to_string(),
@@ -113,6 +114,7 @@ async fn oversized_upstream_body_fails_over_to_next_channel() {
                 max_retries: 0,
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
             },
         ];
         seed
