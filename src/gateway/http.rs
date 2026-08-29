@@ -14,6 +14,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -1937,10 +1938,35 @@ async fn stream_completion(
         };
     }
 
+    // spawn 流任务前先 peek 首块：首块前的流内错误（200 下的 overloaded_error
+    // 等）、空流或首帧超时按 Retryable 上抛换渠道——此时尚未向下游转发任何帧，
+    // failover 对下游零痕迹。正常流只多读首个内容帧，peek 受空闲超时约束。
+    let idle = channel_idle(channel.timeout_ms);
+    let byte_stream: UpstreamByteStream = Box::pin(resp.bytes_stream());
+    let (peek, byte_stream) = peek_stream_head(byte_stream, channel.protocol, idle).await;
+    let peeked = match peek {
+        PeekHead::Content(frames) => frames,
+        PeekHead::UpstreamError(message) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                retry_after: None,
+                message: format!("上游流内错误：{message}"),
+            };
+        }
+        PeekHead::Interrupted(reason) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                retry_after: None,
+                message: reason,
+            };
+        }
+    };
+
     // 逐上游 SSE 帧处理：解码 → 累积（计费）→ 重编码为入站 SSE 帧。
     // 在派生任务中消费上游字节流并推送到 mpsc 通道，主函数把通道接成 SSE 响应。
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
-    let byte_stream = resp.bytes_stream();
     let ctx = StreamTask {
         deps: deps.clone(),
         snapshot: ctx.snapshot.clone(),
@@ -1958,6 +1984,7 @@ async fn stream_completion(
         request_body: ctx.request_body.clone(),
         response_body: Vec::new(),
         request_id: ctx.request_id.to_string(),
+        peeked,
     };
     tokio::spawn(async move {
         pipe_stream(byte_stream, tx, ctx).await;
@@ -1989,6 +2016,118 @@ struct StreamTask {
     request_body: Option<Bytes>,
     response_body: Vec<u8>,
     request_id: String,
+    /// 首块 peek 阶段缓存的原始上游帧，流水任务开头重放（peek 用独立解码器
+    /// 消费过，重放还原同一事件序列与解码器状态）。
+    peeked: Vec<Value>,
+}
+
+/// 上游 SSE 字节流的装箱形态：peek 与流水任务间传递所有权。
+type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+
+/// 流首 peek 的结果。
+#[derive(Debug)]
+enum PeekHead {
+    /// 已见首个内容帧或正常收尾事件（空应答）：缓存帧交流水任务重放。
+    Content(Vec<Value>),
+    /// 首块前流内错误（如 overloaded_error），按可重试语义上抛。
+    UpstreamError(String),
+    /// 流未产出内容即中断：空流、EOF、读错误、首帧空闲超时或缺 `message_start`。
+    Interrupted(String),
+}
+
+/// 事件是否产出下游可见内容。
+fn is_content_event(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::TextStart { .. }
+            | StreamEvent::TextDelta { .. }
+            | StreamEvent::TextEnd { .. }
+            | StreamEvent::ReasoningStart { .. }
+            | StreamEvent::ReasoningDelta { .. }
+            | StreamEvent::ReasoningEnd { .. }
+            | StreamEvent::ToolInputStart { .. }
+            | StreamEvent::ToolInputDelta { .. }
+            | StreamEvent::ToolInputEnd { .. }
+            | StreamEvent::ToolCall { .. }
+    )
+}
+
+/// spawn 流任务前 peek 首块：读帧并解码，直到首个内容帧（或正常 Finish）。
+///
+/// 首块前的流内错误、空流、首帧空闲超时与 Anthropic 流缺 `message_start`
+/// 都在此归类为可重试——此刻尚未向下游转发任何帧，换渠道零痕迹。已读的
+/// 原始帧随 [`PeekHead::Content`] 返回，由流任务重放；未读完的字节流原样
+/// 交回，剩余部分由流水任务继续消费。
+async fn peek_stream_head(
+    byte_stream: UpstreamByteStream,
+    protocol: Protocol,
+    idle: Duration,
+) -> (PeekHead, UpstreamByteStream) {
+    use futures_util::StreamExt as _;
+
+    let mut byte_stream = byte_stream;
+    let mut decoder = protocol::make_decoder(protocol);
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut peeked: Vec<Value> = Vec::new();
+    // Anthropic 的 message_start 对应 IR ResponseMetadata；内容帧先于它出现
+    // 属协议破坏。
+    let mut saw_message_start = false;
+    loop {
+        if let Some((_event_name, frame)) = take_frame(&mut buffer) {
+            if frame.is_empty() {
+                continue;
+            }
+            let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
+            let decoded = decoder.process(&chunk);
+            let mut content = false;
+            for event in &decoded.events {
+                match event {
+                    StreamEvent::Error { message } => {
+                        return (PeekHead::UpstreamError(message.clone()), byte_stream);
+                    }
+                    // 空应答的正常收尾：合法流，交由流任务照常转发。
+                    StreamEvent::Finish { .. } => content = true,
+                    StreamEvent::ResponseMetadata { .. } => saw_message_start = true,
+                    _ if is_content_event(event) => {
+                        if matches!(protocol, Protocol::AnthropicMessages) && !saw_message_start {
+                            return (
+                                PeekHead::Interrupted("上游流缺少 message_start".to_string()),
+                                byte_stream,
+                            );
+                        }
+                        content = true;
+                    }
+                    _ => {}
+                }
+            }
+            peeked.push(chunk);
+            if content {
+                return (PeekHead::Content(peeked), byte_stream);
+            }
+            continue;
+        }
+        match tokio::time::timeout(idle, byte_stream.as_mut().next()).await {
+            Ok(Some(Ok(bytes))) => buffer.extend_from_slice(&bytes),
+            Ok(Some(Err(_))) => {
+                return (
+                    PeekHead::Interrupted("上游流读取失败".to_string()),
+                    byte_stream,
+                );
+            }
+            Ok(None) => {
+                return (
+                    PeekHead::Interrupted("上游流未产出内容即结束（空流）".to_string()),
+                    byte_stream,
+                );
+            }
+            Err(_) => {
+                return (
+                    PeekHead::Interrupted("上游流首帧超时".to_string()),
+                    byte_stream,
+                );
+            }
+        }
+    }
 }
 
 /// 把上游 SSE 字节流逐帧解码 → 累积 → 重编码，推送到下游通道。
@@ -2022,6 +2161,11 @@ async fn pipe_stream<S>(
     // 以字节缓冲、帧边界后再转文本：多字节 UTF-8 可能被拆在两个字节块里，
     // 提前转换会截坏字符。
     let mut sse_buffer: Vec<u8> = Vec::new();
+    // peek 阶段缓存的首批原始帧先入解码缓冲：重放还原同一事件序列与解码器
+    // 状态，随后与实时字节流无缝衔接。
+    for chunk in &ctx.peeked {
+        sse_buffer.extend_from_slice(format!("data: {chunk}\n\n").as_bytes());
+    }
     let mut saw_finish = false;
     let mut downstream_open = true;
     let mut truncated = false;
@@ -2109,21 +2253,15 @@ async fn pipe_stream<S>(
         }
     }
 
-    // 流结束：若上游未发 finish 帧（异常中断），补发一个。
-    // 缓冲超限已向下游发过错误事件，流内错误同理；两者都不再合成 Finish，
-    // 以免被当成完整成功。
+    // 流结束：若上游未发 finish 帧（异常中断），不合成成功 Finish——以入站
+    // 协议错误帧告知下游截断（缺收尾归类，杜绝「200 + 异常流」被当成完整
+    // 成功）。缓冲超限与流内错误已发过各自的错误帧，不再重复。
     let response = accumulator.finish();
     if !saw_finish && downstream_open && !truncated && !stream_errored {
-        let finish_event = StreamEvent::Finish {
-            finish_reason: response.finish_reason.clone(),
-            usage: response.usage.clone(),
-            provider_metadata: response.provider_metadata.clone(),
-        };
-        for frame in encoder.encode(&finish_event) {
-            record_frame_wire(&mut ctx, &frame);
-            if tx.send(event_from_frame(&frame)).await.is_err() {
-                break;
-            }
+        let frame = inbound_stream_error_frame(ctx.inbound_protocol, STREAM_UNTERMINATED_MESSAGE);
+        record_frame_wire(&mut ctx, &frame);
+        if tx.send(event_from_frame(&frame)).await.is_err() {
+            downstream_open = false;
         }
     }
     // 终止哨兵也是入站响应的一部分，full_body 开启时先记入再结算，
@@ -2159,6 +2297,9 @@ fn record_frame_wire(ctx: &mut StreamTask, frame: &SseFrame) {
 
 /// SSE 重装缓冲超限时写入日志与下游错误事件的固定文案。
 const SSE_REASSEMBLY_OVERFLOW_MESSAGE: &str = "SSE 重装缓冲超过上限，流已截断";
+
+/// 上游流缺收尾事件（未以 finish 类事件正常结束即中断）时的错误文案。
+const STREAM_UNTERMINATED_MESSAGE: &str = "上游流未正常收尾，已中断";
 
 /// 把即将落库的响应字节封顶追加，达到 `log_body_max_bytes` 后停止。
 fn append_logged_body(buf: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) {
@@ -2603,5 +2744,127 @@ mod tests {
         assert_eq!(responses.event.as_deref(), Some("error"));
         let anthropic = inbound_stream_error_frame(Protocol::AnthropicMessages, "截断");
         assert_eq!(anthropic.event.as_deref(), Some("error"));
+    }
+
+    /// 构造 SSE 字节流：每帧为 `data: {json}\n\n`。
+    fn sse_stream(frames: Vec<serde_json::Value>) -> super::UpstreamByteStream {
+        use futures_util::stream;
+        let data: Vec<Result<bytes::Bytes, reqwest::Error>> = frames
+            .into_iter()
+            .map(|frame| Ok(bytes::Bytes::from(format!("data: {frame}\n\n"))))
+            .collect();
+        Box::pin(stream::iter(data))
+    }
+
+    fn anthropic_message_start() -> serde_json::Value {
+        serde_json::json!({
+            "type": "message_start",
+            "message": { "type": "message", "role": "assistant", "id": "msg_1", "model": "claude-sonnet", "content": [] }
+        })
+    }
+
+    fn anthropic_text_delta() -> serde_json::Value {
+        serde_json::json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": { "type": "text_delta", "text": "ok" }
+        })
+    }
+
+    /// 首块前流内错误归类为 UpstreamError（可重试语义）。
+    #[tokio::test]
+    async fn peek_classifies_pre_first_chunk_error_as_retryable() {
+        let stream = sse_stream(vec![
+            anthropic_message_start(),
+            serde_json::json!({
+                "type": "error", "error": { "type": "overloaded_error", "message": "Overloaded" }
+            }),
+        ]);
+        let (peek, _rest) = super::peek_stream_head(
+            stream,
+            Protocol::AnthropicMessages,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(peek, super::PeekHead::UpstreamError(m) if m == "Overloaded"));
+    }
+
+    /// 空流（未产出内容即 EOF）归类为 Interrupted。
+    #[tokio::test]
+    async fn peek_classifies_empty_stream_as_interrupted() {
+        let stream = sse_stream(vec![]);
+        let (peek, _rest) = super::peek_stream_head(
+            stream,
+            Protocol::AnthropicMessages,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(peek, super::PeekHead::Interrupted(m) if m.contains("空流")));
+    }
+
+    /// Anthropic 内容帧先于 message_start 属协议破坏，归类为 Interrupted。
+    #[tokio::test]
+    async fn peek_classifies_missing_message_start_as_interrupted() {
+        let stream = sse_stream(vec![anthropic_text_delta()]);
+        let (peek, _rest) = super::peek_stream_head(
+            stream,
+            Protocol::AnthropicMessages,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            matches!(&peek, super::PeekHead::Interrupted(m) if m.contains("message_start")),
+            "缺 message_start 应归类为 Interrupted: {peek:?}"
+        );
+    }
+
+    /// 正常流：读到首个内容事件（content_block_start）即返回 Content，
+    /// 缓存帧含此前全部原始帧，后续帧留给流水任务。
+    #[tokio::test]
+    async fn peek_stops_at_first_content_event_and_caches() {
+        let stream = sse_stream(vec![
+            anthropic_message_start(),
+            serde_json::json!({
+                "type": "content_block_start", "index": 0, "content_block": { "type": "text" }
+            }),
+            anthropic_text_delta(),
+        ]);
+        let (peek, mut rest) = super::peek_stream_head(
+            stream,
+            Protocol::AnthropicMessages,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        match peek {
+            super::PeekHead::Content(frames) => assert_eq!(frames.len(), 2),
+            other => panic!("应归类为 Content: {other:?}"),
+        }
+        // 未消费的剩余帧仍可读。
+        use futures_util::StreamExt as _;
+        let mut remaining = Vec::new();
+        while let Some(chunk) = rest.next().await {
+            remaining.push(chunk.expect("剩余流应可读"));
+        }
+        assert_eq!(remaining.len(), 1, "text_delta 帧应留在剩余流中");
+    }
+
+    /// 空应答（无内容、直接正常收尾）是合法流：归类为 Content。
+    #[tokio::test]
+    async fn peek_treats_bare_finish_as_content() {
+        let stream = sse_stream(vec![
+            anthropic_message_start(),
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                "usage": { "input_tokens": 10, "output_tokens": 1 }
+            }),
+            serde_json::json!({ "type": "message_stop" }),
+        ]);
+        let (peek, _rest) = super::peek_stream_head(
+            stream,
+            Protocol::AnthropicMessages,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(matches!(peek, super::PeekHead::Content(_)));
     }
 }

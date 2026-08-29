@@ -268,3 +268,180 @@ async fn midstream_error_delivers_error_frame_and_settles() {
     assert_eq!(row.0, 5_000_000, "零累积 usage 不扣费");
     assert_eq!(row.1, 0, "日志按已累积 usage 落账（零费用）");
 }
+
+/// anthropic 双渠道 seed（同一模型，供流式 failover 用例使用）。
+fn two_anthropic_channel_seed(bases: &[String]) -> common::Seed {
+    let mut seed = common::test_seed(&bases[0]);
+    seed.channels = bases
+        .iter()
+        .enumerate()
+        .map(|(index, base)| {
+            let mut channel = seed.channels[0].clone();
+            channel.name = format!("ch-{index}");
+            channel.protocol = kairos::config::Protocol::AnthropicMessages;
+            channel.base_url = base.clone();
+            channel.keys = vec![kairos::store::resources::ChannelKey {
+                name: "default".to_string(),
+                api_key: format!("sk-{index}"),
+                weight: 1,
+                enabled: true,
+                models: None,
+                blocked_models: None,
+            }];
+            channel
+        })
+        .collect();
+    seed
+}
+
+fn anthropic_message_start() -> String {
+    serde_json::to_string(&json!({
+        "type": "message_start",
+        "message": { "type": "message", "role": "assistant", "id": "msg_1", "model": "claude-sonnet", "content": [] }
+    }))
+    .unwrap()
+}
+
+fn anthropic_text_stream(text: &str) -> Vec<String> {
+    vec![
+        anthropic_message_start(),
+        serde_json::to_string(&json!({
+            "type": "content_block_start", "index": 0, "content_block": { "type": "text" }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+            "usage": { "input_tokens": 25, "output_tokens": 12 }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({ "type": "message_stop" })).unwrap(),
+    ]
+}
+
+/// 首块前流内错误（200 后立即 `event: error`）触发 failover：下游收到的是
+/// 下一渠道的完整流，无任何残留帧，结算只按次渠道一次落账。
+#[tokio::test]
+async fn pre_first_chunk_error_fails_over_to_next_channel() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, two_anthropic_channel_seed).await;
+    ups[0].set_behavior(UpstreamBehavior::Sse(vec![
+        anthropic_message_start(),
+        serde_json::to_string(&json!({
+            "type": "error", "error": { "type": "overloaded_error", "message": "Overloaded" }
+        }))
+        .unwrap(),
+    ]));
+    ups[1].set_behavior(UpstreamBehavior::Sse(anthropic_text_stream("ok")));
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "failover 后应成功");
+    let frames = collect_sse_frames(resp).await;
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.data["choices"][0]["delta"]["content"] == json!("ok")),
+        "下游应收次渠道的内容帧"
+    );
+    assert!(
+        frames.iter().all(|f| !serde_json::to_string(&f.data)
+            .unwrap()
+            .contains("Overloaded")),
+        "首渠道的错误帧不得泄漏给下游"
+    );
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.data["choices"][0]["finish_reason"] == json!("stop")),
+        "下游应收次渠道的正常收尾"
+    );
+
+    // 两个渠道都被请求过；只有次渠道成功落账。
+    assert_eq!(ups[0].received().len(), 1);
+    assert_eq!(ups[1].received().len(), 1);
+    let row: (String, i64) = sqlx::query_as("SELECT channel, cost_usd_micros FROM request_log")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应有结算日志");
+    assert_eq!(row.0, "ch-1", "日志只记成功的次渠道");
+    assert!(row.1 > 0, "次渠道按 usage 计费");
+}
+
+/// 空流（200 后零帧即断）按可重试归类：failover 到下一渠道成功。
+#[tokio::test]
+async fn empty_stream_fails_over_to_next_channel() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, two_anthropic_channel_seed).await;
+    ups[0].set_behavior(UpstreamBehavior::Sse(vec![]));
+    ups[1].set_behavior(UpstreamBehavior::Sse(anthropic_text_stream("ok")));
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "空流应 failover 而非当成成功"
+    );
+    let frames = collect_sse_frames(resp).await;
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.data["choices"][0]["delta"]["content"] == json!("ok"))
+    );
+    assert_eq!(ups[0].received().len(), 1);
+    assert_eq!(ups[1].received().len(), 1);
+}
+
+/// 上游流缺收尾事件（内容后即断）归类为异常：下游收到错误帧而非合成
+/// 成功 Finish，结算按已累积 usage 落账（此处为零）。
+#[tokio::test]
+async fn unterminated_stream_delivers_error_frame_and_settles() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = kairos::config::Protocol::AnthropicMessages;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::Sse(vec![
+        anthropic_message_start(),
+        serde_json::to_string(&json!({
+            "type": "content_block_start", "index": 0, "content_block": { "type": "text" }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "你好" }
+        }))
+        .unwrap(),
+    ]));
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let frames = collect_sse_frames(resp).await;
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.data["choices"][0]["delta"]["content"] == json!("你好"))
+    );
+    let last = frames.last().expect("应有错误帧");
+    assert_eq!(
+        last.data["error"]["message"],
+        json!("上游流未正常收尾，已中断"),
+        "缺收尾应以错误帧收场而非合成成功 Finish"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|f| f.data["choices"][0]["finish_reason"].is_null())
+    );
+
+    let row: (i64,) = sqlx::query_as(
+        "SELECT rl.cost_usd_micros FROM tokens t \
+         JOIN request_log rl ON rl.token_key = t.token_key WHERE t.token_key = ?",
+    )
+    .bind(TEST_TOKEN_KEY)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应有结算日志");
+    assert_eq!(row.0, 0, "零累积 usage 落账不扣费");
+}
