@@ -14,7 +14,7 @@
 //! - 流式：事件名驱动的 SSE（`event:` 名），`signature_delta` 以零长增量携带
 //!   signature，`message_delta` 携带最终 usage 与 stop_reason。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -989,6 +989,10 @@ fn encode_messages(
     ir_messages: &[Message],
     warnings: &mut Vec<Warning>,
 ) -> (Option<String>, Vec<Value>) {
+    // tool 身份整形：Anthropic 要求 tool_use.id 合法且与 tool_result 一一
+    // 配对；重复 tool 消息按原始 id 取最后一条、只产出一次。重排在编码后
+    // 统一执行（align_tool_results），IR 保持中立。
+    let mut alignment = ToolAlignment::scan(ir_messages);
     let mut system_out: Option<String> = None;
     let mut wire_messages: Vec<Value> = Vec::new();
 
@@ -1038,7 +1042,7 @@ fn encode_messages(
                 }
             }
             Role::Assistant => {
-                let blocks = encode_assistant_blocks(&message.content, warnings);
+                let blocks = encode_assistant_blocks(&message.content, &mut alignment, warnings);
                 // 连续 assistant 消息合并为一条（Anthropic 要求）。
                 if let Some(last) = wire_messages.last_mut()
                     && last.get("role").and_then(Value::as_str) == Some("assistant")
@@ -1052,7 +1056,7 @@ fn encode_messages(
                 }
             }
             Role::Tool => {
-                let blocks = encode_tool_result_blocks(&message.content);
+                let blocks = encode_tool_result_blocks(&message.content, &mut alignment);
                 // 连续 tool 消息合并为一条 user 的多个 tool_result 块。
                 if let Some(last) = wire_messages.last_mut()
                     && last.get("role").and_then(Value::as_str) == Some("user")
@@ -1076,9 +1080,86 @@ fn encode_messages(
         }
     }
 
+    align_tool_results(&mut wire_messages);
     // 末尾 assistant 文本块去除尾随空白（Anthropic 拒绝预置 assistant 的尾随空白）。
     trim_trailing_whitespace(&mut wire_messages);
     (system_out, wire_messages)
+}
+
+/// 单次出站请求的 tool 身份整形状态。
+///
+/// Anthropic 要求 `tool_use.id` 匹配 `^[a-zA-Z0-9_-]+$` 且与紧随的
+/// `tool_result.tool_use_id` 一一配对。原始 id → 合法 id 经同一 memo 映射，
+/// 空 id 只生成一次（配对不因生成而断裂）；重复 tool 消息按原始 id 取
+/// 最后一条并去重，把客户端脏序列整形为合法配对结构。
+struct ToolAlignment {
+    /// 原始 tool_call_id → 合法 wire id。
+    memo: HashMap<String, String>,
+    /// 空 id 兜底生成的计数器（附请求内序号避免纳秒碰撞）。
+    generated: u64,
+    /// 已产出 tool_result 的原始 id：重复出现只发一次。
+    emitted: HashSet<String>,
+    /// 原始 tool_call_id → 最后一条 tool 消息中的 ToolResult part。
+    last_result: HashMap<String, ContentPart>,
+}
+
+impl ToolAlignment {
+    /// 前置扫描：记录每个原始 tool_call_id 最后一次出现的 ToolResult part。
+    fn scan(ir_messages: &[Message]) -> Self {
+        let mut last_result = HashMap::new();
+        for message in ir_messages {
+            if message.role != Role::Tool {
+                continue;
+            }
+            for part in &message.content {
+                if let ContentPart::ToolResult { tool_call_id, .. } = part {
+                    last_result.insert(tool_call_id.clone(), part.clone());
+                }
+            }
+        }
+        Self {
+            memo: HashMap::new(),
+            generated: 0,
+            emitted: HashSet::new(),
+            last_result,
+        }
+    }
+
+    /// 原始 id 对应的合法 wire id：非空清洗（幂等纯函数），空结果生成
+    /// `toolu_<纳秒>_<序号>`；同一原始 id 在 tool_use 与 tool_result 两侧
+    /// 得到同一 wire id。
+    fn wire_id(&mut self, original: &str) -> String {
+        if let Some(wire) = self.memo.get(original) {
+            return wire.clone();
+        }
+        let sanitized = sanitize_tool_id(original);
+        let wire = if sanitized.is_empty() {
+            self.generated += 1;
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            format!("toolu_{nanos}_{}", self.generated)
+        } else {
+            sanitized
+        };
+        self.memo.insert(original.to_string(), wire.clone());
+        wire
+    }
+}
+
+/// 清洗单个 tool id 为 Anthropic 合法形状：`^[a-zA-Z0-9_-]+$` 之外的字符
+/// 替换 `_`，空结果由调用方生成兜底。合法输入逐字节不变。
+fn sanitize_tool_id(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn push_user_text(wire_messages: &mut Vec<Value>, text: &str) {
@@ -1244,7 +1325,11 @@ fn append_blocks(message: &mut Value, blocks: Vec<Value>) {
 /// 无逃生舱的 reasoning 以 thinking 块无 signature 预置。跨协议族丢弃的
 /// reasoning 已在出站前由调用方判定，此处只负责同协议族回传。末尾 assistant
 /// 文本块的尾随空白裁剪由 `trim_trailing_whitespace` 统一处理。
-fn encode_assistant_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -> Vec<Value> {
+fn encode_assistant_blocks(
+    parts: &[ContentPart],
+    alignment: &mut ToolAlignment,
+    warnings: &mut Vec<Warning>,
+) -> Vec<Value> {
     let mut blocks = Vec::new();
     for part in parts {
         match part {
@@ -1282,7 +1367,7 @@ fn encode_assistant_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -
             } => {
                 blocks.push(json!({
                     "type": "tool_use",
-                    "id": tool_call_id,
+                    "id": alignment.wire_id(tool_call_id),
                     "name": tool_name,
                     "input": input,
                 }));
@@ -1310,25 +1395,37 @@ fn encode_assistant_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -
 }
 
 /// 编码 tool 消息的内容块：每条 tool_result。
-fn encode_tool_result_blocks(parts: &[ContentPart]) -> Vec<Value> {
+/// 编码 Tool 消息的 ToolResult parts 为 tool_result 块。
+///
+/// 重复 tool 消息按原始 id 去重（重复出现只发一次），内容一律取该 id
+/// 最后一条 tool 消息——客户端重发同 id 结果时以最新为准；wire id 经
+/// 共享映射清洗，与前置 assistant 消息的 tool_use 保持配对。
+fn encode_tool_result_blocks(parts: &[ContentPart], alignment: &mut ToolAlignment) -> Vec<Value> {
     parts
         .iter()
         .filter_map(|part| {
-            let (tool_call_id, output, is_error) = match part {
-                ContentPart::ToolResult {
-                    tool_call_id,
+            let tool_call_id = match part {
+                ContentPart::ToolResult { tool_call_id, .. } => tool_call_id.clone(),
+                _ => return None,
+            };
+            if !alignment.emitted.insert(tool_call_id.clone()) {
+                return None;
+            }
+            // 内容与 is_error 取该 id 的最后一条 tool 消息。
+            let (output, is_error) = match alignment.last_result.get(&tool_call_id) {
+                Some(ContentPart::ToolResult {
                     output,
                     provider_options,
                     ..
-                } => {
+                }) => {
                     let is_error = provider_options
                         .get("anthropic")
                         .and_then(|a| a.get("is_error"))
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    (tool_call_id.clone(), output.clone(), is_error)
+                    (output.clone(), is_error)
                 }
-                _ => return None,
+                _ => (part_output(part), false),
             };
             // 输出为字符串时直接用；否则 JSON 序列化（tool_result content 是文本）。
             let content_value = match output {
@@ -1337,7 +1434,10 @@ fn encode_tool_result_blocks(parts: &[ContentPart]) -> Vec<Value> {
             };
             let mut block = serde_json::Map::new();
             block.insert("type".into(), json!("tool_result"));
-            block.insert("tool_use_id".into(), json!(tool_call_id));
+            block.insert(
+                "tool_use_id".into(),
+                json!(alignment.wire_id(&tool_call_id)),
+            );
             block.insert("content".into(), content_value);
             if is_error {
                 block.insert("is_error".into(), Value::Bool(true));
@@ -1345,6 +1445,76 @@ fn encode_tool_result_blocks(parts: &[ContentPart]) -> Vec<Value> {
             Some(Value::Object(block))
         })
         .collect()
+}
+
+/// 取 ToolResult part 的 output 字段；part 形态异常时回退空串
+/// （调用方已由前置扫描保证命中，此为防御性兜底）。
+fn part_output(part: &ContentPart) -> Value {
+    match part {
+        ContentPart::ToolResult { output, .. } => output.clone(),
+        _ => Value::String(String::new()),
+    }
+}
+
+/// 把纯 tool_result 块的 user 消息按前置 assistant 消息的 tool_use 顺序重排。
+///
+/// 结果块与 tool_use id 构成一对一匹配时才重排（匹配失败保持原序，交由
+/// 上游判定）。合法已对齐的序列重排为恒等，同族往返逐字节稳定。
+fn align_tool_results(wire_messages: &mut [Value]) {
+    for index in 1..wire_messages.len() {
+        let is_tool_result_message = wire_messages[index].get("role").and_then(Value::as_str)
+            == Some("user")
+            && wire_messages[index]
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    !blocks.is_empty()
+                        && blocks
+                            .iter()
+                            .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                });
+        if !is_tool_result_message {
+            continue;
+        }
+        let Some(tool_use_ids) = wire_messages[..index]
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .map(|assistant| {
+                assistant["content"]
+                    .as_array()
+                    .expect("assistant 消息应为块数组")
+                    .iter()
+                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .filter_map(|b| b.get("id").and_then(Value::as_str).map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|ids| !ids.is_empty())
+        else {
+            continue;
+        };
+        let results = wire_messages[index]
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .expect("已确认 content 为块数组");
+        if results.len() != tool_use_ids.len() {
+            continue;
+        }
+        let mut ordered = Vec::with_capacity(results.len());
+        let mut used = vec![false; results.len()];
+        for use_id in &tool_use_ids {
+            let matched = results.iter().enumerate().position(|(index, block)| {
+                !used[index] && block.get("tool_use_id").and_then(Value::as_str) == Some(use_id)
+            });
+            let Some(matched) = matched else {
+                // 无完整一对一匹配：保持原序，交由上游判定。
+                return;
+            };
+            used[matched] = true;
+            ordered.push(results[matched].clone());
+        }
+        *results = ordered;
+    }
 }
 
 /// 裁剪末尾 assistant 消息末尾文本块的尾随空白；裁剪后为空则移除该块，
@@ -2432,6 +2602,134 @@ mod tests {
         assert_eq!(assistant["content"][0]["type"], "thinking");
         assert_eq!(assistant["content"][0]["signature"], "ErUBCkY");
         assert!(warnings.is_empty());
+    }
+
+    /// tool id 清洗：非法字符替换 `_`、空 id 生成 `toolu_` 前缀兜底，
+    /// tool_use 与 tool_result 经同一映射保持配对且形状合法。
+    #[test]
+    fn invalid_and_empty_tool_ids_are_sanitized_with_pairing() {
+        let wire = json!({
+            "model": "claude-sonnet",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "we!rd@id", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                    { "id": "", "type": "function",
+                      "function": { "name": "g", "arguments": "{}" } }
+                ]},
+                { "role": "tool", "tool_call_id": "we!rd@id", "content": "ok1" },
+                { "role": "tool", "tool_call_id": "", "content": "ok2" }
+            ]
+        });
+        let request = crate::core::openai_chat::decode_request(&wire).expect("应可解码");
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert!(warnings.is_empty());
+
+        let assistant = encoded["messages"]
+            .as_array()
+            .expect("应有消息数组")
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("应有 assistant 消息");
+        let use_ids: Vec<&str> = assistant["content"]
+            .as_array()
+            .expect("assistant 应为块数组")
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| b["id"].as_str().expect("tool_use 应有 id"))
+            .collect();
+        assert_eq!(use_ids[0], "we_rd_id", "非法字符应替换为下划线");
+        assert!(
+            use_ids[1].starts_with("toolu_") && use_ids[1].len() > "toolu_".len(),
+            "空 id 应生成 toolu_ 前缀兜底: {}",
+            use_ids[1]
+        );
+        for id in &use_ids {
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "wire id 应匹配 Anthropic 合法形状: {id}"
+            );
+        }
+
+        let result_message = encoded["messages"]
+            .as_array()
+            .expect("应有消息数组")
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"].is_array())
+            .expect("应有 tool_result 消息");
+        let result_ids: Vec<&str> = result_message["content"]
+            .as_array()
+            .expect("应为块数组")
+            .iter()
+            .map(|b| b["tool_use_id"].as_str().expect("tool_result 应有 id"))
+            .collect();
+        assert_eq!(
+            result_ids, use_ids,
+            "tool_use 与 tool_result 应经同一映射配对且按 tool_use 顺序对齐"
+        );
+    }
+
+    /// 重复 tool 消息取每 id 最后一条内容且只产出一次，乱序结果按前置
+    /// tool_use 顺序重排（每条 tool_result 紧随对应 tool_use 的序列）。
+    #[test]
+    fn duplicate_and_out_of_order_tool_results_are_deduped_and_aligned() {
+        let wire = json!({
+            "model": "claude-sonnet",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": "", "tool_calls": [
+                    { "id": "call_A", "type": "function",
+                      "function": { "name": "f", "arguments": "{}" } },
+                    { "id": "call_B", "type": "function",
+                      "function": { "name": "g", "arguments": "{}" } }
+                ]},
+                { "role": "tool", "tool_call_id": "call_B", "content": "B-first" },
+                { "role": "tool", "tool_call_id": "call_A", "content": "A-final" },
+                { "role": "tool", "tool_call_id": "call_B", "content": "B-final" }
+            ]
+        });
+        let request = crate::core::openai_chat::decode_request(&wire).expect("应可解码");
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert!(warnings.is_empty());
+
+        let results = encoded["messages"]
+            .as_array()
+            .expect("应有消息数组")
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"].is_array())
+            .expect("应有 tool_result 消息")["content"]
+            .as_array()
+            .expect("应为块数组")
+            .clone();
+        assert_eq!(results.len(), 2, "重复 tool 消息应去重");
+        assert_eq!(results[0]["tool_use_id"], json!("call_A"));
+        assert_eq!(results[0]["content"], json!("A-final"));
+        assert_eq!(results[1]["tool_use_id"], json!("call_B"));
+        assert_eq!(
+            results[1]["content"],
+            json!("B-final"),
+            "同 id 重发取最后一条内容"
+        );
+    }
+
+    /// tool id 清洗为幂等纯函数：合法输入逐字节不变，非法输入收敛到合法形状。
+    #[test]
+    fn sanitize_tool_id_is_idempotent_and_legality_preserving() {
+        for (raw, expected) in [
+            ("toolu_01", "toolu_01"),
+            ("call-9_X", "call-9_X"),
+            ("we!rd@id", "we_rd_id"),
+            ("中文名", "___"),
+        ] {
+            assert_eq!(sanitize_tool_id(raw), expected);
+            assert_eq!(sanitize_tool_id(&sanitize_tool_id(raw)), expected, "应幂等");
+        }
+        assert_eq!(sanitize_tool_id("!!"), "__", "全非法字符清洗后仍为合法形状");
+        assert_eq!(sanitize_tool_id(""), "", "空串清洗为空，生成由调用方兜底");
     }
 
     /// 请求编码：tool 消息的 tool_result 还原为 user 消息，assistant 连续消息合并。
