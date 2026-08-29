@@ -349,6 +349,7 @@ fn base_request() -> ChatRequest {
                 "properties": { "city": { "type": "string" } },
                 "required": ["city"],
             })),
+            provider_options: HashMap::new(),
         }],
         tool_choice: None,
         parallel_tool_calls: None,

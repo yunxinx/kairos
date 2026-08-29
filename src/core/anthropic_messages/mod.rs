@@ -467,6 +467,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                 name: t.name,
                 description: t.description,
                 parameters: t.input_schema,
+                provider_options: HashMap::new(),
             })
             .collect(),
         tool_choice,
@@ -3187,11 +3188,13 @@ mod tests {
                             { "type": "object", "properties": { "a": { "type": "string" } } },
                         ],
                     })),
+                    provider_options: HashMap::new(),
                 },
                 Tool {
                     name: "bare".to_string(),
                     description: None,
                     parameters: None,
+                    provider_options: HashMap::new(),
                 },
             ],
             tool_choice: None,

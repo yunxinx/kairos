@@ -367,6 +367,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                 name: t.function.name,
                 description: t.function.description,
                 parameters: t.function.parameters,
+                provider_options: HashMap::new(),
             })
             .collect(),
         tool_choice: wire

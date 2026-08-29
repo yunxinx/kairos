@@ -279,6 +279,13 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
+    /// 工具级逃生舱，形状与 content part 一致。
+    ///
+    /// 承载缓存断点（cache_control）等 provider 特有的工具设置：Anthropic
+    /// 的工具断点约定键为 `provider_options["anthropic"]["cache_control"]`
+    /// （见 CONTEXT.md 缓存断点词条与 ADR-0014）。
+    #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+    pub provider_options: ProviderOptions,
 }
 
 /// 工具选择：跨协议类型化枚举。
@@ -705,6 +712,38 @@ mod tests {
             "messages": messages,
         }))
         .expect("测试请求应能解码")
+    }
+
+    /// Tool 的工具级逃生舱 serde 形状：空时省略（wire 零噪音），携带
+    /// cache_control 断点时随序列化出现且解码还原。
+    #[test]
+    fn tool_provider_options_serde_shape() {
+        use super::Tool;
+
+        let bare: Tool =
+            serde_json::from_value(json!({ "name": "get_weather" })).expect("最小工具应可解码");
+        assert!(bare.provider_options.is_empty());
+        let encoded = serde_json::to_value(&bare).expect("工具应可序列化");
+        assert_eq!(encoded, json!({ "name": "get_weather" }), "空逃生舱不落盘");
+
+        let annotated = Tool {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: None,
+            provider_options: [(
+                "anthropic".to_string(),
+                json!({ "cache_control": { "type": "ephemeral", "ttl": "1h" } }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let encoded = serde_json::to_value(&annotated).expect("工具应可序列化");
+        assert_eq!(
+            encoded["provider_options"]["anthropic"]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        let back: Tool = serde_json::from_value(encoded).expect("带逃生舱工具应可解码");
+        assert_eq!(back, annotated);
     }
 
     #[test]

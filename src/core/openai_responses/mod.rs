@@ -361,6 +361,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                     name: t.name.unwrap_or_default(),
                     description: t.description,
                     parameters: t.parameters,
+                    provider_options: HashMap::new(),
                 })
             })
             .collect(),
