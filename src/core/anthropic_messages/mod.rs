@@ -1493,6 +1493,9 @@ fn encode_messages(
     }
 
     align_tool_results(&mut wire_messages);
+    // assistant 块整形：thinking 归位块首（Anthropic 要求 thinking 紧邻
+    // 消息前缀），合法序列恒等。
+    move_thinking_blocks_to_front(&mut wire_messages);
     // 末尾 assistant 文本块去除尾随空白（Anthropic 拒绝预置 assistant 的尾随空白）。
     trim_trailing_whitespace(&mut wire_messages);
     // 有断点时 system 以单文本块数组出站，断点挂尾块；否则保持字符串形状。
@@ -1964,6 +1967,37 @@ fn align_tool_results(wire_messages: &mut [Value]) {
             ordered.push(results[matched].clone());
         }
         *results = ordered;
+    }
+}
+
+/// 把 assistant 消息内的 `thinking`/`redacted_thinking` 块稳定挪到块序列最前。
+///
+/// Anthropic 要求 thinking 块位于助手消息开头；跨协议族历史可能产出
+/// tool_use/text 在前的块序（如 Responses 的 function_call 项先于
+/// reasoning 项、或客户端原样回放的脏序列），原样出站会被上游拒绝。
+/// 各类块的相对顺序保持不变，thinking 已在前缀的合法序列恒等。
+fn move_thinking_blocks_to_front(wire_messages: &mut [Value]) {
+    for message in wire_messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut leading = Vec::with_capacity(blocks.len());
+        let mut trailing = Vec::new();
+        for block in blocks.drain(..) {
+            if matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking") | Some("redacted_thinking")
+            ) {
+                leading.push(block);
+            } else {
+                trailing.push(block);
+            }
+        }
+        leading.append(&mut trailing);
+        *blocks = leading;
     }
 }
 
@@ -4012,6 +4046,125 @@ mod tests {
 
         let err = encode_error(500, "boom");
         assert_eq!(err["error"]["type"], "api_error");
+    }
+
+    /// 纯函数整形：乱序 assistant 块内 thinking/redacted_thinking 稳定归位
+    /// 块首（相对顺序保持），user 消息不参与，合法序列恒等。
+    #[test]
+    fn thinking_blocks_move_to_front_stably() {
+        let mut messages = vec![
+            json!({ "role": "user", "content": "hi" }),
+            json!({ "role": "assistant", "content": [
+                { "type": "text", "text": "a" },
+                { "type": "thinking", "thinking": "t1", "signature": "s1" },
+                { "type": "tool_use", "id": "toolu_1", "name": "f", "input": {} },
+                { "type": "redacted_thinking", "data": "d" },
+                { "type": "text", "text": "b" }
+            ]}),
+        ];
+        move_thinking_blocks_to_front(&mut messages);
+        let types: Vec<&str> = messages[1]["content"]
+            .as_array()
+            .expect("content 应为数组")
+            .iter()
+            .map(|block| block["type"].as_str().expect("块应有 type"))
+            .collect();
+        assert_eq!(
+            types,
+            ["thinking", "redacted_thinking", "text", "tool_use", "text"],
+            "thinking 归位块首，其余块相对顺序不变"
+        );
+        assert_eq!(messages[0]["role"], "user", "user 消息不参与整形");
+
+        let mut valid = vec![json!({ "role": "assistant", "content": [
+            { "type": "thinking", "thinking": "t", "signature": "s" },
+            { "type": "redacted_thinking", "data": "d" },
+            { "type": "tool_use", "id": "toolu_1", "name": "f", "input": {} }
+        ]})];
+        let before = valid.clone();
+        move_thinking_blocks_to_front(&mut valid);
+        assert_eq!(valid, before, "合法序列应恒等");
+    }
+
+    /// 编码接线：连续 assistant 消息（tool_use 在前、thinking 在后，跨族
+    /// 常见脏序列）合并后 thinking 归位块首；末尾 prefill 文本裁去尾随空白。
+    #[test]
+    fn encode_shapes_merged_assistant_blocks() {
+        let request = ChatRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "hi".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentPart::ToolCall {
+                        tool_call_id: "call-1".to_string(),
+                        tool_name: "get_weather".to_string(),
+                        input: json!({}),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        ContentPart::Reasoning {
+                            text: "think".to_string(),
+                            provider_options: [(
+                                "anthropic".to_string(),
+                                json!({ "signature": "sig-1" }),
+                            )]
+                            .into_iter()
+                            .collect(),
+                        },
+                        ContentPart::Text {
+                            text: "prefill  ".to_string(),
+                            provider_options: HashMap::new(),
+                        },
+                    ],
+                    provider_options: HashMap::new(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: Some(100),
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert!(warnings.is_empty());
+
+        // 连续 assistant 已合并为一条；thinking 归位块首，tool_use 随后，
+        // prefill 尾随空白被裁剪（前导空白保留）。
+        let assistant = &encoded["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        let content = assistant["content"].as_array().expect("content 应为数组");
+        let types: Vec<&str> = content
+            .iter()
+            .map(|block| block["type"].as_str().expect("块应有 type"))
+            .collect();
+        assert_eq!(types, ["thinking", "tool_use", "text"]);
+        assert_eq!(content[0]["signature"], "sig-1");
+        assert_eq!(content[2]["text"], "prefill");
     }
 
     /// 模型列表编码对齐官方 `GET /v1/models` 黄金样例。
