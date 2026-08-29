@@ -351,6 +351,7 @@ fn base_request() -> ChatRequest {
             })),
         }],
         tool_choice: None,
+        parallel_tool_calls: None,
         provider_options: HashMap::new(),
         warnings: Vec::new(),
     }
@@ -577,10 +578,12 @@ fn tool_choice_all_variants_survive_all_six_pairs() {
     }
 }
 
-/// anthropic 附加语义逃生舱：入站 `disable_parallel_tool_use` 捕获进
-/// 请求级逃生舱并与 thinking 共存；同族出站并回 tool_choice 对象。
+/// anthropic 反语义映射：tool_choice 内的 `disable_parallel_tool_use` 取反
+/// 进 IR 类型化 `parallel_tool_calls`（不进 tool_choice_extra 逃生舱）；同族
+/// 出站取反写回，与 thinking 共存。tool_choice 上其余未知键仍经
+/// tool_choice_extra 逃生舱原样回写。
 #[test]
-fn anthropic_tool_choice_extra_survives_same_family() {
+fn anthropic_disable_parallel_tool_use_maps_to_typed_knob() {
     let mut request = base_request();
     request.tool_choice = Some(ToolChoice::Auto);
     let (mut wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
@@ -588,9 +591,10 @@ fn anthropic_tool_choice_extra_survives_same_family() {
 
     let decoded = decode_request_wire(Protocol::AnthropicMessages, &wire);
     assert_eq!(decoded.tool_choice, Some(ToolChoice::Auto));
-    assert_eq!(
-        decoded.provider_options["anthropic"]["tool_choice_extra"]["disable_parallel_tool_use"],
-        json!(true)
+    assert_eq!(decoded.parallel_tool_calls, Some(false));
+    assert!(
+        !decoded.provider_options.contains_key("anthropic"),
+        "反语义字段已类型化，不应再进逃生舱"
     );
 
     let (wire_back, warnings) = encode_request_wire(Protocol::AnthropicMessages, &decoded);
@@ -600,7 +604,18 @@ fn anthropic_tool_choice_extra_survives_same_family() {
         json!({ "type": "auto", "disable_parallel_tool_use": true })
     );
 
-    // 逃生舱与 thinking 共存：同一 anthropic 对象内两个键互不覆盖。
+    // 反语义取反回程：disable=false 即允许并行，同族往返逐位还原。
+    let (mut wire_open, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    wire_open["tool_choice"] = json!({ "type": "auto", "disable_parallel_tool_use": false });
+    let decoded_open = decode_request_wire(Protocol::AnthropicMessages, &wire_open);
+    assert_eq!(decoded_open.parallel_tool_calls, Some(true));
+    let (wire_back, _) = encode_request_wire(Protocol::AnthropicMessages, &decoded_open);
+    assert_eq!(
+        wire_back["tool_choice"],
+        json!({ "type": "auto", "disable_parallel_tool_use": false })
+    );
+
+    // 与 thinking 共存：同一 anthropic 对象内 thinking 与类型化旋钮互不影响。
     let mut both = base_request();
     both.tool_choice = Some(ToolChoice::Auto);
     both.provider_options = options(&[(
@@ -614,7 +629,18 @@ fn anthropic_tool_choice_extra_survives_same_family() {
         decoded_both.provider_options["anthropic"]["thinking"]["budget_tokens"],
         json!(1024)
     );
-    assert!(decoded_both.provider_options["anthropic"]["tool_choice_extra"].is_object());
+    assert_eq!(decoded_both.parallel_tool_calls, Some(false));
+
+    // tool_choice 上的其余未知键仍经 tool_choice_extra 逃生舱同族回写。
+    let (mut wire_extra, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    wire_extra["tool_choice"] = json!({ "type": "auto", "custom_hint": "keep" });
+    let decoded_extra = decode_request_wire(Protocol::AnthropicMessages, &wire_extra);
+    assert_eq!(
+        decoded_extra.provider_options["anthropic"]["tool_choice_extra"]["custom_hint"],
+        json!("keep")
+    );
+    let (wire_back, _) = encode_request_wire(Protocol::AnthropicMessages, &decoded_extra);
+    assert_eq!(wire_back["tool_choice"]["custom_hint"], json!("keep"));
 }
 
 /// 未知 tool_choice 形状在入站面直接拒绝，错误信息指明字段。
@@ -1328,4 +1354,74 @@ fn multiple_system_messages_survive_all_six_pairs() {
     for (a, b) in directed_pairs() {
         request_survives(a, b, &request);
     }
+}
+
+/// parallel_tool_calls 类型化旋钮的三协议映射：chat/responses 原生承载同族
+/// 原样往返；anthropic 无请求级字段，以 `tool_choice.disable_parallel_tool_use`
+/// 反语义承载（取反）——禁并行时无显式 tool_choice 按 auto 兜底合成，允许
+/// 并行为缺省语义不合成、经 anthropic 中转后旋钮落空（等价默认，非信息损失）。
+#[test]
+fn parallel_tool_calls_knob_maps_across_protocols() {
+    for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
+        for parallel in [true, false] {
+            let mut request = base_request();
+            request.parallel_tool_calls = Some(parallel);
+            let (wire, warnings) = encode_request_wire(protocol, &request);
+            assert!(warnings.is_empty());
+            assert_eq!(wire["parallel_tool_calls"], json!(parallel), "{protocol:?}");
+            let back = decode_request_wire(protocol, &wire);
+            assert_eq!(back.parallel_tool_calls, Some(parallel), "{protocol:?}");
+        }
+    }
+
+    // chat → anthropic：false 取反为 disable=true（无 tool_choice 按自动合成）。
+    let mut request = base_request();
+    request.parallel_tool_calls = Some(false);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        wire["tool_choice"],
+        json!({ "type": "auto", "disable_parallel_tool_use": true })
+    );
+    let back = decode_request_wire(Protocol::AnthropicMessages, &wire);
+    assert_eq!(back.parallel_tool_calls, Some(false));
+
+    // 允许并行为 anthropic 缺省语义：不合成 tool_choice，中转后旋钮落空。
+    let mut request = base_request();
+    request.parallel_tool_calls = Some(true);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert!(warnings.is_empty());
+    assert!(
+        wire.get("tool_choice").is_none(),
+        "允许并行不应合成 tool_choice"
+    );
+    let back = decode_request_wire(Protocol::AnthropicMessages, &wire);
+    assert_eq!(back.parallel_tool_calls, None);
+
+    // anthropic 入站（any + disable）→ chat 出站：取反还原 parallel 字段。
+    let anthropic = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "tools": [{ "name": "get_weather", "input_schema": { "type": "object" } }],
+        "tool_choice": { "type": "any", "disable_parallel_tool_use": true },
+    });
+    let ir = decode_request_wire(Protocol::AnthropicMessages, &anthropic);
+    assert_eq!(ir.tool_choice, Some(ToolChoice::Required));
+    assert_eq!(ir.parallel_tool_calls, Some(false));
+    let (chat_wire, warnings) = encode_request_wire(Protocol::OpenAiChat, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(chat_wire["parallel_tool_calls"], json!(false));
+    assert_eq!(chat_wire["tool_choice"], json!("required"));
+
+    // chat → anthropic → chat 全链路：false 原样还原；tool_choice None→auto
+    // 是 anthropic 承载面的协议整形（承载禁并行必须挂 tool_choice）。
+    let mut request = base_request();
+    request.parallel_tool_calls = Some(false);
+    let (anth_wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    let via_anthropic = decode_request_wire(Protocol::AnthropicMessages, &anth_wire);
+    let (chat_wire, warnings) = encode_request_wire(Protocol::OpenAiChat, &via_anthropic);
+    assert!(warnings.is_empty());
+    assert_eq!(chat_wire["parallel_tool_calls"], json!(false));
+    assert_eq!(chat_wire["tool_choice"], json!("auto"));
 }

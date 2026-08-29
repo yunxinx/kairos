@@ -73,6 +73,7 @@ const KNOWN_REQUEST_FIELDS: &[&str] = &[
     "response_format",
     "tools",
     "tool_choice",
+    "parallel_tool_calls",
     "reasoning_effort",
 ];
 
@@ -110,6 +111,8 @@ struct WireChatRequest {
     tools: Option<Vec<WireTool>>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    #[serde(default)]
+    parallel_tool_calls: Option<bool>,
     #[serde(default)]
     reasoning_effort: Option<String>,
 }
@@ -371,6 +374,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             .as_ref()
             .map(decode_tool_choice)
             .transpose()?,
+        parallel_tool_calls: wire.parallel_tool_calls,
         reasoning: wire
             .reasoning_effort
             .as_deref()
@@ -815,6 +819,9 @@ pub fn encode_request_with(
     }
     if let Some(choice) = &request.tool_choice {
         obj.insert("tool_choice".into(), encode_tool_choice(choice));
+    }
+    if let Some(v) = request.parallel_tool_calls {
+        obj.insert("parallel_tool_calls".into(), json!(v));
     }
     if let Some(effort) = request.reasoning {
         obj.insert("reasoning_effort".into(), json!(effort.as_str()));
@@ -1914,6 +1921,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -1962,6 +1970,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -2557,6 +2566,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -2653,6 +2663,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),

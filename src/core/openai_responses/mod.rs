@@ -79,6 +79,7 @@ const KNOWN_REQUEST_FIELDS: &[&str] = &[
     "max_output_tokens",
     "tools",
     "tool_choice",
+    "parallel_tool_calls",
     "text",
     "reasoning",
     "store",
@@ -109,6 +110,8 @@ struct WireRequest {
     tools: Option<Vec<WireTool>>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    #[serde(default)]
+    parallel_tool_calls: Option<bool>,
     #[serde(default)]
     text: Option<Value>,
     #[serde(default)]
@@ -366,6 +369,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             .as_ref()
             .map(decode_tool_choice)
             .transpose()?,
+        parallel_tool_calls: wire.parallel_tool_calls,
         reasoning: wire
             .reasoning
             .as_ref()
@@ -822,6 +826,9 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     }
     if let Some(choice) = &request.tool_choice {
         obj.insert("tool_choice".into(), encode_tool_choice(choice));
+    }
+    if let Some(v) = request.parallel_tool_calls {
+        obj.insert("parallel_tool_calls".into(), json!(v));
     }
 
     // 请求级逃生舱回传；有状态特性出站丢弃并显式 warning。
@@ -2360,6 +2367,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -2472,6 +2480,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -2787,6 +2796,7 @@ mod tests {
             response_format: Some(json!({ "type": "json_object" })),
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),

@@ -436,6 +436,14 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         .as_ref()
         .map(|value| decode_tool_choice(value, &mut provider_options))
         .transpose()?;
+    // 反语义取反：`disable_parallel_tool_use` 承载为 IR `parallel_tool_calls`
+    // （true → 允许并行）；字段缺省时旋钮留空（Anthropic 缺省允许并行）。
+    let parallel_tool_calls = wire
+        .tool_choice
+        .as_ref()
+        .and_then(|choice| choice.get("disable_parallel_tool_use"))
+        .and_then(Value::as_bool)
+        .map(|disable| !disable);
 
     Ok(ChatRequest {
         model: wire.model,
@@ -462,6 +470,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             })
             .collect(),
         tool_choice,
+        parallel_tool_calls,
         reasoning,
         provider_options,
         warnings: Vec::new(),
@@ -487,10 +496,11 @@ fn system_text(system: &Value) -> Option<String> {
 
 /// 解码 wire `tool_choice` 为 IR 类型化枚举。
 ///
-/// `type`/`name` 之外的键（如 `disable_parallel_tool_use`）是 Anthropic 附加
-/// 语义，经请求级逃生舱 `provider_options["anthropic"]["tool_choice_extra"]`
-/// 保留，只在 Anthropic 出站写回；逃生舱并入已有的 `anthropic` 对象，
-/// thinking 等先前捕获的配置共存。
+/// `type`/`name` 之外的键是 Anthropic 附加语义：`disable_parallel_tool_use`
+/// 取反映射为 IR 类型化 `parallel_tool_calls`（由调用方提取），其余键经请求级
+/// 逃生舱 `provider_options["anthropic"]["tool_choice_extra"]` 保留，只在
+/// Anthropic 出站写回；逃生舱并入已有的 `anthropic` 对象，thinking 等先前
+/// 捕获的配置共存。
 fn decode_tool_choice(
     value: &Value,
     provider_options: &mut crate::core::ir::ProviderOptions,
@@ -502,7 +512,11 @@ fn decode_tool_choice(
     };
     let extra: serde_json::Map<String, Value> = map
         .iter()
-        .filter(|(key, _)| key.as_str() != "type" && key.as_str() != "name")
+        .filter(|(key, _)| {
+            key.as_str() != "type"
+                && key.as_str() != "name"
+                && key.as_str() != "disable_parallel_tool_use"
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     if !extra.is_empty() {
@@ -957,7 +971,18 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if let Some(choice) = &request.tool_choice {
         obj.insert(
             "tool_choice".into(),
-            encode_tool_choice(choice, &request.provider_options),
+            encode_tool_choice(
+                choice,
+                &request.provider_options,
+                request.parallel_tool_calls,
+            ),
+        );
+    } else if request.parallel_tool_calls == Some(false) && !request.tools.is_empty() {
+        // Anthropic 的禁并行语义只挂在 tool_choice 上：请求未显式选择工具时
+        // 按 auto 兜底合成（允许并行是缺省语义，true 不合成）。
+        obj.insert(
+            "tool_choice".into(),
+            json!({ "type": "auto", "disable_parallel_tool_use": true }),
         );
     }
     if let Some(thinking) = thinking {
@@ -996,10 +1021,12 @@ fn supports_adaptive_thinking(model: &str) -> bool {
 }
 
 /// 编码 IR tool_choice 为 Anthropic wire 值；请求级逃生舱
-/// `tool_choice_extra` 的附加键（如 `disable_parallel_tool_use`）并回对象。
+/// `tool_choice_extra` 的附加键并回对象，类型化 `parallel_tool_calls` 以
+/// 反语义 `disable_parallel_tool_use`（取反）最终定值。
 fn encode_tool_choice(
     choice: &ToolChoice,
     provider_options: &crate::core::ir::ProviderOptions,
+    parallel_tool_calls: Option<bool>,
 ) -> Value {
     let mut obj = serde_json::Map::new();
     match choice {
@@ -1025,6 +1052,9 @@ fn encode_tool_choice(
         for (key, value) in extra {
             obj.insert(key.clone(), value.clone());
         }
+    }
+    if let Some(parallel) = parallel_tool_calls {
+        obj.insert("disable_parallel_tool_use".into(), json!(!parallel));
     }
     Value::Object(obj)
 }
@@ -2653,6 +2683,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -2768,6 +2799,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -2953,6 +2985,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -3010,6 +3043,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -3161,6 +3195,7 @@ mod tests {
                 },
             ],
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),
@@ -3431,6 +3466,7 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             provider_options: HashMap::new(),
             warnings: Vec::new(),

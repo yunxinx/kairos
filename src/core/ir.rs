@@ -428,6 +428,11 @@ pub struct ChatRequest {
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
+    /// 是否允许模型一次发起多个工具调用。chat/responses 原生承载；Anthropic
+    /// 无请求级字段，以 `tool_choice.disable_parallel_tool_use` 反语义表达，
+    /// 映射时取反（`false` → `disable: true`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     /// reasoning 请求旋钮（effort 档位）。Anthropic 原始 `thinking` 配置经
     /// `provider_options["anthropic"]["thinking"]` 逃生舱无损往返，本字段
     /// 只承载可枚举的 effort 语义；本族逃生舱缺席时按协议形状兜底出站。
