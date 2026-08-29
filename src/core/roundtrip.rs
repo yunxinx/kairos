@@ -406,7 +406,11 @@ fn anthropic_reasoning_escape_hatches_survive_same_family() {
     let back = decode_response_wire(Protocol::AnthropicMessages, &wire);
     assert_eq!(project_response(&back), project_response(&response));
 
+    // 采样参数中性化：thinking 激活时的采样整形属有损面（见专属用例），
+    // 本格只锁定逃生舱无损语义。
     let mut request = base_request();
+    request.temperature = None;
+    request.top_p = None;
     request.provider_options = options(&[(
         "anthropic",
         json!({ "thinking": { "type": "enabled", "budget_tokens": 1024 } }),
@@ -635,7 +639,10 @@ fn reasoning_knob_decodes_and_survives_same_family() {
     }
 
     // anthropic：enabled + budget → 逃生舱逐位还原，typed 按阶梯区间派生。
+    // 采样参数中性化（同上，整形属有损面）。
     let mut request = base_request();
+    request.temperature = None;
+    request.top_p = None;
     request.provider_options = options(&[(
         "anthropic",
         json!({ "thinking": { "type": "enabled", "budget_tokens": 8000 } }),
@@ -660,6 +667,8 @@ fn reasoning_knob_decodes_and_survives_same_family() {
         (json!({ "type": "adaptive" }), None),
     ] {
         let mut request = base_request();
+        request.temperature = None;
+        request.top_p = None;
         request.provider_options = options(&[("anthropic", json!({ "thinking": thinking }))]);
         let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
         let back = decode_request_wire(Protocol::AnthropicMessages, &wire);
@@ -669,11 +678,14 @@ fn reasoning_knob_decodes_and_survives_same_family() {
     }
 }
 
-/// 类型化旋钮在本族逃生舱缺席时按协议形状兜底出站：anthropic 按阶梯出
-/// budget（None 档为 disabled），chat/responses 出 effort 字符串。
+/// 类型化旋钮在本族逃生舱缺席时按协议形状兜底出站：anthropic 按模型形态
+/// 分流（legacy 阶梯出 budget，adaptive 模型出 adaptive + 原生 effort），
+/// chat/responses 出 effort 字符串。采样参数中性化，整形见专属用例。
 #[test]
 fn reasoning_typed_knob_encodes_when_escape_hatch_absent() {
     let mut request = base_request();
+    request.temperature = None;
+    request.top_p = None;
     request.reasoning = Some(ReasoningEffort::High);
     let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
     assert!(warnings.is_empty());
@@ -683,6 +695,8 @@ fn reasoning_typed_knob_encodes_when_escape_hatch_absent() {
     );
 
     let mut request = base_request();
+    request.temperature = None;
+    request.top_p = None;
     request.reasoning = Some(ReasoningEffort::Ultra);
     let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
     assert_eq!(
@@ -691,6 +705,8 @@ fn reasoning_typed_knob_encodes_when_escape_hatch_absent() {
     );
 
     let mut request = base_request();
+    request.temperature = None;
+    request.top_p = None;
     request.reasoning = Some(ReasoningEffort::None);
     let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &request);
     assert_eq!(wire["thinking"], json!({ "type": "disabled" }));
@@ -738,4 +754,223 @@ fn unknown_reasoning_effort_rejected_at_ingress() {
         let err = decode_request_result(protocol, &wire).expect_err("未知 effort 档位应被拒绝");
         assert!(err.contains(key), "{protocol:?} 错误应指明字段: {err}");
     }
+}
+
+/// reasoning 旋钮的跨族全链路：chat 入站 → anthropic 中转 → chat 回归，
+/// 类型化档位在投影面无损。anthropic 中转会在 IR 上固化 thinking 逃生舱，
+/// 回到 chat 面时该逃生舱显式丢弃并告警——属声明过的有损面，告警形状
+/// 在此一并锁定。
+#[test]
+fn reasoning_knob_survives_chat_anthropic_chat_cycle() {
+    let mut request = base_request();
+    request.temperature = Some(1.0);
+    request.top_p = None;
+    request.reasoning = Some(ReasoningEffort::High);
+    let (wire_a, warnings_a) = encode_request_wire(Protocol::OpenAiChat, &request);
+    assert!(warnings_a.is_empty());
+    let via_a = decode_request_wire(Protocol::OpenAiChat, &wire_a);
+
+    let (wire_b, warnings_b) = encode_request_wire(Protocol::AnthropicMessages, &via_a);
+    assert!(warnings_b.is_empty());
+    assert_eq!(
+        wire_b["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 24576 })
+    );
+    let via_b = decode_request_wire(Protocol::AnthropicMessages, &wire_b);
+    assert_eq!(via_b.reasoning, Some(ReasoningEffort::High));
+
+    let (wire_back, warnings_back) = encode_request_wire(Protocol::OpenAiChat, &via_b);
+    assert_eq!(wire_back["reasoning_effort"], json!("high"));
+    assert!(matches!(
+        warnings_back.as_slice(),
+        [Warning::Unsupported { feature, .. }] if feature == "provider_options"
+    ));
+    let back = decode_request_wire(Protocol::OpenAiChat, &wire_back);
+    assert_eq!(project_request(&back), project_request(&request));
+}
+
+/// 跨族映射验收：chat 入站 effort 经 IR 到 anthropic 出站按模型形态分流
+/// （adaptive 模型 → adaptive + output_config.effort；legacy 模型 → budget
+/// 阶梯），effort 面钳制 Minimal→low、Ultra→max，budget 面 Ultra→128000。
+#[test]
+fn chat_effort_maps_to_anthropic_by_model_form() {
+    let user = "上海天气如何？";
+    let chat_wire = |model: &str, effort: &str| {
+        json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": user }],
+            "reasoning_effort": effort
+        })
+    };
+
+    let ir = decode_request_wire(Protocol::OpenAiChat, &chat_wire("claude-opus-4-6", "high"));
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(wire["thinking"], json!({ "type": "adaptive" }));
+    assert_eq!(wire["output_config"], json!({ "effort": "high" }));
+
+    let ir = decode_request_wire(
+        Protocol::OpenAiChat,
+        &chat_wire("claude-sonnet-4-5", "high"),
+    );
+    let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert_eq!(
+        wire["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 24576 })
+    );
+
+    for (effort, native) in [("minimal", "low"), ("ultra", "max")] {
+        let ir = decode_request_wire(Protocol::OpenAiChat, &chat_wire("claude-opus-4-6", effort));
+        let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+        assert_eq!(wire["output_config"], json!({ "effort": native }));
+    }
+    let ir = decode_request_wire(
+        Protocol::OpenAiChat,
+        &chat_wire("claude-sonnet-4-5", "ultra"),
+    );
+    let (wire, _) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert_eq!(wire["thinking"]["budget_tokens"], json!(128_000));
+}
+
+/// anthropic 入站 `output_config.effort` 捕获进类型化旋钮并同族往返；
+/// 与 `thinking.budget_tokens` 并存时显式 effort 优先，原始配置双双经
+/// 逃生舱无损回传。
+#[test]
+fn anthropic_output_config_effort_captures_to_typed_and_roundtrips() {
+    let anthropic_wire = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": [{ "type": "text", "text": "你好" }] }],
+        "output_config": { "effort": "xhigh" }
+    });
+    let ir = decode_request_wire(Protocol::AnthropicMessages, &anthropic_wire);
+    assert_eq!(ir.reasoning, Some(ReasoningEffort::XHigh));
+    let (wire_back, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(wire_back["output_config"], json!({ "effort": "xhigh" }));
+
+    let both = json!({
+        "model": "claude-opus-4-6",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": [{ "type": "text", "text": "你好" }] }],
+        "thinking": { "type": "enabled", "budget_tokens": 8000 },
+        "output_config": { "effort": "high" }
+    });
+    let ir = decode_request_wire(Protocol::AnthropicMessages, &both);
+    assert_eq!(ir.reasoning, Some(ReasoningEffort::High));
+    let (wire_back, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        wire_back["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 8000 })
+    );
+    assert_eq!(wire_back["output_config"], json!({ "effort": "high" }));
+}
+
+/// tool_choice 强制（any/tool）时 thinking 配置整体剥离且 warning 可观测；
+/// auto 不剥离。剥离后 thinking 未激活，采样参数不再受约束整形。
+#[test]
+fn forced_tool_choice_strips_thinking_with_warning() {
+    let mut request = base_request();
+    request.temperature = Some(0.7);
+    request.reasoning = Some(ReasoningEffort::High);
+    request.tool_choice = Some(ToolChoice::Required);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert!(wire.get("thinking").is_none());
+    assert!(wire.get("output_config").is_none());
+    assert_eq!(wire["temperature"], json!(0.7));
+    assert_eq!(
+        warnings,
+        vec![Warning::compatibility(
+            "thinking",
+            "tool_choice 强制工具调用时 Anthropic 拒绝 thinking 配置，已剥离（含 output_config.effort）",
+        )]
+    );
+
+    let mut request = base_request();
+    request.provider_options = options(&[(
+        "anthropic",
+        json!({ "thinking": { "type": "enabled", "budget_tokens": 1024 } }),
+    )]);
+    request.tool_choice = Some(ToolChoice::Tool {
+        name: "f".to_string(),
+    });
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert!(wire.get("thinking").is_none());
+    assert!(matches!(
+        warnings.as_slice(),
+        [Warning::Compatibility { feature, .. }] if feature == "thinking"
+    ));
+
+    let mut request = base_request();
+    request.temperature = None;
+    request.top_p = None;
+    request.reasoning = Some(ReasoningEffort::High);
+    request.tool_choice = Some(ToolChoice::Auto);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        wire["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 24576 })
+    );
+}
+
+/// thinking 激活时的采样整形：temperature→1、top_p 下限 0.95、top_k 剥离，
+/// 各动作记 compatibility warning；未激活（disabled 或旋钮缺席）时采样
+/// 参数原样透传。
+#[test]
+fn thinking_active_sampling_shaped_with_warning() {
+    let thinking = json!({ "type": "enabled", "budget_tokens": 1024 });
+    let mut request = base_request();
+    request.temperature = Some(0.7);
+    request.top_p = Some(0.9);
+    request.top_k = Some(40);
+    request.provider_options = options(&[("anthropic", json!({ "thinking": thinking }))]);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(wire["temperature"], json!(1.0));
+    assert_eq!(wire["top_p"], json!(0.95));
+    assert!(wire.get("top_k").is_none());
+    assert_eq!(
+        warnings,
+        vec![
+            Warning::compatibility("temperature", "thinking 激活时 temperature 0.7 整形为 1"),
+            Warning::compatibility("top_p", "thinking 激活时 top_p 0.9 整形为 0.95"),
+            Warning::compatibility("top_k", "thinking 激活时 top_k 已剥离"),
+        ]
+    );
+
+    // 已在约束内：零整形零告警。
+    let mut request = base_request();
+    request.temperature = Some(1.0);
+    request.top_p = Some(0.95);
+    request.provider_options = options(&[(
+        "anthropic",
+        json!({ "thinking": { "type": "enabled", "budget_tokens": 1024 } }),
+    )]);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(wire["temperature"], json!(1.0));
+    assert_eq!(wire["top_p"], json!(0.95));
+    assert!(warnings.is_empty());
+
+    // thinking disabled：采样参数原样。
+    let mut request = base_request();
+    request.temperature = Some(0.7);
+    request.top_p = Some(0.9);
+    request.top_k = Some(40);
+    request.provider_options =
+        options(&[("anthropic", json!({ "thinking": { "type": "disabled" } }))]);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(wire["temperature"], json!(0.7));
+    assert_eq!(wire["top_p"], json!(0.9));
+    assert_eq!(wire["top_k"], json!(40));
+    assert!(warnings.is_empty());
+
+    // thinking 旋钮整体缺席：采样参数原样。
+    let mut request = base_request();
+    request.top_k = Some(40);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
+    assert_eq!(wire["temperature"], json!(0.5));
+    assert_eq!(wire["top_p"], json!(0.9));
+    assert_eq!(wire["top_k"], json!(40));
+    assert!(warnings.is_empty());
 }

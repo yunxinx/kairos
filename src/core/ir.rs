@@ -313,6 +313,22 @@ impl ReasoningEffort {
         }
     }
 
+    /// Anthropic 原生 effort 档位（`output_config.effort` 面）：官方取值为
+    /// low/medium/high/xhigh/max，无 none/minimal/ultra。`Minimal` 归 `low`，
+    /// `Ultra` 钳到 `max`；`None` 档无 effort 语义（对应 `thinking: disabled`），
+    /// 返回 `None`。与 [`ReasoningEffort::budget_tokens`] 分别服务
+    /// adaptive/native-effort 与 legacy budget 两条模型形态。
+    pub fn native_effort(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Minimal | Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max | Self::Ultra => Some("max"),
+        }
+    }
+
     /// Anthropic budget → effort 的有损反向映射，阈值与正向阶梯一致；
     /// 超过 32768 归 `Max`（budget 路径上见不到 `Ultra`）。`disabled`/`adaptive`
     /// 与缺 budget 由调用方另行处理，不经本函数。

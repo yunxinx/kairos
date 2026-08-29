@@ -83,6 +83,11 @@ struct WireRequest {
     /// 请求级逃生舱：同协议族经 IR 出站时原样回传。
     #[serde(default)]
     thinking: Option<Value>,
+    /// 请求级逃生舱：`output_config`（原生 effort 档位、structured outputs 的
+    /// format、task budget 等）。同协议族经 IR 出站时原样回传；`effort` 键
+    /// 另捕获进类型化 reasoning 旋钮供跨族映射。
+    #[serde(default)]
+    output_config: Option<Value>,
 }
 
 /// wire 消息。
@@ -348,7 +353,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     let mut provider_options = HashMap::new();
     // 类型化 effort 从 thinking 配置派生（有损，仅供跨族映射与观测）；
     // 原始配置已进逃生舱，同族往返不受派生精度影响。
-    let reasoning = wire.thinking.as_ref().and_then(|thinking| {
+    let mut reasoning = wire.thinking.as_ref().and_then(|thinking| {
         match thinking.get("type").and_then(Value::as_str) {
             Some("disabled") => Some(ReasoningEffort::None),
             Some("enabled") => {
@@ -365,6 +370,26 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     });
     if let Some(thinking) = &wire.thinking {
         provider_options.insert("anthropic".to_string(), json!({ "thinking": thinking }));
+    }
+    // 原生 effort 档位（adaptive/native-effort 模型的请求面）捕获进类型化
+    // 旋钮；未识别的取值不拒绝——原始对象已在逃生舱，档位语义留空即可。
+    // 显式 effort 比 budget 派生更直接，命中时覆盖。
+    if let Some(effort) = wire
+        .output_config
+        .as_ref()
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .and_then(ReasoningEffort::parse_effort)
+    {
+        reasoning = Some(effort);
+    }
+    if let Some(output_config) = &wire.output_config {
+        let entry = provider_options
+            .entry("anthropic".to_string())
+            .or_insert_with(|| json!({}));
+        if let Value::Object(anthropic) = entry {
+            anthropic.insert("output_config".into(), output_config.clone());
+        }
     }
     let tool_choice = wire
         .tool_choice
@@ -722,8 +747,10 @@ fn decode_media_part(
 /// 编码 IR 请求为出站 Anthropic Messages 请求体。
 ///
 /// 首个 System 消息提升为顶层 `system`；请求级 `provider_options["anthropic"]`
-/// 原样回传（thinking 配置经 IR 路径不丢失）。目标协议无法表达的内容追加到
-/// `warnings`。
+/// 原样回传（thinking 与 output_config 经 IR 路径不丢失）。thinking 请求面
+/// 按优先级解析：tool_choice 强制时整体剥离 > 本族逃生舱 > 类型化 effort 按
+/// 模型形态兜底；thinking 激活时整形采样参数（temperature=1、top_p≥0.95、
+/// 剥离 top_k）。目标协议无法表达或被约束整形的设置追加到 `warnings`。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
     let (system, messages) = encode_messages(&request.messages, warnings);
 
@@ -737,13 +764,119 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     // 否则跨协议请求（如 OpenAI 入站未带 max_tokens）会被上游 400 拒绝。
     let max_tokens = request.max_tokens.filter(|&v| v > 0).unwrap_or(4096);
     obj.insert("max_tokens".into(), json!(max_tokens));
-    if let Some(v) = request.temperature {
+
+    let anthropic_options = request.provider_options.get("anthropic");
+    let hatch_thinking = anthropic_options.and_then(|options| options.get("thinking"));
+    let hatch_output_config = anthropic_options.and_then(|options| options.get("output_config"));
+    let adaptive_model = supports_adaptive_thinking(&request.model);
+
+    // 类型化 effort 兜底出站：本族逃生舱缺席时把旋钮展开为请求模型形态的
+    // 原生形状——adaptive/native-effort 模型出 `thinking: adaptive` + 原生
+    // effort 档位；legacy 模型出 budget 阶梯（`None` 档两族均为 disabled）。
+    // 逃生舱 thinking 在场时请求面由原始配置承载，effort 不再补写，避免
+    // budget 与 effort 双表达。
+    let typed_thinking = request.reasoning.map(|effort| {
+        if adaptive_model {
+            match effort.native_effort() {
+                Some(_) => json!({ "type": "adaptive" }),
+                None => json!({ "type": "disabled" }),
+            }
+        } else {
+            match effort.budget_tokens() {
+                Some(budget) => json!({ "type": "enabled", "budget_tokens": budget }),
+                None => json!({ "type": "disabled" }),
+            }
+        }
+    });
+    let typed_effort = request
+        .reasoning
+        .filter(|_| hatch_thinking.is_none())
+        .and_then(|effort| {
+            if adaptive_model {
+                effort
+                    .native_effort()
+                    .map(|native| json!({ "effort": native }))
+            } else {
+                None
+            }
+        });
+
+    // tool_choice 强制（any/tool）时 Anthropic 拒绝 thinking 配置：整体剥离，
+    // output_config 仅保留 effort 之外的键；发生实际剥离才记 warning。
+    let would_emit_thinking = hatch_thinking.is_some() || typed_thinking.is_some();
+    let forced_tool_choice = matches!(
+        request.tool_choice,
+        Some(ToolChoice::Required) | Some(ToolChoice::Tool { .. })
+    );
+    let thinking = if forced_tool_choice {
+        None
+    } else {
+        hatch_thinking.cloned().or(typed_thinking)
+    };
+    let mut output_config = if forced_tool_choice {
+        hatch_output_config.cloned()
+    } else {
+        hatch_output_config.cloned().or(typed_effort)
+    };
+    if forced_tool_choice {
+        let effort_leaked = hatch_output_config
+            .and_then(|config| config.get("effort"))
+            .is_some();
+        if would_emit_thinking || effort_leaked {
+            warnings.push(Warning::compatibility(
+                "thinking",
+                "tool_choice 强制工具调用时 Anthropic 拒绝 thinking 配置，已剥离（含 output_config.effort）",
+            ));
+        }
+        output_config = match output_config {
+            Some(Value::Object(mut config)) => {
+                config.remove("effort");
+                (!config.is_empty()).then_some(Value::Object(config))
+            }
+            other => other,
+        };
+    }
+
+    // thinking 激活时的采样约束（Anthropic 语义）：temperature 必须为 1、
+    // top_p 不低于 0.95、top_k 不可用。整形动作记 warning，未激活时原样透传。
+    let thinking_active = thinking
+        .as_ref()
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "enabled" | "adaptive" | "auto"));
+    let mut temperature = request.temperature;
+    let mut top_p = request.top_p;
+    let mut top_k = request.top_k;
+    if thinking_active {
+        if let Some(value) = temperature.filter(|&value| value != 1.0) {
+            warnings.push(Warning::compatibility(
+                "temperature",
+                format!("thinking 激活时 temperature {value} 整形为 1"),
+            ));
+            temperature = Some(1.0);
+        }
+        if let Some(value) = top_p.filter(|&value| value < 0.95) {
+            warnings.push(Warning::compatibility(
+                "top_p",
+                format!("thinking 激活时 top_p {value} 整形为 0.95"),
+            ));
+            top_p = Some(0.95);
+        }
+        if request.top_k.is_some() {
+            warnings.push(Warning::compatibility(
+                "top_k",
+                "thinking 激活时 top_k 已剥离",
+            ));
+            top_k = None;
+        }
+    }
+    if let Some(v) = temperature {
         obj.insert("temperature".into(), json!(v));
     }
-    if let Some(v) = request.top_p {
+    if let Some(v) = top_p {
         obj.insert("top_p".into(), json!(v));
     }
-    if let Some(v) = request.top_k {
+    if let Some(v) = top_k {
         obj.insert("top_k".into(), json!(v));
     }
     if !request.stop.is_empty() {
@@ -780,22 +913,37 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             encode_tool_choice(choice, &request.provider_options),
         );
     }
-    // 请求级逃生舱回传：Anthropic thinking 原始配置优先（budget 数值、
-    // adaptive 等枚举外语义都在其中）；旋钮缺席时以类型化 effort 按阶梯兜底。
-    if let Some(thinking) = request
-        .provider_options
-        .get("anthropic")
-        .and_then(|anthropic| anthropic.get("thinking"))
-    {
-        obj.insert("thinking".into(), thinking.clone());
-    } else if let Some(effort) = request.reasoning {
-        let thinking = match effort.budget_tokens() {
-            Some(budget) => json!({ "type": "enabled", "budget_tokens": budget }),
-            None => json!({ "type": "disabled" }),
-        };
+    if let Some(thinking) = thinking {
         obj.insert("thinking".into(), thinking);
     }
+    if let Some(output_config) = output_config {
+        obj.insert("output_config".into(), output_config);
+    }
     Value::Object(obj)
+}
+
+/// 请求模型是否支持 adaptive thinking 与原生 effort（`output_config.effort`）。
+///
+/// 网关暂无模型能力表，按模型名模式判定：opus 4.6/4.7/4.8/5+、sonnet 4.6/5+、
+/// fable/mythos 家族，日期后缀与点分变体（bedrock/vertex/azure 接入形态）
+/// 一并覆盖。判否时按 legacy budget 阶梯兜底——该形状对所有 budget 模型合法，
+/// 误判只损失 effort 档位粒度，不产生非法请求。
+fn supports_adaptive_thinking(model: &str) -> bool {
+    let model = model.to_lowercase();
+    let opus = model.contains("opus");
+    let version_46 = model.contains("4-6") || model.contains("4.6");
+    let opus_47_plus = opus
+        && (model.contains("4-7")
+            || model.contains("4.7")
+            || model.contains("4-8")
+            || model.contains("4.8")
+            || model.contains("opus-5"));
+    let sonnet_5_plus = model.contains("sonnet-5");
+    let fable_family = model.contains("fable") || model.contains("mythos");
+    opus_47_plus
+        || sonnet_5_plus
+        || fable_family
+        || (version_46 && (opus || model.contains("sonnet")))
 }
 
 /// 把 IR 消息编码为（顶层 system，wire messages）。
@@ -1948,6 +2096,43 @@ mod tests {
     use crate::core::stream::StreamAccumulator;
     use crate::core::testing::frames_to_snapshot;
     use similar_asserts::assert_eq;
+
+    /// 模型形态判定：adaptive/native-effort 家族覆盖官方名、日期后缀与
+    /// bedrock/vertex 变体；legacy 模型与异族模型名判否。
+    #[test]
+    fn supports_adaptive_thinking_matches_model_forms() {
+        for model in [
+            "claude-opus-4-6",
+            "claude-opus-4-6-20260201",
+            "claude-opus-4.6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "us.anthropic.claude-opus-4-6-v1:0",
+        ] {
+            assert!(
+                supports_adaptive_thinking(model),
+                "{model} 应判为 adaptive 形态"
+            );
+        }
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-5",
+            "claude-opus-4-1",
+            "claude-haiku-4-5",
+            "claude-3-7-sonnet",
+            "gpt-4o",
+        ] {
+            assert!(
+                !supports_adaptive_thinking(model),
+                "{model} 应判为 legacy 形态"
+            );
+        }
+    }
 
     /// wire 形状错误指明出错字段的 JSON 路径，而非笼统的「不是合法 JSON 对象」。
     #[test]
