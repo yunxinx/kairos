@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
-    ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
+    ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning, warning_feature,
 };
 use crate::core::stream::SseFrame;
 
@@ -673,43 +673,43 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     // Responses 无以下采样与输出控制参数：显式丢弃并记 warning（不静默吞掉）。
     if request.top_k.is_some() {
         warnings.push(Warning::unsupported(
-            "top_k",
+            warning_feature::TOP_K,
             "OpenAI Responses 无 top_k 参数，已丢弃",
         ));
     }
     if request.n.is_some() {
         warnings.push(Warning::unsupported(
-            "n",
+            warning_feature::N,
             "OpenAI Responses 无 n 参数，已丢弃",
         ));
     }
     if request.seed.is_some() {
         warnings.push(Warning::unsupported(
-            "seed",
+            warning_feature::SEED,
             "OpenAI Responses 无 seed 参数，已丢弃",
         ));
     }
     if !request.stop.is_empty() {
         warnings.push(Warning::unsupported(
-            "stop",
+            warning_feature::STOP,
             "OpenAI Responses 无 stop 序列参数，已丢弃",
         ));
     }
     if request.presence_penalty.is_some() {
         warnings.push(Warning::unsupported(
-            "presence_penalty",
+            warning_feature::PRESENCE_PENALTY,
             "OpenAI Responses 无 presence_penalty 参数，已丢弃",
         ));
     }
     if request.frequency_penalty.is_some() {
         warnings.push(Warning::unsupported(
-            "frequency_penalty",
+            warning_feature::FREQUENCY_PENALTY,
             "OpenAI Responses 无 frequency_penalty 参数，已丢弃",
         ));
     }
     if request.response_format.is_some() {
         warnings.push(Warning::unsupported(
-            "response_format",
+            warning_feature::RESPONSE_FORMAT,
             "OpenAI Responses 无 response_format 字段（JSON 输出需以 text.format 表达），已丢弃",
         ));
     }
@@ -721,13 +721,13 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             match part {
                 ContentPart::Media { media_type, .. } => {
                     warnings.push(Warning::unsupported(
-                        "media",
+                        warning_feature::MEDIA,
                         format!("OpenAI Responses 系统消息不支持媒体内容（{media_type}），已丢弃"),
                     ));
                 }
                 ContentPart::Custom { kind, .. } => {
                     warnings.push(Warning::unsupported(
-                        "custom",
+                        warning_feature::CUSTOM,
                         format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                     ));
                 }
@@ -897,7 +897,7 @@ fn encode_user_item(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Value
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                 ));
             }
@@ -1044,13 +1044,13 @@ fn encode_assistant_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec
             }
             ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "media",
+                    warning_feature::MEDIA,
                     format!("OpenAI Responses 助手消息不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                 ));
             }
@@ -1078,7 +1078,7 @@ fn encode_tool_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Valu
             }
             _ => {
                 warnings.push(Warning::unsupported(
-                    "tool_result",
+                    warning_feature::TOOL_RESULT,
                     "tool 消息含非 ToolResult part，已丢弃",
                 ));
             }
@@ -1481,13 +1481,13 @@ pub fn encode_response(response: &ChatResponse) -> Value {
             ContentPart::ToolResult { .. } => {}
             ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "media",
+                    warning_feature::MEDIA,
                     format!("OpenAI Responses 响应输出不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                 ));
             }

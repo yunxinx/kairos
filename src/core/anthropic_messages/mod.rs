@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
-    ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
+    ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning, warning_feature,
 };
 use crate::core::stream::SseFrame;
 
@@ -837,7 +837,7 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             .is_some();
         if would_emit_thinking || effort_leaked {
             warnings.push(Warning::compatibility(
-                "thinking",
+                warning_feature::THINKING,
                 "tool_choice 强制工具调用时 Anthropic 拒绝 thinking 配置，已剥离（含 output_config.effort）",
             ));
         }
@@ -863,21 +863,21 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if thinking_active {
         if let Some(value) = temperature.filter(|&value| value != 1.0) {
             warnings.push(Warning::compatibility(
-                "temperature",
+                warning_feature::TEMPERATURE,
                 format!("thinking 激活时 temperature {value} 整形为 1"),
             ));
             temperature = Some(1.0);
         }
         if let Some(value) = top_p.filter(|&value| value < 0.95) {
             warnings.push(Warning::compatibility(
-                "top_p",
+                warning_feature::TOP_P,
                 format!("thinking 激活时 top_p {value} 整形为 0.95"),
             ));
             top_p = Some(0.95);
         }
         if request.top_k.is_some() {
             warnings.push(Warning::compatibility(
-                "top_k",
+                warning_feature::TOP_K,
                 "thinking 激活时 top_k 已剥离",
             ));
             top_k = None;
@@ -914,7 +914,7 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
                         let (schema, action) = normalize_input_schema(t.parameters.as_ref());
                         if let Some(action) = action {
                             warnings.push(Warning::compatibility(
-                                "input_schema",
+                                warning_feature::INPUT_SCHEMA,
                                 format!("tool {} 的 input_schema {}", t.name, action),
                             ));
                         }
@@ -1133,7 +1133,7 @@ fn encode_messages(
                 for part in &message.content {
                     if let ContentPart::Media { media_type, .. } = part {
                         warnings.push(Warning::unsupported(
-                            "media",
+                            warning_feature::MEDIA,
                             format!(
                                 "Anthropic Messages 系统消息不支持媒体内容（{media_type}），已丢弃"
                             ),
@@ -1359,7 +1359,7 @@ fn encode_user_blocks(parts: &[ContentPart], warnings: &mut Vec<Warning>) -> Vec
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("Anthropic Messages 不支持 {kind} 内容块，已丢弃"),
                 ));
             }
@@ -1390,7 +1390,7 @@ fn encode_media_block(
         && top_level != "document"
     {
         warnings.push(Warning::unsupported(
-            "media",
+            warning_feature::MEDIA,
             format!("Anthropic Messages 不支持 {top_level} 媒体类型（{media_type}），已丢弃"),
         ));
         return None;
@@ -1509,13 +1509,13 @@ fn encode_assistant_blocks(
                 // Anthropic 媒体内容块仅允许出现在 user 消息；assistant 侧媒体
                 // 非标准，跨协议族转换时丢弃并记 warning。
                 warnings.push(Warning::unsupported(
-                    "media",
+                    warning_feature::MEDIA,
                     format!("Anthropic Messages 助手消息不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("Anthropic Messages 不支持 {kind} 内容块，已丢弃"),
                 ));
             }

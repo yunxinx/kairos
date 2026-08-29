@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
-    Message, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
+    Message, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning, warning_feature,
 };
 use crate::core::stream::SseFrame;
 
@@ -525,7 +525,7 @@ fn decode_assistant(
                 Ok(input @ Value::Object(_)) => input,
                 _ => {
                     warnings.push(Warning::compatibility(
-                        "tool_arguments",
+                        warning_feature::TOOL_ARGUMENTS,
                         format!(
                             "tool call {} 的 arguments 非合法 JSON 对象，已兜底为空对象",
                             tc.function.name
@@ -670,7 +670,7 @@ pub fn encode_request_with(
                     .any(|p| matches!(p, ContentPart::Reasoning { .. }))
                 {
                     warnings.push(Warning::unsupported(
-                        "reasoning",
+                        warning_feature::REASONING,
                         "OpenAI Chat Completions 无 reasoning 内容块，system 消息中的推理内容已丢弃",
                     ));
                 }
@@ -692,7 +692,7 @@ pub fn encode_request_with(
 
     if request.top_k.is_some() {
         warnings.push(Warning::unsupported(
-            "top_k",
+            warning_feature::TOP_K,
             "OpenAI Chat Completions 无 top_k 参数，已丢弃",
         ));
     }
@@ -707,7 +707,7 @@ pub fn encode_request_with(
         };
         if unexpressed {
             warnings.push(Warning::unsupported(
-                "provider_options",
+                warning_feature::PROVIDER_OPTIONS,
                 format!("{provider} 的请求级逃生舱设置无法表达，已丢弃"),
             ));
         }
@@ -819,7 +819,7 @@ fn encode_message(
         && (message.role != Role::Assistant || !options.reasoning_content)
     {
         warnings.push(Warning::unsupported(
-            "reasoning",
+            warning_feature::REASONING,
             "OpenAI Chat Completions 无 reasoning 内容块，助手消息中的推理内容已丢弃",
         ));
     }
@@ -936,7 +936,7 @@ fn encode_user_part(part: &ContentPart, warnings: &mut Vec<Warning>) -> Option<V
             // 远程 URL 或 base64 data URL。非图片媒体类型丢弃并记 warning。
             if !is_image_media(media_type) {
                 warnings.push(Warning::unsupported(
-                    "media",
+                    warning_feature::MEDIA,
                     format!("OpenAI Chat Completions 仅支持图片媒体，{media_type} 已丢弃"),
                 ));
                 return None;
@@ -1119,7 +1119,7 @@ pub fn encode_response(response: &ChatResponse) -> Value {
         .any(|p| matches!(p, ContentPart::Reasoning { .. }))
     {
         warnings.push(Warning::unsupported(
-            "reasoning",
+            warning_feature::REASONING,
             "OpenAI Chat Completions 无 reasoning 内容块，响应中的推理内容已丢弃",
         ));
     }
@@ -1584,7 +1584,7 @@ impl StreamEncoder {
                 // 流中丢弃过 reasoning：finish 帧显式 warning，供下游感知信息损失。
                 if self.saw_reasoning {
                     let warning = Warning::unsupported(
-                        "reasoning",
+                        warning_feature::REASONING,
                         "OpenAI Chat Completions 无 reasoning 内容块，推理内容已丢弃",
                     );
                     if let Some(gateway) = encode_warnings(&[warning]) {

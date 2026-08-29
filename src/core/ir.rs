@@ -59,6 +59,49 @@ impl Warning {
     }
 }
 
+/// warning `feature` 词汇表：跨协议转换中触发信息损失或兼容整形的主题名。
+///
+/// 各适配器统一引用本表构造 warning；下游与日志侧按值聚合统计，改名即
+/// 破坏契约，须同步调整消费方。新增触发条件在此登记，不再手写字面量。
+pub mod warning_feature {
+    /// 媒体 part（image/document/audio 等）在目标协议无承载形态，已丢弃。
+    pub const MEDIA: &str = "media";
+    /// 未知或目标协议不支持的自定义内容块，已丢弃。
+    pub const CUSTOM: &str = "custom";
+    /// top-k 采样在目标协议无对应字段，或被 thinking 采样约束剥离。
+    pub const TOP_K: &str = "top_k";
+    /// top-p 采样在目标协议无对应字段，或被 thinking 采样约束下限整形。
+    pub const TOP_P: &str = "top_p";
+    /// temperature 在目标协议无对应字段，或被 thinking 采样约束整形为 1。
+    pub const TEMPERATURE: &str = "temperature";
+    /// presence penalty 在目标协议无对应字段，已丢弃。
+    pub const PRESENCE_PENALTY: &str = "presence_penalty";
+    /// frequency penalty 在目标协议无对应字段，已丢弃。
+    pub const FREQUENCY_PENALTY: &str = "frequency_penalty";
+    /// seed 在目标协议无对应字段，已丢弃。
+    pub const SEED: &str = "seed";
+    /// stop 序列在目标协议无对应字段，已丢弃。
+    pub const STOP: &str = "stop";
+    /// 单请求多候选（n）在目标协议无对应字段，已丢弃。
+    pub const N: &str = "n";
+    /// reasoning / thinking 内容在目标协议无承载通道，已丢弃（含渠道级
+    /// 兼容输出开关关闭时的历史回放丢弃）。
+    pub const REASONING: &str = "reasoning";
+    /// Anthropic thinking 配置因上游硬约束被整体剥离（tool_choice 强制时）。
+    pub const THINKING: &str = "thinking";
+    /// JSON 输出设置（response_format）在目标协议无对应表达。
+    pub const RESPONSE_FORMAT: &str = "response_format";
+    /// 请求级 provider 逃生舱设置在目标协议无法表达，已丢弃。
+    pub const PROVIDER_OPTIONS: &str = "provider_options";
+    /// tool 消息携带非 tool_result 的内容 part，无法表达已丢弃。
+    pub const TOOL_RESULT: &str = "tool_result";
+    /// tool call 的 arguments 非合法 JSON 对象，兜底为空对象。
+    pub const TOOL_ARGUMENTS: &str = "tool_arguments";
+    /// Anthropic 出站 tool 的 input_schema 已归一化改写（union 摊平、
+    /// 非 object 根兜底等）。
+    pub const INPUT_SCHEMA: &str = "input_schema";
+}
+
 /// 消息角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -548,8 +591,36 @@ pub enum StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::prefix_hash;
+    use super::{prefix_hash, warning_feature};
     use serde_json::json;
+
+    /// 词汇表常量与 wire 值逐一定值：`gateway.warnings[].feature` 是下游与
+    /// 日志侧的聚合键，改名属破坏性变更，须显式改本表并同步消费方。
+    #[test]
+    fn warning_feature_values_are_pinned() {
+        let expected = [
+            (warning_feature::MEDIA, "media"),
+            (warning_feature::CUSTOM, "custom"),
+            (warning_feature::TOP_K, "top_k"),
+            (warning_feature::TOP_P, "top_p"),
+            (warning_feature::TEMPERATURE, "temperature"),
+            (warning_feature::PRESENCE_PENALTY, "presence_penalty"),
+            (warning_feature::FREQUENCY_PENALTY, "frequency_penalty"),
+            (warning_feature::SEED, "seed"),
+            (warning_feature::STOP, "stop"),
+            (warning_feature::N, "n"),
+            (warning_feature::REASONING, "reasoning"),
+            (warning_feature::THINKING, "thinking"),
+            (warning_feature::RESPONSE_FORMAT, "response_format"),
+            (warning_feature::PROVIDER_OPTIONS, "provider_options"),
+            (warning_feature::TOOL_RESULT, "tool_result"),
+            (warning_feature::TOOL_ARGUMENTS, "tool_arguments"),
+            (warning_feature::INPUT_SCHEMA, "input_schema"),
+        ];
+        for (constant, value) in expected {
+            assert_eq!(constant, value);
+        }
+    }
 
     fn request(messages: serde_json::Value) -> super::ChatRequest {
         serde_json::from_value(json!({
