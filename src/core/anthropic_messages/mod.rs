@@ -964,11 +964,6 @@ fn supports_adaptive_thinking(model: &str) -> bool {
         || (version_46 && (opus || model.contains("sonnet")))
 }
 
-/// 把 IR 消息编码为（顶层 system，wire messages）。
-///
-/// 合并连续 assistant 消息（Anthropic 要求）与连续 tool 消息（拆为单条 user 的
-/// 多个 tool_result 块）。首个 System 消息提升为 system；其余 System 消息以
-/// user 文本夹在消息流中，保持顺序。
 /// 编码 IR tool_choice 为 Anthropic wire 值；请求级逃生舱
 /// `tool_choice_extra` 的附加键（如 `disable_parallel_tool_use`）并回对象。
 fn encode_tool_choice(
@@ -1115,6 +1110,11 @@ fn required_schema_names(required: Option<&Value>) -> Option<Vec<String>> {
     Some(names)
 }
 
+/// 把 IR 消息编码为（顶层 system，wire messages）。
+///
+/// 全部 System 消息按序合并进顶层 system（`\n\n` 连接，空文本跳过）；
+/// 连续 assistant 消息合并为一条（Anthropic 要求）；连续 tool 消息拆为
+/// 单条 user 的多个 tool_result 块。tool 身份配对经 [`ToolAlignment`] 整形。
 fn encode_messages(
     ir_messages: &[Message],
     warnings: &mut Vec<Warning>,

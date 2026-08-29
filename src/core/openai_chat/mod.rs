@@ -671,7 +671,7 @@ pub fn encode_request_with(
                 {
                     warnings.push(Warning::unsupported(
                         "reasoning",
-                        "OpenAI Chat Completions 无 reasoning 内容块，助手消息中的推理内容已丢弃",
+                        "OpenAI Chat Completions 无 reasoning 内容块，system 消息中的推理内容已丢弃",
                     ));
                 }
                 if let Some(text) = text_parts(&message.content)

@@ -12,9 +12,10 @@
 //! - `ToolResult.tool_name` 是 IR 侧反规范化字段，三种 wire 均不承载，
 //!   配对身份由 `tool_call_id` 承载。
 //!
-//! 基线只覆盖当前已无损的语义面；跨族有损面（reasoning 丢弃、`Other` finish
-//! 等）的 warning 行为由各适配器测试锁定。后续票（tool_choice、reasoning
-//! 旋钮、缓存断点）在本基建上扩格。
+//! 基线只覆盖当前已无损的语义面（消息序列含归并后的 system、工具轮、
+//! tool_choice、reasoning 旋钮、采样参数）；跨族有损面（reasoning 丢弃、
+//! `Other` finish、tool arguments 兜底等）的 warning 行为由专用用例声明，
+//! 不进零告警基线。
 
 use std::collections::HashMap;
 
