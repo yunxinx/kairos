@@ -756,6 +756,67 @@ fn unknown_reasoning_effort_rejected_at_ingress() {
     }
 }
 
+/// chat 入站的 developer 角色按 System 处理：跨协议出站归并语义与 system
+/// 一致（anthropic 提升为顶层 system，responses 归 system 项）。
+#[test]
+fn developer_role_treats_as_system_across_protocols() {
+    let wire = json!({
+        "model": "gpt-5",
+        "messages": [
+            { "role": "developer", "content": "输出须为 JSON" },
+            { "role": "user", "content": "上海天气如何？" }
+        ]
+    });
+    let ir = decode_request_wire(Protocol::OpenAiChat, &wire);
+    assert!(matches!(
+        ir.messages.as_slice(),
+        [
+            Message {
+                role: Role::System,
+                ..
+            },
+            Message {
+                role: Role::User,
+                ..
+            }
+        ]
+    ));
+
+    let (anthropic_wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(anthropic_wire["system"], json!("输出须为 JSON"));
+
+    let (responses_wire, warnings) = encode_request_wire(Protocol::OpenAiResponses, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(responses_wire["instructions"], json!("输出须为 JSON"));
+}
+
+/// chat 入站 `max_completion_tokens` 归一进 IR 后三方向出站不丢：
+/// anthropic 映射 `max_tokens`，responses 映射 `max_output_tokens`，
+/// chat 同族按请求原字段回写。
+#[test]
+fn max_completion_tokens_survives_three_outbound_directions() {
+    let wire = json!({
+        "model": "o4-mini",
+        "messages": [{ "role": "user", "content": "上海天气如何？" }],
+        "max_completion_tokens": 2048
+    });
+    let ir = decode_request_wire(Protocol::OpenAiChat, &wire);
+
+    let (anthropic_wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(anthropic_wire["max_tokens"], json!(2048));
+
+    let (responses_wire, warnings) = encode_request_wire(Protocol::OpenAiResponses, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(responses_wire["max_output_tokens"], json!(2048));
+
+    let (chat_wire, warnings) = encode_request_wire(Protocol::OpenAiChat, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(chat_wire["max_completion_tokens"], json!(2048));
+    assert!(chat_wire.get("max_tokens").is_none(), "不应双写旧字段");
+}
+
 /// reasoning 旋钮的跨族全链路：chat 入站 → anthropic 中转 → chat 回归，
 /// 类型化档位在投影面无损。anthropic 中转会在 IR 上固化 thinking 逃生舱，
 /// 回到 chat 面时该逃生舱显式丢弃并告警——属声明过的有损面，告警形状

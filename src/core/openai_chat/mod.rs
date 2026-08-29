@@ -68,6 +68,10 @@ struct WireChatRequest {
     top_p: Option<f64>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// o 系/gpt-5 客户端的输出上限字段（`max_tokens` 的事实标准继任者）。
+    /// 捕获进 IR `max_tokens`（归一），原字段名经请求级逃生舱记忆供同族回写。
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
     #[serde(default)]
     n: Option<u32>,
     #[serde(default)]
@@ -287,6 +291,16 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         .map(|(index, m)| decode_message(m, index))
         .collect::<Result<Vec<_>, _>>()?;
 
+    // 输出上限归一进 IR `max_tokens`；两字段并存（客户端冲突）取事实标准
+    // 继任字段。原字段名经逃生舱记忆，同族出站按请求原字段回写。
+    let mut provider_options = HashMap::new();
+    if let Some(value) = wire.max_completion_tokens {
+        provider_options.insert(
+            "openai".to_string(),
+            json!({ "max_completion_tokens": value }),
+        );
+    }
+
     Ok(ChatRequest {
         model: wire.model,
         messages,
@@ -295,7 +309,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         top_p: wire.top_p,
         // Chat Completions 没有 top_k 字段；入站解码不产出该值。
         top_k: None,
-        max_tokens: wire.max_tokens,
+        max_tokens: wire.max_completion_tokens.or(wire.max_tokens),
         n: wire.n,
         stop: wire.stop.unwrap_or_default(),
         presence_penalty: wire.presence_penalty,
@@ -328,7 +342,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                 })
             })
             .transpose()?,
-        provider_options: HashMap::new(),
+        provider_options,
     })
 }
 
@@ -373,9 +387,12 @@ fn decode_tool_choice(value: &Value) -> Result<ToolChoice, DecodeError> {
 }
 
 /// 解码单条 wire 消息为 IR 消息。
+///
+/// `developer` role 是 `system` 的事实标准继任者（o 系客户端普遍使用），
+/// 与 Responses 适配器同规按 System 处理；角色名本身不做同族保留。
 fn decode_message(wire: &WireMessage, index: usize) -> Result<Message, DecodeError> {
     let role = match wire.role.as_str() {
-        "system" => Role::System,
+        "system" | "developer" => Role::System,
         "user" => Role::User,
         "assistant" => Role::Assistant,
         "tool" => Role::Tool,
@@ -577,12 +594,21 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             "OpenAI Chat Completions 无 top_k 参数，已丢弃",
         ));
     }
-    // 请求级逃生舱（如 Anthropic thinking 配置）在 OpenAI Chat 无对应字段，显式丢弃。
-    for provider in request.provider_options.keys() {
-        warnings.push(Warning::unsupported(
-            "provider_options",
-            format!("{provider} 的请求级逃生舱设置无法表达，已丢弃"),
-        ));
+    // 请求级逃生舱在 OpenAI Chat 无对应字段，显式丢弃；openai 逃生舱内的
+    // max_completion_tokens 字段名记忆已按原字段回写，不计丢弃。
+    for (provider, options) in &request.provider_options {
+        let unexpressed = match options.as_object() {
+            Some(map) => map
+                .keys()
+                .any(|key| provider != "openai" || key.as_str() != "max_completion_tokens"),
+            None => true,
+        };
+        if unexpressed {
+            warnings.push(Warning::unsupported(
+                "provider_options",
+                format!("{provider} 的请求级逃生舱设置无法表达，已丢弃"),
+            ));
+        }
     }
 
     let mut obj = serde_json::Map::new();
@@ -594,8 +620,20 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if let Some(v) = request.top_p {
         obj.insert("top_p".into(), json!(v));
     }
+    // 输出上限按请求原字段回写：入站走 max_completion_tokens 的请求（o 系
+    // 上游普遍拒绝 max_tokens）同族出站保持原字段，其余出 max_tokens。
+    let max_tokens_field = if request
+        .provider_options
+        .get("openai")
+        .and_then(|openai| openai.get("max_completion_tokens"))
+        .is_some()
+    {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
     if let Some(v) = request.max_tokens {
-        obj.insert("max_tokens".into(), json!(v));
+        obj.insert(max_tokens_field.into(), json!(v));
     }
     if let Some(v) = request.n {
         obj.insert("n".into(), json!(v));
@@ -1470,6 +1508,19 @@ mod tests {
         assert!(warnings.is_empty(), "同协议往返不应产出 warning");
     }
 
+    /// 黄金样例（max_completion_tokens 入站）decode → encode 往返还原 wire：
+    /// 归一值经逃生舱记忆按原字段名回写，同族逐位稳定。
+    #[test]
+    fn max_completion_fixture_roundtrip() {
+        let raw = include_str!("__fixtures__/request_max_completion.json");
+        let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
+        let ir = decode_request(&wire).expect("fixture 应可解码为 IR");
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded, wire, "往返应还原 wire 请求");
+        assert!(warnings.is_empty(), "同协议往返不应产出 warning");
+    }
+
     /// 黄金样例响应 decode → encode 往返还原 wire。
     #[test]
     fn response_fixture_roundtrip() {
@@ -1556,17 +1607,74 @@ mod tests {
         ));
     }
 
-    /// 未知角色报错。
+    /// `developer` role 按 System 处理（o 系客户端的事实标准继任角色）；
+    /// 其余未知角色仍在入站面拒绝。
     #[test]
-    fn unknown_role_is_rejected() {
-        let wire = json!({
+    fn developer_role_decodes_as_system_and_unknown_role_is_rejected() {
+        let developer = json!({
             "model": "gpt-4o",
-            "messages": [{ "role": "developer", "content": "hi" }]
+            "messages": [{ "role": "developer", "content": "指令" }]
+        });
+        let ir = decode_request(&developer).expect("developer 角色应可解码");
+        assert!(matches!(
+            ir.messages.as_slice(),
+            [Message {
+                role: Role::System,
+                ..
+            }]
+        ));
+
+        let unknown = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "bogus", "content": "hi" }]
         });
         assert!(matches!(
-            decode_request(&wire),
+            decode_request(&unknown),
             Err(DecodeError::UnknownRole { index: 0 })
         ));
+    }
+
+    /// `max_completion_tokens` 归一进 IR `max_tokens`（与 `max_tokens` 并存时
+    /// 取事实标准继任字段），原字段名经逃生舱记忆供同族出站回写。
+    #[test]
+    fn max_completion_tokens_normalizes_and_writes_back_original_field() {
+        let wire = json!({
+            "model": "o4-mini",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_completion_tokens": 2048
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        assert_eq!(ir.max_tokens, Some(2048));
+
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(reencoded["max_completion_tokens"], json!(2048));
+        assert!(reencoded.get("max_tokens").is_none(), "不应双写旧字段");
+
+        // 仅 max_tokens 的请求不受影响：出 max_tokens，无逃生舱记忆。
+        let legacy = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 512
+        });
+        let ir = decode_request(&legacy).expect("应可解码");
+        assert_eq!(ir.max_tokens, Some(512));
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(reencoded["max_tokens"], json!(512));
+        assert!(reencoded.get("max_completion_tokens").is_none());
+
+        // 两字段并存（客户端冲突）：归一取 max_completion_tokens。
+        let conflict = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 512,
+            "max_completion_tokens": 2048
+        });
+        let ir = decode_request(&conflict).expect("应可解码");
+        assert_eq!(ir.max_tokens, Some(2048));
     }
 
     /// wire 形状错误指明出错字段的 JSON 路径，而非笼统的「不是合法 JSON 对象」。
