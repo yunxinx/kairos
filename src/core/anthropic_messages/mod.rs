@@ -1106,7 +1106,91 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     }
     // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
     apply_provider_extra(&mut obj, request, "anthropic", warnings);
+    // 缓存断点预算钳制：超限时按 render order 保后弃前，动作可观测。
+    let dropped = clamp_cache_breakpoints(&mut obj);
+    if dropped > 0 {
+        warnings.push(Warning::unsupported(
+            warning_feature::CACHE_BREAKPOINT,
+            format!(
+                "Anthropic 缓存断点上限 {MAX_CACHE_BREAKPOINTS} 个，已保留靠后者，丢弃最早的 {dropped} 个"
+            ),
+        ));
+    }
     Value::Object(obj)
+}
+
+/// Anthropic 单请求缓存断点预算。
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// 出站对象中断点的位置（render order 采集序）。
+enum BreakpointLocation {
+    Tool(usize),
+    SystemBlock(usize),
+    MessageBlock { message: usize, block: usize },
+}
+
+/// 断点预算钳制：出站对象中断点超过 [`MAX_CACHE_BREAKPOINTS`] 时，按
+/// render order（tools → system → messages）保留靠后者、牺牲最早者，返回
+/// 丢弃数量。
+///
+/// 纯函数，作用于已编码的 wire 对象；只剥 `cache_control` 键，不动块本体，
+/// 保留块形状（Anthropic 对无断点块数组同样接受）。
+fn clamp_cache_breakpoints(obj: &mut serde_json::Map<String, Value>) -> usize {
+    let mut locations = Vec::new();
+    if let Some(tools) = obj.get_mut("tools").and_then(Value::as_array_mut) {
+        for (index, tool) in tools.iter_mut().enumerate() {
+            if tool.get("cache_control").is_some() {
+                locations.push(BreakpointLocation::Tool(index));
+            }
+        }
+    }
+    if let Some(system) = obj.get_mut("system").and_then(Value::as_array_mut) {
+        for (index, block) in system.iter_mut().enumerate() {
+            if block.get("cache_control").is_some() {
+                locations.push(BreakpointLocation::SystemBlock(index));
+            }
+        }
+    }
+    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for (message_index, message) in messages.iter_mut().enumerate() {
+            let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for (block_index, block) in blocks.iter_mut().enumerate() {
+                if block.get("cache_control").is_some() {
+                    locations.push(BreakpointLocation::MessageBlock {
+                        message: message_index,
+                        block: block_index,
+                    });
+                }
+            }
+        }
+    }
+
+    let excess = locations.len().saturating_sub(MAX_CACHE_BREAKPOINTS);
+    for location in locations.into_iter().take(excess) {
+        let block = match location {
+            BreakpointLocation::Tool(index) => obj
+                .get_mut("tools")
+                .and_then(Value::as_array_mut)
+                .and_then(|tools| tools.get_mut(index)),
+            BreakpointLocation::SystemBlock(index) => obj
+                .get_mut("system")
+                .and_then(Value::as_array_mut)
+                .and_then(|blocks| blocks.get_mut(index)),
+            BreakpointLocation::MessageBlock { message, block } => obj
+                .get_mut("messages")
+                .and_then(Value::as_array_mut)
+                .and_then(|messages| messages.get_mut(message))
+                .and_then(|message| message.get_mut("content"))
+                .and_then(Value::as_array_mut)
+                .and_then(|blocks| blocks.get_mut(block)),
+        };
+        if let Some(Value::Object(map)) = block {
+            map.remove("cache_control");
+        }
+    }
+    excess
 }
 
 /// 请求模型是否支持 adaptive thinking 与原生 effort（`output_config.effort`）。
@@ -2758,31 +2842,33 @@ mod tests {
 
     /// System 断点合并语义：多条 System 消息各带断点时取最后出现的（尾块
     /// 前缘），断点在场时 system 以单文本块数组出站，缺席保持字符串形状。
+    /// 最小化请求骨架（各测试按需覆写消息/工具）。
+    fn bare_request(messages: Vec<Message>) -> ChatRequest {
+        ChatRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages,
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: Some(1024),
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn system_cache_control_merges_to_tail_block() {
-        fn bare_request(messages: Vec<Message>) -> ChatRequest {
-            ChatRequest {
-                model: "claude-sonnet-4-5".to_string(),
-                messages,
-                stream: false,
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                max_tokens: Some(1024),
-                n: None,
-                stop: Vec::new(),
-                presence_penalty: None,
-                frequency_penalty: None,
-                seed: None,
-                response_format: None,
-                tools: Vec::new(),
-                tool_choice: None,
-                parallel_tool_calls: None,
-                reasoning: None,
-                provider_options: HashMap::new(),
-                warnings: Vec::new(),
-            }
-        }
         let cached = json!({ "type": "ephemeral" });
         let make = |text: &str, cc: Option<&Value>| Message {
             role: Role::System,
@@ -2818,6 +2904,104 @@ mod tests {
         let request = bare_request(vec![make("无断点", None)]);
         let wire = encode_request(&request, &mut Vec::new());
         assert_eq!(wire["system"], json!("无断点"), "无断点保持字符串形状");
+    }
+
+    /// 断点预算钳制：超 4 上限时按 render order（tools → system → messages）
+    /// 保后弃前，牺牲最早者并记 cache_breakpoint warning；恰好 4 个时不超限
+    /// 零改动零告警。
+    #[test]
+    fn cache_breakpoints_clamp_to_budget_keeping_latest() {
+        let hatch = || {
+            [(
+                "anthropic".to_string(),
+                json!({ "cache_control": { "type": "ephemeral" } }),
+            )]
+            .into_iter()
+            .collect::<crate::core::ir::ProviderOptions>()
+        };
+        let cached_tool = |name: &str| crate::core::ir::Tool {
+            name: name.to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": { "x": { "type": "string" } },
+            })),
+            provider_options: hatch(),
+        };
+        let cached_system = |text: &str| Message {
+            role: Role::System,
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+                provider_options: HashMap::new(),
+            }],
+            provider_options: hatch(),
+        };
+        let cached_user = |text: &str| Message {
+            role: Role::User,
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+                provider_options: hatch(),
+            }],
+            provider_options: HashMap::new(),
+        };
+
+        // render order 共 7 个断点：tool0、tool1、system、消息 0..3；
+        // 保留靠后 4 个（四条消息），牺牲最早的工具与 system 断点。
+        let mut request = bare_request(vec![
+            cached_system("你是天气助手"),
+            cached_user("问 1"),
+            cached_user("问 2"),
+            cached_user("问 3"),
+            cached_user("问 4"),
+        ]);
+        request.tools = vec![cached_tool("tool_a"), cached_tool("tool_b")];
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+
+        assert!(wire["tools"][0].get("cache_control").is_none());
+        assert!(wire["tools"][1].get("cache_control").is_none());
+        assert!(
+            wire["system"]
+                .as_array()
+                .expect("块形状保持")
+                .iter()
+                .all(|block| block.get("cache_control").is_none()),
+            "system 断点应被牺牲"
+        );
+        let kept = wire["messages"]
+            .as_array()
+            .expect("应有消息数组")
+            .iter()
+            .flat_map(|message| message["content"].as_array().expect("块数组").iter())
+            .filter(|block| block.get("cache_control").is_some())
+            .count();
+        assert_eq!(kept, 4, "应保留靠后的 4 个消息断点");
+        assert_eq!(
+            warnings,
+            vec![Warning::unsupported(
+                warning_feature::CACHE_BREAKPOINT,
+                "Anthropic 缓存断点上限 4 个，已保留靠后者，丢弃最早的 3 个",
+            )]
+        );
+
+        // 恰好 4 个：零改动零告警。
+        let request = bare_request(vec![
+            cached_user("问 1"),
+            cached_user("问 2"),
+            cached_user("问 3"),
+            cached_user("问 4"),
+        ]);
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+        assert!(warnings.is_empty(), "不超限不应告警");
+        let kept = wire["messages"]
+            .as_array()
+            .expect("应有消息数组")
+            .iter()
+            .flat_map(|message| message["content"].as_array().expect("块数组").iter())
+            .filter(|block| block.get("cache_control").is_some())
+            .count();
+        assert_eq!(kept, 4, "预算内断点零改动");
     }
 
     /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。

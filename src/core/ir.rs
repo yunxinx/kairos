@@ -102,6 +102,9 @@ pub mod warning_feature {
     pub const INPUT_SCHEMA: &str = "input_schema";
     /// 请求级白名单外的顶层未知字段在目标协议无法表达，已丢弃。
     pub const UNKNOWN_FIELDS: &str = "unknown_fields";
+    /// 缓存断点超过目标协议预算（Anthropic 上限 4 个），按 render order
+    /// 保留靠后者、牺牲最早者。
+    pub const CACHE_BREAKPOINT: &str = "cache_breakpoint";
 }
 
 /// 未知字段逃生舱在 provider 逃生舱内的键：`provider_options[<provider>]["extra"]`。
@@ -700,6 +703,7 @@ mod tests {
             (warning_feature::TOOL_ARGUMENTS, "tool_arguments"),
             (warning_feature::INPUT_SCHEMA, "input_schema"),
             (warning_feature::UNKNOWN_FIELDS, "unknown_fields"),
+            (warning_feature::CACHE_BREAKPOINT, "cache_breakpoint"),
         ];
         for (constant, value) in expected {
             assert_eq!(constant, value);
