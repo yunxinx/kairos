@@ -11,7 +11,8 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
-    Message, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning, warning_feature,
+    Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage,
+    Warning, apply_provider_extra, capture_unknown_fields, warning_feature,
 };
 use crate::core::stream::SseFrame;
 
@@ -53,6 +54,27 @@ pub enum DecodeError {
 }
 
 // ---- wire 请求类型 ----
+
+/// 本协议已知顶层请求字段白名单；白名单外的顶层字段由入站解码收进
+/// 未知字段逃生舱（`provider_options["openai"]["extra"]`）。
+const KNOWN_REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "response_format",
+    "tools",
+    "tool_choice",
+    "reasoning_effort",
+];
 
 /// OpenAI Chat Completions 出站/入站请求体（wire）。
 #[derive(Debug, Clone, Deserialize)]
@@ -307,6 +329,16 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
             "openai".to_string(),
             json!({ "max_completion_tokens": value }),
         );
+    }
+    // 白名单外的顶层字段收进未知字段逃生舱，同族出站原样回写。
+    let extra = capture_unknown_fields(value, KNOWN_REQUEST_FIELDS);
+    if !extra.is_empty() {
+        let entry = provider_options
+            .entry("openai".to_string())
+            .or_insert_with(|| json!({}));
+        if let Value::Object(openai) = entry {
+            openai.insert(PROVIDER_EXTRA_KEY.to_string(), Value::Object(extra));
+        }
     }
 
     Ok(ChatRequest {
@@ -697,12 +729,14 @@ pub fn encode_request_with(
         ));
     }
     // 请求级逃生舱在 OpenAI Chat 无对应字段，显式丢弃；openai 逃生舱内的
-    // max_completion_tokens 字段名记忆已按原字段回写，不计丢弃。
+    // max_completion_tokens 字段名记忆已按原字段回写，未知字段（extra）由
+    // 专用逃生舱回写或告警，均不计丢弃。
     for (provider, options) in &request.provider_options {
         let unexpressed = match options.as_object() {
-            Some(map) => map
-                .keys()
-                .any(|key| provider != "openai" || key.as_str() != "max_completion_tokens"),
+            Some(map) => map.keys().any(|key| {
+                key.as_str() != PROVIDER_EXTRA_KEY
+                    && (provider != "openai" || key.as_str() != "max_completion_tokens")
+            }),
             None => true,
         };
         if unexpressed {
@@ -712,7 +746,6 @@ pub fn encode_request_with(
             ));
         }
     }
-
     let mut obj = serde_json::Map::new();
     obj.insert("model".into(), json!(request.model));
     obj.insert("messages".into(), Value::Array(messages));
@@ -786,6 +819,8 @@ pub fn encode_request_with(
     if let Some(effort) = request.reasoning {
         obj.insert("reasoning_effort".into(), json!(effort.as_str()));
     }
+    // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
+    apply_provider_extra(&mut obj, request, "openai", warnings);
     Value::Object(obj)
 }
 

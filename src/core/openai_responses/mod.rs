@@ -25,7 +25,8 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
-    ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning, warning_feature,
+    PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage, Warning,
+    apply_provider_extra, capture_unknown_fields, warning_feature,
 };
 use crate::core::stream::SseFrame;
 
@@ -65,6 +66,25 @@ pub enum DecodeError {
 }
 
 // ---- wire 请求类型 ----
+
+/// 本协议已知顶层请求字段白名单；白名单外的顶层字段由入站解码收进
+/// 未知字段逃生舱（`provider_options["openai"]["extra"]`）。
+const KNOWN_REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "tools",
+    "tool_choice",
+    "text",
+    "reasoning",
+    "store",
+    "previous_response_id",
+    "conversation",
+];
 
 /// OpenAI Responses 出站/入站请求体（wire）。
 ///
@@ -300,6 +320,11 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     }
     if let Some(conv) = &wire.conversation {
         openai.insert(STATEFUL_CONVERSATION.into(), conv.clone());
+    }
+    // 白名单外的顶层字段收进未知字段逃生舱，同族出站原样回写。
+    let extra = capture_unknown_fields(value, KNOWN_REQUEST_FIELDS);
+    if !extra.is_empty() {
+        openai.insert(PROVIDER_EXTRA_KEY.to_string(), Value::Object(extra));
     }
     if !openai.is_empty() {
         provider_options.insert(OPENAI_PROVIDER.into(), Value::Object(openai));
@@ -826,6 +851,8 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if !reasoning_emitted && let Some(effort) = request.reasoning {
         obj.insert("reasoning".into(), json!({ "effort": effort.as_str() }));
     }
+    // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
+    apply_provider_extra(&mut obj, request, OPENAI_PROVIDER, warnings);
     Value::Object(obj)
 }
 

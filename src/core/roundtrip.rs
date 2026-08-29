@@ -1179,6 +1179,139 @@ fn root_union_input_schema_normalizes_only_for_anthropic() {
     assert!(warnings.is_empty());
 }
 
+/// 请求级未知字段逃生舱：白名单外的顶层字段入站收进
+/// `provider_options[<本协议>]["extra"]`，同族出站原样回写（往返 byte-shape
+/// 一致），与既有逃生舱键（max_completion_tokens / thinking / reasoning 面板）
+/// 同一 provider 对象内共存。
+#[test]
+fn unknown_fields_capture_and_roundtrip_same_family() {
+    let chat = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_completion_tokens": 2048,
+        "service_tier": "flex",
+        "logprobs": true,
+    });
+    let ir = decode_request_wire(Protocol::OpenAiChat, &chat);
+    assert_eq!(
+        ir.provider_options["openai"]["extra"],
+        json!({ "service_tier": "flex", "logprobs": true })
+    );
+    assert_eq!(
+        ir.provider_options["openai"]["max_completion_tokens"],
+        json!(2048)
+    );
+    let (wire_back, warnings) = encode_request_wire(Protocol::OpenAiChat, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(wire_back, chat, "chat 同族未知字段往返 byte-shape 一致");
+
+    let responses = json!({
+        "model": "gpt-4o",
+        "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }],
+        "reasoning": { "effort": "low" },
+        "service_tier": "flex",
+    });
+    let ir = decode_request_wire(Protocol::OpenAiResponses, &responses);
+    assert_eq!(
+        ir.provider_options["openai"]["extra"],
+        json!({ "service_tier": "flex" })
+    );
+    let (wire_back, warnings) = encode_request_wire(Protocol::OpenAiResponses, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        wire_back, responses,
+        "responses 同族未知字段往返 byte-shape 一致"
+    );
+
+    let anthropic = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "thinking": { "type": "disabled" },
+        "metadata": { "user_id": "u_1" },
+    });
+    let ir = decode_request_wire(Protocol::AnthropicMessages, &anthropic);
+    assert_eq!(
+        ir.provider_options["anthropic"]["extra"],
+        json!({ "metadata": { "user_id": "u_1" } })
+    );
+    assert_eq!(
+        ir.provider_options["anthropic"]["thinking"],
+        json!({ "type": "disabled" })
+    );
+    let (wire_back, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(
+        wire_back, anthropic,
+        "anthropic 同族未知字段往返 byte-shape 一致"
+    );
+}
+
+/// 未知字段跨族出站：目标协议不表达该字段，丢弃并记 unknown_fields
+/// warning（details 携带字段名，可观测）。anthropic 入站来源在 OpenAI 两个
+/// 出站面均告警；chat 入站来源在 anthropic 出站面告警。
+#[test]
+fn unknown_fields_warn_and_drop_on_cross_family_outbound() {
+    let chat = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "logprobs": true,
+    });
+    let ir = decode_request_wire(Protocol::OpenAiChat, &chat);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(wire.get("logprobs").is_none(), "跨族出站不应携带未知字段");
+    assert!(matches!(
+        warnings.as_slice(),
+        [Warning::Unsupported { feature, details }]
+            if feature == "unknown_fields" && details.as_deref().is_some_and(|d| d.contains("logprobs"))
+    ));
+
+    let anthropic = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }],
+        "metadata": { "user_id": "u_1" },
+    });
+    let ir = decode_request_wire(Protocol::AnthropicMessages, &anthropic);
+    for protocol in [Protocol::OpenAiChat, Protocol::OpenAiResponses] {
+        let (wire, warnings) = encode_request_wire(protocol, &ir);
+        assert!(
+            wire.get("metadata").is_none(),
+            "{protocol:?} 跨族出站不应携带未知字段"
+        );
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Unsupported { feature, .. }] if feature == "unknown_fields"
+        ));
+    }
+}
+
+/// openai 族内（chat ↔ responses 共用 openai 逃生舱键）未知字段直接回写：
+/// 两协议均为 OpenAI 家族，常见共享字段（service_tier、metadata 等）跨协议
+/// 不丢不告警。
+#[test]
+fn unknown_fields_write_back_across_openai_protocols() {
+    let chat = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "service_tier": "flex",
+    });
+    let ir = decode_request_wire(Protocol::OpenAiChat, &chat);
+    let (responses_wire, warnings) = encode_request_wire(Protocol::OpenAiResponses, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(responses_wire["service_tier"], json!("flex"));
+
+    let responses = json!({
+        "model": "gpt-4o",
+        "input": [{ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }],
+        "metadata": { "request_tag": "t1" },
+    });
+    let ir = decode_request_wire(Protocol::OpenAiResponses, &responses);
+    let (chat_wire, warnings) = encode_request_wire(Protocol::OpenAiChat, &ir);
+    assert!(warnings.is_empty());
+    assert_eq!(chat_wire["metadata"], json!({ "request_tag": "t1" }));
+}
+
 /// 基线语义面：散布的多条 System 消息经全部有向对无损——三协议出站统一
 /// 归并（单条置顶 / 顶层 system / instructions），投影把 System 归一为
 /// 合并文本后往返相等，全程零告警。

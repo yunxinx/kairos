@@ -100,7 +100,15 @@ pub mod warning_feature {
     /// Anthropic 出站 tool 的 input_schema 已归一化改写（union 摊平、
     /// 非 object 根兜底等）。
     pub const INPUT_SCHEMA: &str = "input_schema";
+    /// 请求级白名单外的顶层未知字段在目标协议无法表达，已丢弃。
+    pub const UNKNOWN_FIELDS: &str = "unknown_fields";
 }
+
+/// 未知字段逃生舱在 provider 逃生舱内的键：`provider_options[<provider>]["extra"]`。
+///
+/// 各适配器入站解码把本协议白名单外的顶层字段收进该键，同族出站原样回写，
+/// 跨族出站丢弃并记 [`warning_feature::UNKNOWN_FIELDS`] warning。
+pub const PROVIDER_EXTRA_KEY: &str = "extra";
 
 /// 消息角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,6 +448,69 @@ pub struct ChatRequest {
     pub warnings: Vec<Warning>,
 }
 
+impl ChatRequest {
+    /// 读取指定 provider 未知字段逃生舱内的字段集合；键缺席或非对象时为 `None`。
+    pub(crate) fn provider_extra(&self, provider: &str) -> Option<&serde_json::Map<String, Value>> {
+        self.provider_options
+            .get(provider)?
+            .get(PROVIDER_EXTRA_KEY)?
+            .as_object()
+    }
+}
+
+/// 从入站 wire 请求对象捕获白名单外的顶层字段（未知字段逃生舱的捕获面）。
+///
+/// 请求对象非 JSON object 时返回空集（形状错误由 wire 解码另行拒绝）。
+pub(crate) fn capture_unknown_fields(
+    value: &Value,
+    known: &[&str],
+) -> serde_json::Map<String, Value> {
+    let mut extra = serde_json::Map::new();
+    if let Some(fields) = value.as_object() {
+        for (key, field) in fields {
+            if !known.contains(&key.as_str()) {
+                extra.insert(key.clone(), field.clone());
+            }
+        }
+    }
+    extra
+}
+
+/// 出站编码的未知字段逃生舱处理：本族字段回写、跨族字段丢弃并告警。
+///
+/// `family` 为本适配器的 provider 键：本族 `extra` 内的字段原样写回出站
+/// 对象（不覆盖类型化字段已写的键）；其他 provider 的字段丢弃并记
+/// [`warning_feature::UNKNOWN_FIELDS`] warning，details 携带字段名。
+pub(crate) fn apply_provider_extra(
+    obj: &mut serde_json::Map<String, Value>,
+    request: &ChatRequest,
+    family: &str,
+    warnings: &mut Vec<Warning>,
+) {
+    if let Some(extra) = request.provider_extra(family) {
+        for (key, field) in extra {
+            obj.entry(key.clone()).or_insert(field.clone());
+        }
+    }
+    for provider in request.provider_options.keys() {
+        if provider == family {
+            continue;
+        }
+        let Some(extra) = request.provider_extra(provider) else {
+            continue;
+        };
+        if !extra.is_empty() {
+            warnings.push(Warning::unsupported(
+                warning_feature::UNKNOWN_FIELDS,
+                format!(
+                    "{provider} 的未知字段 {} 无法在目标协议表达，已丢弃",
+                    extra.keys().cloned().collect::<Vec<_>>().join("、")
+                ),
+            ));
+        }
+    }
+}
+
 /// 为没有显式会话头的请求计算前缀亲和标识。
 ///
 /// 只纳入 system 消息全文与前两条消息的角色/文本；这对应上游 prompt cache
@@ -616,6 +687,7 @@ mod tests {
             (warning_feature::TOOL_RESULT, "tool_result"),
             (warning_feature::TOOL_ARGUMENTS, "tool_arguments"),
             (warning_feature::INPUT_SCHEMA, "input_schema"),
+            (warning_feature::UNKNOWN_FIELDS, "unknown_fields"),
         ];
         for (constant, value) in expected {
             assert_eq!(constant, value);
