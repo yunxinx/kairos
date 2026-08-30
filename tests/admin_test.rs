@@ -730,7 +730,7 @@ async fn price_for_unlisted_callable_is_400() {
     assert_eq!(listed_prices(&gw).await, before, "PUT 拒绝后价格列表应不变");
 }
 
-/// 同一 (渠道, 模型) 再 POST 冲突（spec 9）；播种已有 test-channel / gpt-4o。
+/// 同一 (渠道, 模型) 再 POST 冲突；播种已有 test-channel / gpt-4o。
 #[tokio::test]
 async fn posting_existing_channel_model_price_is_409() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;

@@ -48,7 +48,7 @@ async fn config_driven_listen_and_fallback() {
     });
 
     // 配置的端口上，未实现路径返回确定 404。
-    // embeddings / image generation / audio / batch 均属 spec Out of Scope。
+    // embeddings / 图片生成 / 音频 / batch 等端点本网关不提供，同样返回 404。
     let client = reqwest::Client::new();
     for path in [
         "/v1/embeddings",
@@ -67,7 +67,7 @@ async fn config_driven_listen_and_fallback() {
             assert_eq!(
                 resp.status(),
                 reqwest::StatusCode::NOT_FOUND,
-                "Out of Scope 路径 {method} {path} 应 404"
+                "未实现路径 {method} {path} 应 404"
             );
             let body = resp.text().await.expect("响应应可读");
             assert!(body.contains("未实现"), "响应应含可读提示，实际 {body:?}");
