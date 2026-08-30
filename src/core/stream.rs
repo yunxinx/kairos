@@ -71,8 +71,9 @@ struct PendingTool {
 ///
 /// Anthropic thinking 的 signature 在 `signature_delta` 才到达（内容增量之后），
 /// 因此逃生舱必须逐事件累加而非只取首个事件的值，否则 signature 丢失、多轮
-/// thinking 被上游拒绝。
-fn merge_provider_options(
+/// thinking 被上游拒绝。适配器的流式路径（解码器累积、编码器下发）共用同一
+/// 合并语义。
+pub(crate) fn merge_provider_options(
     target: &mut crate::core::ir::ProviderOptions,
     incoming: crate::core::ir::ProviderOptions,
 ) {

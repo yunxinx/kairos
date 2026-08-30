@@ -1,0 +1,108 @@
+---
+source: src/core/gemini/mod.rs
+expression: frames_to_snapshot(&frames)
+---
+[
+  {
+    "data": {
+      "candidates": [],
+      "gateway": {
+        "warnings": [
+          {
+            "details": "已丢弃",
+            "feature": "top_k",
+            "type": "unsupported"
+          }
+        ]
+      }
+    },
+    "event": null
+  },
+  {
+    "data": {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "先想",
+                "thought": true,
+                "thoughtSignature": "sig_thought"
+              }
+            ],
+            "role": "model"
+          },
+          "index": 0
+        }
+      ],
+      "modelVersion": "gemini-flash",
+      "responseId": "resp-1"
+    },
+    "event": null
+  },
+  {
+    "data": {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "答案"
+              }
+            ],
+            "role": "model"
+          },
+          "index": 0
+        }
+      ],
+      "modelVersion": "gemini-flash",
+      "responseId": "resp-1"
+    },
+    "event": null
+  },
+  {
+    "data": {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "functionCall": {
+                  "args": {
+                    "city": "上海"
+                  },
+                  "id": "call_1",
+                  "name": "get_weather"
+                }
+              }
+            ],
+            "role": "model"
+          },
+          "index": 0
+        }
+      ],
+      "modelVersion": "gemini-flash",
+      "responseId": "resp-1"
+    },
+    "event": null
+  },
+  {
+    "data": {
+      "candidates": [
+        {
+          "finishReason": "STOP",
+          "index": 0
+        }
+      ],
+      "modelVersion": "gemini-flash",
+      "responseId": "resp-1",
+      "usageMetadata": {
+        "cachedContentTokenCount": 4,
+        "candidatesTokenCount": 12,
+        "promptTokenCount": 14,
+        "totalTokenCount": 26
+      }
+    },
+    "event": null
+  }
+]

@@ -1,4 +1,4 @@
-//! Gemini generateContent 协议适配器：wire ↔ IR 双向编解码（非流式）。
+//! Gemini generateContent 协议适配器：wire ↔ IR 双向编解码（非流式 + 流式）。
 //!
 //! wire 结构体全部私有，透过 `decode_*`/`encode_*` 公共函数暴露 IR 边界，
 //! wire 类型不出本模块边界。
@@ -18,6 +18,9 @@
 //!   functionCall part 时 finish 归 `ToolCalls`）；usage 输入侧为
 //!   「`promptTokenCount` 含缓存」的减法约定（与 OpenAI 系同口径），
 //!   `thoughtsTokenCount` 是输出侧子集，不另计价。
+//! - 流式：`alt=sse` 的逐 chunk 是完整响应的 part 级片段，流以服务器关闭收尾、
+//!   无哨兵行；末 chunk 携带 `finishReason` 与 `usageMetadata`，usage 逐 chunk
+//!   累计（取最近一次出现的为终值）。
 //! - 模型名不在请求体内（承载在 URL 路径的 `:generateContent` 端点上），
 //!   由网关在调用本模块前注入；出站编码同样不写 `model` 字段。
 
@@ -30,9 +33,10 @@ use thiserror::Error;
 
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
-    Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, Tool, ToolChoice, Usage, Warning,
-    apply_provider_extra, capture_unknown_fields, warning_feature,
+    Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage,
+    Warning, apply_provider_extra, capture_unknown_fields, warning_feature,
 };
+use crate::core::stream::{SseFrame, merge_provider_options};
 
 /// 本适配器的 provider 逃生舱键。
 const PROVIDER_KEY: &str = "google";
@@ -1077,6 +1081,417 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     Some(convert_usage(usage))
 }
 
+// ---- 流式：上游 chunk → IR 流事件 ----
+
+/// 单个 chunk 解码结果：IR 事件 + 是否产出任何输出内容。
+#[derive(Debug)]
+pub struct DecodeStreamChunk {
+    pub events: Vec<StreamEvent>,
+    pub is_output: bool,
+}
+
+impl DecodeStreamChunk {
+    fn delivery(events: Vec<StreamEvent>) -> Self {
+        Self {
+            events,
+            is_output: false,
+        }
+    }
+}
+
+/// 流式解码器：把上游 `alt=sse` 逐 chunk 的 `GenerateContentResponse` 解码为
+/// IR 流事件。
+///
+/// 每个 chunk 是完整响应的 part 级片段：思维链与正文增量各成一帧，块切换时
+/// 先收前一块再开新块；`functionCall` 整 part 到达（无参数增量），展开为
+/// tool-input 的 start/delta/end 三事件。流以服务器关闭收尾、无哨兵行。
+#[derive(Debug, Default)]
+pub struct StreamDecoder {
+    /// `ResponseMetadata` 一次响应只发一次：chunk 重复携带的 id/model 不重复产出。
+    metadata_emitted: bool,
+    reasoning_open: bool,
+    text_open: bool,
+    /// 流内出现过 functionCall part：`STOP` 在场时 finish 归 `ToolCalls`（与
+    /// 非流式同一规则，调用可能先于 finishReason 若干 chunk 到达）。
+    saw_function_call: bool,
+    /// Finish 只产出一次；此后仅当 usage 终值补达时再发一次。
+    finish_emitted: bool,
+    /// finishReason 收过后的记忆，供补达的 usage 下发终值 Finish。
+    last_finish_reason: Option<FinishReason>,
+    /// 最近一次出现的 usage 折算值：`usageMetadata` 逐 chunk 累计，末 chunk
+    /// 的值即终值。
+    last_usage: Option<Usage>,
+}
+
+impl StreamDecoder {
+    /// 解码单个上游 chunk 为若干 IR 流事件。
+    ///
+    /// 形状不符的 chunk 跳过（产出空事件）：流式面对的是已建立连接的上游，
+    /// 单个坏块不值得整条流报废，异常流由网关的流完整性校验归类。
+    pub fn process(&mut self, chunk: &Value) -> DecodeStreamChunk {
+        let Ok(wire) = serde_json::from_value::<WireResponse>(chunk.clone()) else {
+            return DecodeStreamChunk::delivery(Vec::new());
+        };
+
+        let mut events = Vec::new();
+        let mut is_output = false;
+
+        if !self.metadata_emitted && (wire.response_id.is_some() || wire.model_version.is_some()) {
+            self.metadata_emitted = true;
+            events.push(StreamEvent::ResponseMetadata {
+                id: wire.response_id.clone().unwrap_or_default(),
+                model: wire.model_version.clone().unwrap_or_default(),
+            });
+        }
+
+        if let Some(usage) = &wire.usage_metadata {
+            self.last_usage = Some(convert_usage(usage));
+        }
+
+        let candidate = wire.candidates.first();
+        if let Some(content) = candidate.and_then(|c| c.content.as_ref()) {
+            for part in &content.parts {
+                // 无法识别的 part 跳过：与坏块跳过同理，不因个别未知形状中断流。
+                let Ok(decoded) = decode_part(part, 0, &mut Vec::new()) else {
+                    continue;
+                };
+                match decoded {
+                    ContentPart::Reasoning {
+                        text,
+                        provider_options,
+                    } => {
+                        self.close_text(&mut events);
+                        if !self.reasoning_open {
+                            self.reasoning_open = true;
+                            events.push(StreamEvent::ReasoningStart {
+                                id: "0".to_string(),
+                                provider_options: HashMap::new(),
+                            });
+                        }
+                        is_output = true;
+                        // 签名可与零长增量并存：逃生舱在场时即使无文本也要下发。
+                        if !text.is_empty() || !provider_options.is_empty() {
+                            events.push(StreamEvent::ReasoningDelta {
+                                id: "0".to_string(),
+                                delta: text,
+                                provider_options,
+                            });
+                        }
+                    }
+                    ContentPart::Text {
+                        text,
+                        provider_options,
+                    } => {
+                        self.close_reasoning(&mut events);
+                        if !self.text_open {
+                            self.text_open = true;
+                            events.push(StreamEvent::TextStart {
+                                id: "0".to_string(),
+                                provider_options: HashMap::new(),
+                            });
+                        }
+                        is_output = true;
+                        if !text.is_empty() || !provider_options.is_empty() {
+                            events.push(StreamEvent::TextDelta {
+                                id: "0".to_string(),
+                                delta: text,
+                                provider_options,
+                            });
+                        }
+                    }
+                    ContentPart::ToolCall {
+                        tool_call_id,
+                        tool_name,
+                        input,
+                        provider_options,
+                    } => {
+                        self.close_reasoning(&mut events);
+                        self.close_text(&mut events);
+                        is_output = true;
+                        self.saw_function_call = true;
+                        events.push(StreamEvent::ToolInputStart {
+                            id: tool_call_id.clone(),
+                            tool_name,
+                            provider_options,
+                        });
+                        events.push(StreamEvent::ToolInputDelta {
+                            id: tool_call_id.clone(),
+                            delta: input.to_string(),
+                            provider_options: HashMap::new(),
+                        });
+                        events.push(StreamEvent::ToolInputEnd {
+                            id: tool_call_id,
+                            provider_options: HashMap::new(),
+                        });
+                    }
+                    // 响应流不承载媒体与工具结果 part。
+                    _ => {}
+                }
+            }
+        }
+
+        // Finish 由 finishReason 触发：usage 逐 chunk 累计，中途出现不构成流
+        // 终止信号。finishReason 先到而 usage 终值后补时，以第二次 Finish 下发
+        // 终值（流以服务器关闭收尾，此后无更多内容）。
+        let has_finish_reason = candidate.is_some_and(|c| c.finish_reason.is_some());
+        if has_finish_reason {
+            self.close_reasoning(&mut events);
+            self.close_text(&mut events);
+            let raw = candidate.and_then(|c| c.finish_reason.clone());
+            let unified = match raw.as_deref() {
+                Some("STOP") if self.saw_function_call => FinishReasonUnified::ToolCalls,
+                _ => map_finish_reason(raw.as_deref()),
+            };
+            self.last_finish_reason = Some(FinishReason { unified, raw });
+            if !self.finish_emitted {
+                self.finish_emitted = true;
+                events.push(StreamEvent::Finish {
+                    finish_reason: self.last_finish_reason.clone().unwrap_or(FinishReason {
+                        unified: FinishReasonUnified::Other,
+                        raw: None,
+                    }),
+                    usage: self.last_usage.clone().unwrap_or_default(),
+                    provider_metadata: HashMap::new(),
+                });
+            }
+        } else if self.finish_emitted && wire.usage_metadata.is_some() {
+            events.push(StreamEvent::Finish {
+                finish_reason: self.last_finish_reason.clone().unwrap_or(FinishReason {
+                    unified: FinishReasonUnified::Other,
+                    raw: None,
+                }),
+                usage: self.last_usage.clone().unwrap_or_default(),
+                provider_metadata: HashMap::new(),
+            });
+        }
+
+        DecodeStreamChunk { events, is_output }
+    }
+
+    fn close_reasoning(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.reasoning_open {
+            self.reasoning_open = false;
+            events.push(StreamEvent::ReasoningEnd {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            });
+        }
+    }
+
+    fn close_text(&mut self, events: &mut Vec<StreamEvent>) {
+        if self.text_open {
+            self.text_open = false;
+            events.push(StreamEvent::TextEnd {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            });
+        }
+    }
+}
+
+// ---- 流式：IR 流事件 → 入站 SSE 帧 ----
+
+/// 把 IR 流事件编码为入站 Gemini 流 chunk（`data:` 行、无事件名、无哨兵行）。
+///
+/// Gemini 的 chunk 是无状态片段：文本/思维链增量各成一帧 part；工具调用无
+/// 参数增量，参数缓冲到 `ToolInputEnd` 整块成 part 下发；Finish 以末 chunk 的
+/// `finishReason` + `usageMetadata` 收尾，流随后由服务器关闭。
+#[derive(Debug, Default)]
+pub struct StreamEncoder {
+    /// 从 ResponseMetadata 记录的响应 id 与 model，逐 chunk 携带。
+    id: String,
+    model: String,
+    /// 入站模型名覆盖：别名命中时，出站响应模型名须重写回入站短名。
+    inbound_model: Option<String>,
+    /// 进行中的工具调用（wire 无参数增量，缓冲到收尾一次性成块）。
+    open_tools: Vec<OpenToolCall>,
+    /// 思维链开始事件携带的逃生舱（如签名）：随首个增量 part 下发。
+    reasoning_start_options: HashMap<String, Value>,
+}
+
+/// 入站侧进行中的工具调用。
+#[derive(Debug)]
+struct OpenToolCall {
+    id: String,
+    tool_name: String,
+    arguments: String,
+    provider_options: HashMap<String, Value>,
+}
+
+impl StreamEncoder {
+    /// 指定入站模型名覆盖（别名重写响应模型名）；`None` 表示不覆盖。
+    pub fn new(inbound_model: Option<String>) -> Self {
+        Self {
+            inbound_model,
+            ..Self::default()
+        }
+    }
+
+    /// 编码一个 IR 流事件，返回需要下发的 SSE 帧（可能为空）。
+    pub fn encode(&mut self, event: &StreamEvent) -> Vec<SseFrame> {
+        match event {
+            // warnings 以独立首帧下发，让下游在收到任何内容前就感知信息损失。
+            StreamEvent::StreamStart { warnings } => {
+                match crate::core::openai_chat::encode_warnings(warnings) {
+                    Some(gateway) => vec![SseFrame::data(
+                        json!({ "candidates": [], "gateway": gateway }).to_string(),
+                    )],
+                    None => Vec::new(),
+                }
+            }
+            StreamEvent::ResponseMetadata { id, model } => {
+                self.id = id.clone();
+                self.model = model.clone();
+                Vec::new()
+            }
+            StreamEvent::TextStart { .. } | StreamEvent::TextEnd { .. } => Vec::new(),
+            StreamEvent::TextDelta {
+                delta,
+                provider_options,
+                ..
+            } => {
+                if delta.is_empty() && provider_options.is_empty() {
+                    return Vec::new();
+                }
+                self.part_frame(ContentPart::Text {
+                    text: delta.clone(),
+                    provider_options: provider_options.clone(),
+                })
+            }
+            StreamEvent::ReasoningStart {
+                provider_options, ..
+            } => {
+                // 签名可能在开始事件先行到达（非流式响应的流式回放形状）：
+                // 缓存到首个增量 part 上下发。
+                self.reasoning_start_options = provider_options.clone();
+                Vec::new()
+            }
+            StreamEvent::ReasoningDelta {
+                delta,
+                provider_options,
+                ..
+            } => {
+                let mut options = std::mem::take(&mut self.reasoning_start_options);
+                merge_provider_options(&mut options, provider_options.clone());
+                if delta.is_empty() && options.is_empty() {
+                    return Vec::new();
+                }
+                self.part_frame(ContentPart::Reasoning {
+                    text: delta.clone(),
+                    provider_options: options,
+                })
+            }
+            StreamEvent::ReasoningEnd { .. } => Vec::new(),
+            StreamEvent::ToolInputStart {
+                id,
+                tool_name,
+                provider_options,
+            } => {
+                self.open_tools.push(OpenToolCall {
+                    id: id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: String::new(),
+                    provider_options: provider_options.clone(),
+                });
+                Vec::new()
+            }
+            StreamEvent::ToolInputDelta { id, delta, .. } => {
+                if let Some(tool) = self.open_tools.iter_mut().find(|tool| tool.id == *id) {
+                    tool.arguments.push_str(delta);
+                }
+                Vec::new()
+            }
+            StreamEvent::ToolInputEnd { id, .. } => {
+                let Some(index) = self.open_tools.iter().position(|tool| tool.id == *id) else {
+                    return Vec::new();
+                };
+                let tool = self.open_tools.remove(index);
+                // 残缺参数收尾为 `{}`：functionCall.args 必须是对象。
+                let input = serde_json::from_str(&tool.arguments).unwrap_or_else(|_| json!({}));
+                self.part_frame(ContentPart::ToolCall {
+                    tool_call_id: tool.id,
+                    tool_name: tool.tool_name,
+                    input,
+                    provider_options: tool.provider_options,
+                })
+            }
+            StreamEvent::ToolCall {
+                tool_call_id,
+                tool_name,
+                input,
+                provider_options,
+            } => self.part_frame(ContentPart::ToolCall {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                input: input.clone(),
+                provider_options: provider_options.clone(),
+            }),
+            StreamEvent::Finish {
+                finish_reason,
+                usage,
+                ..
+            } => {
+                let mut candidate = Map::new();
+                candidate.insert(
+                    "finishReason".into(),
+                    json!(encode_finish_reason(finish_reason)),
+                );
+                candidate.insert("index".into(), json!(0));
+                let mut obj = Map::new();
+                obj.insert(
+                    "candidates".into(),
+                    Value::Array(vec![Value::Object(candidate)]),
+                );
+                obj.insert("usageMetadata".into(), encode_usage_metadata(usage));
+                self.attach_metadata(&mut obj);
+                vec![SseFrame::data(Value::Object(obj).to_string())]
+            }
+            // 流内错误以独立 `data:` 帧下发错误 JSON（与网关兜底错误帧同形状），
+            // 由调用方感知并终止流。
+            StreamEvent::Error { message } => vec![stream_error_frame(message)],
+        }
+    }
+
+    /// 把单个 IR part 编码为一条 chunk 帧；无法表达的 part（Custom）不产帧。
+    fn part_frame(&self, part: ContentPart) -> Vec<SseFrame> {
+        let Some(block) = encode_part(&part, &mut Vec::new()) else {
+            return Vec::new();
+        };
+        let mut obj = Map::new();
+        obj.insert(
+            "candidates".into(),
+            json!([{
+                "content": { "role": "model", "parts": [block] },
+                "index": 0,
+            }]),
+        );
+        self.attach_metadata(&mut obj);
+        vec![SseFrame::data(Value::Object(obj).to_string())]
+    }
+
+    /// 为 chunk 补响应元数据：`modelVersion`（别名覆盖）与 `responseId` 在
+    /// 已知时逐 chunk 携带，与官方流形状一致。
+    fn attach_metadata(&self, obj: &mut Map<String, Value>) {
+        let model = self.inbound_model.as_deref().unwrap_or(&self.model);
+        if !model.is_empty() {
+            obj.insert("modelVersion".into(), json!(model));
+        }
+        if !self.id.is_empty() {
+            obj.insert("responseId".into(), json!(self.id));
+        }
+    }
+}
+
+// ---- 错误编码 ----
+
+/// 流内错误的入站 SSE 帧（`data:` 纯帧，500 语义）。流式编码器消费 IR Error
+/// 事件与网关兜底路径共用，保证形状一致。
+pub fn stream_error_frame(message: &str) -> SseFrame {
+    SseFrame::data(
+        json!({ "error": { "code": 500, "message": message, "status": "INTERNAL" } }).to_string(),
+    )
+}
+
 // ---- 响应编码：IR → wire ----
 
 /// 编码 IR 响应为 generateContent 响应体。
@@ -1098,25 +1513,12 @@ pub fn encode_response(response: &ChatResponse) -> Value {
     );
     candidate.insert("index".into(), json!(0));
 
-    let mut usage = Map::new();
-    let cached = response.usage.cache_read_tokens;
-    let prompt = response.usage.input_tokens + cached + response.usage.cache_write_tokens;
-    usage.insert("promptTokenCount".into(), json!(prompt));
-    usage.insert(
-        "candidatesTokenCount".into(),
-        json!(response.usage.output_tokens),
-    );
-    usage.insert(
-        "totalTokenCount".into(),
-        json!(prompt + response.usage.output_tokens),
-    );
-    if cached > 0 {
-        usage.insert("cachedContentTokenCount".into(), json!(cached));
-    }
-
     let mut obj = Map::new();
     obj.insert("candidates".into(), json!([Value::Object(candidate)]));
-    obj.insert("usageMetadata".into(), Value::Object(usage));
+    obj.insert(
+        "usageMetadata".into(),
+        encode_usage_metadata(&response.usage),
+    );
     if !response.model.is_empty() {
         obj.insert("modelVersion".into(), json!(response.model));
     }
@@ -1125,6 +1527,23 @@ pub fn encode_response(response: &ChatResponse) -> Value {
     }
     if let Some(gateway) = crate::core::openai_chat::encode_warnings(&response.warnings) {
         obj.insert("gateway".into(), gateway);
+    }
+    Value::Object(obj)
+}
+
+/// IR 四分量 usage → `usageMetadata`（加法约定回写：`promptTokenCount` 含缓存）。
+fn encode_usage_metadata(usage: &Usage) -> Value {
+    let cached = usage.cache_read_tokens;
+    let prompt = usage.input_tokens + cached + usage.cache_write_tokens;
+    let mut obj = Map::new();
+    obj.insert("promptTokenCount".into(), json!(prompt));
+    obj.insert("candidatesTokenCount".into(), json!(usage.output_tokens));
+    obj.insert(
+        "totalTokenCount".into(),
+        json!(prompt + usage.output_tokens),
+    );
+    if cached > 0 {
+        obj.insert("cachedContentTokenCount".into(), json!(cached));
     }
     Value::Object(obj)
 }
@@ -1144,6 +1563,8 @@ fn encode_finish_reason(finish_reason: &FinishReason) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::testing::frames_to_snapshot;
+    use similar_asserts::assert_eq;
 
     /// 带思维链、媒体、工具轮与工具声明的完整请求（fixture 黄金样例）。
     fn fixture_request() -> Value {
@@ -1742,5 +2163,379 @@ mod tests {
         );
         assert_eq!(contents[1]["parts"][1]["text"], json!("明天呢？"));
         assert!(warnings.is_empty());
+    }
+
+    /// 流式 chunk 序列解码：元数据一次、思维链与正文块切换先收后开、
+    /// functionCall 展开为 tool-input 三事件、末 chunk 的 finishReason 触发
+    /// Finish 并携带累计 usage。
+    #[test]
+    fn stream_chunk_sequence_decodes_to_ir_events() {
+        let chunks = [
+            json!({
+                "candidates": [{ "content": { "role": "model", "parts": [
+                    { "text": "先想", "thought": true, "thoughtSignature": "sig_thought" }
+                ] }, "index": 0 }],
+                "responseId": "resp-1",
+                "modelVersion": "gemini-2.5-pro",
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 2 }
+            }),
+            json!({
+                "candidates": [{ "content": { "role": "model", "parts": [{ "text": "答案" }] }, "index": 0 }],
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5 }
+            }),
+            json!({
+                "candidates": [{ "content": { "role": "model", "parts": [
+                    { "functionCall": { "name": "get_weather", "args": { "city": "上海" } } }
+                ] }, "index": 0 }],
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 9 }
+            }),
+            json!({
+                "candidates": [{ "finishReason": "STOP", "index": 0 }],
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 12 }
+            }),
+        ];
+        let mut decoder = StreamDecoder::default();
+        let events: Vec<StreamEvent> = chunks
+            .iter()
+            .flat_map(|chunk| decoder.process(chunk).events)
+            .collect();
+
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ResponseMetadata {
+                    id: "resp-1".to_string(),
+                    model: "gemini-2.5-pro".to_string(),
+                },
+                StreamEvent::ReasoningStart {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::ReasoningDelta {
+                    id: "0".to_string(),
+                    delta: "先想".to_string(),
+                    provider_options: [(
+                        PROVIDER_KEY.to_string(),
+                        json!({ THOUGHT_SIGNATURE_KEY: "sig_thought" }),
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+                StreamEvent::ReasoningEnd {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::TextStart {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::TextDelta {
+                    id: "0".to_string(),
+                    delta: "答案".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::TextEnd {
+                    id: "0".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::ToolInputStart {
+                    id: stable_tool_call_id("get_weather", &json!({ "city": "上海" })),
+                    tool_name: "get_weather".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::ToolInputDelta {
+                    id: stable_tool_call_id("get_weather", &json!({ "city": "上海" })),
+                    delta: json!({ "city": "上海" }).to_string(),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::ToolInputEnd {
+                    id: stable_tool_call_id("get_weather", &json!({ "city": "上海" })),
+                    provider_options: HashMap::new(),
+                },
+                StreamEvent::Finish {
+                    finish_reason: FinishReason {
+                        unified: FinishReasonUnified::ToolCalls,
+                        raw: Some("STOP".to_string()),
+                    },
+                    usage: Usage {
+                        input_tokens: 10,
+                        output_tokens: 12,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                        raw: Some(json!({
+                            "promptTokenCount": 10,
+                            "candidatesTokenCount": 12,
+                        })),
+                    },
+                    provider_metadata: HashMap::new(),
+                },
+            ]
+        );
+    }
+
+    /// usage 逐 chunk 累计：中途出现不触发 Finish（不是流终止信号），
+    /// finishReason 触发 Finish，其后补达的 usage 终值再发一次 Finish。
+    #[test]
+    fn cumulative_usage_finishes_only_on_finish_reason() {
+        let mut decoder = StreamDecoder::default();
+        let mid_stream = decoder.process(&json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "a" }] } }],
+            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 1 }
+        }));
+        assert!(
+            !mid_stream
+                .events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::Finish { .. })),
+            "中途 usage 不应触发 Finish"
+        );
+
+        let finish = decoder.process(&json!({
+            "candidates": [{ "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 3 }
+        }));
+        let finish_event = finish
+            .events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Finish { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("finishReason chunk 应触发 Finish");
+        assert_eq!(finish_event.output_tokens, 3);
+
+        let trailing = decoder.process(&json!({
+            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5 }
+        }));
+        let final_usage = trailing
+            .events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Finish { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("补达的 usage 终值应再发一次 Finish");
+        assert_eq!(final_usage.output_tokens, 5, "第二次 Finish 携带终值");
+    }
+
+    /// 流内出现过 functionCall part 时，`STOP` 归 `ToolCalls`（与非流式同一
+    /// 规则，调用先于 finishReason 到达也要记住）。
+    #[test]
+    fn stop_after_function_call_finishes_as_tool_calls() {
+        let mut decoder = StreamDecoder::default();
+        decoder.process(&json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "functionCall": { "name": "get_weather", "args": {} } }
+            ] } }]
+        }));
+        let events = decoder
+            .process(&json!({ "candidates": [{ "finishReason": "STOP" }] }))
+            .events;
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Finish { finish_reason, .. }]
+                if finish_reason.unified == FinishReasonUnified::ToolCalls
+                    && finish_reason.raw.as_deref() == Some("STOP")
+        ));
+    }
+
+    /// IR 流事件编码为入站 chunk 帧。
+    ///
+    /// 快照锁住整条帧序列：开始/结束事件不产帧、工具参数缓冲到收尾整块成
+    /// part、思维链签名随 part 下发、别名覆盖 modelVersion、Finish chunk 携带
+    /// finishReason 与 usageMetadata，全程无事件名（Gemini 流无哨兵行）。
+    #[test]
+    fn stream_events_encode_to_gemini_frames() {
+        let mut encoder = StreamEncoder::new(Some("gemini-flash".to_string()));
+        let events = vec![
+            StreamEvent::StreamStart {
+                warnings: vec![Warning::unsupported("top_k", "已丢弃")],
+            },
+            StreamEvent::ResponseMetadata {
+                id: "resp-1".to_string(),
+                model: "gemini-2.5-flash".to_string(),
+            },
+            StreamEvent::ReasoningStart {
+                id: "0".to_string(),
+                provider_options: [(
+                    PROVIDER_KEY.to_string(),
+                    json!({ THOUGHT_SIGNATURE_KEY: "sig_thought" }),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            StreamEvent::ReasoningDelta {
+                id: "0".to_string(),
+                delta: "先想".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::ReasoningEnd {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextStart {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "0".to_string(),
+                delta: "答案".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextEnd {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::ToolInputStart {
+                id: "call_1".to_string(),
+                tool_name: "get_weather".to_string(),
+                provider_options: [(
+                    PROVIDER_KEY.to_string(),
+                    json!({ FUNCTION_CALL_ID_KEY: "call_1" }),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_1".to_string(),
+                delta: json!({ "city": "上海" }).to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::ToolInputEnd {
+                id: "call_1".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::Finish {
+                finish_reason: FinishReason {
+                    unified: FinishReasonUnified::Stop,
+                    raw: Some("STOP".to_string()),
+                },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 12,
+                    cache_read_tokens: 4,
+                    cache_write_tokens: 0,
+                    raw: None,
+                },
+                provider_metadata: HashMap::new(),
+            },
+        ];
+        let mut frames = Vec::new();
+        for event in &events {
+            frames.extend(encoder.encode(event));
+        }
+        insta::assert_json_snapshot!(frames_to_snapshot(&frames));
+    }
+
+    /// 流内错误编码：以独立 `data:` 帧下发 Gemini 错误形状（500 语义）。
+    #[test]
+    fn stream_error_event_encodes_to_error_frame() {
+        let mut encoder = StreamEncoder::default();
+        let frames = encoder.encode(&StreamEvent::Error {
+            message: "Overloaded".to_string(),
+        });
+        assert_eq!(frames, vec![stream_error_frame("Overloaded")]);
+        assert!(frames[0].event.is_none());
+        let body: Value = serde_json::from_str(&frames[0].data).expect("错误帧载荷应为 JSON");
+        assert_eq!(
+            body,
+            json!({ "error": { "code": 500, "message": "Overloaded", "status": "INTERNAL" } })
+        );
+    }
+
+    /// 同族流式往返：IR 事件 → chunk 帧 → 解码，得到等价的事件序列（工具
+    /// 调用 id 经逃生舱保留、签名随 part 往返、usage 加法/减法约定互逆）。
+    #[test]
+    fn stream_frames_decode_back_to_equivalent_events() {
+        let events = vec![
+            StreamEvent::ResponseMetadata {
+                id: "resp-1".to_string(),
+                model: "gemini-2.5-flash".to_string(),
+            },
+            StreamEvent::ReasoningStart {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::ReasoningDelta {
+                id: "0".to_string(),
+                delta: "先想".to_string(),
+                provider_options: [(
+                    PROVIDER_KEY.to_string(),
+                    json!({ THOUGHT_SIGNATURE_KEY: "sig_thought" }),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            StreamEvent::ReasoningEnd {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextStart {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "0".to_string(),
+                delta: "答案".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextEnd {
+                id: "0".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::ToolInputStart {
+                id: "call_1".to_string(),
+                tool_name: "get_weather".to_string(),
+                provider_options: [(
+                    PROVIDER_KEY.to_string(),
+                    json!({ FUNCTION_CALL_ID_KEY: "call_1" }),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            StreamEvent::ToolInputDelta {
+                id: "call_1".to_string(),
+                delta: json!({ "city": "上海" }).to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::ToolInputEnd {
+                id: "call_1".to_string(),
+                provider_options: HashMap::new(),
+            },
+            // 流内含 functionCall：`STOP` 按双轨规则归 `ToolCalls`（与非流式
+            // 解码同一规则），同族往返后两侧一致。
+            StreamEvent::Finish {
+                finish_reason: FinishReason {
+                    unified: FinishReasonUnified::ToolCalls,
+                    raw: Some("STOP".to_string()),
+                },
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 12,
+                    cache_read_tokens: 4,
+                    cache_write_tokens: 0,
+                    raw: None,
+                },
+                provider_metadata: HashMap::new(),
+            },
+        ];
+        let mut encoder = StreamEncoder::default();
+        let mut decoder = StreamDecoder::default();
+        let mut decoded = Vec::new();
+        for event in &events {
+            for frame in encoder.encode(event) {
+                let payload: Value =
+                    serde_json::from_str(&frame.data).expect("帧载荷应为合法 JSON");
+                decoded.extend(decoder.process(&payload).events);
+            }
+        }
+        // usage.raw 保留解码侧的原 wire 值（加法回写后的 usageMetadata），
+        // 不参与语义比较。
+        for event in &mut decoded {
+            if let StreamEvent::Finish { usage, .. } = event {
+                usage.raw = None;
+            }
+        }
+        assert_eq!(decoded, events, "同族往返应还原等价事件序列");
     }
 }
