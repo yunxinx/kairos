@@ -5,6 +5,7 @@
 
 pub mod anthropic_messages;
 pub mod billing;
+pub mod gemini;
 pub mod ir;
 pub mod openai_chat;
 pub mod openai_responses;

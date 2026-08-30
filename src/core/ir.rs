@@ -100,6 +100,9 @@ pub mod warning_feature {
     /// Anthropic 出站 tool 的 input_schema 已归一化改写（union 摊平、
     /// 非 object 根兜底等）。
     pub const INPUT_SCHEMA: &str = "input_schema";
+    /// 请求级并行工具调用开关在目标协议无承载字段（并行能力由协议缺省语义
+    /// 决定），已丢弃。
+    pub const PARALLEL_TOOL_CALLS: &str = "parallel_tool_calls";
     /// 请求级白名单外的顶层未知字段在目标协议无法表达，已丢弃。
     pub const UNKNOWN_FIELDS: &str = "unknown_fields";
     /// 缓存断点超过目标协议预算（Anthropic 上限 4 个），按 render order
@@ -714,6 +717,7 @@ mod tests {
             (warning_feature::TOOL_RESULT, "tool_result"),
             (warning_feature::TOOL_ARGUMENTS, "tool_arguments"),
             (warning_feature::INPUT_SCHEMA, "input_schema"),
+            (warning_feature::PARALLEL_TOOL_CALLS, "parallel_tool_calls"),
             (warning_feature::UNKNOWN_FIELDS, "unknown_fields"),
             (warning_feature::CACHE_BREAKPOINT, "cache_breakpoint"),
         ];
