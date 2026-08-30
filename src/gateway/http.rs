@@ -1071,171 +1071,106 @@ async fn dispatch_hop(
     request_id: &str,
     session_identity: &str,
 ) -> Response {
-    // 直通需全部候选渠道同协议：跨协议 failover 会向异协议渠道发原生字节，故此时回落 IR。
-    // 任一渠道命中别名、或统一模型成员名与入站名不同时也回落 IR：直通无法改写请求体模型名。
-    let passthrough = hop.route.channels.iter().all(|record| {
-        record.channel.protocol == inbound_protocol
-            && routing::outbound_model(&record.channel, &hop.routed_model) == request.model
-    });
-    if passthrough {
-        let passthrough_ctx = PassthroughCtx {
-            deps,
-            snapshot,
-            request,
-            routed_model: &hop.routed_model,
-            token,
-            started,
-            raw_body,
-            inbound_protocol,
-            request_body: request_body_for_log,
-            inbound_anthropic_version,
-            inbound_headers,
-            request_id,
-        };
-        return passthrough_with_failover(&passthrough_ctx, &hop.route).await;
-    }
-    outbound_with_failover(
+    let hop_ctx = HopCtx {
         deps,
         snapshot,
         request,
-        &hop.routed_model,
-        &hop.route,
+        routed_model: &hop.routed_model,
         token,
         started,
+        raw_body,
         inbound_protocol,
-        request_body_for_log,
+        request_body: request_body_for_log,
+        inbound_anthropic_version,
         inbound_headers,
         request_id,
         session_identity,
-    )
-    .await
+    };
+    hop_with_failover(&hop_ctx, &hop.route).await
 }
 
-/// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
+/// 一跳出站的共享上下文：出站目标、计费与日志所需的请求级信息。
 ///
-/// 每个候选渠道按其自身 `max_retries` 尝试（首试 + max_retries 次重试）；
-/// 渠道耗尽或请求须整体失败时切换到下一候选。剩余候选全失败或遇到不可
-/// 重试 4xx 时返回最终错误响应。成功时返回下游响应。
-#[allow(clippy::too_many_arguments)]
-async fn outbound_with_failover(
-    deps: &Deps,
-    snapshot: &Arc<RuntimeSnapshot>,
-    request: &ChatRequest,
-    routed_model: &str,
-    route: &routing::Route,
-    token: &Token,
-    started: i64,
-    inbound_protocol: Protocol,
-    request_body_for_log: Option<Bytes>,
-    inbound_headers: &HeaderMap,
-    request_id: &str,
-    session_identity: &str,
-) -> Response {
-    run_failover(
-        route,
-        routed_model,
-        |record, key| {
-            let record = record.clone();
-            let key = key.clone();
-            let request_body_for_log = request_body_for_log.clone();
-            Box::pin(async move {
-                let mut ctx = CallCtx {
-                    deps,
-                    snapshot,
-                    routed_model,
-                    token,
-                    price: billed_price(snapshot, &record, routed_model),
-                    started,
-                    inbound_protocol,
-                    request_body: request_body_for_log.clone(),
-                    inbound_headers,
-                    request_id,
-                    session_identity,
-                };
-                if request.stream {
-                    stream_completion(&mut ctx, request, &record.channel, &key, true).await
-                } else {
-                    non_stream_completion(&mut ctx, request, &record.channel, &key, true).await
-                }
-            })
-        },
-        |channel, status, _failover, body_wire, key_name| {
-            let outbound_model =
-                outbound_model_for_channel_name(route, channel, routed_model).map(str::to_string);
-            let channel = channel.to_string();
-            let channel_key = (!key_name.is_empty()).then(|| key_name.to_string());
-            let request_body = request_body_for_log.clone();
-            let response_body = snapshot.full_body.then(|| body_wire.to_vec());
-            let request_id = request_id.to_string();
-            Box::pin(async move {
-                let discount_bp = snapshot.discount_bp_for_token(token);
-                log_request(
-                    deps,
-                    token,
-                    &request.model,
-                    outbound_model.as_deref(),
-                    &channel,
-                    channel_key.as_deref(),
-                    status,
-                    started,
-                    Billing {
-                        discount_bp,
-                        request_body,
-                        response_body,
-                        ..Default::default()
-                    },
-                    inbound_protocol,
-                    &request_id,
-                )
-                .await;
-            })
-        },
-        inbound_protocol,
-        retry_backoff(snapshot),
-    )
-    .await
-}
-
-/// 直通快路径的请求侧共享上下文：出站目标、计费与日志所需的请求级信息。
-///
-/// 打包 `passthrough_*_completion` 的公共参数，避免过长参数列表。`raw_body`
-/// 用于出站请求的目标性补丁。
-struct PassthroughCtx<'a> {
+/// 直通与 IR 两条出站路径共用；`raw_body` 是入站原始字节，仅直通路径用作
+/// 出站请求体（施加目标性补丁），IR 路径从请求 IR 重编码。
+struct HopCtx<'a> {
     deps: &'a Deps,
     /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
     snapshot: &'a Arc<RuntimeSnapshot>,
     request: &'a ChatRequest,
-    /// 本跳出站用的已登记模型名（统一模型时为成员）。
+    /// 本跳出站用的已登记模型名（统一模型时为成员，否则同入站名）。
     routed_model: &'a str,
     token: &'a Token,
     started: i64,
     raw_body: &'a [u8],
-    /// 入站 wire 协议（直通时与出站同协议）。
+    /// 入站 wire 协议：响应重编码与错误格式按此分派。
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
     /// 直通时转发下游的 `anthropic-version`；缺省则出站用官方默认。
     inbound_anthropic_version: Option<&'a HeaderValue>,
     inbound_headers: &'a HeaderMap,
     request_id: &'a str,
+    /// 解析出的会话标识原文（显式头优先、前缀哈希兜底），供会话缓存键回写。
+    session_identity: &'a str,
 }
 
-/// 直通快路径：按渠道路由顺序发起同协议出站调用，遇可重试错误自动 failover。
+impl<'a> HopCtx<'a> {
+    /// 单渠道的路径判定：协议与入站一致且出站名与入站名相同才可字节直通
+    /// （直通无法改写请求体模型名）；其余渠道走 IR 编码路径。
+    fn channel_is_passthrough(&self, record: &ChannelRecord) -> bool {
+        record.channel.protocol == self.inbound_protocol
+            && routing::outbound_model(&record.channel, self.routed_model) == self.request.model
+    }
+}
+
+/// 一跳出站：路径选择下沉到单渠道——同协议且出站名一致的渠道字节直通，
+/// 其余渠道按 IR 编码，混合协议候选互不拖累。
 ///
-/// 与 IR 路径的 failover 语义一致（共用 [`run_failover`]）：可重试错误（网络
-/// 错误/429/5xx）在首字节之前切换下一渠道重试；不可重试 4xx 直接返回。快路径
-/// 同样不免认证与计费（已在准入阶段完成）。
-async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Route) -> Response {
+/// 两路径共享同一套 failover/日志/结算设施：可重试错误（网络错误/429/5xx）
+/// 在首字节之前切换下一渠道（按接手渠道各自判定路径）；不可重试 4xx 直接
+/// 返回。快路径同样不免认证与计费（已在准入阶段完成）。
+async fn hop_with_failover(ctx: &HopCtx<'_>, route: &routing::Route) -> Response {
     run_failover(
         route,
         ctx.routed_model,
         |record, key| {
+            let passthrough = ctx.channel_is_passthrough(record);
             let record = record.clone();
             let key = key.clone();
             Box::pin(async move {
-                if ctx.request.stream {
-                    passthrough_stream_completion(ctx, &record, &key).await
+                if passthrough {
+                    if ctx.request.stream {
+                        passthrough_stream_completion(ctx, &record, &key).await
+                    } else {
+                        passthrough_non_stream_completion(ctx, &record, &key).await
+                    }
                 } else {
-                    passthrough_non_stream_completion(ctx, &record, &key).await
+                    let mut call_ctx = CallCtx {
+                        deps: ctx.deps,
+                        snapshot: ctx.snapshot,
+                        routed_model: ctx.routed_model,
+                        token: ctx.token,
+                        price: billed_price(ctx.snapshot, &record, ctx.routed_model),
+                        started: ctx.started,
+                        inbound_protocol: ctx.inbound_protocol,
+                        request_body: ctx.request_body.clone(),
+                        inbound_headers: ctx.inbound_headers,
+                        request_id: ctx.request_id,
+                        session_identity: ctx.session_identity,
+                    };
+                    if ctx.request.stream {
+                        stream_completion(&mut call_ctx, ctx.request, &record.channel, &key, true)
+                            .await
+                    } else {
+                        non_stream_completion(
+                            &mut call_ctx,
+                            ctx.request,
+                            &record.channel,
+                            &key,
+                            true,
+                        )
+                        .await
+                    }
                 }
             })
         },
@@ -1248,6 +1183,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
             let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = ctx.request_id.to_string();
             Box::pin(async move {
+                let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
                 log_request(
                     ctx.deps,
                     ctx.token,
@@ -1258,7 +1194,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
                     status,
                     ctx.started,
                     Billing {
-                        discount_bp: ctx.snapshot.discount_bp_for_token(ctx.token),
+                        discount_bp,
                         request_body,
                         response_body,
                         ..Default::default()
@@ -1281,7 +1217,7 @@ async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Ro
 /// Anthropic 无需补丁），响应以字节流直通到下游，不做完整解码。流结束后按嗅探
 /// 累积的 usage 结算并落日志。渠道 timeout 只约束到响应头。
 async fn passthrough_stream_completion(
-    ctx: &PassthroughCtx<'_>,
+    ctx: &HopCtx<'_>,
     record: &ChannelRecord,
     key: &StoredChannelKey,
 ) -> Outbound {
@@ -1393,7 +1329,7 @@ async fn passthrough_stream_completion(
 /// 请求体仅做目标性补丁（OpenAI 流式注入 stream_options；Anthropic 无需），
 /// 响应体原样返回，不做完整解码。
 async fn passthrough_non_stream_completion(
-    ctx: &PassthroughCtx<'_>,
+    ctx: &HopCtx<'_>,
     record: &ChannelRecord,
     key: &StoredChannelKey,
 ) -> Outbound {

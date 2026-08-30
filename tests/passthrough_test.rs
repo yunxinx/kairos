@@ -436,65 +436,89 @@ async fn cross_protocol_falls_back_to_ir_path() {
     );
 }
 
-/// 混合协议候选渠道：首渠道同协议、failover 候选为异协议时，整体回落 IR 完整
-/// 路径（直通不能向异协议渠道发原生字节），出站请求体不注入直通补丁。
-#[tokio::test]
-async fn mixed_protocol_route_falls_back_to_ir_path() {
-    let (_gw, mut upstreams) = TestGateway::start_with_multi(2, |bases| {
-        let mut seed = common::test_seed(&bases[0]);
-        // 首渠道 openai_chat（同入站协议），failover 候选为 openai_responses（异协议）。
-        seed.channels = vec![
-            Channel {
-                name: "same-protocol".to_string(),
-                protocol: config::Protocol::OpenAiChat,
-                base_url: bases[0].clone(),
-                keys: vec![kairos::store::resources::ChannelKey {
-                    name: "default".to_string(),
-                    api_key: "k".to_string(),
-                    weight: 1,
-                    enabled: true,
-                    models: None,
-                    blocked_models: None,
-                }],
-                models: vec![TEST_MODEL.to_string()],
-                model_aliases: Default::default(),
-                timeout_ms: 1000,
-                max_retries: 0,
-                enabled: true,
-                model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
-                reasoning_output: Default::default(),
-                session_cache_key: Default::default(),
-                injects_cache_breakpoints: false,
-            },
-            Channel {
-                name: "cross-protocol".to_string(),
-                protocol: config::Protocol::OpenAiResponses,
-                base_url: bases[1].clone(),
-                keys: vec![kairos::store::resources::ChannelKey {
-                    name: "default".to_string(),
-                    api_key: "k".to_string(),
-                    weight: 1,
-                    enabled: true,
-                    models: None,
-                    blocked_models: None,
-                }],
-                models: vec![TEST_MODEL.to_string()],
-                model_aliases: Default::default(),
-                timeout_ms: 1000,
-                max_retries: 0,
-                enabled: true,
-                model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
-                reasoning_output: Default::default(),
-                session_cache_key: Default::default(),
-                injects_cache_breakpoints: false,
-            },
-        ];
-        seed
-    })
-    .await;
+/// 单密钥渠道，其余字段沿用测试默认。
+fn channel_of(name: &str, protocol: config::Protocol, base_url: &str) -> Channel {
+    Channel {
+        name: name.to_string(),
+        protocol,
+        base_url: base_url.to_string(),
+        keys: vec![kairos::store::resources::ChannelKey {
+            name: "default".to_string(),
+            api_key: "k".to_string(),
+            weight: 1,
+            enabled: true,
+            models: None,
+            blocked_models: None,
+        }],
+        models: vec![TEST_MODEL.to_string()],
+        model_aliases: Default::default(),
+        timeout_ms: 1000,
+        max_retries: 0,
+        enabled: true,
+        model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+        reasoning_output: Default::default(),
+        session_cache_key: Default::default(),
+        injects_cache_breakpoints: false,
+    }
+}
 
+/// 混合协议候选（首渠道 openai_chat、次渠道 openai_responses）。
+fn mixed_channel_seed(bases: &[String]) -> common::Seed {
+    let mut seed = common::test_seed(&bases[0]);
+    seed.channels = vec![
+        channel_of("same-protocol", config::Protocol::OpenAiChat, &bases[0]),
+        channel_of(
+            "cross-protocol",
+            config::Protocol::OpenAiResponses,
+            &bases[1],
+        ),
+    ];
+    seed
+}
+
+/// 混合协议候选（首渠道 openai_responses、次渠道 openai_chat）。
+fn mixed_channel_seed_reversed(bases: &[String]) -> common::Seed {
+    let mut seed = common::test_seed(&bases[0]);
+    seed.channels = vec![
+        channel_of(
+            "cross-protocol",
+            config::Protocol::OpenAiResponses,
+            &bases[0],
+        ),
+        channel_of("same-protocol", config::Protocol::OpenAiChat, &bases[1]),
+    ];
+    seed
+}
+
+/// 路径哨兵：显式 `temperature: null`。字节直通原样保留该键，IR 重编码后
+/// `temperature` 为 `None`、出站体不再携带——借此区分渠道实际走了哪条路径。
+fn body_with_path_sentinel() -> Value {
+    json!({
+        "model": TEST_MODEL,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "temperature": null,
+    })
+}
+
+/// Responses 上游的非流式成功响应。
+fn responses_ok() -> Value {
+    json!({
+        "id": "resp_01m", "object": "response", "status": "completed", "model": TEST_MODEL,
+        "output": [
+            { "id": "msg_1", "type": "message", "role": "assistant",
+              "content": [ { "type": "output_text", "text": "ok", "annotations": [] } ] }
+        ],
+        "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+    })
+}
+
+/// 混合协议候选：同协议首渠道命中时该渠道字节直通（`temperature: null` 哨兵
+/// 原样到达），异协议候选不再拖累整条路由退回 IR。
+#[tokio::test]
+async fn mixed_protocol_route_passthroughs_same_protocol_channel() {
+    let (gw, mut upstreams) = TestGateway::start_with_multi(2, mixed_channel_seed).await;
     upstreams[0].set_behavior(UpstreamBehavior::Json(json!({
-        "id": "chatcmpl-m", "object": "chat.completion", "model": "gpt-4o",
+        "id": "chatcmpl-m", "object": "chat.completion", "model": TEST_MODEL,
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
                      "logprobs": null, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
@@ -502,23 +526,234 @@ async fn mixed_protocol_route_falls_back_to_ir_path() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{}/v1/chat/completions", _gw.base_url()))
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&body_with_path_sentinel())
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+
+    let received = upstreams[0].received();
+    assert_eq!(received.len(), 1, "只有首渠道出场");
+    assert_eq!(
+        received[0].get("temperature"),
+        Some(&Value::Null),
+        "同协议渠道应走字节直通，哨兵字段原样保留"
+    );
+    assert!(
+        upstreams[1].received().is_empty(),
+        "首渠道命中时异协议候选不应被调用"
+    );
+}
+
+/// 混合协议候选 failover：同协议首渠道可重试失败后，异协议候选接手走 IR
+/// 编码路径，下游收到入站协议形状的成功响应。
+#[tokio::test]
+async fn mixed_protocol_route_falls_over_to_ir_for_cross_protocol_channel() {
+    let (gw, mut upstreams) = TestGateway::start_with_multi(2, mixed_channel_seed).await;
+    upstreams[0].set_behavior(UpstreamBehavior::Status429);
+    upstreams[1].set_behavior(UpstreamBehavior::Json(responses_ok()));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&body_with_path_sentinel())
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+
+    // 首渠道收到直通字节（含哨兵），接手渠道收到 IR 重编码的 Responses 出站体。
+    let first = upstreams[0].received();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].get("temperature"), Some(&Value::Null));
+    let second = upstreams[1].received();
+    assert_eq!(second.len(), 1);
+    assert!(
+        second[0].get("input").is_some() && second[0].get("messages").is_none(),
+        "异协议接手渠道应收到 Responses 形状的 IR 出站体: {second:?}"
+    );
+    assert!(
+        second[0].get("temperature").is_none(),
+        "IR 路径应丢弃哨兵字段（temperature 为 None 不出站）"
+    );
+}
+
+/// 反序候选：异协议渠道在前走 IR，同协议渠道在后仍字节直通——路径判定
+/// 逐渠道独立，与候选顺序无关。
+#[tokio::test]
+async fn reversed_mixed_route_passes_through_later_same_protocol_channel() {
+    let (gw, mut upstreams) = TestGateway::start_with_multi(2, mixed_channel_seed_reversed).await;
+    upstreams[0].set_behavior(UpstreamBehavior::Status429);
+    upstreams[1].set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-r", "object": "chat.completion", "model": TEST_MODEL,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&body_with_path_sentinel())
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let first = upstreams[0].received();
+    assert_eq!(first.len(), 1);
+    assert!(
+        first[0].get("input").is_some(),
+        "异协议首渠道应走 IR 编码路径"
+    );
+    let second = upstreams[1].received();
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0].get("temperature"),
+        Some(&Value::Null),
+        "靠后的同协议渠道仍应字节直通"
+    );
+}
+
+/// 混合路径候选：同协议直通渠道在前、同协议命中别名的渠道在后（别名改写
+/// 出站模型名，只能走 IR）。首渠道 429 后由别名渠道接手，出站模型重写为
+/// 别名真名，且直通渠道的哨兵不被拖累。
+#[tokio::test]
+async fn alias_channel_in_mixed_route_takes_ir_path() {
+    let (gw, mut upstreams) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        // 首渠道：名单含入站短名 fast，无别名，出站名与入站名一致 → 直通。
+        let mut first = channel_of(
+            "passthrough-channel",
+            config::Protocol::OpenAiChat,
+            &bases[0],
+        );
+        first.models = vec!["fast".to_string()];
+        // 接手渠道：别名 fast → gpt-4o-mini，出站名与入站名不同 → IR。
+        let mut second = channel_of("alias-channel", config::Protocol::OpenAiChat, &bases[1]);
+        second.models = vec!["gpt-4o-mini".to_string()];
+        second.model_aliases = [("fast".to_string(), "gpt-4o-mini".to_string())]
+            .into_iter()
+            .collect();
+        seed.channels = vec![first, second];
+        seed
+    })
+    .await;
+    upstreams[0].set_behavior(UpstreamBehavior::Status429);
+    upstreams[1].set_behavior(UpstreamBehavior::Json(json!({
+        "id": "chatcmpl-a", "object": "chat.completion", "model": "gpt-4o-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                     "logprobs": null, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
         .bearer_auth(TEST_TOKEN_KEY)
         .json(&json!({
-            "model": TEST_MODEL,
-            "messages": [{ "role": "user", "content": "hi" }]
+            "model": "fast",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "temperature": null,
         }))
         .send()
         .await
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 首渠道收到出站请求，且为 IR 完整路径（不注入直通补丁）。
-    let received = upstreams[0].received();
-    assert_eq!(received.len(), 1);
+    let first = upstreams[0].received();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].get("temperature"), Some(&Value::Null));
+    let second = upstreams[1].received();
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0]["model"], "gpt-4o-mini",
+        "别名渠道接手应重写出站模型名"
+    );
     assert!(
-        received[0].get("stream_options").is_none(),
-        "混合协议路由应回落 IR 路径，不应注入直通补丁"
+        second[0].get("temperature").is_none(),
+        "别名渠道应走 IR 路径（哨兵被重编码丢弃）"
+    );
+}
+
+/// 混合协议候选的流式 failover：同协议首渠道（流式直通尝试，哨兵保留）429
+/// 后，异协议渠道接手走 IR 流式路径，下游收到入站协议的 chunk 流。
+#[tokio::test]
+async fn mixed_protocol_stream_falls_over_to_ir() {
+    let (gw, mut upstreams) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = mixed_channel_seed(bases);
+        seed.channels[1].protocol = config::Protocol::AnthropicMessages;
+        seed
+    })
+    .await;
+    upstreams[0].set_behavior(UpstreamBehavior::Status429);
+    upstreams[1].set_behavior(UpstreamBehavior::Sse(vec![
+        json!({
+            "type": "message_start",
+            "message": { "id": "msg_01s", "model": TEST_MODEL, "usage": { "input_tokens": 10, "output_tokens": 0 } }
+        })
+        .to_string(),
+        json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": { "type": "text", "text": "" }
+        })
+        .to_string(),
+        json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": { "type": "text_delta", "text": "ok" }
+        })
+        .to_string(),
+        json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+            "usage": { "input_tokens": 10, "output_tokens": 2 }
+        })
+        .to_string(),
+    ]));
+
+    let client = reqwest::Client::new();
+    let mut body = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "temperature": null,
+        }))
+        .send()
+        .await
+        .expect("应能请求网关")
+        .bytes_stream();
+    let mut raw = Vec::new();
+    while let Some(chunk) = body.next().await {
+        raw.extend_from_slice(&chunk.expect("流分块应可读"));
+    }
+    let text = String::from_utf8(raw).expect("SSE 流应为 UTF-8");
+    assert!(
+        text.contains("chat.completion.chunk") && text.contains("ok"),
+        "下游应收到入站协议的 chunk 流: {text}"
+    );
+
+    // 首渠道的直通尝试（哨兵保留），接手渠道收到 Anthropic 形状的流式出站体。
+    let first = upstreams[0].received();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].get("temperature"), Some(&Value::Null));
+    let second = upstreams[1].received();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0]["stream"], true, "IR 流式路径应强制 stream");
+    assert!(
+        second[0].get("stream_options").is_none(),
+        "Anthropic 出站不应携带 chat 专属补丁"
     );
 }
 
