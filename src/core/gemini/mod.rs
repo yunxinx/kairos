@@ -135,9 +135,9 @@ struct WirePart {
     #[serde(default, alias = "thought_signature")]
     thought_signature: Option<String>,
     #[serde(default, alias = "inline_data")]
-    inline_data: Option<WireInlineData>,
+    inline_data: Option<WireInlineMedia>,
     #[serde(default, alias = "file_data")]
-    file_data: Option<WireFileData>,
+    file_data: Option<WireFileReference>,
     #[serde(default, alias = "function_call")]
     function_call: Option<WireFunctionCall>,
     #[serde(default, alias = "function_response")]
@@ -146,7 +146,7 @@ struct WirePart {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WireInlineData {
+struct WireInlineMedia {
     #[serde(default, alias = "mime_type")]
     mime_type: Option<String>,
     #[serde(default)]
@@ -155,7 +155,7 @@ struct WireInlineData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WireFileData {
+struct WireFileReference {
     #[serde(default, alias = "mime_type")]
     mime_type: Option<String>,
     #[serde(default, alias = "file_uri")]

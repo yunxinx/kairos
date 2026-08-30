@@ -289,6 +289,21 @@ async fn create_price(
     crate::store::resources::upsert_price(&mut tx, &price)
         .await
         .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "prices",
+        &store::SystemLogEvent::new(
+            "prices.created",
+            serde_json::json!({
+                "channel_id": price.channel_id,
+                "model": price.model,
+            }),
+            format!("创建价格 渠道 {} / {}", price.channel_id, price.model),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_price(&deps, price.channel_id, &price.model).await?;
@@ -307,15 +322,35 @@ async fn update_price(
     price.channel_id = channel_id;
     price.model = model;
     validate_price(&price)?;
-    {
+    let previous = {
         let snapshot = deps.snapshot.read().await;
         reject_unknown_price_channel(&snapshot, price.channel_id)?;
         reject_unlisted_price_callable(&snapshot, price.channel_id, &price.model)?;
-    }
+        snapshot
+            .price_for_channel(price.channel_id, &price.model)
+            .cloned()
+    };
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_price(&mut tx, &price)
         .await
         .map_err(AdminError::Store)?;
+    if previous.as_ref() != Some(&price) {
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "prices",
+            &store::SystemLogEvent::new(
+                "prices.updated",
+                serde_json::json!({
+                    "channel_id": price.channel_id,
+                    "model": price.model,
+                }),
+                format!("修改价格 渠道 {} / {}", price.channel_id, price.model),
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_price(&deps, price.channel_id, &price.model).await?;
@@ -334,6 +369,18 @@ async fn delete_price(
     crate::store::resources::delete_price(&mut tx, channel_id, &model)
         .await
         .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "prices",
+        &store::SystemLogEvent::new(
+            "prices.deleted",
+            serde_json::json!({ "channel_id": channel_id, "model": model }),
+            format!("删除价格 渠道 {channel_id} / {model}"),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(deleted))
@@ -375,6 +422,18 @@ async fn create_model_group(
     crate::store::resources::upsert_model_group(&mut tx, &group)
         .await
         .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "model_groups",
+        &store::SystemLogEvent::new(
+            "model_groups.created",
+            serde_json::json!({ "name": group.name }),
+            format!("创建模型组 {}", group.name),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_model_group(&deps, &group.name).await?;
@@ -391,20 +450,33 @@ async fn update_model_group(
     identity.require_capability(ManagementCapability::EditModelGroups)?;
     let mut group = body.map_err(AdminError::bad_body)?;
     group.name = name;
-    {
+    let previous = {
         let snapshot = deps.snapshot.read().await;
         normalize_model_group(&mut group, &snapshot)?;
-        if !snapshot.model_groups.contains_key(&group.name) {
-            return Err(AdminError::NotFound(format!(
-                "模型组 {} 不存在",
-                group.name
-            )));
-        }
-    }
+        snapshot
+            .model_groups
+            .get(&group.name)
+            .cloned()
+            .ok_or_else(|| AdminError::NotFound(format!("模型组 {} 不存在", group.name)))?
+    };
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_model_group(&mut tx, &group)
         .await
         .map_err(AdminError::Store)?;
+    if previous != *group {
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "model_groups",
+            &store::SystemLogEvent::new(
+                "model_groups.updated",
+                serde_json::json!({ "name": group.name }),
+                format!("修改模型组 {}", group.name),
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_model_group(&deps, &group.name).await?;
@@ -429,6 +501,18 @@ async fn delete_model_group(
     crate::store::resources::delete_model_group(&mut tx, &name)
         .await
         .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "model_groups",
+        &store::SystemLogEvent::new(
+            "model_groups.deleted",
+            serde_json::json!({ "name": name }),
+            format!("删除模型组 {name}"),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(deleted))
@@ -465,6 +549,18 @@ async fn delete_model_groups(
             .await
             .map_err(AdminError::Store)?;
     }
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "model_groups",
+        &store::SystemLogEvent::new(
+            "model_groups.bulk_deleted",
+            serde_json::json!({ "names": targets.clone() }),
+            format!("批量删除模型组：{}", targets.join("、")),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(BulkDeleteResult::new(targets)))
@@ -474,7 +570,7 @@ async fn delete_model_groups(
 
 /// 列出全部统一模型（按 `id` 排序，保证确定性）。
 ///
-/// 读视图带 `available`：渠道已删/停用/不再登记该名时为 false，写契约不含此字段。
+/// 读视图带 `available`：成员渠道需启用、登记该名、已定价且有可用密钥；写契约不含此字段。
 async fn list_unified_models(
     State(deps): State<AdminDeps>,
 ) -> Result<Json<Vec<UnifiedModelView>>, AdminError> {
@@ -517,6 +613,18 @@ async fn create_unified_model(
     crate::store::resources::upsert_unified_model(&mut tx, &model)
         .await
         .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "unified_models",
+        &store::SystemLogEvent::new(
+            "unified_models.created",
+            serde_json::json!({ "id": model.id }),
+            format!("创建统一模型 {}", model.id),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_unified_model(&deps, &model.id).await?;
@@ -533,15 +641,14 @@ async fn update_unified_model(
     identity.require_capability(ManagementCapability::EditUnifiedModels)?;
     let mut model = body.map_err(AdminError::bad_body)?;
     model.id = id;
-    {
+    let previous = {
         let snapshot = deps.snapshot.read().await;
         normalize_unified_model(&mut model, &snapshot)?;
-        if !snapshot.unified_models.contains_key(&model.id) {
-            return Err(AdminError::NotFound(format!(
-                "统一模型 {} 不存在",
-                model.id
-            )));
-        }
+        let previous = snapshot
+            .unified_models
+            .get(&model.id)
+            .cloned()
+            .ok_or_else(|| AdminError::NotFound(format!("统一模型 {} 不存在", model.id)))?;
         reject_unhidden_unified_collision(
             &snapshot.channels,
             None,
@@ -549,11 +656,26 @@ async fn update_unified_model(
             snapshot.unified_models.values(),
             Some(&model),
         )?;
-    }
+        previous
+    };
     let mut tx = deps.pool.begin().await.map_err(db_err)?;
     crate::store::resources::upsert_unified_model(&mut tx, &model)
         .await
         .map_err(AdminError::Store)?;
+    if previous != *model {
+        store::record_audit(
+            &mut tx,
+            identity.actor(),
+            "unified_models",
+            &store::SystemLogEvent::new(
+                "unified_models.updated",
+                serde_json::json!({ "id": model.id }),
+                format!("修改统一模型 {}", model.id),
+            ),
+        )
+        .await
+        .map_err(AdminError::Store)?;
+    }
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_unified_model(&deps, &model.id).await?;
@@ -572,6 +694,18 @@ async fn delete_unified_model(
     crate::store::resources::delete_unified_model(&mut tx, &id)
         .await
         .map_err(AdminError::Store)?;
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "unified_models",
+        &store::SystemLogEvent::new(
+            "unified_models.deleted",
+            serde_json::json!({ "id": id }),
+            format!("删除统一模型 {id}"),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(deleted))
@@ -599,6 +733,18 @@ async fn delete_unified_models(
             .await
             .map_err(AdminError::Store)?;
     }
+    store::record_audit(
+        &mut tx,
+        identity.actor(),
+        "unified_models",
+        &store::SystemLogEvent::new(
+            "unified_models.bulk_deleted",
+            serde_json::json!({ "ids": targets.clone() }),
+            format!("批量删除统一模型：{}", targets.join("、")),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     Ok(Json(BulkDeleteResult::new(targets)))
@@ -711,7 +857,7 @@ fn unified_model_view(
                 available: member_is_available(snapshot, member),
             })
             .collect(),
-        hide: model.hide,
+        hide: model.is_hidden,
     }
 }
 
@@ -720,6 +866,10 @@ fn member_is_available(snapshot: &crate::runtime::RuntimeSnapshot, member: &Unif
         record.id == member.channel_id
             && record.channel.enabled
             && channel_lists_callable(&record.channel, &member.model)
+            && snapshot
+                .price_for_channel(record.id, &member.model)
+                .is_some()
+            && crate::store::channel_keys::channel_has_eligible_key(&record.keys, &member.model)
     })
 }
 
@@ -853,8 +1003,11 @@ pub(super) fn reject_unhidden_unified_collision<'a>(
         models.push(model);
     }
     for model in models {
-        if crate::store::resources::unhidden_unified_id_collides(&model.id, model.hide, &registered)
-        {
+        if crate::store::resources::unhidden_unified_id_collides(
+            &model.id,
+            model.is_hidden,
+            &registered,
+        ) {
             return Err(AdminError::Conflict(format!(
                 "统一模型 {} 与已登记模型或别名同名且未隐藏。开隐藏则该名只表示统一模型，否则请换 ID",
                 model.id

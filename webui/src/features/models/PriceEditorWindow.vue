@@ -99,6 +99,7 @@ const saveMutation = useMutation({
   onSuccess: async () => {
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
+    await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },
   onError: (err) => {
     error(extractApiError(err).message);

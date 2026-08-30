@@ -69,7 +69,7 @@ const RETRY_JITTER_MAX: f64 = 1.2;
 /// 有 `Retry-After` 时用其值（仍受 `after_cap` 封顶），不加抖动——那是上游指定的
 /// 等待。无则走指数退避，并施加 ±20% 抖动，避免 429 恢复瞬间所有在途重试同拍。
 pub(super) fn retry_delay(
-    attempt_no: usize,
+    attempt_no: u32,
     retry_after: Option<Duration>,
     backoff: RetryBackoff,
 ) -> Duration {
@@ -80,8 +80,8 @@ pub(super) fn retry_delay(
 }
 
 /// 无抖动的指数退避：`base * 2^attempt`，封顶 `cap`。
-fn exponential_delay(attempt_no: usize, backoff: RetryBackoff) -> Duration {
-    let shift = u32::try_from(attempt_no).unwrap_or(u32::MAX).min(16);
+fn exponential_delay(attempt_no: u32, backoff: RetryBackoff) -> Duration {
+    let shift = attempt_no.min(16);
     backoff.base.saturating_mul(1u32 << shift).min(backoff.cap)
 }
 
@@ -140,8 +140,7 @@ where
             continue;
         }
         let mut rotation = KeyRotation::new(pool);
-        let max_attempts = (record.channel.max_retries + 1) as usize;
-        let mut attempt_no = 0usize;
+        let mut retries_used = 0u32;
 
         loop {
             rotation.mark_attempted();
@@ -199,17 +198,17 @@ where
                     if matches!(advanced, Rotation::Fresh) {
                         continue;
                     }
-                    attempt_no += 1;
                     last_failure = Some(FinalFailure {
                         channel,
                         status,
                         message,
                         key_name: key.name.clone(),
                     });
-                    if attempt_no >= max_attempts {
+                    if retries_used >= record.channel.max_retries {
                         break;
                     }
-                    tokio::time::sleep(retry_delay(attempt_no - 1, retry_after, backoff)).await;
+                    tokio::time::sleep(retry_delay(retries_used, retry_after, backoff)).await;
+                    retries_used += 1;
                 }
             }
         }

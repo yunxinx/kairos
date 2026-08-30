@@ -310,3 +310,76 @@ async fn settling_unsettled_log_is_audited() {
         "补扣应记费用，实际:\n{joined}"
     );
 }
+
+/// 价格、模型组和统一模型的变更也应进入同一套操作者审计流。
+#[tokio::test]
+async fn model_resource_mutations_are_audited() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channels: Value = admin_get(&gw, &gw.session, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let channel_id = channels[0]["id"].as_i64().expect("应有渠道 id");
+
+    let price = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/prices/{channel_id}/{}", common::TEST_MODEL),
+        json!({
+            "channel_id": channel_id,
+            "model": common::TEST_MODEL,
+            "input_micros": 2_500_000,
+            "output_micros": 10_000_000,
+            "cache_read_micros": null,
+            "cache_write_micros": null,
+            "cache_write_1h_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(price.status(), StatusCode::OK);
+
+    let group = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({
+            "name": "audited-models",
+            "models": [{ "kind": "source", "channel_id": channel_id, "model": common::TEST_MODEL }]
+        }),
+    )
+    .await;
+    assert_eq!(group.status(), StatusCode::CREATED);
+
+    let unified = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/unified-models",
+        json!({
+            "id": "audited-unified",
+            "models": [{ "channel_id": channel_id, "model": common::TEST_MODEL }],
+            "hide": false
+        }),
+    )
+    .await;
+    assert_eq!(unified.status(), StatusCode::CREATED);
+
+    let joined: String = audit_rows(&gw)
+        .await
+        .iter()
+        .map(|(target, message, _)| format!("{target}|{message}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("prices|修改价格"), "改价应留痕：{joined}");
+    assert!(
+        joined.contains("model_groups|创建模型组"),
+        "建组应留痕：{joined}"
+    );
+    assert!(
+        joined.contains("unified_models|创建统一模型"),
+        "建统一模型应留痕：{joined}"
+    );
+}

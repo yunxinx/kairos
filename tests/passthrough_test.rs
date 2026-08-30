@@ -168,6 +168,93 @@ async fn stream_passthrough_forwards_and_bills_usage() {
     assert_eq!(row.4, 4250, "日志应记录费用 4250");
 }
 
+/// 同协议直通在首帧前遇到上游流内错误时，应在下游收到响应头前切换渠道。
+#[tokio::test]
+async fn stream_passthrough_fails_over_on_pre_first_error() {
+    fn anthropic_channels(bases: &[String]) -> common::Seed {
+        let mut seed = common::test_seed(&bases[0]);
+        seed.channels = bases
+            .iter()
+            .enumerate()
+            .map(|(index, base)| {
+                let mut channel = seed.channels[0].clone();
+                channel.name = format!("anthropic-{index}");
+                channel.protocol = config::Protocol::AnthropicMessages;
+                channel.base_url = base.clone();
+                channel
+            })
+            .collect();
+        seed
+    }
+
+    let (gw, mut upstreams) = TestGateway::start_with_multi(2, anthropic_channels).await;
+    upstreams[0].set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "type": "message_start",
+            "message": { "type": "message", "role": "assistant", "id": "msg-1", "model": TEST_MODEL, "content": [] }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "error",
+            "error": { "type": "overloaded_error", "message": "Overloaded" }
+        }))
+        .unwrap(),
+    ]));
+    upstreams[1].set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "type": "message_start",
+            "message": { "type": "message", "role": "assistant", "id": "msg-2", "model": TEST_MODEL, "content": [] }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "content_block_start", "index": 0, "content_block": { "type": "text" }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "ok" }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({ "type": "message_stop" })).unwrap(),
+    ]));
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .header("x-api-key", TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let frames = collect_sse_frames(response).await;
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.data["delta"]["text"] == json!("ok")),
+        "下游应收到次渠道的正文"
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| !serde_json::to_string(&frame.data)
+                .unwrap()
+                .contains("Overloaded")),
+        "首渠道的流内错误不得泄漏给下游"
+    );
+    assert_eq!(upstreams[0].received().len(), 1);
+    assert_eq!(upstreams[1].received().len(), 1);
+}
+
 /// raw chunk 直搬：跨块的大帧不参与转发决策，拼接后的下游字节与上游一致。
 ///
 /// usage 帧也刻意跨块切分，验证旁路解析仍能完成计费；SSE 注释、CRLF 与字段

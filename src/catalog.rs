@@ -96,7 +96,7 @@ fn catalog_dollars_to_micros(value: Option<f64>) -> Option<i64> {
         return None;
     }
     let micros = (value * MICROS_PER_USD).round();
-    if micros > i64::MAX as f64 {
+    if micros >= i64::MAX as f64 {
         return None;
     }
     Some(micros as i64)
@@ -236,5 +236,10 @@ mod tests {
         assert_eq!(catalog_dollars_to_micros(Some(f64::NAN)), None);
         assert_eq!(catalog_dollars_to_micros(None), None);
         assert_eq!(catalog_dollars_to_micros(Some(0.0)), Some(0));
+        assert_eq!(
+            catalog_dollars_to_micros(Some(i64::MAX as f64 / MICROS_PER_USD)),
+            None,
+            "不能把超出 i64 的 2^63 饱和成 i64::MAX"
+        );
     }
 }

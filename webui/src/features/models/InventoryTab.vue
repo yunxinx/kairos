@@ -15,6 +15,7 @@ import UiIcon from '@/components/ui/UiIcon.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableBulkBar from '@/components/ui/data-table/DataTableBulkBar.vue';
 import DataTableMenuItem from '@/components/ui/data-table/DataTableMenuItem.vue';
+import DataTableMenuSeparator from '@/components/ui/data-table/DataTableMenuSeparator.vue';
 import DataTableRowActions from '@/components/ui/data-table/DataTableRowActions.vue';
 import DataTableToolbar from '@/components/ui/data-table/DataTableToolbar.vue';
 import SelectCell from '@/components/ui/data-table/SelectCell.vue';
@@ -52,6 +53,7 @@ type InventorySectionRow = InventoryRow & { aliasChipItems: AliasChip[] };
 type InventoryWindowPayload =
   | { kind: 'editor'; row: InventoryRow }
   | { kind: 'delete'; row: InventoryRow; channelName: string }
+  | { kind: 'delete-price'; row: InventoryRow }
   | { kind: 'catalog' }
   | BulkDeletePayload;
 
@@ -240,6 +242,37 @@ const deleteMutation = useMutation({
   },
 });
 
+const deletePriceMutation = useMutation({
+  mutationFn: ({ channelId, model }: { channelId: number; model: string }) =>
+    apiClient.deletePrice(channelId, model),
+  onSuccess: async (_data, target) => {
+    for (const item of [...windows.value]) {
+      if (
+        item.payload.kind === 'delete-price' &&
+        item.payload.row.channelId === target.channelId &&
+        item.payload.row.name === target.model
+      ) {
+        closeWindow(item.id);
+      }
+    }
+    await queryClient.invalidateQueries({ queryKey: ['prices'] });
+    await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
+  },
+  onError: (err, target) => {
+    const message = extractApiError(err).message;
+    error(message);
+    for (const item of windows.value) {
+      if (
+        item.payload.kind === 'delete-price' &&
+        item.payload.row.channelId === target.channelId &&
+        item.payload.row.name === target.model
+      ) {
+        deleteErrors.value[item.id] = message;
+      }
+    }
+  },
+});
+
 const deletingTarget = computed(() => {
   const targets = deleteMutation.variables.value;
   return deleteMutation.isPending.value && targets?.length === 1 ? (targets[0] ?? null) : null;
@@ -290,6 +323,21 @@ function openDelete(row: InventoryRow, channelName: string) {
     return;
   }
   const entry = openWindow(takePendingAnchor(), { kind: 'delete', row, channelName });
+  if (entry) deleteErrors.value[entry.id] = '';
+}
+
+function openDeletePrice(row: InventoryRow) {
+  const existing = windows.value.find(
+    (entry) =>
+      entry.payload.kind === 'delete-price' &&
+      entry.payload.row.channelId === row.channelId &&
+      entry.payload.row.name === row.name,
+  );
+  if (existing) {
+    bringToFront(existing.id);
+    return;
+  }
+  const entry = openWindow(takePendingAnchor(), { kind: 'delete-price', row });
   if (entry) deleteErrors.value[entry.id] = '';
 }
 
@@ -487,8 +535,23 @@ function loadErrorMessage(): string {
                     >
                       <UiIcon name="pencil" :size="16" />
                     </button>
-                    <DataTableRowActions v-if="canRewriteChannels">
+                    <DataTableRowActions
+                      v-if="canRewriteChannels || (canEditPrices && row.price !== null)"
+                    >
                       <DataTableMenuItem
+                        v-if="canEditPrices && row.price !== null"
+                        danger
+                        data-testid="pricing-delete-entry"
+                        @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
+                        @select="openDeletePrice(row)"
+                      >
+                        {{ t('pricing.removePrice') }}
+                      </DataTableMenuItem>
+                      <DataTableMenuSeparator
+                        v-if="canRewriteChannels && canEditPrices && row.price !== null"
+                      />
+                      <DataTableMenuItem
+                        v-if="canRewriteChannels"
                         danger
                         data-testid="inventory-delete"
                         @pointerup.capture="pendingAnchor = anchorFromEvent($event)"
@@ -604,6 +667,38 @@ function loadErrorMessage(): string {
               channelName: win.payload.channelName,
             },
           ])
+        "
+      />
+      <ConfirmWindow
+        v-else-if="win.payload.kind === 'delete-price'"
+        :title="t('pricing.removePriceTitle')"
+        :message="
+          t('pricing.removePriceMessage', {
+            name: win.payload.row.name,
+            channel: win.payload.row.channelName,
+          })
+        "
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        :error="deleteErrors[win.id] ?? ''"
+        :busy="
+          deletePriceMutation.isPending.value &&
+          deletePriceMutation.variables.value?.channelId === win.payload.row.channelId &&
+          deletePriceMutation.variables.value?.model === win.payload.row.name
+        "
+        :confirm-label="t('pricing.removePrice')"
+        confirm-test-id="pricing-delete-confirm"
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @confirm="
+          deletePriceMutation.mutate({
+            channelId: win.payload.row.channelId,
+            model: win.payload.row.name,
+          })
         "
       />
       <ConfirmWindow

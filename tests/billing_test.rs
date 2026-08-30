@@ -175,6 +175,17 @@ async fn missing_usage_on_success_writes_system_warning() {
         message.contains("request_id="),
         "消息回退文本也应带请求 id: {message}"
     );
+
+    // 同一令牌、模型和渠道的重复缺报在冷却窗口内只保留一条告警。
+    let second = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    let warning_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system_log WHERE event_code = 'billing.usage_missing'",
+    )
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应能统计 usage 缺失告警");
+    assert_eq!(warning_count, 1, "重复缺报不应淹没系统日志");
 }
 #[tokio::test]
 async fn failed_request_is_not_charged() {

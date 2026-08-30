@@ -524,7 +524,7 @@ mod tests {
                     channel_id,
                     model: "gpt-4o".to_string(),
                 }],
-                hide: false,
+                is_hidden: false,
             },
         )
         .await

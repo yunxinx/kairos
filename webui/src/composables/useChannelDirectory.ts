@@ -8,15 +8,17 @@ import { useCurrentUser } from '@/lib/session';
 export const CHANNEL_SUMMARY_KEY = ['channel-summaries'] as const;
 
 /**
- * 改动渠道定义后刷新两份缓存。
+ * 改动渠道定义后刷新所有受影响的投影。
  *
  * 完整定义与名录是同一份数据的两个投影，只失效其中一个会让另一个继续渲染旧的
- * 渠道名与启用态——例如刚停用的渠道在模型页仍显示正常。
+ * 渠道名与启用态——例如刚停用的渠道在模型页仍显示正常。统一模型成员的
+ * `available` 也依赖渠道清单、启用态与密钥，因此同一变更必须刷新统一模型视图。
  */
 export async function invalidateChannelCaches(queryClient: QueryClient): Promise<void> {
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: ['channels'] }),
     queryClient.invalidateQueries({ queryKey: [...CHANNEL_SUMMARY_KEY] }),
+    queryClient.invalidateQueries({ queryKey: ['unified-models'] }),
   ]);
 }
 

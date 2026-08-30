@@ -412,7 +412,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
     seed.unified_models = vec![UnifiedModel {
         id: "bundle".to_string(),
         models: vec![member(1, "cheap"), member(2, "pricey")],
-        hide: false,
+        is_hidden: false,
     }];
     seed
 }
@@ -476,7 +476,7 @@ async fn same_name_on_two_channels_are_independent_members() {
         seed.unified_models = vec![UnifiedModel {
             id: "bundle".to_string(),
             models: vec![member(1, "gpt-4o"), member(2, "gpt-4o")],
-            hide: false,
+            is_hidden: false,
         }];
         seed
     })
@@ -551,7 +551,7 @@ async fn hidden_colliding_id_is_served_as_unified_model() {
         seed.unified_models = vec![UnifiedModel {
             id: "gpt-4o".to_string(),
             models: vec![member(1, "gpt-4o"), member(2, "pricey")],
-            hide: true,
+            is_hidden: true,
         }];
         seed
     })
@@ -574,7 +574,7 @@ async fn invalid_members_return_gateway_reason_not_acl() {
         seed.unified_models = vec![UnifiedModel {
             id: "bundle".to_string(),
             models: vec![member(1, "missing")],
-            hide: false,
+            is_hidden: false,
         }];
         seed
     })
@@ -659,4 +659,38 @@ async fn deleted_channel_marks_unified_member_unavailable() {
         listed[0]["models"][0]["available"], false,
         "渠道删除后成员应标为不可用"
     );
+}
+
+/// 统一成员只有在渠道启用、登记、具备密钥且已定价时才标为可用。
+#[tokio::test]
+async fn unpriced_unified_member_is_marked_unavailable() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = first_channel_id(&gw).await;
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/unified-models",
+        json!({
+            "id": "unpriced-bundle",
+            "models": [member_json(channel_id, TEST_MODEL)],
+            "hide": false
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let deleted = admin_send(
+        &gw,
+        reqwest::Method::DELETE,
+        &format!("/prices/{channel_id}/{TEST_MODEL}"),
+    )
+    .await;
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+
+    let listed: Value = admin_get(&gw, "/unified-models")
+        .await
+        .json()
+        .await
+        .expect("列表应可解析");
+    assert_eq!(listed[0]["models"][0]["available"], false);
 }

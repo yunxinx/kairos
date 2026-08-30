@@ -1,18 +1,66 @@
 //! 请求日志与计费结果的持久化适配。
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
 use crate::{
     config::Protocol,
-    core::billing::{self, BillingError, PriceSnapshot},
+    core::billing::{self, Error as BillingError, PriceSnapshot},
     core::ir::Usage,
     store,
     store::resources::Token,
 };
 
 use super::http::Deps;
+
+/// 同一令牌/模型/渠道组合的 usage 缺失告警冷却窗口。
+const USAGE_WARNING_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct UsageWarningKey {
+    token_key: String,
+    model: String,
+    channel: String,
+}
+
+/// usage 缺失告警的进程内去重器，避免异常上游把 system_log 写满。
+#[derive(Clone)]
+pub(super) struct UsageWarningGate {
+    seen: Arc<Mutex<HashMap<UsageWarningKey, std::time::Instant>>>,
+}
+
+impl UsageWarningGate {
+    pub(super) fn new() -> Self {
+        Self {
+            seen: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// 组合首次出现或冷却期已过时允许落一条告警。
+    pub(super) fn should_warn(&self, token_key: &str, model: &str, channel: &str) -> bool {
+        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.retain(|_, recorded| recorded.elapsed() < USAGE_WARNING_COOLDOWN);
+        let key = UsageWarningKey {
+            token_key: token_key.to_string(),
+            model: model.to_string(),
+            channel: channel.to_string(),
+        };
+        match seen.get_mut(&key) {
+            Some(recorded) if recorded.elapsed() < USAGE_WARNING_COOLDOWN => false,
+            Some(recorded) => {
+                *recorded = std::time::Instant::now();
+                true
+            }
+            None => {
+                seen.insert(key, std::time::Instant::now());
+                true
+            }
+        }
+    }
+}
 
 /// 一次请求的计费结果，供日志落库。
 ///
@@ -135,7 +183,8 @@ fn utf8_prefix_len(bytes: &[u8], max: usize) -> usize {
 ///
 /// 结算成功后若插入失败，回滚扣费并尽力单独写入 `settled = false` 的请求日志。
 /// 开事务或结算失败时同样尽力留下未结算请求日志，并记入系统日志。
-/// HTTP 2xx 且 usage 四分量全零时另记一条 warn 系统日志，使上游漏报 usage 可观测。
+/// HTTP 2xx 且 usage 四分量全零时按组合冷却记 warn 系统日志，使上游漏报 usage
+/// 可观测，同时避免异常上游按请求淹没 system_log。
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn log_request(
     deps: &Deps,
@@ -152,7 +201,12 @@ pub(super) async fn log_request(
 ) {
     let now = unix_millis();
     let max_bytes = deps.snapshot.read().await.log_body_max_bytes;
-    if (200..300).contains(&status) && billing.usage.is_zero() {
+    if (200..300).contains(&status)
+        && billing.usage.is_zero()
+        && deps
+            .usage_warning_gate
+            .should_warn(&token.token_key, model, channel)
+    {
         let inbound = protocol_name(inbound_protocol);
         store::record_system_warn(
             &deps.pool,

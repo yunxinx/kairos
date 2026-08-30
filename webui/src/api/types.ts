@@ -193,7 +193,7 @@ export interface ModelGroup {
 export interface UnifiedMember {
   channel_id: number;
   model: string;
-  /** GET 读视图：渠道仍在、已启用且仍登记该名。写契约不含此字段。 */
+  /** GET 读视图：渠道启用、登记该名、已定价且有可用密钥。写契约不含此字段。 */
   available?: boolean;
 }
 

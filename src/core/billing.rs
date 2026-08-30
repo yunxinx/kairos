@@ -8,11 +8,11 @@
 
 use crate::core::ir::Usage;
 use crate::store::resources::Price;
-use thiserror::Error;
+use thiserror::Error as ThisError;
 
 /// 费用计算失败；任何一种错误都必须阻止结算，不能截断或饱和后继续扣款。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum BillingError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ThisError)]
+pub enum Error {
     #[error("单价不能为负数")]
     NegativePrice,
     #[error("折扣前费用不能为负数")]
@@ -71,13 +71,13 @@ pub const DEFAULT_DISCOUNT_BP: i64 = 10_000;
 /// 两段分别截断再求和在非整除边界会少于单一费率的结果。
 ///
 /// 这是渠道原价，不套用套餐折扣；折扣在总额上再做一次整数乘除。
-pub fn cost_micros(usage: &Usage, price: &PriceSnapshot) -> Result<i64, BillingError> {
+pub fn cost_micros(usage: &Usage, price: &PriceSnapshot) -> Result<i64, Error> {
     let write_cost = if price.cache_write_1h_micros > 0 {
         let write_1h = usage.cache_write_1h_tokens.min(usage.cache_write_tokens);
         let write_rest = usage.cache_write_tokens - write_1h;
         component_cost(write_1h, price.cache_write_1h_micros)?
             .checked_add(component_cost(write_rest, price.cache_write_micros)?)
-            .ok_or(BillingError::AmountOverflow)?
+            .ok_or(Error::AmountOverflow)?
     } else {
         component_cost(usage.cache_write_tokens, price.cache_write_micros)?
     };
@@ -88,9 +88,7 @@ pub fn cost_micros(usage: &Usage, price: &PriceSnapshot) -> Result<i64, BillingE
         write_cost,
     ];
     components.into_iter().try_fold(0i64, |total, component| {
-        total
-            .checked_add(component)
-            .ok_or(BillingError::AmountOverflow)
+        total.checked_add(component).ok_or(Error::AmountOverflow)
     })
 }
 
@@ -98,19 +96,16 @@ pub fn cost_micros(usage: &Usage, price: &PriceSnapshot) -> Result<i64, BillingE
 ///
 /// `discount_bp` 必须已在 [`MIN_DISCOUNT_BP`] 与 [`MAX_DISCOUNT_BP`] 之间；
 /// 库加载与写入侧负责校验，调用方直接使用。
-pub fn discounted_cost_micros(
-    base_cost_usd_micros: i64,
-    discount_bp: i64,
-) -> Result<i64, BillingError> {
+pub fn discounted_cost_micros(base_cost_usd_micros: i64, discount_bp: i64) -> Result<i64, Error> {
     if base_cost_usd_micros < 0 {
-        return Err(BillingError::NegativeBaseCost);
+        return Err(Error::NegativeBaseCost);
     }
     if !(MIN_DISCOUNT_BP..=MAX_DISCOUNT_BP).contains(&discount_bp) {
-        return Err(BillingError::InvalidDiscount);
+        return Err(Error::InvalidDiscount);
     }
     let discounted =
         base_cost_usd_micros as i128 * discount_bp as i128 / DEFAULT_DISCOUNT_BP as i128;
-    i64::try_from(discounted).map_err(|_| BillingError::AmountOverflow)
+    i64::try_from(discounted).map_err(|_| Error::AmountOverflow)
 }
 
 /// 计算原价与折后实收；任一步失败都不产生部分结果。
@@ -118,7 +113,7 @@ pub fn charge_micros(
     usage: &Usage,
     price: &PriceSnapshot,
     discount_bp: i64,
-) -> Result<Charge, BillingError> {
+) -> Result<Charge, Error> {
     let base_cost_usd_micros = cost_micros(usage, price)?;
     let cost_usd_micros = discounted_cost_micros(base_cost_usd_micros, discount_bp)?;
     Ok(Charge {
@@ -131,7 +126,7 @@ pub fn charge_micros(
 pub fn estimate_max_output_cost_micros(
     max_tokens: u32,
     output_micros_per_1m: i64,
-) -> Result<i64, BillingError> {
+) -> Result<i64, Error> {
     cost_micros(
         &Usage {
             output_tokens: u64::from(max_tokens),
@@ -145,12 +140,12 @@ pub fn estimate_max_output_cost_micros(
 }
 
 /// 单分量费用：`tokens × 单价 / 1M`，用 i128 防大 token 数溢出。
-fn component_cost(tokens: u64, micros_per_1m: i64) -> Result<i64, BillingError> {
+fn component_cost(tokens: u64, micros_per_1m: i64) -> Result<i64, Error> {
     if micros_per_1m < 0 {
-        return Err(BillingError::NegativePrice);
+        return Err(Error::NegativePrice);
     }
     let cost = tokens as i128 * micros_per_1m as i128 / 1_000_000;
-    i64::try_from(cost).map_err(|_| BillingError::AmountOverflow)
+    i64::try_from(cost).map_err(|_| Error::AmountOverflow)
 }
 
 #[cfg(test)]
@@ -312,7 +307,7 @@ mod tests {
     fn overflowing_discount_is_rejected_instead_of_wrapping_negative() {
         assert_eq!(
             discounted_cost_micros(i64::MAX, MAX_DISCOUNT_BP),
-            Err(BillingError::AmountOverflow)
+            Err(Error::AmountOverflow)
         );
     }
 
@@ -326,7 +321,7 @@ mod tests {
                     ..PriceSnapshot::default()
                 }
             ),
-            Err(BillingError::AmountOverflow)
+            Err(Error::AmountOverflow)
         );
         assert_eq!(
             cost_micros(
@@ -337,7 +332,7 @@ mod tests {
                     ..PriceSnapshot::default()
                 }
             ),
-            Err(BillingError::AmountOverflow)
+            Err(Error::AmountOverflow)
         );
     }
 
@@ -351,7 +346,7 @@ mod tests {
             let expected = base as i128 * discount as i128 / DEFAULT_DISCOUNT_BP as i128;
             match discounted_cost_micros(base, discount) {
                 Ok(actual) => prop_assert_eq!(i128::from(actual), expected),
-                Err(BillingError::AmountOverflow) => prop_assert!(expected > i128::from(i64::MAX)),
+                Err(Error::AmountOverflow) => prop_assert!(expected > i128::from(i64::MAX)),
                 Err(other) => prop_assert!(false, "合法输入不应产生 {other}"),
             }
         }

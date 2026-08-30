@@ -34,20 +34,21 @@ use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
+use thiserror::Error;
 
 use crate::{
     config::Protocol,
     core::billing,
     core::billing::PriceSnapshot,
-    core::ir::{ChatRequest, ChatResponse, StreamEvent, Usage, prefix_hash},
-    core::stream::{SseFrame, StreamAccumulator},
+    core::ir::{ChatRequest, StreamEvent, Usage, prefix_hash},
+    core::stream::SseFrame,
     runtime::{PlanBinding, RuntimeSnapshot, SnapshotHandle},
     store,
     store::resources::{Channel, ChannelRecord, StoredChannelKey, Token, protocol_to_wire},
 };
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
-use super::logging::{Billing, log_request, new_request_id, unix_millis};
+use super::logging::{Billing, UsageWarningGate, log_request, new_request_id, unix_millis};
 use super::rate_limit::{RequestRateLimiter, SessionStickyCache};
 use super::rectifier;
 use super::sse::{
@@ -67,6 +68,7 @@ pub struct Deps {
     pub(super) auth_throttle: AuthThrottle,
     pub(super) request_rate: RequestRateLimiter,
     pub(super) sticky: SessionStickyCache,
+    pub(super) usage_warning_gate: UsageWarningGate,
 }
 
 /// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
@@ -85,6 +87,7 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         auth_throttle: AuthThrottle::new(),
         request_rate: RequestRateLimiter::new(),
         sticky: SessionStickyCache::new(),
+        usage_warning_gate: UsageWarningGate::new(),
     };
 
     // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
@@ -940,13 +943,13 @@ fn estimate_admission_cost_micros(
     snapshot: &RuntimeSnapshot,
     discount_bp: i64,
     max_tokens: u32,
-) -> Result<i64, billing::BillingError> {
+) -> Result<i64, billing::Error> {
     let mut max_output = 0i64;
     for hop in hops {
         for record in &hop.route.channels {
             let price = billed_price(snapshot, record, &hop.routed_model);
             if price.output_micros < 0 {
-                return Err(billing::BillingError::NegativePrice);
+                return Err(billing::Error::NegativePrice);
             }
             max_output = max_output.max(price.output_micros);
         }
@@ -1035,7 +1038,7 @@ fn session_cache_identity(headers: &HeaderMap, request: &ChatRequest) -> String 
 
 /// 单次出站调用的请求侧上下文：入站请求、认证令牌与计费/日志所需的
 /// 请求级信息。作为 `*_completion` 的参数打包，避免过长参数列表。
-struct CallCtx<'a> {
+struct OutboundCall<'a> {
     deps: &'a Deps,
     /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
     snapshot: &'a Arc<RuntimeSnapshot>,
@@ -1071,7 +1074,7 @@ async fn dispatch_hop(
     request_id: &str,
     session_identity: &str,
 ) -> Response {
-    let hop_ctx = HopCtx {
+    let hop_dispatch = HopDispatch {
         deps,
         snapshot,
         request,
@@ -1086,14 +1089,14 @@ async fn dispatch_hop(
         request_id,
         session_identity,
     };
-    hop_with_failover(&hop_ctx, &hop.route).await
+    hop_with_failover(&hop_dispatch, &hop.route).await
 }
 
 /// 一跳出站的共享上下文：出站目标、计费与日志所需的请求级信息。
 ///
 /// 直通与 IR 两条出站路径共用；`raw_body` 是入站原始字节，仅直通路径用作
 /// 出站请求体（施加目标性补丁），IR 路径从请求 IR 重编码。
-struct HopCtx<'a> {
+struct HopDispatch<'a> {
     deps: &'a Deps,
     /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
     snapshot: &'a Arc<RuntimeSnapshot>,
@@ -1114,7 +1117,7 @@ struct HopCtx<'a> {
     session_identity: &'a str,
 }
 
-impl<'a> HopCtx<'a> {
+impl<'a> HopDispatch<'a> {
     /// 单渠道的路径判定：协议与入站一致且出站名与入站名相同才可字节直通
     /// （直通无法改写请求体模型名）；其余渠道走 IR 编码路径。
     fn channel_is_passthrough(&self, record: &ChannelRecord) -> bool {
@@ -1129,7 +1132,7 @@ impl<'a> HopCtx<'a> {
 /// 两路径共享同一套 failover/日志/结算设施：可重试错误（网络错误/429/5xx）
 /// 在首字节之前切换下一渠道（按接手渠道各自判定路径）；不可重试 4xx 直接
 /// 返回。快路径同样不免认证与计费（已在准入阶段完成）。
-async fn hop_with_failover(ctx: &HopCtx<'_>, route: &routing::Route) -> Response {
+async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Response {
     run_failover(
         route,
         ctx.routed_model,
@@ -1145,7 +1148,7 @@ async fn hop_with_failover(ctx: &HopCtx<'_>, route: &routing::Route) -> Response
                         passthrough_non_stream_completion(ctx, &record, &key).await
                     }
                 } else {
-                    let mut call_ctx = CallCtx {
+                    let mut call_ctx = OutboundCall {
                         deps: ctx.deps,
                         snapshot: ctx.snapshot,
                         routed_model: ctx.routed_model,
@@ -1215,9 +1218,9 @@ async fn hop_with_failover(ctx: &HopCtx<'_>, route: &routing::Route) -> Response
 ///
 /// 请求体仅做目标性补丁（OpenAI 流式注入 `stream_options.include_usage` 供计费，
 /// Anthropic 无需补丁），响应以字节流直通到下游，不做完整解码。流结束后按嗅探
-/// 累积的 usage 结算并落日志。渠道 timeout 只约束到响应头。
+/// 到的 usage 结算并落日志。渠道 timeout 约束响应头与流式读取的空闲间隔。
 async fn passthrough_stream_completion(
-    ctx: &HopCtx<'_>,
+    ctx: &HopDispatch<'_>,
     record: &ChannelRecord,
     key: &StoredChannelKey,
 ) -> Outbound {
@@ -1289,12 +1292,43 @@ async fn passthrough_stream_completion(
         };
     }
 
+    // 与 IR 流式路径保持相同的首帧语义：在向下游返回响应前先检查流内错误、
+    // 空流与首帧超时。这样 200 + overloaded_error 也能在首字节前切换渠道。
+    let idle = channel_idle(channel.timeout_ms);
+    let byte_stream: UpstreamByteStream = Box::pin(resp.bytes_stream());
+    let (peek, byte_stream) = peek_passthrough_stream_head(
+        byte_stream,
+        channel.protocol,
+        idle,
+        ctx.snapshot.sse_reassembly_max(),
+    )
+    .await;
+    let peeked = match peek {
+        PassthroughPeek::Content(chunks) => chunks,
+        PassthroughPeek::UpstreamError(message) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                retry_after: None,
+                message: format!("上游流内错误：{message}"),
+            };
+        }
+        PassthroughPeek::Interrupted(reason) => {
+            return Outbound::Retryable {
+                channel: channel.name.clone(),
+                status: None,
+                retry_after: None,
+                message: reason,
+            };
+        }
+    };
+
     // 逐 SSE 帧嗅探 usage 计费，同时原样转发字节流到下游。
     let task = PassthroughStreamTask {
         deps: ctx.deps.clone(),
         snapshot: ctx.snapshot.clone(),
         token: ctx.token.clone(),
-        request: ctx.request.clone(),
+        request_model: ctx.request.model.clone(),
         routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
         channel_key_name: key.name.clone(),
@@ -1305,8 +1339,8 @@ async fn passthrough_stream_completion(
         request_body: ctx.request_body.clone(),
         response_body: Vec::new(),
         request_id: ctx.request_id.to_string(),
+        peeked,
     };
-    let byte_stream = resp.bytes_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
     tokio::spawn(async move {
         pipe_passthrough_stream(byte_stream, tx, task).await;
@@ -1329,7 +1363,7 @@ async fn passthrough_stream_completion(
 /// 请求体仅做目标性补丁（OpenAI 流式注入 stream_options；Anthropic 无需），
 /// 响应体原样返回，不做完整解码。
 async fn passthrough_non_stream_completion(
-    ctx: &HopCtx<'_>,
+    ctx: &HopDispatch<'_>,
     record: &ChannelRecord,
     key: &StoredChannelKey,
 ) -> Outbound {
@@ -1506,7 +1540,7 @@ struct PassthroughStreamTask {
     deps: Deps,
     snapshot: Arc<RuntimeSnapshot>,
     token: Token,
-    request: ChatRequest,
+    request_model: String,
     routed_model: String,
     channel: Channel,
     channel_key_name: String,
@@ -1518,6 +1552,122 @@ struct PassthroughStreamTask {
     request_body: Option<Bytes>,
     response_body: Vec<u8>,
     request_id: String,
+    /// 首帧检查阶段已消费的原始字节块；流水任务先重放，再继续读取上游。
+    peeked: Vec<Bytes>,
+}
+
+/// 直通流首帧检查结果。
+enum PassthroughPeek {
+    /// 已看到首个内容或正常收尾事件；字节块保持原样交给流水任务重放。
+    Content(Vec<Bytes>),
+    /// 首帧前上游主动发送流内错误，可在下游收到响应头前切换渠道。
+    UpstreamError(String),
+    /// 没有任何可转发字节时的空流、首帧超时或读取失败。
+    Interrupted(String),
+}
+
+/// 直通流在返回响应前检查首帧，保留原始字节块以便后续无损重放。
+///
+/// 直通路径不重编码响应，因此不能复用 IR 路径只保存 JSON 帧的 peek 结果；
+/// 这里保留已消费的网络块，并在流水任务开头先发送它们。检查同时受 SSE 重装
+/// 上限约束，避免上游长时间只发无法组成完整帧的字节时无限增长。
+async fn peek_passthrough_stream_head(
+    byte_stream: UpstreamByteStream,
+    protocol: Protocol,
+    idle: Duration,
+    max_bytes: usize,
+) -> (PassthroughPeek, UpstreamByteStream) {
+    use futures_util::StreamExt as _;
+
+    let mut byte_stream = byte_stream;
+    let mut decoder = protocol::make_decoder(protocol);
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut peeked: Vec<Bytes> = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let mut saw_message_start = false;
+
+    loop {
+        if let Some((event_name, frame)) = take_frame(&mut buffer) {
+            if frame.is_empty() {
+                continue;
+            }
+            let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
+            let decoded = decoder.process(&chunk);
+            let mut content = false;
+            if matches!(protocol, Protocol::AnthropicMessages)
+                && event_name.as_deref() == Some("message_start")
+            {
+                // 部分合法 Anthropic 流省略 `message.model`；SSE 事件名仍足以确认流首序言。
+                saw_message_start = true;
+            }
+            for event in &decoded.events {
+                match event {
+                    StreamEvent::Error { message } => {
+                        return (PassthroughPeek::UpstreamError(message.clone()), byte_stream);
+                    }
+                    StreamEvent::Finish { .. } => content = true,
+                    StreamEvent::ResponseMetadata { .. } => saw_message_start = true,
+                    _ if is_content_event(event) => {
+                        if matches!(protocol, Protocol::AnthropicMessages) && !saw_message_start {
+                            return (
+                                PassthroughPeek::Interrupted(
+                                    "上游流缺少 message_start".to_string(),
+                                ),
+                                byte_stream,
+                            );
+                        }
+                        content = true;
+                    }
+                    _ => {}
+                }
+            }
+            if content {
+                return (PassthroughPeek::Content(peeked), byte_stream);
+            }
+            continue;
+        }
+
+        match tokio::time::timeout(idle, byte_stream.as_mut().next()).await {
+            Ok(Some(Ok(bytes))) => {
+                buffered_bytes = buffered_bytes.saturating_add(bytes.len());
+                buffer.extend_from_slice(&bytes);
+                peeked.push(bytes);
+                if buffered_bytes > max_bytes {
+                    return (PassthroughPeek::Content(peeked), byte_stream);
+                }
+            }
+            Ok(Some(Err(_))) => {
+                return if peeked.is_empty() {
+                    (
+                        PassthroughPeek::Interrupted("上游流读取失败".to_string()),
+                        byte_stream,
+                    )
+                } else {
+                    (PassthroughPeek::Content(peeked), byte_stream)
+                };
+            }
+            Ok(None) => {
+                return if peeked.is_empty() {
+                    (
+                        PassthroughPeek::Interrupted("上游流未产出内容即结束（空流）".to_string()),
+                        byte_stream,
+                    )
+                } else {
+                    (PassthroughPeek::Content(peeked), byte_stream)
+                };
+            }
+            Err(_) => {
+                return if peeked.is_empty() {
+                    (
+                        PassthroughPeek::Interrupted("上游流首帧超时".to_string()),
+                        byte_stream,
+                    )
+                } else {
+                    (PassthroughPeek::Content(peeked), byte_stream)
+                };
+            }
+        }
+    }
 }
 
 /// 把上游 SSE 原始字节块直搬到下游，并在旁路缓冲中逐帧嗅探 usage。
@@ -1542,12 +1692,17 @@ async fn pipe_passthrough_stream<S>(
     let mut done_filter = OpenAiDoneFilter::default();
     let idle = channel_idle(ctx.channel.timeout_ms);
     let mut byte_stream = Box::pin(byte_stream);
+    let mut pending = ctx.peeked.into_iter();
     let log_body_max = ctx.snapshot.log_body_max();
 
     loop {
-        let chunk = match tokio::time::timeout(idle, byte_stream.next()).await {
-            Ok(Some(Ok(chunk))) => chunk,
-            Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+        let chunk = if let Some(chunk) = pending.next() {
+            chunk
+        } else {
+            match tokio::time::timeout(idle, byte_stream.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            }
         };
         sse_buffer.extend_from_slice(&chunk);
         // 传输快路径只处理原始块；旁路解析的结果不影响这个块是否转发。
@@ -1635,7 +1790,7 @@ async fn pipe_passthrough_stream<S>(
     log_request(
         &ctx.deps,
         &ctx.token,
-        &ctx.request.model,
+        &ctx.request_model,
         outbound_model_for_log(&ctx.channel, &ctx.routed_model),
         &ctx.channel.name,
         Some(&ctx.channel_key_name),
@@ -1686,7 +1841,7 @@ async fn send_passthrough_chunk(
 /// 按渠道协议编码出站请求、调用上游、解码响应为 IR，再重编码为入站协议返回。
 /// 成功且 usage 非零才结算；失败或零输出不扣费。
 async fn non_stream_completion(
-    ctx: &mut CallCtx<'_>,
+    ctx: &mut OutboundCall<'_>,
     request: &ChatRequest,
     channel: &Channel,
     key: &StoredChannelKey,
@@ -1879,10 +2034,10 @@ async fn non_stream_completion(
 /// 流式出站调用单个渠道：SSE 全链路，返回可重试判定。
 ///
 /// 按渠道协议编码出站请求（强制流式，OpenAI 另注入 `stream_options.include_usage`
-/// 供计费），逐 SSE 帧解码为 IR 流事件，累积为 `ChatResponse` 以取 usage 计费，
-/// 同时重编码为入站协议 SSE 帧流回下游。流结束后按累积 usage 结算并落日志。
+/// 供计费），逐 SSE 帧解码为 IR 流事件，仅保留 finish 携带的 usage，
+/// 同时重编码为入站协议 SSE 帧流回下游。流结束后按该 usage 结算并落日志。
 async fn stream_completion(
-    ctx: &mut CallCtx<'_>,
+    ctx: &mut OutboundCall<'_>,
     request: &ChatRequest,
     channel: &Channel,
     key: &StoredChannelKey,
@@ -2034,14 +2189,14 @@ async fn stream_completion(
         }
     };
 
-    // 逐上游 SSE 帧处理：解码 → 累积（计费）→ 重编码为入站 SSE 帧。
+    // 逐上游 SSE 帧处理：解码 → 提取 usage（计费）→ 重编码为入站 SSE 帧。
     // 在派生任务中消费上游字节流并推送到 mpsc 通道，主函数把通道接成 SSE 响应。
     let (tx, rx) = tokio::sync::mpsc::channel::<SseEvent>(64);
     let ctx = StreamTask {
         deps: deps.clone(),
         snapshot: ctx.snapshot.clone(),
         token: token.clone(),
-        request: request.clone(),
+        request_model: request.model.clone(),
         routed_model: ctx.routed_model.to_string(),
         channel: channel.clone(),
         channel_key_name: key.name.clone(),
@@ -2070,7 +2225,7 @@ struct StreamTask {
     deps: Deps,
     snapshot: Arc<RuntimeSnapshot>,
     token: Token,
-    request: ChatRequest,
+    request_model: String,
     routed_model: String,
     channel: Channel,
     channel_key_name: String,
@@ -2143,13 +2298,19 @@ async fn peek_stream_head(
     // 属协议破坏。
     let mut saw_message_start = false;
     loop {
-        if let Some((_event_name, frame)) = take_frame(&mut buffer) {
+        if let Some((event_name, frame)) = take_frame(&mut buffer) {
             if frame.is_empty() {
                 continue;
             }
             let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
             let decoded = decoder.process(&chunk);
             let mut content = false;
+            if matches!(protocol, Protocol::AnthropicMessages)
+                && event_name.as_deref() == Some("message_start")
+            {
+                // 部分合法 Anthropic 流省略 `message.model`；SSE 事件名仍足以确认流首序言。
+                saw_message_start = true;
+            }
             for event in &decoded.events {
                 match event {
                     StreamEvent::Error { message } => {
@@ -2169,6 +2330,12 @@ async fn peek_stream_head(
                     }
                     _ => {}
                 }
+            }
+            // 首帧只要已经形成一个非空但无法映射为 IR 事件的载荷，就视为
+            // 已有上游字节可见；此后断流不能再安全地切换渠道。未知事件仍
+            // 交给流水阶段按既有协议策略处理。
+            if decoded.events.is_empty() {
+                content = true;
             }
             peeked.push(chunk);
             if content {
@@ -2200,10 +2367,10 @@ async fn peek_stream_head(
     }
 }
 
-/// 把上游 SSE 字节流逐帧解码 → 累积 → 重编码，推送到下游通道。
+/// 把上游 SSE 字节流逐帧解码 → 提取 usage → 重编码，推送到下游通道。
 ///
-/// 每收到一个完整 SSE 数据帧，解码为 IR 流事件并累积（供计费），同时重编码为
-/// 入站协议 chunk 帧推给下游。上游流结束时按累积 usage 结算并落日志。
+/// 每收到一个完整 SSE 数据帧，解码为 IR 流事件；仅保留 finish 携带的 usage，
+/// 同时把事件重编码为入站协议 chunk 帧推给下游。上游流结束时结算并落日志。
 async fn pipe_stream<S>(
     byte_stream: S,
     tx: tokio::sync::mpsc::Sender<SseEvent>,
@@ -2227,7 +2394,7 @@ async fn pipe_stream<S>(
         reasoning_content,
     );
     let terminator = encoder.terminator();
-    let mut accumulator = StreamAccumulator::new();
+    let mut usage = Usage::default();
     // 以字节缓冲、帧边界后再转文本：多字节 UTF-8 可能被拆在两个字节块里，
     // 提前转换会截坏字符。
     let mut sse_buffer: Vec<u8> = Vec::new();
@@ -2255,7 +2422,6 @@ async fn pipe_stream<S>(
     let start_event = StreamEvent::StreamStart {
         warnings: ctx.request_warnings.clone(),
     };
-    accumulator.push(start_event.clone());
     for frame in encoder.encode(&start_event) {
         if downstream_open {
             record_frame_wire(&mut ctx, &frame);
@@ -2276,10 +2442,13 @@ async fn pipe_stream<S>(
             let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
             let decoded = decoder.process(&chunk);
             for event in &decoded.events {
-                if matches!(event, StreamEvent::Finish { .. }) {
+                if let StreamEvent::Finish {
+                    usage: reported, ..
+                } = event
+                {
                     saw_finish = true;
+                    usage = reported.clone();
                 }
-                accumulator.push(event.clone());
                 if downstream_open {
                     for frame in encoder.encode(event) {
                         record_frame_wire(&mut ctx, &frame);
@@ -2326,7 +2495,6 @@ async fn pipe_stream<S>(
     // 流结束：若上游未发 finish 帧（异常中断），不合成成功 Finish——以入站
     // 协议错误帧告知下游截断（缺收尾归类，杜绝「200 + 异常流」被当成完整
     // 成功）。缓冲超限与流内错误已发过各自的错误帧，不再重复。
-    let response = accumulator.finish();
     if !saw_finish && downstream_open && !truncated && !stream_errored {
         let frame = inbound_stream_error_frame(ctx.inbound_protocol, STREAM_UNTERMINATED_MESSAGE);
         record_frame_wire(&mut ctx, &frame);
@@ -2347,7 +2515,7 @@ async fn pipe_stream<S>(
         );
     }
     // 先结算再发终止哨兵：下游读到终止时计费必定已落库。
-    settle_and_log(&ctx, response).await;
+    settle_and_log(&ctx, usage).await;
     // OpenAI 协议约定以 `data: [DONE]` 结束；Anthropic 以 message_stop 收尾。
     if downstream_open && let Some(terminator) = terminator {
         let _ = tx.send(SseEvent::default().data(terminator)).await;
@@ -2388,19 +2556,19 @@ fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
 }
 
 /// 结算流式请求费用并落日志。
-async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
+async fn settle_and_log(ctx: &StreamTask, usage: Usage) {
     let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
     log_request(
         &ctx.deps,
         &ctx.token,
-        &ctx.request.model,
+        &ctx.request_model,
         outbound_model_for_log(&ctx.channel, &ctx.routed_model),
         &ctx.channel.name,
         Some(&ctx.channel_key_name),
         ctx.status_code,
         ctx.started,
         Billing::calculated(
-            response.usage.clone(),
+            usage,
             ctx.price,
             discount_bp,
             ctx.request_body.clone(),
@@ -2416,25 +2584,35 @@ async fn settle_and_log(ctx: &StreamTask, response: ChatResponse) {
 fn authenticate<'a>(
     snapshot: &'a RuntimeSnapshot,
     headers: &HeaderMap,
-) -> anyhow::Result<&'a Token> {
-    let key = extract_key(headers).ok_or_else(|| {
-        anyhow::anyhow!("缺少认证令牌：请提供 Authorization: Bearer <key> 或 x-api-key")
-    })?;
+) -> Result<&'a Token, AuthenticationError> {
+    let key = extract_key(headers).ok_or(AuthenticationError::MissingToken)?;
     let token = snapshot
         .tokens
         .get(&key)
-        .ok_or_else(|| anyhow::anyhow!("无效的认证令牌"))?;
+        .ok_or(AuthenticationError::InvalidToken)?;
     if !token.enabled {
-        return Err(anyhow::anyhow!("认证令牌已被禁用"));
+        return Err(AuthenticationError::DisabledToken);
     }
     if snapshot
         .users
         .get(&token.user_id)
         .is_none_or(|user| !user.enabled)
     {
-        return Err(anyhow::anyhow!("所属用户已禁用"));
+        return Err(AuthenticationError::DisabledOwner);
     }
     Ok(token)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+enum AuthenticationError {
+    #[error("缺少认证令牌：请提供 Authorization: Bearer <key> 或 x-api-key")]
+    MissingToken,
+    #[error("无效的认证令牌")]
+    InvalidToken,
+    #[error("认证令牌已被禁用")]
+    DisabledToken,
+    #[error("所属用户已禁用")]
+    DisabledOwner,
 }
 
 /// 从入站认证头提取令牌 key：Bearer、`x-api-key`（Anthropic）与
@@ -2791,7 +2969,7 @@ async fn billing_error_response(
     token: &Token,
     model: &str,
     started: i64,
-    err: billing::BillingError,
+    err: billing::Error,
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
     request_id: &str,

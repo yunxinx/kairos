@@ -211,7 +211,8 @@ pub struct UnifiedModel {
     pub models: Vec<UnifiedMember>,
     /// 开隐藏则同名已登记模型在组内只表示本统一模型；默认影响下游列表。
     #[serde(default)]
-    pub hide: bool,
+    #[serde(rename = "hide")]
+    pub is_hidden: bool,
 }
 
 /// 渠道已登记的可调用名：`models` ∪ 别名 key。
@@ -299,8 +300,12 @@ pub fn registered_callable_names<'a>(
 }
 
 /// 未隐藏的统一模型 ID 与已登记模型/别名同名时无法在同组并存。
-pub fn unhidden_unified_id_collides(id: &str, hide: bool, registered: &HashSet<String>) -> bool {
-    !hide && registered.contains(id)
+pub fn unhidden_unified_id_collides(
+    id: &str,
+    is_hidden: bool,
+    registered: &HashSet<String>,
+) -> bool {
+    !is_hidden && registered.contains(id)
 }
 
 /// 令牌绑定组是否允许调用该名。
@@ -346,7 +351,7 @@ pub fn visible_model_ids<'a>(
 
     let hidden_members: HashSet<String> = unified_models
         .values()
-        .filter(|model| model.hide && names.contains(&model.id))
+        .filter(|model| model.is_hidden && names.contains(&model.id))
         .flat_map(|model| {
             model
                 .models
@@ -1348,7 +1353,7 @@ fn map_unified_model(row: &sqlx::sqlite::SqliteRow) -> Result<UnifiedModel, Stor
     Ok(UnifiedModel {
         id,
         models,
-        hide: hide != 0,
+        is_hidden: hide != 0,
     })
 }
 
@@ -1364,7 +1369,7 @@ pub async fn upsert_unified_model(
     )
     .bind(&model.id)
     .bind(&models_json)
-    .bind(model.hide)
+    .bind(model.is_hidden)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -2392,7 +2397,7 @@ mod tests {
                     channel_id,
                     model: "gpt-4o".to_string(),
                 }],
-                hide: false,
+                is_hidden: false,
             },
         )
         .await
@@ -2494,7 +2499,7 @@ mod tests {
                     channel_id: 1,
                     model: "gpt-4o".to_string(),
                 }],
-                hide: true,
+                is_hidden: true,
             },
         );
 
@@ -2559,7 +2564,7 @@ mod tests {
                     model: "fast".to_string(),
                 },
             ],
-            hide: true,
+            is_hidden: true,
         };
         upsert_unified_model(&mut conn, &model)
             .await

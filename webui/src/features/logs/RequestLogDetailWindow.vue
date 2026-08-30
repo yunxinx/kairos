@@ -47,8 +47,8 @@ const props = withDefaults(
 const emit = defineEmits<{
   close: [];
   raise: [];
-  settle: [id: number];
-  waive: [id: number];
+  settle: [event: MouseEvent, entry: LogEntry];
+  waive: [event: MouseEvent, entry: LogEntry];
   filterModel: [model: string];
   filterChannel: [channel: string];
   filterToken: [token: string];
@@ -470,7 +470,7 @@ const calculationSteps = computed(() => {
           data-testid="log-settle"
           :disabled="closing"
           :title="t('logs.settleGuide')"
-          @click="emit('settle', entry.id)"
+          @click="emit('settle', $event, entry)"
         >
           {{ t('logs.settleCharge') }}
         </button>
@@ -480,7 +480,7 @@ const calculationSteps = computed(() => {
           data-testid="log-waive"
           :disabled="closing"
           :title="t('logs.waiveGuide')"
-          @click="emit('waive', entry.id)"
+          @click="emit('waive', $event, entry)"
         >
           {{ t('logs.waiveCharge') }}
         </button>

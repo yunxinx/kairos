@@ -189,6 +189,12 @@ pub async fn insert_request_log_on(
     conn: &mut SqliteConnection,
     log: &RequestLog,
 ) -> Result<i64, StoreError> {
+    let input_tokens = persisted_token_count("input_tokens", log.input_tokens)?;
+    let output_tokens = persisted_token_count("output_tokens", log.output_tokens)?;
+    let cache_read_tokens = persisted_token_count("cache_read_tokens", log.cache_read_tokens)?;
+    let cache_write_tokens = persisted_token_count("cache_write_tokens", log.cache_write_tokens)?;
+    let cache_write_1h_tokens =
+        persisted_token_count("cache_write_1h_tokens", log.cache_write_1h_tokens)?;
     let id = ids::next_id()?;
     sqlx::query(
         "INSERT INTO request_log \
@@ -212,11 +218,11 @@ pub async fn insert_request_log_on(
     .bind(&log.channel_key)
     .bind(log.status_code)
     .bind(log.latency_ms)
-    .bind(log.input_tokens as i64)
-    .bind(log.output_tokens as i64)
-    .bind(log.cache_read_tokens as i64)
-    .bind(log.cache_write_tokens as i64)
-    .bind(log.cache_write_1h_tokens as i64)
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(cache_read_tokens)
+    .bind(cache_write_tokens)
+    .bind(cache_write_1h_tokens)
     .bind(log.price.input_micros)
     .bind(log.price.output_micros)
     .bind(log.price.cache_read_micros)
@@ -234,6 +240,12 @@ pub async fn insert_request_log_on(
     .map_err(StoreError::Query)?;
 
     Ok(id)
+}
+
+fn persisted_token_count(field: &str, count: u64) -> Result<i64, StoreError> {
+    i64::try_from(count).map_err(|_| {
+        StoreError::InvalidResource(format!("请求日志 {field} 超出 SQLite INTEGER 范围"))
+    })
 }
 
 /// 所属用户的钱包余额。
@@ -1641,6 +1653,21 @@ mod tests {
     use serde_json::json;
     use sqlx::Connection;
 
+    #[test]
+    fn token_count_conversion_rejects_sqlite_integer_overflow() {
+        assert_eq!(
+            persisted_token_count("input_tokens", i64::MAX as u64).expect("i64::MAX 应可持久化"),
+            i64::MAX
+        );
+        assert!(
+            matches!(
+                persisted_token_count("input_tokens", i64::MAX as u64 + 1),
+                Err(StoreError::InvalidResource(_))
+            ),
+            "超界 token 计数不能回绕成负数"
+        );
+    }
+
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
@@ -2680,7 +2707,7 @@ mod tests {
         assert!(rows[1].settled, "缺 settled 列的存量行默认已结算");
     }
 
-    /// 迁移 0016：热表过滤列有索引；未结算费用不进入 stats 聚合。
+    /// 请求日志过滤列有索引；未结算费用不进入 stats 聚合。
     #[tokio::test]
     async fn request_log_indexes_exist_and_unsettled_cost_is_excluded() {
         let (_dir, pool) = test_pool().await;
@@ -2694,6 +2721,7 @@ mod tests {
             "idx_request_log_created_at",
             "idx_request_log_token_key",
             "idx_request_log_model",
+            "idx_request_log_user_created_at",
         ] {
             assert!(
                 names.iter().any(|name| name == expected),

@@ -459,7 +459,26 @@ function handleWindowClose() {
 
 // --- 保存 ---
 
-function handleSave() {
+const pendingRemovalCount = ref(0);
+
+watch(
+  [editorModels, editorAliasesMap],
+  () => {
+    pendingRemovalCount.value = 0;
+  },
+  { deep: true },
+);
+
+function callableNames(channel: Pick<Channel, 'models' | 'model_aliases'>): Set<string> {
+  return new Set([...channel.models, ...Object.keys(channel.model_aliases)]);
+}
+
+function removedCallableCount(previous: Channel, next: Channel): number {
+  const nextNames = callableNames(next);
+  return [...callableNames(previous)].filter((name) => !nextNames.has(name)).length;
+}
+
+function handleSave(removalConfirmed = false) {
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
     { name: 'baseUrl', value: editorBaseUrl.value, rules: [{ kind: 'required' }] },
@@ -505,35 +524,7 @@ function handleSave() {
   const keys = editorKeys.value.map(editorToKey);
   const models = [...editorModels.value].sort(compareModels);
   const modelAliases = { ...editorAliasesMap.value };
-  if (props.initial === null) {
-    saveMutation.mutate({
-      name: editorName.value.trim(),
-      protocol: editorProtocol.value,
-      base_url: editorBaseUrl.value.trim(),
-      keys,
-      models,
-      model_aliases: modelAliases,
-      timeout_ms: timeoutMs,
-      max_retries: maxRetries,
-      enabled: editorEnabled.value,
-      model_group: editorGroup.value,
-      reasoning_output: editorReasoningOutput.value,
-      session_cache_key: editorSessionCacheKey.value,
-      injects_cache_breakpoints: editorInjectsCacheBreakpoints.value,
-    });
-    return;
-  }
-  // 编辑以列表中最新定义为基底整体替换写：开窗期间行内改过的字段
-  // 不会被开窗时刻的旧快照覆盖。
-  const latest = queryClient
-    .getQueryData<ChannelView[]>(['channels'])
-    ?.find((item) => item.id === props.initial?.id);
-  if (!latest) {
-    error(t('channel.goneOnSave'));
-    return;
-  }
-  saveMutation.mutate({
-    ...channelWriteBody(latest),
+  const edited: Channel = {
     name: editorName.value.trim(),
     protocol: editorProtocol.value,
     base_url: editorBaseUrl.value.trim(),
@@ -547,7 +538,28 @@ function handleSave() {
     reasoning_output: editorReasoningOutput.value,
     session_cache_key: editorSessionCacheKey.value,
     injects_cache_breakpoints: editorInjectsCacheBreakpoints.value,
-  });
+  };
+  if (props.initial === null) {
+    saveMutation.mutate(edited);
+    return;
+  }
+  // 编辑以列表中最新定义为基底整体替换写：开窗期间行内改过的字段
+  // 不会被开窗时刻的旧快照覆盖。
+  const latest = queryClient
+    .getQueryData<ChannelView[]>(['channels'])
+    ?.find((item) => item.id === props.initial?.id);
+  if (!latest) {
+    error(t('channel.goneOnSave'));
+    return;
+  }
+  const next = { ...channelWriteBody(latest), ...edited };
+  const removed = removedCallableCount(channelWriteBody(latest), next);
+  if (removed > 0 && !removalConfirmed) {
+    pendingRemovalCount.value = removed;
+    return;
+  }
+  pendingRemovalCount.value = 0;
+  saveMutation.mutate(next);
 }
 </script>
 
@@ -578,7 +590,7 @@ function handleSave() {
       v-if="editorView === 'form'"
       novalidate
       data-testid="channel-form"
-      @submit.prevent="handleSave"
+      @submit.prevent="() => handleSave()"
     >
       <div class="card-body space-y-3">
         <!-- 两个页签叠放在同一网格单元：窗口高度取两者最大值，切换页签尺寸不变。
@@ -1025,7 +1037,30 @@ function handleSave() {
           </div>
         </div>
       </div>
-      <div class="card-footer card-body flex justify-between gap-2">
+      <div
+        v-if="pendingRemovalCount > 0"
+        class="card-footer card-body flex items-center justify-between gap-3"
+        data-testid="channel-removal-confirmation"
+      >
+        <p class="text-danger text-sm">
+          {{ t('channel.removalConfirm', { count: pendingRemovalCount }) }}
+        </p>
+        <span class="flex shrink-0 gap-2">
+          <button type="button" class="btn" @click="pendingRemovalCount = 0">
+            {{ t('common.cancel') }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-danger-filled"
+            data-testid="channel-removal-confirm"
+            :disabled="saveMutation.isPending.value"
+            @click="handleSave(true)"
+          >
+            {{ t('common.confirm') }}
+          </button>
+        </span>
+      </div>
+      <div v-else class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">
           {{ t('common.cancel') }}
         </button>
