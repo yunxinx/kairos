@@ -100,6 +100,8 @@ pub mod warning_feature {
     /// Anthropic 出站 tool 的 input_schema 已归一化改写（union 摊平、
     /// 非 object 根兜底等）。
     pub const INPUT_SCHEMA: &str = "input_schema";
+    /// tool_choice 因不合规被降级为 `auto`（如引用的工具不在工具列表）。
+    pub const TOOL_CHOICE: &str = "tool_choice";
     /// 请求级并行工具调用开关在目标协议无承载字段（并行能力由协议缺省语义
     /// 决定），已丢弃。
     pub const PARALLEL_TOOL_CALLS: &str = "parallel_tool_calls";
@@ -717,6 +719,7 @@ mod tests {
             (warning_feature::TOOL_RESULT, "tool_result"),
             (warning_feature::TOOL_ARGUMENTS, "tool_arguments"),
             (warning_feature::INPUT_SCHEMA, "input_schema"),
+            (warning_feature::TOOL_CHOICE, "tool_choice"),
             (warning_feature::PARALLEL_TOOL_CALLS, "parallel_tool_calls"),
             (warning_feature::UNKNOWN_FIELDS, "unknown_fields"),
             (warning_feature::CACHE_BREAKPOINT, "cache_breakpoint"),

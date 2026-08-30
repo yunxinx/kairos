@@ -415,6 +415,8 @@ pub const SETTING_RETRY_BACKOFF_CAP_MS: &str = "retry_backoff_cap_ms";
 pub const SETTING_RETRY_AFTER_CAP_SECS: &str = "retry_after_cap_secs";
 /// 运行时开关键：未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
 pub const SETTING_RATE_LIMIT_RPM: &str = "rate_limit_rpm";
+/// 运行时开关键：上游 400 的请求整流重试（错误模式匹配 + 最小修正）。
+pub const SETTING_REQUEST_RECTIFY: &str = "request_rectify";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
 pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
@@ -440,6 +442,9 @@ pub const DEFAULT_RETRY_BACKOFF_CAP_MS: u64 = 5_000;
 pub const DEFAULT_RETRY_AFTER_CAP_SECS: u64 = 60;
 /// 全局每分钟请求兜底缺省值：`0` 表示不设全局上限（令牌也可显式不限速）。
 pub const DEFAULT_RATE_LIMIT_RPM: u64 = 0;
+/// 请求整流重试缺省开启：只作用于原本必败的 400 请求，动作可审计且随
+/// warnings 回传下游，风险低于让请求直接失败。
+pub const DEFAULT_REQUEST_RECTIFY: bool = true;
 
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_auth_throttle_max_failures() -> u64 {
@@ -464,6 +469,10 @@ fn default_retry_backoff_cap_ms() -> u64 {
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_retry_after_cap_secs() -> u64 {
     DEFAULT_RETRY_AFTER_CAP_SECS
+}
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_request_rectify() -> bool {
+    DEFAULT_REQUEST_RECTIFY
 }
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_log_body_max_bytes() -> u64 {
@@ -517,6 +526,9 @@ pub struct Settings {
     /// 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
     #[serde(default)]
     pub rate_limit_rpm: u64,
+    /// 上游 400 的请求整流重试（错误模式匹配 + 最小修正后重试一次）。
+    #[serde(default = "default_request_rectify")]
+    pub request_rectify: bool,
 }
 
 impl Default for Settings {
@@ -534,12 +546,13 @@ impl Default for Settings {
             retry_backoff_cap_ms: DEFAULT_RETRY_BACKOFF_CAP_MS,
             retry_after_cap_secs: DEFAULT_RETRY_AFTER_CAP_SECS,
             rate_limit_rpm: DEFAULT_RATE_LIMIT_RPM,
+            request_rectify: DEFAULT_REQUEST_RECTIFY,
         }
     }
 }
 
 /// `Protocol` 落库用的 wire 字符串。
-fn protocol_to_wire(p: Protocol) -> &'static str {
+pub(crate) fn protocol_to_wire(p: Protocol) -> &'static str {
     match p {
         Protocol::OpenAiChat => "openai_chat",
         Protocol::OpenAiResponses => "openai_responses",
@@ -1593,6 +1606,12 @@ pub async fn upsert_settings(
         conn,
         SETTING_RATE_LIMIT_RPM,
         &Value::from(settings.rate_limit_rpm),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_REQUEST_RECTIFY,
+        &Value::Bool(settings.request_rectify),
     )
     .await?;
     Ok(())

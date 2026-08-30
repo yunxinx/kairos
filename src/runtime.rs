@@ -22,16 +22,16 @@ use crate::store::resources::{
     self, SETTING_AUTH_THROTTLE_MAX_FAILURES, SETTING_AUTH_THROTTLE_WINDOW_SECS,
     SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_LOG_BODY_MAX_BYTES,
     SETTING_MAX_REQUEST_BYTES, SETTING_MAX_RESPONSE_BYTES, SETTING_RATE_LIMIT_RPM,
-    SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS,
-    SETTING_SSE_REASSEMBLY_MAX_BYTES,
+    SETTING_REQUEST_RECTIFY, SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS,
+    SETTING_RETRY_BACKOFF_MS, SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
 use crate::store::users::{self, ManagementRole};
 
 pub use crate::store::resources::{
     DEFAULT_AUTH_THROTTLE_MAX_FAILURES, DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
     DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
-    DEFAULT_RATE_LIMIT_RPM, DEFAULT_RETRY_AFTER_CAP_SECS, DEFAULT_RETRY_BACKOFF_CAP_MS,
-    DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+    DEFAULT_RATE_LIMIT_RPM, DEFAULT_REQUEST_RECTIFY, DEFAULT_RETRY_AFTER_CAP_SECS,
+    DEFAULT_RETRY_BACKOFF_CAP_MS, DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
 };
 
 /// 网关运行时资源的内存快照：不可变整体，原子替换。
@@ -80,6 +80,8 @@ pub struct RuntimeSnapshot {
     pub retry_after_cap_secs: u64,
     /// 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
     pub rate_limit_rpm: u64,
+    /// 上游 400 的请求整流重试（错误模式匹配 + 最小修正后重试一次）。
+    pub request_rectify: bool,
 }
 
 /// 用户与套餐的绑定：root 不挂档，用类型把「没有套餐」这个合法状态表达出来。
@@ -185,6 +187,7 @@ impl RuntimeSnapshot {
             retry_backoff_cap_ms: self.retry_backoff_cap_ms,
             retry_after_cap_secs: self.retry_after_cap_secs,
             rate_limit_rpm: self.rate_limit_rpm,
+            request_rectify: self.request_rectify,
         }
     }
 }
@@ -322,7 +325,16 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
             DEFAULT_RETRY_AFTER_CAP_SECS,
         ),
         rate_limit_rpm: load_u64(&settings, SETTING_RATE_LIMIT_RPM, DEFAULT_RATE_LIMIT_RPM),
+        request_rectify: load_bool(&settings, SETTING_REQUEST_RECTIFY, DEFAULT_REQUEST_RECTIFY),
     })
+}
+
+/// 从开关表解析布尔值：缺键或非布尔时用 `default`。
+fn load_bool(settings: &HashMap<String, Value>, key: &str, default: bool) -> bool {
+    settings
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
 }
 
 /// 从开关表解析无符号整数：缺键或非整数时用 `default`。
@@ -432,6 +444,7 @@ mod tests {
         assert_eq!(snap.retry_backoff_cap_ms, DEFAULT_RETRY_BACKOFF_CAP_MS);
         assert_eq!(snap.retry_after_cap_secs, DEFAULT_RETRY_AFTER_CAP_SECS);
         assert_eq!(snap.rate_limit_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert!(snap.request_rectify, "请求整流缺省开启");
     }
 
     /// 播种资源与开关后加载：快照反映库内状态。

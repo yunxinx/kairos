@@ -85,6 +85,7 @@ fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
     diff!(retry_backoff_cap_ms);
     diff!(retry_after_cap_secs);
     diff!(rate_limit_rpm);
+    diff!(request_rectify);
     changes
 }
 

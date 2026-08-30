@@ -30,6 +30,7 @@ const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } 
   useFormValidation();
 
 const fullBody = ref(false);
+const requestRectify = ref(true);
 const maxRequestMb = ref('');
 const maxResponseMb = ref('');
 const logBodyMb = ref('');
@@ -83,6 +84,7 @@ function applySettings(settings: Settings) {
   retryBackoffCapMs.value = String(settings.retry_backoff_cap_ms);
   retryAfterCapSecs.value = String(settings.retry_after_cap_secs);
   rateLimitRpm.value = String(settings.rate_limit_rpm);
+  requestRectify.value = settings.request_rectify;
 }
 
 const saveMutation = useMutation({
@@ -243,6 +245,7 @@ function handleSave() {
     retry_backoff_cap_ms: backoffCapMs,
     retry_after_cap_secs: Number(retryAfterCapSecs.value.trim()),
     rate_limit_rpm: Number(rateLimitRpm.value.trim()),
+    request_rectify: requestRectify.value,
   });
 }
 
@@ -684,6 +687,21 @@ const tabsAria = computed(() => t('settings.sections'));
                     :invalid="invalid"
                     :hint-id="hintId"
                     v-on="fieldInputHandlers('rateLimitRpm')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="requestRectify"
+                layout="inline"
+                :label="t('settings.requestRectify')"
+                input-id="settings-request-rectify"
+                :guide="t('settings.requestRectifyGuide')"
+              >
+                <template #default>
+                  <FormSwitch
+                    id="settings-request-rectify"
+                    v-model="requestRectify"
+                    data-testid="settings-request-rectify"
                   />
                 </template>
               </FormField>

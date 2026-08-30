@@ -9,6 +9,7 @@ pub mod gemini;
 pub mod ir;
 pub mod openai_chat;
 pub mod openai_responses;
+pub(crate) mod schema;
 pub mod stream;
 
 #[cfg(test)]

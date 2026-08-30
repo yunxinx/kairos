@@ -587,6 +587,8 @@
     "retryAfterCapGuide": "Maximum wait taken from an upstream Retry-After header.",
     "rateLimitRpm": "Global requests per minute",
     "rateLimitRpmGuide": "Fallback for tokens without their own limit. 0 disables the global cap. A token may set a higher cap or 0 (unlimited).",
+    "requestRectify": "Request rectification",
+    "requestRectifyGuide": "When an upstream 400 matches a known fixable pattern (thinking signature failures, tool schema/tool_choice non-compliance), apply a minimal fix and retry once. Actions are audit-logged.",
     "catalogSyncedAt": "Last catalog sync",
     "catalogSyncedAtGuide": "Successful writes of the models.dev cache. Never synced stays empty.",
     "catalogNeverSynced": "Never synced",
@@ -781,6 +783,9 @@
         "deleted": "Deleted channel {channel_id} ({name})",
         "bulk_deleted": "Deleted {count} channels",
         "models_bulk_removed": "Removed {count} channel model entries"
+      },
+      "rectifier": {
+        "request_rectified": "Channel {channel} rectified and retried once via '{rule}' for an upstream 400: {actions} (upstream error: {error})"
       },
       "logs": {
         "cleaned": "Cleaned {removed_request_logs} settled request logs and {removed_system_logs} system logs older than {older_than_days} days",

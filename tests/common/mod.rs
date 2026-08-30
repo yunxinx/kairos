@@ -55,6 +55,8 @@ pub enum UpstreamBehavior {
     Status5xx(u16),
     /// 返回任意给定状态码（不可重试 4xx 用于测试）。
     Status(u16),
+    /// 返回给定状态码与 JSON 错误体（错误消息形态的测试用）。
+    Error { status: u16, body: Value },
     /// 发送部分字节后突然断开连接。
     Disconnect,
     /// 接收请求后永不响应，供渠道探测超时。
@@ -411,6 +413,12 @@ impl IntoResponse for UpstreamBehavior {
                     panic!("UpstreamBehavior::Status 要求合法状态码，收到 {code}")
                 });
                 (status, "client error").into_response()
+            }
+            UpstreamBehavior::Error { status, body } => {
+                let status = StatusCode::from_u16(status).unwrap_or_else(|_| {
+                    panic!("UpstreamBehavior::Error 要求合法状态码，收到 {status}")
+                });
+                (status, Json(body)).into_response()
             }
             UpstreamBehavior::Disconnect => {
                 // 发送一个 SSE 帧后立即结束连接（axum 关闭响应体即断连）。

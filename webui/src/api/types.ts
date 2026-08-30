@@ -233,6 +233,7 @@ export interface Settings {
   retry_after_cap_secs: number;
   /** 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。 */
   rate_limit_rpm: number;
+  request_rectify: boolean;
 }
 
 /** 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。 */

@@ -587,6 +587,8 @@
     "retryAfterCapGuide": "上游 Retry-After 头的最大等待，超时部分会被截断。",
     "rateLimitRpm": "全局每分钟请求上限",
     "rateLimitRpmGuide": "未单独配置限速的令牌使用该兜底。0 表示不设全局上限。令牌可写出更高上限或 0（不限速）。",
+    "requestRectify": "请求整流重试",
+    "requestRectifyGuide": "上游返回 400 且命中已知可修正模式（thinking signature 失效、tool schema/tool_choice 不合规）时，自动做最小修正并重试一次。动作落系统日志审计。",
     "catalogSyncedAt": "上次目录同步",
     "catalogSyncedAtGuide": "成功写入 models.dev 缓存的时刻。从未同步则为空。",
     "catalogNeverSynced": "从未同步",
@@ -781,6 +783,9 @@
         "deleted": "删除渠道 {channel_id}（{name}）",
         "bulk_deleted": "批量删除 {count} 条渠道",
         "models_bulk_removed": "批量移除 {count} 条渠道模型清单项"
+      },
+      "rectifier": {
+        "request_rectified": "渠道 {channel} 因上游 400 按「{rule}」规则整流重试：{actions}（上游错误：{error}）"
       },
       "logs": {
         "cleaned": "清理日志：删除 {removed_request_logs} 条已结算请求日志与 {removed_system_logs} 条系统日志（早于 {older_than_days} 天）",

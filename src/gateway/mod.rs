@@ -9,6 +9,7 @@ mod http;
 mod logging;
 mod protocol;
 mod rate_limit;
+mod rectifier;
 mod routing;
 mod sse;
 mod throttle;

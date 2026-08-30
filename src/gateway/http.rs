@@ -43,12 +43,13 @@ use crate::{
     core::stream::{SseFrame, StreamAccumulator},
     runtime::{PlanBinding, RuntimeSnapshot, SnapshotHandle},
     store,
-    store::resources::{Channel, ChannelRecord, StoredChannelKey, Token},
+    store::resources::{Channel, ChannelRecord, StoredChannelKey, Token, protocol_to_wire},
 };
 
 use super::failover::{Outbound, RetryBackoff, run_failover};
 use super::logging::{Billing, log_request, new_request_id, unix_millis};
 use super::rate_limit::{RequestRateLimiter, SessionStickyCache};
+use super::rectifier;
 use super::sse::{
     OpenAiDoneFilter, data_frame_to_wire, event_from_frame, frame_to_wire, receiver_stream,
     take_frame,
@@ -1038,7 +1039,6 @@ struct CallCtx<'a> {
     deps: &'a Deps,
     /// 准入时刻的快照引用（Arc 共享，流式派生任务可克隆）。
     snapshot: &'a Arc<RuntimeSnapshot>,
-    request: &'a ChatRequest,
     /// 本跳出站用的已登记模型名（统一模型时为成员，否则同入站名）。
     routed_model: &'a str,
     token: &'a Token,
@@ -1142,7 +1142,6 @@ async fn outbound_with_failover(
                 let mut ctx = CallCtx {
                     deps,
                     snapshot,
-                    request,
                     routed_model,
                     token,
                     price: billed_price(snapshot, &record, routed_model),
@@ -1154,9 +1153,9 @@ async fn outbound_with_failover(
                     session_identity,
                 };
                 if request.stream {
-                    stream_completion(&mut ctx, &record.channel, &key).await
+                    stream_completion(&mut ctx, request, &record.channel, &key, true).await
                 } else {
-                    non_stream_completion(&mut ctx, &record.channel, &key).await
+                    non_stream_completion(&mut ctx, request, &record.channel, &key, true).await
                 }
             })
         },
@@ -1752,12 +1751,13 @@ async fn send_passthrough_chunk(
 /// 成功且 usage 非零才结算；失败或零输出不扣费。
 async fn non_stream_completion(
     ctx: &mut CallCtx<'_>,
+    request: &ChatRequest,
     channel: &Channel,
     key: &StoredChannelKey,
+    allow_rectify: bool,
 ) -> Outbound {
     let deps = ctx.deps;
     let snapshot = ctx.snapshot;
-    let request = ctx.request;
     let token = ctx.token;
     let price = ctx.price;
     let started = ctx.started;
@@ -1920,11 +1920,22 @@ async fn non_stream_completion(
             message: "上游返回可重试错误".to_string(),
         }
     } else {
-        // 不可重试 4xx：直接返回，状态码原样 + 入站协议错误格式。
+        let message = upstream_error_message(&parsed, status_code);
+        // 上游 400 中可自动修正的一类：整流后重试一次，重试结果按常规语义
+        // 上抛（成功/可重试/仍失败各自处理）。每渠道至多一次由 `allow_rectify`
+        // 关断与 400 的 Fatal 短路共同保证。
+        if allow_rectify
+            && status_code == 400
+            && let Some(corrected) =
+                rectify_for_retry(deps, snapshot, request, channel, &message).await
+        {
+            return Box::pin(non_stream_completion(ctx, &corrected, channel, key, false)).await;
+        }
+        // 其余不可重试 4xx：直接返回，状态码原样 + 入站协议错误格式。
         Outbound::Fatal {
             channel: channel.name.clone(),
             status: status_code,
-            message: upstream_error_message(&parsed, status_code),
+            message,
         }
     }
 }
@@ -1936,11 +1947,12 @@ async fn non_stream_completion(
 /// 同时重编码为入站协议 SSE 帧流回下游。流结束后按累积 usage 结算并落日志。
 async fn stream_completion(
     ctx: &mut CallCtx<'_>,
+    request: &ChatRequest,
     channel: &Channel,
     key: &StoredChannelKey,
+    allow_rectify: bool,
 ) -> Outbound {
     let deps = ctx.deps;
-    let request = ctx.request;
     let token = ctx.token;
     let price = ctx.price;
     let started = ctx.started;
@@ -2043,10 +2055,20 @@ async fn stream_completion(
                 message: "上游返回可重试错误".to_string(),
             };
         }
+        let message = upstream_error_message(&parsed, status_code);
+        // 与非流式路径同规：上游 400 的可修正类整流后重试一次（首帧尚未
+        // 下发，整流对下游零痕迹）。
+        if allow_rectify
+            && status_code == 400
+            && let Some(corrected) =
+                rectify_for_retry(deps, ctx.snapshot, request, channel, &message).await
+        {
+            return Box::pin(stream_completion(ctx, &corrected, channel, key, false)).await;
+        }
         return Outbound::Fatal {
             channel: channel.name.clone(),
             status: status_code,
-            message: upstream_error_message(&parsed, status_code),
+            message,
         };
     }
 
@@ -2622,6 +2644,43 @@ impl OutboundAuth for reqwest::RequestBuilder {
         }
         builder
     }
+}
+
+/// 整流闸门：开关开启且上游 400 命中可修正模式时，做最小修正并落审计日志，
+/// 返回修正后的请求 IR；否则返回 `None`（原样失败）。
+async fn rectify_for_retry(
+    deps: &Deps,
+    snapshot: &RuntimeSnapshot,
+    request: &ChatRequest,
+    channel: &Channel,
+    error_message: &str,
+) -> Option<ChatRequest> {
+    if !snapshot.request_rectify {
+        return None;
+    }
+    let rectification = rectifier::rectify(error_message, request)?;
+    // 动作明细落 system_log，自动修正行为可回溯；落库失败只记 tracing。
+    store::record_system_warn(
+        &deps.pool,
+        "rectifier",
+        &store::SystemLogEvent::new(
+            "rectifier.request_rectified",
+            serde_json::json!({
+                "channel": channel.name,
+                "protocol": protocol_to_wire(channel.protocol),
+                "rule": rectification.rule.as_str(),
+                "error": error_message,
+                "actions": rectification.actions,
+            }),
+            format!(
+                "渠道 {} 的上游 400 已整流重试：{}",
+                channel.name,
+                rectification.actions.join("；")
+            ),
+        ),
+    )
+    .await;
+    Some(rectification.request)
 }
 
 /// 从上游错误 body 提取可读消息（OpenAI/Anthropic 均为 `error.message`），
