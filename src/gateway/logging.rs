@@ -362,6 +362,7 @@ pub(super) fn protocol_name(inbound_protocol: Protocol) -> &'static str {
         Protocol::OpenAiChat => "openai_chat",
         Protocol::OpenAiResponses => "openai_responses",
         Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::Gemini => "gemini",
     }
 }
 

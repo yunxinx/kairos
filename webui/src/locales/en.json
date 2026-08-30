@@ -124,7 +124,8 @@
   "protocol": {
     "openai_chat": "OpenAI Chat Completions",
     "openai_responses": "OpenAI Responses",
-    "anthropic_messages": "Anthropic Messages"
+    "anthropic_messages": "Anthropic Messages",
+    "gemini": "Google Gemini"
   },
   "tokens": {
     "create": "Create token",

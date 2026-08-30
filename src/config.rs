@@ -59,7 +59,7 @@ pub struct Database {
     pub path: PathBuf,
 }
 
-/// wire 协议：三种出站/入站协议共用同一枚举。
+/// wire 协议：出站/入站协议共用同一枚举。
 #[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
 pub enum Protocol {
     #[serde(rename = "openai_chat")]
@@ -68,6 +68,8 @@ pub enum Protocol {
     OpenAiResponses,
     #[serde(rename = "anthropic_messages")]
     AnthropicMessages,
+    #[serde(rename = "gemini")]
+    Gemini,
 }
 
 /// 渠道级 reasoning 思维链兼容输出模式。

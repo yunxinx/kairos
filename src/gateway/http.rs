@@ -22,7 +22,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -95,6 +95,10 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         .route("/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
         .route("/v1/models", get(list_models))
+        // Gemini 入站端点：模型名承载在路径上（model-in-path），动作后缀区分
+        // 非流式与流式（流式官方要求 `?alt=sse`，此处不强制——端点本身即 SSE）。
+        .route("/v1beta/models", get(list_models_gemini))
+        .route("/v1beta/models/{*model_method}", post(generate_content))
         .fallback(not_found)
         .layer(DefaultBodyLimit::disable())
         .with_state(deps)
@@ -111,7 +115,7 @@ async fn chat_completions(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    handle_request(deps, Protocol::OpenAiChat, addr.ip(), request).await
+    handle_request(deps, Protocol::OpenAiChat, addr.ip(), request, None).await
 }
 
 /// Anthropic Messages 入站端点。
@@ -120,7 +124,7 @@ async fn messages(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    handle_request(deps, Protocol::AnthropicMessages, addr.ip(), request).await
+    handle_request(deps, Protocol::AnthropicMessages, addr.ip(), request, None).await
 }
 
 /// OpenAI Responses 入站端点。
@@ -129,7 +133,43 @@ async fn responses(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    handle_request(deps, Protocol::OpenAiResponses, addr.ip(), request).await
+    handle_request(deps, Protocol::OpenAiResponses, addr.ip(), request, None).await
+}
+
+/// Gemini generateContent 入站端点：
+/// `POST /v1beta/models/{model}:generateContent`（非流式）与
+/// `POST /v1beta/models/{model}:streamGenerateContent`（流式）。
+async fn generate_content(
+    State(deps): State<Deps>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(model_method): Path<String>,
+    request: Request,
+) -> Response {
+    let Some((model, stream)) = split_model_method(&model_method) else {
+        return (StatusCode::NOT_FOUND, "路径未实现").into_response();
+    };
+    handle_request(
+        deps,
+        Protocol::Gemini,
+        addr.ip(),
+        request,
+        Some((model, stream)),
+    )
+    .await
+}
+
+/// 拆分 Gemini 路径尾段 `{model}:{action}`；动作不是官方端点时返回 `None`。
+fn split_model_method(model_method: &str) -> Option<(String, bool)> {
+    let (model, action) = model_method.rsplit_once(':')?;
+    let model = model.strip_prefix("models/").unwrap_or(model);
+    if model.is_empty() {
+        return None;
+    }
+    match action {
+        "generateContent" => Some((model.to_string(), false)),
+        "streamGenerateContent" => Some((model.to_string(), true)),
+        _ => None,
+    }
 }
 
 /// 下游标准模型列表：`GET /v1/models`。
@@ -142,12 +182,31 @@ async fn list_models(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let snapshot = deps.snapshot.read().await.clone();
     let inbound_protocol = list_models_protocol(&headers);
+    list_models_for(deps, addr.ip(), headers, inbound_protocol).await
+}
+
+/// Gemini 客户端的模型列表端点：`GET /v1beta/models`。
+async fn list_models_gemini(
+    State(deps): State<Deps>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    list_models_for(deps, addr.ip(), headers, Protocol::Gemini).await
+}
+
+/// 模型列表的共享实现：认证、限流与编码按入站协议分派。
+async fn list_models_for(
+    deps: Deps,
+    peer: IpAddr,
+    headers: HeaderMap,
+    inbound_protocol: Protocol,
+) -> Response {
+    let snapshot = deps.snapshot.read().await.clone();
     let started = unix_millis();
     let request_id = new_request_id();
     if deps.auth_throttle.is_blocked(
-        addr.ip(),
+        peer,
         snapshot.auth_throttle_max_failures,
         snapshot.auth_throttle_window(),
     ) {
@@ -169,7 +228,7 @@ async fn list_models(
         Ok(token) => token,
         Err(err) => {
             deps.auth_throttle.record_failure(
-                addr.ip(),
+                peer,
                 snapshot.auth_throttle_max_failures,
                 snapshot.auth_throttle_window(),
             );
@@ -352,6 +411,9 @@ async fn handle_request(
     inbound_protocol: Protocol,
     peer: IpAddr,
     request: Request,
+    // Gemini 的 model-in-path：`(模型名, 是否流式)`，由路径端点提取；其余
+    // 协议模型名与流式标志都在请求体上，传 `None`。
+    path_model: Option<(String, bool)>,
 ) -> Response {
     let started = unix_millis();
     let request_id = new_request_id();
@@ -494,7 +556,7 @@ async fn handle_request(
             .await;
         }
     };
-    let request = match protocol::decode_request(&parsed, inbound_protocol) {
+    let mut request = match protocol::decode_request(&parsed, inbound_protocol) {
         Ok(request) => request,
         Err(err) => {
             let message = format!("请求体无法解析为入站协议: {err}");
@@ -513,6 +575,12 @@ async fn handle_request(
             .await;
         }
     };
+    // model-in-path：Gemini 的模型名与流式标志承载在 URL 路径端点上，
+    // 路径为权威来源，覆盖请求体可能自带的同名键。
+    if let Some((model, stream)) = path_model {
+        request.model = model;
+        request.stream = stream;
+    }
 
     // 3. 模型组允许名单：组外、空组、已撤组一律按「不存在」拒绝，不提分组、不用 503。
     if !snapshot.token_group_assigned(token)
@@ -1231,7 +1299,8 @@ async fn passthrough_stream_completion(
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, true, channel.protocol);
-    let upstream_url = passthrough_upstream_url(channel);
+    // 直通的前提是出站模型名与入站一致，URL 路径上的模型名无需改写。
+    let upstream_url = passthrough_upstream_url(channel, &ctx.request.model, true);
 
     let upstream = tokio::time::timeout(
         Duration::from_millis(channel.timeout_ms),
@@ -1342,7 +1411,7 @@ async fn passthrough_non_stream_completion(
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, false, channel.protocol);
-    let upstream_url = passthrough_upstream_url(channel);
+    let upstream_url = passthrough_upstream_url(channel, &ctx.request.model, false);
 
     let upstream = tokio::time::timeout(
         Duration::from_millis(channel.timeout_ms),
@@ -1499,11 +1568,11 @@ fn passthrough_patch_request(raw_body: &[u8], stream: bool, protocol: Protocol) 
 }
 
 /// 直通快路径的出站 URL：base + 协议路径。
-fn passthrough_upstream_url(channel: &Channel) -> String {
+fn passthrough_upstream_url(channel: &Channel, model: &str, stream: bool) -> String {
     format!(
         "{}{}",
         channel.base_url.trim_end_matches('/'),
-        protocol::upstream_path(channel.protocol)
+        protocol::upstream_path(channel.protocol, model, stream)
     )
 }
 
@@ -1719,7 +1788,10 @@ async fn non_stream_completion(
         reasoning_content,
         &mut request_warnings,
     );
-    if let Value::Object(map) = &mut outbound_value {
+    // Gemini 的模型名在 URL 路径上，请求体不带（写回会与路径冲突）。
+    if let Value::Object(map) = &mut outbound_value
+        && channel.protocol != Protocol::Gemini
+    {
         map.insert("model".into(), Value::String(outbound_model.to_string()));
     }
     // 会话缓存键回写：按渠道开关把解析出的会话标识写为上游缓存亲和键。
@@ -1736,10 +1808,11 @@ async fn non_stream_completion(
         channel.injects_cache_breakpoints,
     );
 
+    // Gemini 的模型名承载在 URL 路径上；其余协议在请求体（下方补丁）。
     let upstream_url = format!(
         "{}{}",
         channel.base_url.trim_end_matches('/'),
-        protocol::upstream_path(channel.protocol)
+        protocol::upstream_path(channel.protocol, outbound_model, false)
     );
 
     let upstream = deps
@@ -1890,7 +1963,11 @@ async fn stream_completion(
     let outbound_model = routing::outbound_model(channel, ctx.routed_model);
     // 目标性 JSON 补丁：强制流式；OpenAI 另注入 stream_options.include_usage
     // （Anthropic 流式自带 usage）。别名重写用该渠道自己的出站模型名。
-    if let Value::Object(map) = &mut outbound {
+    // Gemini 的流式与否由路径端点决定，请求体无 stream/model 字段；
+    // 其余协议在体上强制流式（OpenAI 另注入 include_usage 供计费）。
+    if let Value::Object(map) = &mut outbound
+        && channel.protocol != Protocol::Gemini
+    {
         map.insert("stream".into(), Value::Bool(true));
         if channel.protocol == Protocol::OpenAiChat {
             map.insert(
@@ -1916,7 +1993,7 @@ async fn stream_completion(
     let upstream_url = format!(
         "{}{}",
         channel.base_url.trim_end_matches('/'),
-        protocol::upstream_path(channel.protocol)
+        protocol::upstream_path(channel.protocol, outbound_model, true)
     );
 
     // 渠道 timeout 只约束到响应头（send 返回）：reqwest 的 `.timeout` 覆盖到
@@ -2413,7 +2490,8 @@ fn authenticate<'a>(
     Ok(token)
 }
 
-/// 从两种头任一种提取令牌 key。
+/// 从入站认证头提取令牌 key：Bearer、`x-api-key`（Anthropic）与
+/// `x-goog-api-key`（Gemini），按顺序取首个非空者。
 fn extract_key(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get("authorization") {
         let value = value.to_str().ok()?;
@@ -2421,10 +2499,12 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
             return Some(key.to_string());
         }
     }
-    headers
-        .get("x-api-key")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim().to_string())
+    for name in ["x-api-key", "x-goog-api-key"] {
+        if let Some(value) = headers.get(name) {
+            return value.to_str().ok().map(|value| value.trim().to_string());
+        }
+    }
+    None
 }
 
 /// 从 `Authorization` 头值取出 Bearer token；scheme 大小写不敏感（RFC 9110）。
@@ -2540,6 +2620,7 @@ impl OutboundAuth for reqwest::RequestBuilder {
                     .cloned()
                     .unwrap_or(DEFAULT_ANTHROPIC_VERSION),
             ),
+            Protocol::Gemini => self.header("x-goog-api-key", key.expose_api_key()),
         }
     }
 
@@ -2760,6 +2841,21 @@ async fn billing_error_response(
 mod tests {
     use super::{append_logged_body, extract_bearer, inbound_stream_error_frame};
     use crate::config::Protocol;
+
+    #[test]
+    fn split_model_method_parses_official_actions() {
+        assert_eq!(
+            super::split_model_method("gemini-2.5-pro:generateContent"),
+            Some(("gemini-2.5-pro".to_string(), false))
+        );
+        assert_eq!(
+            super::split_model_method("models/gemini-2.5-flash:streamGenerateContent"),
+            Some(("gemini-2.5-flash".to_string(), true))
+        );
+        assert_eq!(super::split_model_method(":generateContent"), None);
+        assert_eq!(super::split_model_method("gemini:bogus"), None);
+        assert_eq!(super::split_model_method("gemini"), None);
+    }
 
     #[test]
     fn extract_bearer_is_case_insensitive() {

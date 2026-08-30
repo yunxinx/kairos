@@ -9,25 +9,35 @@
 //!
 //! 两条已知的投影排除项，均为 wire 协议事实而非缺陷：
 //! - 空文本 part 无语义（chat 编码会把空内容还原为单个空 text）；
-//! - `ToolResult.tool_name` 是 IR 侧反规范化字段，三种 wire 均不承载，
-//!   配对身份由 `tool_call_id` 承载。
+//! - `ToolResult.tool_name` 是 IR 侧反规范化字段，wire 均不承载，配对身份
+//!   由 `tool_call_id` 承载；Gemini 按名字配对，编码时从上文调用回填空名字。
+//! - `ToolResult.output` 的两种承载整形都在投影中归一：chat 把对象结果
+//!   序列化为 JSON 字符串，Gemini 把非对象结果包进 `{result}` 键（两者形状
+//!   变化、语义保留）；投影先解析 JSON 字符串、再剥单键 `result` 包裹。
 //!
 //! 基线只覆盖当前已无损的语义面（消息序列含归并后的 system、工具轮、
 //! tool_choice、reasoning 旋钮、采样参数）；跨族有损面（reasoning 丢弃、
 //! `Other` finish、tool arguments 兜底等）的 warning 行为由专用用例声明，
 //! 不进零告警基线。
+//!
+//! Gemini 的两条特殊处理：
+//! - 模型名承载在 URL 路径上（model-in-path），请求 wire 不带 `model`；请求
+//!   助手按网关行为把出站模型名折入 body 的 `model` 键供解码读取。
+//! - usage 无缓存写入语义：cache_write 经 `promptTokenCount` 加法回写后折叠
+//!   进 input（见专用有损面用例），基线响应的 cache_write 记 0。
 
 use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use similar_asserts::assert_eq;
 
-use super::{anthropic_messages, openai_chat, openai_responses};
+use super::{anthropic_messages, gemini, openai_chat, openai_responses};
 use crate::config::Protocol;
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
     ReasoningEffort, Role, Tool, ToolChoice, Usage, Warning,
 };
+use gemini::stable_tool_call_id;
 
 /// 全部有向协议对（a 自往返后经 b 中转再回 a）。
 fn directed_pairs() -> Vec<(Protocol, Protocol)> {
@@ -35,6 +45,7 @@ fn directed_pairs() -> Vec<(Protocol, Protocol)> {
         Protocol::OpenAiChat,
         Protocol::OpenAiResponses,
         Protocol::AnthropicMessages,
+        Protocol::Gemini,
     ];
     let mut pairs = Vec::new();
     for a in all {
@@ -52,6 +63,7 @@ fn encode_response_wire(protocol: Protocol, ir: &ChatResponse) -> Value {
         Protocol::OpenAiChat => openai_chat::encode_response(ir),
         Protocol::OpenAiResponses => openai_responses::encode_response(ir),
         Protocol::AnthropicMessages => anthropic_messages::encode_response(ir),
+        Protocol::Gemini => gemini::encode_response(ir),
     }
 }
 
@@ -63,17 +75,25 @@ fn decode_response_wire(protocol: Protocol, wire: &Value) -> ChatResponse {
             .unwrap_or_else(|err| panic!("OpenAiResponses 响应解码应成功: {err}")),
         Protocol::AnthropicMessages => anthropic_messages::decode_response(wire)
             .unwrap_or_else(|err| panic!("AnthropicMessages 响应解码应成功: {err}")),
+        Protocol::Gemini => gemini::decode_response(wire)
+            .unwrap_or_else(|err| panic!("Gemini 响应解码应成功: {err}")),
     }
 }
 
 /// 编码 IR 请求为 wire；返回 wire 与转换 warnings，供基线断言「无损面零告警」。
 fn encode_request_wire(protocol: Protocol, request: &ChatRequest) -> (Value, Vec<Warning>) {
     let mut warnings = Vec::new();
-    let wire = match protocol {
+    let mut wire = match protocol {
         Protocol::OpenAiChat => openai_chat::encode_request(request, &mut warnings),
         Protocol::OpenAiResponses => openai_responses::encode_request(request, &mut warnings),
         Protocol::AnthropicMessages => anthropic_messages::encode_request(request, &mut warnings),
+        Protocol::Gemini => gemini::encode_request(request, &mut warnings),
     };
+    // model-in-path：Gemini 请求体不带模型名（在 URL 上）；按网关行为把出站
+    // 模型名折入 body 的 `model` 键，复用解码的同一读取通道。
+    if protocol == Protocol::Gemini {
+        wire["model"] = json!(request.model);
+    }
     (wire, warnings)
 }
 
@@ -92,6 +112,7 @@ fn decode_request_result(protocol: Protocol, wire: &Value) -> Result<ChatRequest
         Protocol::AnthropicMessages => {
             anthropic_messages::decode_request(wire).map_err(|err| err.to_string())
         }
+        Protocol::Gemini => gemini::decode_request(wire).map_err(|err| err.to_string()),
     }
 }
 
@@ -219,6 +240,34 @@ fn project_usage(usage: &Usage) -> Value {
     ])
 }
 
+/// ToolResult 载荷的投影归一：chat 把对象结果序列化为 JSON 字符串承载，
+/// Gemini 把非对象结果包进单键 `{result}`——两者都是形状整形而非语义损失，
+/// 且可叠加（chat 字符串化的包裹对象再经 Gemini 又被包一层）。归一反复
+/// 「解析 JSON 字符串、剥 `result` 包裹」至不动点；真实载荷恰好是该形状时
+/// 在投影面上与整形结果不可区分，属投影法的已知代价。
+fn normalize_result_output(output: &Value) -> Value {
+    let mut current = output.clone();
+    for _ in 0..4 {
+        let parsed = match &current {
+            Value::String(text) => {
+                serde_json::from_str::<Value>(text).unwrap_or_else(|_| current.clone())
+            }
+            other => other.clone(),
+        };
+        let unwrapped = match &parsed {
+            Value::Object(map) if map.len() == 1 && map.contains_key("result") => {
+                map["result"].clone()
+            }
+            other => other.clone(),
+        };
+        if unwrapped == current {
+            break;
+        }
+        current = unwrapped;
+    }
+    current
+}
+
 fn project_content_part(part: &ContentPart) -> Option<Value> {
     match part {
         ContentPart::Text { text, .. } if text.is_empty() => None,
@@ -240,7 +289,7 @@ fn project_content_part(part: &ContentPart) -> Option<Value> {
             tool_call_id,
             output,
             ..
-        } => Some(json!({ "tool_result": [tool_call_id, output] })),
+        } => Some(json!({ "tool_result": [tool_call_id, normalize_result_output(output)] })),
         ContentPart::Media {
             media_type, data, ..
         } => Some(json!({ "media": [media_type, data] })),
@@ -262,20 +311,29 @@ fn options(entries: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json:
         .collect()
 }
 
-/// 基线响应：文本 + 工具调用 + ToolCalls finish + 带缓存的 usage。
+/// 基线工具调用的稳定 id：跨 Gemini 中转时 wire 不承载 id，解码按
+/// （名字, 入参）重生成同一值，夹具直接取该形状以保持投影稳定。
+fn tool_call_id() -> String {
+    stable_tool_call_id("get_weather", &json!({ "city": "上海" }))
+}
+
+fn tool_call_part() -> ContentPart {
+    ContentPart::ToolCall {
+        tool_call_id: tool_call_id(),
+        tool_name: "get_weather".to_string(),
+        input: json!({ "city": "上海" }),
+        provider_options: HashMap::new(),
+    }
+}
+
+/// 基线响应：文本 + 工具调用 + ToolCalls finish + 带缓存读取的 usage。
+///
+/// cache_write 记 0：Gemini 无缓存写入语义，写入面由专用有损用例声明。
 fn base_response() -> ChatResponse {
     ChatResponse {
         id: "resp-matrix".to_string(),
         model: "matrix-model".to_string(),
-        content: vec![
-            text_part("晴天，微风。"),
-            ContentPart::ToolCall {
-                tool_call_id: "call_1".to_string(),
-                tool_name: "get_weather".to_string(),
-                input: json!({ "city": "上海" }),
-                provider_options: HashMap::new(),
-            },
-        ],
+        content: vec![text_part("晴天，微风。"), tool_call_part()],
         finish_reason: FinishReason {
             unified: FinishReasonUnified::ToolCalls,
             raw: Some("tool_use".to_string()),
@@ -284,7 +342,7 @@ fn base_response() -> ChatResponse {
             input_tokens: 12,
             output_tokens: 5,
             cache_read_tokens: 3,
-            cache_write_tokens: 2,
+            cache_write_tokens: 0,
             raw: None,
         },
         provider_metadata: HashMap::new(),
@@ -310,18 +368,15 @@ fn base_request() -> ChatRequest {
             },
             Message {
                 role: Role::Assistant,
-                content: vec![ContentPart::ToolCall {
-                    tool_call_id: "call_1".to_string(),
-                    tool_name: "get_weather".to_string(),
-                    input: json!({ "city": "上海" }),
-                    provider_options: HashMap::new(),
-                }],
+                content: vec![tool_call_part()],
                 provider_options: HashMap::new(),
             },
             Message {
                 role: Role::Tool,
                 content: vec![ContentPart::ToolResult {
-                    tool_call_id: "call_1".to_string(),
+                    // 与调用同一稳定 id：跨 Gemini 中转时 id 由（名字, 入参）
+                    // 重生成，配对身份不变。
+                    tool_call_id: tool_call_id(),
                     tool_name: "get_weather".to_string(),
                     output: json!("晴，26 度"),
                     provider_options: HashMap::new(),
@@ -477,6 +532,14 @@ fn responses_reasoning_escape_hatch_survives_same_family() {
     assert_eq!(project_response(&back), project_response(&response));
 }
 
+/// tool_choice 在各协议 wire 上的顶层字段名（Gemini 为 `toolConfig`）。
+fn tool_choice_field(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Gemini => "toolConfig",
+        _ => "tool_choice",
+    }
+}
+
 /// 各协议 tool_choice 的 wire 形状 → IR 类型化期望值表。
 fn tool_choice_wire_shapes(protocol: Protocol) -> Vec<(Value, ToolChoice)> {
     match protocol {
@@ -513,6 +576,26 @@ fn tool_choice_wire_shapes(protocol: Protocol) -> Vec<(Value, ToolChoice)> {
                 },
             ),
         ],
+        Protocol::Gemini => vec![
+            (
+                json!({ "functionCallingConfig": { "mode": "AUTO" } }),
+                ToolChoice::Auto,
+            ),
+            (
+                json!({ "functionCallingConfig": { "mode": "NONE" } }),
+                ToolChoice::None,
+            ),
+            (
+                json!({ "functionCallingConfig": { "mode": "ANY" } }),
+                ToolChoice::Required,
+            ),
+            (
+                json!({ "functionCallingConfig": { "mode": "ANY", "allowedFunctionNames": ["f"] } }),
+                ToolChoice::Tool {
+                    name: "f".to_string(),
+                },
+            ),
+        ],
     }
 }
 
@@ -524,12 +607,13 @@ fn tool_choice_wire_shapes_decode_to_typed_across_protocols() {
         Protocol::OpenAiChat,
         Protocol::OpenAiResponses,
         Protocol::AnthropicMessages,
+        Protocol::Gemini,
     ] {
         for (shape, expected) in tool_choice_wire_shapes(protocol) {
             let mut request = base_request();
             request.tool_choice = Some(expected.clone());
             let (mut wire, _) = encode_request_wire(protocol, &request);
-            wire["tool_choice"] = shape.clone();
+            wire[tool_choice_field(protocol)] = shape.clone();
             let back = decode_request_wire(protocol, &wire);
             assert_eq!(
                 back.tool_choice,
@@ -547,13 +631,18 @@ fn tool_choice_typed_encodes_to_each_protocol_shape() {
         Protocol::OpenAiChat,
         Protocol::OpenAiResponses,
         Protocol::AnthropicMessages,
+        Protocol::Gemini,
     ] {
         for (canonical, choice) in tool_choice_wire_shapes(protocol) {
             let mut request = base_request();
             request.tool_choice = Some(choice);
             let (wire, warnings) = encode_request_wire(protocol, &request);
             assert!(warnings.is_empty(), "{protocol:?} 编码不应有 warning");
-            assert_eq!(wire["tool_choice"], canonical, "{protocol:?} 编码形状");
+            assert_eq!(
+                wire[tool_choice_field(protocol)],
+                canonical,
+                "{protocol:?} 编码形状"
+            );
         }
     }
 }
@@ -1425,4 +1514,33 @@ fn parallel_tool_calls_knob_maps_across_protocols() {
     assert!(warnings.is_empty());
     assert_eq!(chat_wire["parallel_tool_calls"], json!(false));
     assert_eq!(chat_wire["tool_choice"], json!("auto"));
+}
+
+/// usage cache_write 的家族差异（声明有损面）：OpenAI/Anthropic 间写入面
+/// 无损往返；Gemini 无缓存写入语义，回写把 cache_write 折叠进
+/// `promptTokenCount`，解码后并入 input（cache_read 减法还原不受影响）。
+#[test]
+fn usage_cache_write_folds_into_prompt_for_gemini() {
+    let mut ir = base_response();
+    ir.usage.cache_write_tokens = 2;
+
+    // OpenAI/Anthropic 家族：写入面无损。
+    for (a, b) in [
+        (Protocol::OpenAiChat, Protocol::AnthropicMessages),
+        (Protocol::AnthropicMessages, Protocol::OpenAiChat),
+        (Protocol::OpenAiChat, Protocol::OpenAiResponses),
+    ] {
+        response_survives(a, b, &ir);
+    }
+
+    // Gemini：write 折叠进 input（prompt = 12 + 3 + 2 = 17，解码 input = 17 - 3）。
+    let via = decode_response_wire(
+        Protocol::Gemini,
+        &encode_response_wire(Protocol::Gemini, &ir),
+    );
+    assert_eq!(
+        project_usage(&via.usage),
+        json!([14, 5, 3, 0]),
+        "cache_write 经 Gemini 往返折叠进 input"
+    );
 }

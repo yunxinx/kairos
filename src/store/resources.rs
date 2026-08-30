@@ -544,6 +544,7 @@ fn protocol_to_wire(p: Protocol) -> &'static str {
         Protocol::OpenAiChat => "openai_chat",
         Protocol::OpenAiResponses => "openai_responses",
         Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::Gemini => "gemini",
     }
 }
 
@@ -553,6 +554,7 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
         "openai_chat" => Ok(Protocol::OpenAiChat),
         "openai_responses" => Ok(Protocol::OpenAiResponses),
         "anthropic_messages" => Ok(Protocol::AnthropicMessages),
+        "gemini" => Ok(Protocol::Gemini),
         other => Err(StoreError::InvalidResource(format!(
             "未知渠道协议: {other}"
         ))),

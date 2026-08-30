@@ -1,40 +1,34 @@
 /** 渠道 wire 协议，与后端 `Protocol` serde rename 一致。 */
-export type Protocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
+export type Protocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages' | 'gemini';
 
 export const PROTOCOLS: readonly Protocol[] = [
   'openai_chat',
   'openai_responses',
   'anthropic_messages',
+  'gemini',
 ];
 
 /** 渠道 reasoning 思维链兼容输出模式，与后端 `ReasoningOutputMode` serde rename 一致。 */
 export type ReasoningOutputMode = 'auto' | 'always' | 'off';
 
-export const REASONING_OUTPUT_MODES: readonly ReasoningOutputMode[] = [
-  'auto',
-  'always',
-  'off',
-];
+export const REASONING_OUTPUT_MODES: readonly ReasoningOutputMode[] = ['auto', 'always', 'off'];
 
 /** 渠道会话缓存键回写模式，与后端 `SessionCacheKeyMode` serde rename 一致。 */
 export type SessionCacheKeyMode = 'off' | 'auto' | 'always';
 
-export const SESSION_CACHE_KEY_MODES: readonly SessionCacheKeyMode[] = [
-  'off',
-  'auto',
-  'always',
-];
+export const SESSION_CACHE_KEY_MODES: readonly SessionCacheKeyMode[] = ['off', 'auto', 'always'];
 
 /** 运行时收窄日志/表单里的协议字符串。 */
 export function isProtocol(value: string): value is Protocol {
   return (PROTOCOLS as readonly string[]).includes(value);
 }
 
-/** 出站路径段，与网关 `protocol::upstream_path` 对齐。 */
+/** 出站路径段，与网关 `protocol::upstream_path` 对齐；Gemini 模型名在路径上，展示为 `{model}` 占位。 */
 const UPSTREAM_PATH: Record<Protocol, string> = {
   openai_chat: '/chat/completions',
   openai_responses: '/responses',
   anthropic_messages: '/messages',
+  gemini: '/v1beta/models/{model}:generateContent',
 };
 
 /** 渠道出站 URL：去掉 base_url 尾斜杠后接协议路径。 */

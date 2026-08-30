@@ -23,6 +23,7 @@ pub fn decode_request(value: &Value, protocol: Protocol) -> Result<ChatRequest, 
         Protocol::OpenAiResponses => {
             crate::core::openai_responses::decode_request(value).map_err(|e| e.to_string())
         }
+        Protocol::Gemini => crate::core::gemini::decode_request(value).map_err(|e| e.to_string()),
     }
 }
 
@@ -60,6 +61,7 @@ pub fn encode_request_with_reasoning(
         Protocol::OpenAiResponses => {
             crate::core::openai_responses::encode_request(request, warnings)
         }
+        Protocol::Gemini => crate::core::gemini::encode_request(request, warnings),
     }
 }
 
@@ -122,6 +124,7 @@ pub fn decode_response(value: &Value, protocol: Protocol) -> Result<ChatResponse
         Protocol::OpenAiResponses => {
             crate::core::openai_responses::decode_response(value).map_err(|e| e.to_string())
         }
+        Protocol::Gemini => crate::core::gemini::decode_response(value).map_err(|e| e.to_string()),
     }
 }
 
@@ -131,6 +134,7 @@ pub fn encode_response(response: &ChatResponse, protocol: Protocol) -> Value {
         Protocol::OpenAiChat => crate::core::openai_chat::encode_response(response),
         Protocol::AnthropicMessages => crate::core::anthropic_messages::encode_response(response),
         Protocol::OpenAiResponses => crate::core::openai_responses::encode_response(response),
+        Protocol::Gemini => crate::core::gemini::encode_response(response),
     }
 }
 
@@ -141,6 +145,7 @@ pub fn sniff_usage(value: &Value, protocol: Protocol) -> Option<Usage> {
         Protocol::OpenAiChat => crate::core::openai_chat::sniff_chat_usage(value),
         Protocol::AnthropicMessages => crate::core::anthropic_messages::sniff_usage(value),
         Protocol::OpenAiResponses => crate::core::openai_responses::sniff_usage(value),
+        Protocol::Gemini => crate::core::gemini::sniff_usage(value),
     }
 }
 
@@ -152,6 +157,7 @@ pub fn encode_error(status: u16, message: &str, protocol: Protocol) -> Value {
             crate::core::anthropic_messages::encode_error(status, message)
         }
         Protocol::OpenAiResponses => crate::core::openai_responses::encode_error(status, message),
+        Protocol::Gemini => crate::core::gemini::encode_error(status, message),
     }
 }
 
@@ -162,6 +168,7 @@ pub fn stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
         Protocol::OpenAiChat => crate::core::openai_chat::stream_error_frame(message),
         Protocol::AnthropicMessages => crate::core::anthropic_messages::stream_error_frame(message),
         Protocol::OpenAiResponses => crate::core::openai_responses::stream_error_frame(message),
+        Protocol::Gemini => crate::core::gemini::stream_error_frame(message),
     }
 }
 
@@ -171,15 +178,24 @@ pub fn encode_model_list(ids: &[String], protocol: Protocol) -> Value {
         Protocol::OpenAiChat => crate::core::openai_chat::encode_model_list(ids),
         Protocol::AnthropicMessages => crate::core::anthropic_messages::encode_model_list(ids),
         Protocol::OpenAiResponses => crate::core::openai_responses::encode_model_list(ids),
+        Protocol::Gemini => crate::core::gemini::encode_model_list(ids),
     }
 }
 
 /// 出站渠道的 upstream 路径段（相对 base_url）。
-pub fn upstream_path(protocol: Protocol) -> &'static str {
+///
+/// Gemini 的模型名承载在路径上：非流式为
+/// `/v1beta/models/{model}:generateContent`，流式为
+/// `:streamGenerateContent?alt=sse`；其余协议的路径为静态段，忽略模型名。
+pub fn upstream_path(protocol: Protocol, model: &str, stream: bool) -> String {
     match protocol {
-        Protocol::OpenAiChat => "/chat/completions",
-        Protocol::AnthropicMessages => "/messages",
-        Protocol::OpenAiResponses => "/responses",
+        Protocol::OpenAiChat => "/chat/completions".to_string(),
+        Protocol::OpenAiResponses => "/responses".to_string(),
+        Protocol::AnthropicMessages => "/messages".to_string(),
+        Protocol::Gemini if stream => {
+            format!("/v1beta/models/{model}:streamGenerateContent?alt=sse")
+        }
+        Protocol::Gemini => format!("/v1beta/models/{model}:generateContent"),
     }
 }
 
@@ -217,6 +233,9 @@ pub fn make_decoder(protocol: Protocol) -> Box<dyn ChatStreamDecoder + Send> {
         Protocol::OpenAiResponses => Box::new(ResponsesStreamDecoder(
             crate::core::openai_responses::StreamDecoder::default(),
         )),
+        Protocol::Gemini => Box::new(GeminiStreamDecoder(
+            crate::core::gemini::StreamDecoder::default(),
+        )),
     }
 }
 
@@ -238,6 +257,9 @@ pub fn make_encoder(
         )),
         Protocol::OpenAiResponses => Box::new(ResponsesStreamEncoder(
             crate::core::openai_responses::StreamEncoder::new(inbound_model),
+        )),
+        Protocol::Gemini => Box::new(GeminiStreamEncoder(
+            crate::core::gemini::StreamEncoder::new(inbound_model),
         )),
     }
 }
@@ -262,6 +284,15 @@ impl ChatStreamDecoder for AnthropicStreamDecoder {
 
 struct ResponsesStreamDecoder(crate::core::openai_responses::StreamDecoder);
 impl ChatStreamDecoder for ResponsesStreamDecoder {
+    fn process(&mut self, value: &Value) -> DecodeChunk {
+        DecodeChunk {
+            events: self.0.process(value).events,
+        }
+    }
+}
+
+struct GeminiStreamDecoder(crate::core::gemini::StreamDecoder);
+impl ChatStreamDecoder for GeminiStreamDecoder {
     fn process(&mut self, value: &Value) -> DecodeChunk {
         DecodeChunk {
             events: self.0.process(value).events,
@@ -309,10 +340,46 @@ impl ChatStreamEncoder for ResponsesStreamEncoder {
     }
 }
 
+struct GeminiStreamEncoder(crate::core::gemini::StreamEncoder);
+impl ChatStreamEncoder for GeminiStreamEncoder {
+    fn message_start(&self) -> Option<SseFrame> {
+        None
+    }
+    fn encode(&mut self, event: &StreamEvent) -> Vec<SseFrame> {
+        self.0.encode(event)
+    }
+    fn terminator(&self) -> Option<String> {
+        // Gemini 流以服务器关闭收尾（末 chunk 自带 finishReason），无哨兵行。
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 出站路径构造：静态协议忽略模型名与流式；Gemini 的模型名承载在路径
+    /// 端点上，流式走 `:streamGenerateContent?alt=sse`。
+    #[test]
+    fn upstream_path_builds_per_protocol() {
+        assert_eq!(
+            upstream_path(Protocol::OpenAiChat, "gpt-4o", true),
+            "/chat/completions"
+        );
+        assert_eq!(
+            upstream_path(Protocol::AnthropicMessages, "claude", false),
+            "/messages"
+        );
+        assert_eq!(
+            upstream_path(Protocol::Gemini, "gemini-2.5-pro", false),
+            "/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+        assert_eq!(
+            upstream_path(Protocol::Gemini, "gemini-2.5-pro", true),
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+    }
 
     /// 注入分派：仅 Anthropic 协议且开关开启时生效，其余一概不动出站对象。
     #[test]

@@ -99,10 +99,11 @@ async fn test_channel(
     let request = minimal_probe_request(&model);
     let mut warnings = Vec::new();
     let outbound = protocol::encode_request(&request, channel.protocol, &mut warnings);
+    // Gemini 的模型名承载在路径端点上（model-in-path）。
     let upstream_url = format!(
         "{}{}",
         channel.base_url.trim_end_matches('/'),
-        protocol::upstream_path(channel.protocol)
+        protocol::upstream_path(channel.protocol, &model, false)
     );
 
     let started = Instant::now();
@@ -205,8 +206,10 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 // --- 上游模型列表 ---
 
-/// 上游模型列表的路径段（相对 `base_url`）：OpenAI 与 Anthropic 均为 `{base}/models`。
+/// 上游模型列表的路径段（相对 `base_url`）：OpenAI 与 Anthropic 均为
+/// `{base}/models`；Gemini 为官方 `{base}/v1beta/models`。
 const UPSTREAM_MODELS_PATH: &str = "/models";
+const GEMINI_UPSTREAM_MODELS_PATH: &str = "/v1beta/models";
 
 /// 拉取上游模型列表的草稿请求：仅含出站相关字段，渠道无需已保存。
 ///
@@ -257,11 +260,11 @@ async fn list_upstream_models(
         None,
         0,
     );
-    let url = format!(
-        "{}{}",
-        draft.base_url.trim_end_matches('/'),
-        UPSTREAM_MODELS_PATH
-    );
+    let models_path = match draft.protocol {
+        Protocol::Gemini => GEMINI_UPSTREAM_MODELS_PATH,
+        _ => UPSTREAM_MODELS_PATH,
+    };
+    let url = format!("{}{}", draft.base_url.trim_end_matches('/'), models_path);
     let send = deps
         .client
         .get(&url)
@@ -285,23 +288,41 @@ async fn list_upstream_models(
             status_code,
         )));
     }
-    let models = parse_upstream_models(&body_text)?;
+    let models = parse_upstream_models(&body_text, draft.protocol)?;
     Ok(Json(UpstreamModelsView { models }))
 }
 
-/// 从 `{"data": [{"id": ...}]}` 解析模型 id 数组；无 `id` 的条目跳过。
-fn parse_upstream_models(body: &str) -> Result<Vec<String>, AdminError> {
+/// 按协议解析上游模型列表：OpenAI/Anthropic 为 `{"data":[{"id"}]}`；
+/// Gemini 为 `{"models":[{"name":"models/<id>"}]}`，剥前缀取裸 id。
+fn parse_upstream_models(body: &str, protocol: Protocol) -> Result<Vec<String>, AdminError> {
     let parsed: Value = serde_json::from_str(body)
         .map_err(|_| AdminError::Upstream("上游响应不是合法 JSON".to_string()))?;
-    let data = parsed
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| AdminError::Upstream("上游响应缺少 data 数组".to_string()))?;
-    Ok(data
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect())
+    match protocol {
+        Protocol::Gemini => {
+            let models = parsed
+                .get("models")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AdminError::Upstream("上游响应缺少 models 数组".to_string()))?;
+            Ok(models
+                .iter()
+                .filter_map(|item| item.get("name").and_then(Value::as_str))
+                .filter_map(|name| name.strip_prefix("models/"))
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect())
+        }
+        _ => {
+            let data = parsed
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AdminError::Upstream("上游响应缺少 data 数组".to_string()))?;
+            Ok(data
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect())
+        }
+    }
 }
 
 /// 出站请求发送失败的错误摘要：超时与连接失败措辞与探测保持一致。

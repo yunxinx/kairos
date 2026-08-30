@@ -30,6 +30,8 @@
   --proto-responses-bg: #e0e7ff;
   --proto-anthropic: #c2410c;
   --proto-anthropic-bg: #ffedd5;
+  --proto-gemini: #2563eb;
+  --proto-gemini-bg: #dbeafe;
   --alias: var(--info);
   --alias-bg: var(--info-bg);
   --dot-color: #dce0eb;
@@ -66,6 +68,8 @@
   --proto-responses-bg: color-mix(in srgb, var(--proto-responses) 16%, var(--seed-surface));
   --proto-anthropic: #fdba74;
   --proto-anthropic-bg: color-mix(in srgb, var(--proto-anthropic) 16%, var(--seed-surface));
+  --proto-gemini: #93c5fd;
+  --proto-gemini-bg: color-mix(in srgb, var(--proto-gemini) 16%, var(--seed-surface));
   /* 点阵：略弱于边框，但仍可感知 */
   --dot-color: color-mix(in srgb, var(--seed-border) 28%, var(--seed-bg));
   --primary-hover: #60a5fa;
@@ -914,6 +918,10 @@ html[lang='zh-CN'] .font-serif {
 .badge-proto-anthropic {
   background: var(--proto-anthropic-bg);
   color: var(--proto-anthropic);
+}
+.badge-proto-gemini {
+  background: var(--proto-gemini-bg);
+  color: var(--proto-gemini);
 }
 
 /* 请求路由 hop 序号：描边圆点，不用实心底色，避免和模型名、chip 抢视觉。 */

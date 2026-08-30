@@ -41,7 +41,7 @@ import { DEFAULT_MODEL_GROUP, groupSelectOptions } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
-const PROTOCOLS: Protocol[] = ['openai_chat', 'openai_responses', 'anthropic_messages'];
+const PROTOCOLS: Protocol[] = ['openai_chat', 'openai_responses', 'anthropic_messages', 'gemini'];
 
 type EditorTab = 'basic' | 'advanced';
 

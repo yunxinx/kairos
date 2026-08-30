@@ -497,8 +497,9 @@ fn pop_pending_call(pending: &mut Vec<(String, String)>, name: &str) -> Option<S
 }
 
 /// wire 不承载调用 id 时的稳定 id：同一（名字, 入参）跨轮重放得到同一 id，
-/// 工具结果按名字配对因此稳定。
-fn stable_tool_call_id(name: &str, input: &Value) -> String {
+/// 工具结果按名字配对因此稳定。矩阵夹具同用此形状（跨本协议中转时 id 由
+/// 名字与入参重生成，见 `core::roundtrip` 模块注释）。
+pub(crate) fn stable_tool_call_id(name: &str, input: &Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(name.as_bytes());
     hasher.update(b"|");
@@ -820,15 +821,29 @@ fn encode_messages(
     let mut contents: Vec<Value> = Vec::new();
     // 待并入下一条 user content 的 functionResponse parts。
     let mut pending_results: Vec<Value> = Vec::new();
+    // 已见调用 id → 函数名：Gemini 的工具结果按名字配对，跨族来源（如 chat
+    // 的 tool 消息）不携带函数名，编码时从上文调用回填空名字。
+    let mut call_names: HashMap<String, String> = HashMap::new();
 
     for message in messages {
+        for part in &message.content {
+            if let ContentPart::ToolCall {
+                tool_call_id,
+                tool_name,
+                ..
+            } = part
+            {
+                call_names.insert(tool_call_id.clone(), tool_name.clone());
+            }
+        }
         match message.role {
             Role::System => continue,
             Role::Tool => {
                 for part in &message.content {
                     match part {
                         ContentPart::ToolResult { .. } => {
-                            if let Some(block) = encode_part(part, warnings) {
+                            let resolved = resolve_result_name(part, &call_names);
+                            if let Some(block) = encode_part(&resolved, warnings) {
                                 pending_results.push(block);
                             }
                         }
@@ -865,6 +880,32 @@ fn encode_messages(
         contents.push(json!({ "role": "user", "parts": pending_results }));
     }
     (system_instruction, contents)
+}
+
+/// 工具结果名字为空时从上文调用回填（Gemini 按名字配对，名字是配对身份）；
+/// 名字已有值或上文无对应调用时原样返回。
+fn resolve_result_name(part: &ContentPart, call_names: &HashMap<String, String>) -> ContentPart {
+    let ContentPart::ToolResult {
+        tool_call_id,
+        tool_name,
+        output,
+        provider_options,
+    } = part
+    else {
+        return part.clone();
+    };
+    if !tool_name.is_empty() {
+        return part.clone();
+    }
+    let Some(name) = call_names.get(tool_call_id) else {
+        return part.clone();
+    };
+    ContentPart::ToolResult {
+        tool_call_id: tool_call_id.clone(),
+        tool_name: name.clone(),
+        output: output.clone(),
+        provider_options: provider_options.clone(),
+    }
 }
 
 /// 消息内文本 part 拼接（system 合并用）。
@@ -1484,12 +1525,53 @@ impl StreamEncoder {
 
 // ---- 错误编码 ----
 
-/// 流内错误的入站 SSE 帧（`data:` 纯帧，500 语义）。流式编码器消费 IR Error
-/// 事件与网关兜底路径共用，保证形状一致。
+/// 编码为 Gemini 错误格式 `{"error":{code,message,status}}`。
+///
+/// `status` 是 google.rpc.Code 枚举名，按 HTTP 状态码映射；流内错误（固定
+/// 500）与网关兜底路径共用本形状。
+pub fn encode_error(status: u16, message: &str) -> Value {
+    let status_name = match status {
+        400 => "INVALID_ARGUMENT",
+        401 => "UNAUTHENTICATED",
+        403 => "PERMISSION_DENIED",
+        404 => "NOT_FOUND",
+        409 => "ABORTED",
+        429 => "RESOURCE_EXHAUSTED",
+        499 => "CANCELLED",
+        500 => "INTERNAL",
+        501 => "UNIMPLEMENTED",
+        503 => "UNAVAILABLE",
+        504 => "DEADLINE_EXCEEDED",
+        _ => "UNKNOWN",
+    };
+    json!({
+        "error": {
+            "code": status,
+            "message": message,
+            "status": status_name,
+        }
+    })
+}
+
+/// 流内错误的入站 SSE 帧（500 语义）。流式编码器消费 IR Error 事件与网关
+/// 兜底路径共用，保证形状一致。
 pub fn stream_error_frame(message: &str) -> SseFrame {
-    SseFrame::data(
-        json!({ "error": { "code": 500, "message": message, "status": "INTERNAL" } }).to_string(),
-    )
+    SseFrame::data(encode_error(500, message).to_string())
+}
+
+/// 编码为 Gemini `GET /v1beta/models` 列表：`models[].name` 带 `models/`
+/// 前缀的官方形状。
+pub fn encode_model_list(ids: &[String]) -> Value {
+    let models: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "name": format!("models/{id}"),
+                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+            })
+        })
+        .collect();
+    json!({ "models": models })
 }
 
 // ---- 响应编码：IR → wire ----
@@ -2425,6 +2507,51 @@ mod tests {
             frames.extend(encoder.encode(event));
         }
         insta::assert_json_snapshot!(frames_to_snapshot(&frames));
+    }
+
+    /// 错误编码：`code` 为 HTTP 状态码，`status` 按 google.rpc.Code 枚举映射。
+    #[test]
+    fn encode_error_maps_status_to_google_rpc_code() {
+        assert_eq!(
+            encode_error(429, "配额耗尽"),
+            json!({ "error": { "code": 429, "message": "配额耗尽", "status": "RESOURCE_EXHAUSTED" } })
+        );
+        assert_eq!(
+            encode_error(400, "参数错误")["error"]["status"],
+            json!("INVALID_ARGUMENT")
+        );
+        assert_eq!(
+            encode_error(404, "不存在")["error"]["status"],
+            json!("NOT_FOUND")
+        );
+        assert_eq!(
+            encode_error(503, "过载")["error"]["status"],
+            json!("UNAVAILABLE")
+        );
+        assert_eq!(
+            encode_error(599, "未知")["error"]["status"],
+            json!("UNKNOWN")
+        );
+    }
+
+    /// 模型列表编码：`models[].name` 带 `models/` 前缀的官方形状。
+    #[test]
+    fn encode_model_list_prefixes_names() {
+        assert_eq!(
+            encode_model_list(&["gemini-2.5-pro".to_string(), "gemini-2.5-flash".to_string()]),
+            json!({
+                "models": [
+                    {
+                        "name": "models/gemini-2.5-pro",
+                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+                    },
+                    {
+                        "name": "models/gemini-2.5-flash",
+                        "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+                    },
+                ]
+            })
+        );
     }
 
     /// 流内错误编码：以独立 `data:` 帧下发 Gemini 错误形状（500 语义）。
