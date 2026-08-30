@@ -504,6 +504,7 @@ mod tests {
                 output_micros: 10_000_000,
                 cache_read_micros: None,
                 cache_write_micros: None,
+                cache_write_1h_micros: None,
             },
         )
         .await

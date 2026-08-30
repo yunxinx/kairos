@@ -1437,6 +1437,7 @@ fn parse_usage_object(usage: &serde_json::Map<String, Value>) -> Option<Usage> {
             .unwrap_or(0),
         cache_read_tokens: cached,
         cache_write_tokens: cache_write,
+        cache_write_1h_tokens: 0,
         raw: Some(Value::Object(usage.clone())),
     })
 }
@@ -1462,6 +1463,7 @@ fn convert_usage(wire: WireUsage) -> Usage {
         output_tokens: wire.output_tokens,
         cache_read_tokens: cached,
         cache_write_tokens: cache_write,
+        cache_write_1h_tokens: 0,
         raw,
     }
 }

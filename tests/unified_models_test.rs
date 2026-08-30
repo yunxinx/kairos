@@ -397,6 +397,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             output_micros: 1_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         },
         Price {
             channel_id: SEED_PRICE_ATTACH_LISTING_CHANNELS,
@@ -405,6 +406,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             output_micros: 10_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         },
     ];
     seed.unified_models = vec![UnifiedModel {

@@ -192,6 +192,7 @@ pub(super) async fn log_request(
         output_tokens: billing.usage.output_tokens,
         cache_read_tokens: billing.usage.cache_read_tokens,
         cache_write_tokens: billing.usage.cache_write_tokens,
+        cache_write_1h_tokens: billing.usage.cache_write_1h_tokens,
         price: billing.price,
         base_cost_usd_micros: billing.base_cost_usd_micros,
         discount_bp: billing.discount_bp,

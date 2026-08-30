@@ -343,6 +343,7 @@ fn base_response() -> ChatResponse {
             output_tokens: 5,
             cache_read_tokens: 3,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             raw: None,
         },
         provider_metadata: HashMap::new(),

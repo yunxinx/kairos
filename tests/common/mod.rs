@@ -521,6 +521,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
                 output_micros: 10_000_000,
                 cache_read_micros: Some(1_250_000),
                 cache_write_micros: Some(10_000_000),
+                cache_write_1h_micros: None,
             },
             // 别名短名 `fast` 也是计费模型名（本票按 request.model 计价）。
             Price {
@@ -530,6 +531,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
                 output_micros: 600_000,
                 cache_read_micros: None,
                 cache_write_micros: None,
+                cache_write_1h_micros: None,
             },
         ],
         unified_models: vec![],

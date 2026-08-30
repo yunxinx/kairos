@@ -1101,6 +1101,7 @@ fn convert_usage(usage: &Value) -> Usage {
         output_tokens: candidates,
         cache_read_tokens: cached,
         cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
         raw: Some(usage.clone()),
     }
 }
@@ -2344,6 +2345,7 @@ mod tests {
                         output_tokens: 12,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        cache_write_1h_tokens: 0,
                         raw: Some(json!({
                             "promptTokenCount": 10,
                             "candidatesTokenCount": 12,
@@ -2497,6 +2499,7 @@ mod tests {
                     output_tokens: 12,
                     cache_read_tokens: 4,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     raw: None,
                 },
                 provider_metadata: HashMap::new(),
@@ -2641,6 +2644,7 @@ mod tests {
                     output_tokens: 12,
                     cache_read_tokens: 4,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     raw: None,
                 },
                 provider_metadata: HashMap::new(),

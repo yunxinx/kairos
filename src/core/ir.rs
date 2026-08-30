@@ -254,14 +254,20 @@ pub struct FinishReason {
     pub raw: Option<String>,
 }
 
-/// usage 四分量 + raw 兜底。四分量对齐价格表四档（input/output/cache_read/cache_write），
-/// `raw` 保留上游原始 usage 形状，供后续计费与对账。
+/// usage 四分量 + 1h 写入明细 + raw 兜底。四分量对齐价格表四档
+/// （input/output/cache_read/cache_write），`raw` 保留上游原始 usage 形状，
+/// 供后续计费与对账。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// cache 写入中 1h TTL 档的明细：[`Self::cache_write_tokens`] 的子集，
+    /// 不参与任何 prompt 总额与用量统计。仅 Anthropic 上游回报
+    /// `cache_creation.ephemeral_1h_input_tokens` 时非零。
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
 }
@@ -277,17 +283,19 @@ impl Usage {
         self.output_tokens = self.output_tokens.max(other.output_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        self.cache_write_1h_tokens = self.cache_write_1h_tokens.max(other.cache_write_1h_tokens);
         if self.raw.is_none() {
             self.raw = other.raw;
         }
     }
 
-    /// 四分量是否全为零（上游未回报 usage 时的嗅探/解码缺省值）。
+    /// 计费相关分量是否全为零（上游未回报 usage 时的嗅探/解码缺省值）。
     pub fn is_zero(&self) -> bool {
         self.input_tokens == 0
             && self.output_tokens == 0
             && self.cache_read_tokens == 0
             && self.cache_write_tokens == 0
+            && self.cache_write_1h_tokens == 0
     }
 }
 

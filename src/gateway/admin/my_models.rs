@@ -251,6 +251,7 @@ mod tests {
             output_micros: 8_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let pricey = resources::Price {
             channel_id: 2,
@@ -259,6 +260,7 @@ mod tests {
             output_micros: 8_000_000,
             cache_read_micros: Some(500_000),
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let candidates = vec![&cheap, &pricey];
         assert_eq!(
@@ -300,6 +302,7 @@ mod tests {
             output_micros: 10_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let candidates = vec![&price];
         assert_eq!(

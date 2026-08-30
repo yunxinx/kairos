@@ -377,7 +377,8 @@ pub struct TokenRecord {
     pub last_used_at: Option<i64>,
 }
 
-/// 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）；
+/// 某一渠道上某一已登记模型名的价格档（micro-USD / 1M tokens），
+/// cache 写入可细分 1h TTL 档；
 /// 缓存档 `None` 表示该档不计价。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -389,6 +390,9 @@ pub struct Price {
     pub output_micros: i64,
     pub cache_read_micros: Option<i64>,
     pub cache_write_micros: Option<i64>,
+    /// cache 写入 1h TTL 档单价；`None` 表示未配置，整行按 `cache_write`
+    /// 单一费率计。配置了即启用 1h 分档，是渠道级运营决策。
+    pub cache_write_1h_micros: Option<i64>,
 }
 
 /// 运行时开关键：是否落完整请求/响应 body。
@@ -1394,7 +1398,7 @@ pub async fn rebind_channels_to_default(
 /// 读出全部价格（每渠道每模型一行）。
 pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
     let rows = sqlx::query(
-        "SELECT channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros \
+        "SELECT channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros, cache_write_1h_micros \
          FROM prices",
     )
     .fetch_all(pool)
@@ -1415,6 +1419,9 @@ pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
                 cache_write_micros: row
                     .try_get("cache_write_micros")
                     .map_err(StoreError::Query)?,
+                cache_write_1h_micros: row
+                    .try_get("cache_write_1h_micros")
+                    .map_err(StoreError::Query)?,
             })
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
@@ -1425,12 +1432,13 @@ pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
 pub async fn upsert_price(conn: &mut SqliteConnection, price: &Price) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO prices \
-         (channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros) \
-         VALUES (?, ?, ?, ?, ?, ?) \
+         (channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros, cache_write_1h_micros) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(channel_id, model) DO UPDATE SET \
            input_micros = excluded.input_micros, output_micros = excluded.output_micros, \
            cache_read_micros = excluded.cache_read_micros, \
-           cache_write_micros = excluded.cache_write_micros",
+           cache_write_micros = excluded.cache_write_micros, \
+           cache_write_1h_micros = excluded.cache_write_1h_micros",
     )
     .bind(price.channel_id)
     .bind(&price.model)
@@ -1438,6 +1446,7 @@ pub async fn upsert_price(conn: &mut SqliteConnection, price: &Price) -> Result<
     .bind(price.output_micros)
     .bind(price.cache_read_micros)
     .bind(price.cache_write_micros)
+    .bind(price.cache_write_1h_micros)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -2606,6 +2615,7 @@ mod tests {
             output_micros: 10_000_000,
             cache_read_micros: Some(1_250_000),
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         upsert_price(&mut conn, &price).await.expect("应能写价格");
 
@@ -2636,6 +2646,7 @@ mod tests {
             output_micros: 2_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let right_price = Price {
             channel_id: right_id,
@@ -2644,6 +2655,7 @@ mod tests {
             output_micros: 8_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         upsert_price(&mut conn, &left_price)
             .await

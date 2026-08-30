@@ -58,6 +58,7 @@ const inputInputId = `pricing-editor-input-${uid}`;
 const outputInputId = `pricing-editor-output-${uid}`;
 const cacheReadInputId = `pricing-editor-cache-read-${uid}`;
 const cacheWriteInputId = `pricing-editor-cache-write-${uid}`;
+const cacheWrite1hInputId = `pricing-editor-cache-write-1h-${uid}`;
 
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, validate } = useFormValidation();
@@ -71,19 +72,22 @@ const initialValues = {
   output: props.initial ? formatUsdAmount(props.initial.output_micros) : '',
   cacheRead: props.initial ? formatOptional(props.initial.cache_read_micros) : '',
   cacheWrite: props.initial ? formatOptional(props.initial.cache_write_micros) : '',
+  cacheWrite1h: props.initial ? formatOptional(props.initial.cache_write_1h_micros) : '',
 };
 
 const editorInput = ref(initialValues.input);
 const editorOutput = ref(initialValues.output);
 const editorCacheRead = ref(initialValues.cacheRead);
 const editorCacheWrite = ref(initialValues.cacheWrite);
+const editorCacheWrite1h = ref(initialValues.cacheWrite1h);
 
 const dirty = computed(
   () =>
     editorInput.value !== initialValues.input ||
     editorOutput.value !== initialValues.output ||
     editorCacheRead.value !== initialValues.cacheRead ||
-    editorCacheWrite.value !== initialValues.cacheWrite,
+    editorCacheWrite.value !== initialValues.cacheWrite ||
+    editorCacheWrite1h.value !== initialValues.cacheWrite1h,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -121,6 +125,7 @@ function handleSave() {
     },
     { name: 'cacheRead', value: editorCacheRead.value, rules: [{ kind: 'usd', min: 0 }] },
     { name: 'cacheWrite', value: editorCacheWrite.value, rules: [{ kind: 'usd', min: 0 }] },
+    { name: 'cacheWrite1h', value: editorCacheWrite1h.value, rules: [{ kind: 'usd', min: 0 }] },
   ];
   if (!validate(specs, t)) return;
   const inputMicros = parseUsdToMicros(editorInput.value);
@@ -135,6 +140,7 @@ function handleSave() {
     output_micros: outputMicros,
     cache_read_micros: optionalMicros(editorCacheRead.value),
     cache_write_micros: optionalMicros(editorCacheWrite.value),
+    cache_write_1h_micros: optionalMicros(editorCacheWrite1h.value),
   });
 }
 </script>
@@ -259,6 +265,26 @@ function handleSave() {
                 :invalid="invalid"
                 :hint-id="hintId"
                 v-on="fieldInputHandlers('cacheWrite')"
+              />
+            </template>
+          </FormField>
+          <FormField
+            field-name="cacheWrite1h"
+            :label="t('pricing.cacheWrite1h')"
+            :input-id="cacheWrite1hInputId"
+            :error="fieldError('cacheWrite1h')"
+            :guide="t('pricing.cacheWrite1hGuide')"
+          >
+            <template #default="{ hintId, invalid }">
+              <FormTextInput
+                :id="cacheWrite1hInputId"
+                v-model="editorCacheWrite1h"
+                type="text"
+                inputmode="decimal"
+                class="font-mono"
+                :invalid="invalid"
+                :hint-id="hintId"
+                v-on="fieldInputHandlers('cacheWrite1h')"
               />
             </template>
           </FormField>

@@ -864,7 +864,7 @@ pub(super) fn reject_unhidden_unified_collision<'a>(
     Ok(())
 }
 
-/// 校验价格字段：四档单价均非负。
+/// 校验价格字段：各档单价均非负。
 fn validate_price(price: &Price) -> Result<(), AdminError> {
     if price.input_micros < 0 || price.output_micros < 0 {
         return Err(AdminError::InvalidBody(
@@ -879,6 +879,11 @@ fn validate_price(price: &Price) -> Result<(), AdminError> {
     if matches!(price.cache_write_micros, Some(value) if value < 0) {
         return Err(AdminError::InvalidBody(
             "cache_write 单价不能为负".to_string(),
+        ));
+    }
+    if matches!(price.cache_write_1h_micros, Some(value) if value < 0) {
+        return Err(AdminError::InvalidBody(
+            "cache_write_1h 单价不能为负".to_string(),
         ));
     }
     Ok(())

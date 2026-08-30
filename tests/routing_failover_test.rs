@@ -535,6 +535,7 @@ async fn failover_bills_succeeding_channel_price_once() {
                 output_micros: 0,
                 cache_read_micros: None,
                 cache_write_micros: None,
+                cache_write_1h_micros: None,
             },
             Price {
                 channel_id: 2,
@@ -543,6 +544,7 @@ async fn failover_bills_succeeding_channel_price_once() {
                 output_micros: 0,
                 cache_read_micros: None,
                 cache_write_micros: None,
+                cache_write_1h_micros: None,
             },
         ];
         seed

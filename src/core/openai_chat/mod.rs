@@ -1194,6 +1194,7 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
         raw: None,
     });
 
@@ -1250,6 +1251,7 @@ fn convert_usage(wire: WireUsage) -> Usage {
         output_tokens: wire.completion_tokens,
         cache_read_tokens: cached,
         cache_write_tokens: cache_write,
+        cache_write_1h_tokens: 0,
         raw,
     }
 }
@@ -2994,6 +2996,7 @@ mod tests {
                 output_tokens: 2,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 raw: None,
             },
             provider_metadata: HashMap::new(),

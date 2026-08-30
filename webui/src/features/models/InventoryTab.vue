@@ -403,6 +403,7 @@ function loadErrorMessage(): string {
             <TableHead>{{ t('pricing.outputUsd') }}</TableHead>
             <TableHead>{{ t('pricing.cacheReadUsd') }}</TableHead>
             <TableHead>{{ t('pricing.cacheWriteUsd') }}</TableHead>
+            <TableHead>{{ t('pricing.cacheWrite1hUsd') }}</TableHead>
             <TableHead v-if="hasActions" align="center" class="w-24">
               {{ t('common.actions') }}
             </TableHead>
@@ -468,6 +469,9 @@ function loadErrorMessage(): string {
                 </TableCell>
                 <TableCell class="font-mono" data-testid="price-cache-write">
                   {{ row.price ? formatOptionalAmount(row.price.cache_write_micros) : '—' }}
+                </TableCell>
+                <TableCell class="font-mono" data-testid="price-cache-write-1h">
+                  {{ row.price ? formatOptionalAmount(row.price.cache_write_1h_micros) : '—' }}
                 </TableCell>
                 <TableCell v-if="hasActions" align="center">
                   <span class="inline-flex items-center justify-center gap-1">

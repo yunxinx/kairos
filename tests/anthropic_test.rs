@@ -200,6 +200,58 @@ async fn anthropic_passthrough_forwards_and_bills() {
     assert_eq!(row.1, 100);
 }
 
+/// Anthropic 直通 + 1h 分档计费：usage 的 cache_creation 明细按
+/// 1h/5m 双速率拆分计价，日志记录 1h 明细与价格快照。
+#[tokio::test]
+async fn anthropic_passthrough_bills_1h_cache_write_tier() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = anthropic_channel_seed(base);
+        seed.prices[0].cache_write_1h_micros = Some(20_000_000);
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_01t", "type": "message", "role": "assistant", "model": TEST_MODEL,
+        "content": [{ "type": "text", "text": "直通" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {
+            "input_tokens": 100, "output_tokens": 20,
+            "cache_creation_input_tokens": 300, "cache_read_input_tokens": 40,
+            "cache_creation": { "ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200 }
+        }
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 1h 写入 200 × 20.0 + 5m 写入 100 × 10.0 + input 100 × 2.5 + output 20 × 10.0
+    // + read 40 × 1.25（micro-USD / 1M tokens）= 4000 + 1000 + 250 + 200 + 50 = 5500。
+    let row: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT settled_usd_micros, cache_write_1h_tokens, cache_write_1h_price_usd_micros, \
+         cache_write_tokens FROM token_balance JOIN request_log \
+         ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
+    )
+    .bind(TEST_TOKEN_KEY)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应能查询计费");
+    assert_eq!(row.0, 5500);
+    assert_eq!(row.1, 200);
+    assert_eq!(row.2, 20_000_000);
+    assert_eq!(row.3, 300);
+}
+
 /// OpenAI chat 入站 → Anthropic 渠道：流式跨协议，下游收到 openai chunk 帧。
 #[tokio::test]
 async fn openai_inbound_to_anthropic_channel_streaming() {

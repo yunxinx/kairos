@@ -167,7 +167,7 @@ export interface ChannelModelOrder {
   channel_ids: number[];
 }
 
-/** 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）。 */
+/** 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens），cache 写入可细分 1h 档。 */
 export interface Price {
   channel_id: number;
   model: string;
@@ -175,6 +175,8 @@ export interface Price {
   output_micros: number;
   cache_read_micros: number | null;
   cache_write_micros: number | null;
+  /** 1h TTL 档单价；null 表示未配置，整行按 cache_write 单一费率计。 */
+  cache_write_1h_micros: number | null;
 }
 
 /** 组名单一条：钉渠道的已登记名，或统一模型 ID。 */
@@ -505,6 +507,10 @@ export interface LogEntry {
   output_price_usd_micros: number;
   cache_read_price_usd_micros: number;
   cache_write_price_usd_micros: number;
+  /** cache 写入中 1h TTL 档明细（写入总数的子集）。 */
+  cache_write_1h_tokens: number;
+  /** 1h TTL 档价格快照；0 表示价格行未配置该档。 */
+  cache_write_1h_price_usd_micros: number;
   /** 渠道原价（折扣前）。 */
   base_cost_usd_micros: number;
   /** 万分比折扣率；10000 表示原价。 */

@@ -52,10 +52,14 @@ pub(super) struct LogEntry {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    /// cache 写入中 1h TTL 档明细（写入总数的子集）。
+    cache_write_1h_tokens: u64,
     input_price_usd_micros: i64,
     output_price_usd_micros: i64,
     cache_read_price_usd_micros: i64,
     cache_write_price_usd_micros: i64,
+    /// 1h TTL 档价格快照；0 表示价格行未配置该档。
+    cache_write_1h_price_usd_micros: i64,
     /// 渠道原价（折扣前）。
     base_cost_usd_micros: i64,
     /// 万分比折扣率（10000 = 原价）。
@@ -87,10 +91,12 @@ impl LogEntry {
             output_tokens: log.output_tokens,
             cache_read_tokens: log.cache_read_tokens,
             cache_write_tokens: log.cache_write_tokens,
+            cache_write_1h_tokens: log.cache_write_1h_tokens,
             input_price_usd_micros: log.price.input_micros,
             output_price_usd_micros: log.price.output_micros,
             cache_read_price_usd_micros: log.price.cache_read_micros,
             cache_write_price_usd_micros: log.price.cache_write_micros,
+            cache_write_1h_price_usd_micros: log.price.cache_write_1h_micros,
             base_cost_usd_micros: log.base_cost_usd_micros,
             discount_bp: log.discount_bp,
             cost_usd_micros: log.cost_usd_micros,

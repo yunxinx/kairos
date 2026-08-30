@@ -122,16 +122,46 @@ const calculationSteps = computed(() => {
     });
   }
   if (props.entry.cache_write_tokens > 0) {
-    steps.push({
-      name: t('logs.cacheWriteTokens'),
-      tokens: props.entry.cache_write_tokens,
-      price: props.entry.cache_write_price_usd_micros,
-      subtotalMicros: componentCostMicros(
-        props.entry.cache_write_tokens,
-        props.entry.cache_write_price_usd_micros,
-      ),
-      isCache: true,
-    });
+    // 与网关计费同一口径：配置 1h 档时写入拆两行（1h 明细钳制在写入总数内），
+    // 未配置则整行按缓存写单一费率。
+    const oneHourTokens = Math.min(
+      props.entry.cache_write_1h_tokens,
+      props.entry.cache_write_tokens,
+    );
+    const oneHourPriced = props.entry.cache_write_1h_price_usd_micros > 0 && oneHourTokens > 0;
+    if (oneHourPriced) {
+      const restTokens = props.entry.cache_write_tokens - oneHourTokens;
+      steps.push({
+        name: t('logs.cacheWrite1hTokens'),
+        tokens: oneHourTokens,
+        price: props.entry.cache_write_1h_price_usd_micros,
+        subtotalMicros: componentCostMicros(
+          oneHourTokens,
+          props.entry.cache_write_1h_price_usd_micros,
+        ),
+        isCache: true,
+      });
+      if (restTokens > 0) {
+        steps.push({
+          name: t('logs.cacheWriteTokens'),
+          tokens: restTokens,
+          price: props.entry.cache_write_price_usd_micros,
+          subtotalMicros: componentCostMicros(restTokens, props.entry.cache_write_price_usd_micros),
+          isCache: true,
+        });
+      }
+    } else {
+      steps.push({
+        name: t('logs.cacheWriteTokens'),
+        tokens: props.entry.cache_write_tokens,
+        price: props.entry.cache_write_price_usd_micros,
+        subtotalMicros: componentCostMicros(
+          props.entry.cache_write_tokens,
+          props.entry.cache_write_price_usd_micros,
+        ),
+        isCache: true,
+      });
+    }
   }
   return steps;
 });

@@ -150,12 +150,13 @@ pub struct RequestLog {
     pub channel_key: Option<String>,
     pub status_code: i64,
     pub latency_ms: i64,
-    /// usage 四分量。
+    /// usage 四分量与 1h 写入明细（明细为写入总数的子集）。
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
-    /// 计费时的四档价格快照（micro-USD / 1M tokens）。
+    pub cache_write_1h_tokens: u64,
+    /// 计费时的价格快照（micro-USD / 1M tokens）。
     pub price: PriceSnapshot,
     /// 渠道原价（micro-USD），不套用折扣。
     pub base_cost_usd_micros: i64,
@@ -193,11 +194,11 @@ pub async fn insert_request_log_on(
         "INSERT INTO request_log \
          (id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
           channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
-          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-          cache_read_price_usd_micros, cache_write_price_usd_micros, \
+          cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
+          cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
           base_cost_usd_micros, discount_bp, cost_usd_micros, \
           settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(log.created_at)
@@ -215,10 +216,12 @@ pub async fn insert_request_log_on(
     .bind(log.output_tokens as i64)
     .bind(log.cache_read_tokens as i64)
     .bind(log.cache_write_tokens as i64)
+    .bind(log.cache_write_1h_tokens as i64)
     .bind(log.price.input_micros)
     .bind(log.price.output_micros)
     .bind(log.price.cache_read_micros)
     .bind(log.price.cache_write_micros)
+    .bind(log.price.cache_write_1h_micros)
     .bind(log.base_cost_usd_micros)
     .bind(log.discount_bp)
     .bind(log.cost_usd_micros)
@@ -654,8 +657,8 @@ async fn query_request_logs_on(
     let mut qb = sqlx::QueryBuilder::new(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
          channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
-         cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, \
+         cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
          settled FROM request_log",
     );
@@ -690,8 +693,8 @@ pub async fn get_request_log_on_conn(
     let row = sqlx::query(
         "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
          channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
-         cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, \
+         cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
+         cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
          settled, request_body, response_body FROM request_log WHERE id = ?",
     )
@@ -1579,6 +1582,9 @@ fn map_request_log_row(
         cache_write_micros: row
             .try_get("cache_write_price_usd_micros")
             .map_err(StoreError::Query)?,
+        cache_write_1h_micros: row
+            .try_get("cache_write_1h_price_usd_micros")
+            .map_err(StoreError::Query)?,
     };
     Ok(RequestLog {
         id: row.try_get("id").map_err(StoreError::Query)?,
@@ -1600,6 +1606,9 @@ fn map_request_log_row(
             .map_err(StoreError::Query)?,
         cache_write_tokens: row
             .try_get("cache_write_tokens")
+            .map_err(StoreError::Query)?,
+        cache_write_1h_tokens: row
+            .try_get("cache_write_1h_tokens")
             .map_err(StoreError::Query)?,
         price,
         base_cost_usd_micros: row
@@ -2195,6 +2204,7 @@ mod tests {
             output_micros: 10_000_000,
             cache_read_micros: 1_250_000,
             cache_write_micros: 10_000_000,
+            cache_write_1h_micros: 0,
         };
         for (i, model) in ["gpt-4o", "gpt-4o-mini", "gpt-4o", "gpt-4o-mini"]
             .iter()
@@ -2219,6 +2229,7 @@ mod tests {
                     output_tokens: 1,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     price,
                     cost_usd_micros: i as i64,
                     base_cost_usd_micros: 0,
@@ -2312,6 +2323,7 @@ mod tests {
             output_micros: 0,
             cache_read_micros: 0,
             cache_write_micros: 0,
+            cache_write_1h_micros: 0,
         };
         let rows = [
             ("sk-alpha", "生产令牌", "gpt-4o", "azure-east"),
@@ -2338,6 +2350,7 @@ mod tests {
                     output_tokens: 1,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     price,
                     cost_usd_micros: 0,
                     base_cost_usd_micros: 0,
@@ -2399,6 +2412,7 @@ mod tests {
             output_micros: 0,
             cache_read_micros: 0,
             cache_write_micros: 0,
+            cache_write_1h_micros: 0,
         };
         let rows = [
             ("生产", "sk-a", "gpt-4o", "azure"),
@@ -2424,6 +2438,7 @@ mod tests {
                     output_tokens: 1,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     price,
                     cost_usd_micros: 0,
                     base_cost_usd_micros: 0,
@@ -2464,6 +2479,7 @@ mod tests {
             output_micros: 0,
             cache_read_micros: 0,
             cache_write_micros: 0,
+            cache_write_1h_micros: 0,
         };
         insert_request_log(
             &pool,
@@ -2484,6 +2500,7 @@ mod tests {
                 output_tokens: 10,
                 cache_read_tokens: 1_000,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 price,
                 cost_usd_micros: 0,
                 base_cost_usd_micros: 0,
@@ -2515,6 +2532,7 @@ mod tests {
                 output_tokens: 20,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 price,
                 cost_usd_micros: 0,
                 base_cost_usd_micros: 0,
@@ -2552,6 +2570,7 @@ mod tests {
             output_micros: 10_000_000,
             cache_read_micros: 1_250_000,
             cache_write_micros: 10_000_000,
+            cache_write_1h_micros: 0,
         };
         insert_request_log(
             &pool,
@@ -2572,6 +2591,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 price,
                 cost_usd_micros: 12,
                 base_cost_usd_micros: 0,
@@ -2638,6 +2658,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
                 base_cost_usd_micros: 0,
@@ -2700,6 +2721,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 price,
                 cost_usd_micros: 9_999,
                 base_cost_usd_micros: 0,
@@ -2731,6 +2753,7 @@ mod tests {
                 output_tokens: 1,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 price,
                 cost_usd_micros: 100,
                 base_cost_usd_micros: 0,
@@ -2766,6 +2789,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             price: PriceSnapshot::default(),
             cost_usd_micros: 1,
             base_cost_usd_micros: 0,

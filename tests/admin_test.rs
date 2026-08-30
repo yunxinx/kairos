@@ -597,7 +597,8 @@ async fn same_model_prices_are_per_channel() {
             "input_micros": 9_000_000,
             "output_micros": 0,
             "cache_read_micros": null,
-            "cache_write_micros": null
+            "cache_write_micros": null,
+            "cache_write_1h_micros": 20_000_000
         }),
     )
     .await;
@@ -634,6 +635,9 @@ async fn same_model_prices_are_per_channel() {
         .expect("右渠道价格应在");
     assert_eq!(left_price["input_micros"], 1_000_000);
     assert_eq!(right_price["input_micros"], 9_000_000);
+    // 1h 档按行独立：配置了即回读，未配置保持 null（整行单一费率）。
+    assert_eq!(right_price["cache_write_1h_micros"], 20_000_000);
+    assert_eq!(left_price["cache_write_1h_micros"], serde_json::Value::Null);
 
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "chatcmpl-per-ch", "object": "chat.completion", "model": "gpt-4o",
@@ -781,7 +785,8 @@ async fn dropping_listed_name_retains_other_channel_price() {
             "input_micros": 9_000_000,
             "output_micros": 0,
             "cache_read_micros": null,
-            "cache_write_micros": null
+            "cache_write_micros": null,
+            "cache_write_1h_micros": 20_000_000
         }),
     )
     .await;
@@ -2200,6 +2205,7 @@ async fn logs_redact_long_token_keys() {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: 0,
             base_cost_usd_micros: 0,
@@ -2257,6 +2263,7 @@ async fn logs_redact_long_token_keys() {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: 0,
             base_cost_usd_micros: 0,
@@ -2307,6 +2314,7 @@ async fn logs_mask_multibyte_token_keys_without_panic() {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: 0,
             base_cost_usd_micros: 0,
@@ -2361,6 +2369,7 @@ async fn logs_filter_settled_and_report_unsettled_total() {
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
         price: kairos::core::billing::PriceSnapshot::default(),
         cost_usd_micros: 9,
         base_cost_usd_micros: 0,
@@ -2431,6 +2440,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
         price: kairos::core::billing::PriceSnapshot::default(),
         cost_usd_micros: 1_000_000,
         base_cost_usd_micros: 0,
@@ -2577,6 +2587,7 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
         output_tokens: 0,
         cache_read_tokens: 0,
         cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
         price: kairos::core::billing::PriceSnapshot::default(),
         cost_usd_micros: 1_000_000,
         base_cost_usd_micros: 0,
@@ -2868,6 +2879,7 @@ async fn seed_log(pool: &sqlx::SqlitePool, log: SeededLog) {
             output_tokens: log.output_tokens,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: log.cost_usd_micros,
             base_cost_usd_micros: log.cost_usd_micros,

@@ -270,6 +270,16 @@ struct WireUsage {
     cache_creation_input_tokens: u64,
     #[serde(default)]
     cache_read_input_tokens: u64,
+    /// 上游回报的 cache 写入 TTL 明细；仅 1h 档参与计费分档，缺省不出现。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_creation: Option<WireCacheCreation>,
+}
+
+/// 上游 usage 的 `cache_creation` TTL 明细。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct WireCacheCreation {
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
 }
 
 // ---- 流式 wire 事件 ----
@@ -2125,14 +2135,20 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     None
 }
 
-/// 从 usage 对象解析 IR 四分量。
+/// 从 usage 对象解析 IR 四分量与 1h 写入明细。
 fn parse_usage_object(usage: &serde_json::Map<String, Value>) -> Option<Usage> {
     let get = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let cache_write_1h = usage
+        .get("cache_creation")
+        .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     Some(Usage {
         input_tokens: get("input_tokens"),
         output_tokens: get("output_tokens"),
         cache_read_tokens: get("cache_read_input_tokens"),
         cache_write_tokens: get("cache_creation_input_tokens"),
+        cache_write_1h_tokens: cache_write_1h,
         raw: Some(Value::Object(usage.clone())),
     })
 }
@@ -2145,6 +2161,10 @@ fn convert_usage(wire: WireUsage) -> Usage {
         output_tokens: wire.output_tokens,
         cache_read_tokens: wire.cache_read_input_tokens,
         cache_write_tokens: wire.cache_creation_input_tokens,
+        cache_write_1h_tokens: wire
+            .cache_creation
+            .map(|c| c.ephemeral_1h_input_tokens)
+            .unwrap_or(0),
         raw,
     }
 }
@@ -3451,6 +3471,35 @@ mod tests {
         assert_eq!(ir.usage.output_tokens, 50);
     }
 
+    /// usage 的 cache_creation TTL 明细解码为 1h 写入分量；缺失时为 0。
+    #[test]
+    fn response_decodes_cache_creation_1h_detail() {
+        let wire = json!({
+            "id": "msg_02", "type": "message", "role": "assistant", "model": "claude-sonnet",
+            "content": [{ "type": "text", "text": "ok" }],
+            "stop_reason": "end_turn", "stop_sequence": null,
+            "usage": {
+                "input_tokens": 100, "output_tokens": 10,
+                "cache_creation_input_tokens": 300, "cache_read_input_tokens": 40,
+                "cache_creation": { "ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200 }
+            }
+        });
+        let ir = decode_response(&wire).expect("应可解码");
+        assert_eq!(ir.usage.cache_write_tokens, 300);
+        assert_eq!(ir.usage.cache_write_1h_tokens, 200);
+
+        // 无 cache_creation 明细的上游（旧形状）1h 分量为 0，写入总数不变。
+        let wire = json!({
+            "id": "msg_03", "type": "message", "role": "assistant", "model": "claude-sonnet",
+            "content": [{ "type": "text", "text": "ok" }],
+            "stop_reason": "end_turn", "stop_sequence": null,
+            "usage": { "input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 7 }
+        });
+        let ir = decode_response(&wire).expect("应可解码");
+        assert_eq!(ir.usage.cache_write_tokens, 7);
+        assert_eq!(ir.usage.cache_write_1h_tokens, 0);
+    }
+
     /// 请求编码：同协议族回传 thinking signature（多轮不被上游拒绝）。
     #[test]
     fn request_encodes_thinking_signature() {
@@ -3971,6 +4020,7 @@ mod tests {
                 output_tokens: 2,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 raw: None,
             },
             provider_metadata: HashMap::new(),
