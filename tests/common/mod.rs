@@ -72,6 +72,8 @@ impl UpstreamBehavior {
 #[derive(Debug, Default)]
 pub struct ReceivedLog {
     pub requests: Vec<Value>,
+    /// 请求路径（含查询串），供 model-in-path 的出站 URL 断言。
+    pub paths: Vec<String>,
     pub api_keys: Vec<Option<String>>,
     pub anthropic_versions: Vec<Option<String>>,
     pub anthropic_betas: Vec<Option<String>>,
@@ -99,11 +101,13 @@ impl MockUpstream {
             .route("/chat/completions", post(handle))
             .route("/messages", post(handle))
             .route("/responses", post(handle))
+            .route("/v1beta/models/{*model_method}", post(handle))
             .layer(middleware::from_fn_with_state(
                 received.clone(),
-                capture_outbound_headers,
+                capture_outbound_request,
             ))
             .route("/models", get(handle_models))
+            .route("/v1beta/models", get(handle_models))
             // 禁用 axum 默认 2MB 上限：mock 上游需接收大请求体（模拟网关转发的多模态/base64）。
             .layer(DefaultBodyLimit::disable())
             .with_state(MockDeps {
@@ -152,6 +156,18 @@ impl MockUpstream {
             .lock()
             .expect("received 锁不应被污染")
             .requests
+            .clone()
+    }
+
+    /// 拷贝收到的请求路径（含查询串），供 model-in-path 的出站 URL 断言。
+    ///
+    /// 与 `received` 同序：POST 路径在出站头捕获中间件记录，GET 模型列表
+    /// 在处理函数内记录。
+    pub fn received_paths(&self) -> Vec<String> {
+        self.received
+            .lock()
+            .expect("received 锁不应被污染")
+            .paths
             .clone()
     }
 
@@ -207,8 +223,18 @@ struct MockDeps {
     received: Arc<Mutex<ReceivedLog>>,
 }
 
-/// 记录出站功能头；只挂在有请求体的 POST 路由上，避免 GET `/models` 错位。
-async fn capture_outbound_headers(
+/// 请求路径（含查询串）的文本形态。
+fn request_path(request: &Request) -> String {
+    request
+        .uri()
+        .path_and_query()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| request.uri().path().to_string())
+}
+
+/// 记录出站请求的路径与功能头；只挂在有请求体的 POST 路由上，避免 GET
+/// 模型列表路由漏记路径（GET 的路径在其处理函数内补记）。
+async fn capture_outbound_request(
     State(received): State<Arc<Mutex<ReceivedLog>>>,
     request: Request,
     next: Next,
@@ -243,10 +269,18 @@ async fn capture_outbound_headers(
                 .get("x-api-key")
                 .and_then(|value| value.to_str().ok())
         })
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
         .map(str::to_string);
+    let path = request_path(&request);
     {
         let mut log = received.lock().expect("received 锁不应被污染");
         log.api_keys.push(api_key);
+        log.paths.push(path);
         log.anthropic_versions.push(version);
         log.anthropic_betas.push(beta);
         log.openai_organizations.push(organization);
@@ -266,7 +300,13 @@ async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Respon
 }
 
 /// GET `/models` 无请求体；与 `handle` 共用行为队列，逐请求消费。
-async fn handle_models(State(deps): State<MockDeps>) -> Response {
+async fn handle_models(State(deps): State<MockDeps>, request: Request) -> Response {
+    deps.received
+        .lock()
+        .expect("received 锁不应被污染")
+        .paths
+        .push(request_path(&request));
+
     respond_next(
         &deps,
         UpstreamBehavior::Json(serde_json::json!({ "data": [] })),
@@ -810,42 +850,55 @@ pub struct DownstreamFrame {
     pub data: Value,
 }
 
+/// 收取下游 SSE 响应体的原始字节。
+///
+/// 哨兵有无（如 Gemini 流无 `[DONE]`）要对原始字节断言，`collect_sse_frames`
+/// 会把 `[DONE]` 过滤掉，故拆出本接缝。
+pub async fn collect_sse_body(resp: reqwest::Response) -> bytes::Bytes {
+    use futures_util::StreamExt;
+
+    let mut buffer = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk.expect("响应流应可读"));
+    }
+    bytes::Bytes::from(buffer)
+}
+
 /// 解析下游 SSE 响应体为帧序列，跳过空载荷与 `[DONE]` 哨兵。
 ///
 /// 此前各测试二进制各持一份实现，形状还不一致（有的丢弃 `event:`）。收敛到夹具
 /// 后，帧序列本身可直接作为快照值，事件名与载荷的对应关系也不再丢失。
-pub async fn collect_sse_frames(resp: reqwest::Response) -> Vec<DownstreamFrame> {
-    use futures_util::StreamExt;
-
+pub fn parse_sse_frames(body: &[u8]) -> Vec<DownstreamFrame> {
     let mut frames = Vec::new();
-    let mut buffer = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("响应流应可读");
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(end) = buffer.find("\n\n") {
-            let raw: String = buffer.drain(..end + 2).collect();
-            let mut event = None;
-            let mut data = None;
-            for line in raw.lines() {
-                if let Some(name) = line.strip_prefix("event:") {
-                    event = Some(name.trim().to_string());
-                } else if let Some(payload) = line.strip_prefix("data:") {
-                    let payload = payload.trim();
-                    if payload.is_empty() || payload == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(payload) {
-                        data = Some(value);
-                    }
+    let mut buffer = String::from_utf8_lossy(body).into_owned();
+    while let Some(end) = buffer.find("\n\n") {
+        let raw: String = buffer.drain(..end + 2).collect();
+        let mut event = None;
+        let mut data = None;
+        for line in raw.lines() {
+            if let Some(name) = line.strip_prefix("event:") {
+                event = Some(name.trim().to_string());
+            } else if let Some(payload) = line.strip_prefix("data:") {
+                let payload = payload.trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                    data = Some(value);
                 }
             }
-            if let Some(data) = data {
-                frames.push(DownstreamFrame { event, data });
-            }
+        }
+        if let Some(data) = data {
+            frames.push(DownstreamFrame { event, data });
         }
     }
     frames
+}
+
+/// 收取下游 SSE 响应体并解析为帧序列。
+pub async fn collect_sse_frames(resp: reqwest::Response) -> Vec<DownstreamFrame> {
+    parse_sse_frames(&collect_sse_body(resp).await)
 }
 
 /// 帧序列中所有 `data:` 载荷，供只关心载荷的断言使用。
