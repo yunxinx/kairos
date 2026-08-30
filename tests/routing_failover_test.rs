@@ -177,36 +177,43 @@ async fn channel_key_model_filter_selects_usable_auth_key() {
     );
 }
 
-/// 同一会话的首试、429 重试与后续请求均复用同一把渠道密钥。
+/// 双密钥 seed：`a` 权重 1（粘性首选确定性命中），`b` 权重 0（永远不是首选，
+/// 只在轮换时启用）。
+fn two_key_channel(channel: &mut Channel) {
+    channel.keys = vec![
+        kairos::store::resources::ChannelKey {
+            name: "a".to_string(),
+            api_key: "sk-a".to_string(),
+            weight: 1,
+            enabled: true,
+            models: None,
+            blocked_models: None,
+        },
+        kairos::store::resources::ChannelKey {
+            name: "b".to_string(),
+            api_key: "sk-b".to_string(),
+            weight: 0,
+            enabled: true,
+            models: None,
+            blocked_models: None,
+        },
+    ];
+}
+
+/// 同一会话内粘性首选 key 跨请求保持，429 轮换不改写粘性缓存。
+///
+/// 首选 `sk-a` 恒定 429、`sk-b` 恒定成功：每次请求先试粘性首选 a，429 后
+/// 轮换到未试过的 b 恢复；两次请求的粘性首选仍是 a（轮换不回写粘性缓存）。
 #[tokio::test]
 async fn session_stickiness_keeps_key_across_retry_and_requests() {
     let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
         let mut seed = common::test_seed(&bases[0]);
-        seed.channels[0].max_retries = 1;
-        seed.channels[0].keys = vec![
-            kairos::store::resources::ChannelKey {
-                name: "a".to_string(),
-                api_key: "sk-a".to_string(),
-                weight: 1,
-                enabled: true,
-                models: None,
-                blocked_models: None,
-            },
-            kairos::store::resources::ChannelKey {
-                name: "b".to_string(),
-                api_key: "sk-b".to_string(),
-                weight: 1,
-                enabled: true,
-                models: None,
-                blocked_models: None,
-            },
-        ];
+        two_key_channel(&mut seed.channels[0]);
         seed
     })
     .await;
-    ups[0].set_behavior(UpstreamBehavior::Status429);
-    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
-    ups[0].set_behavior(UpstreamBehavior::Json(ok_response()));
+    ups[0].set_key_behavior("sk-a", UpstreamBehavior::Status429);
+    ups[0].set_key_behavior("sk-b", UpstreamBehavior::Json(ok_response()));
 
     let client = reqwest::Client::new();
     let request = || {
@@ -219,15 +226,154 @@ async fn session_stickiness_keeps_key_across_retry_and_requests() {
                 "messages": [{ "role": "user", "content": "hi" }]
             }))
     };
-    assert_eq!(request().send().await.expect("首请求应成功").status(), 200);
+    assert_eq!(
+        request().send().await.expect("首请求应成功").status(),
+        reqwest::StatusCode::OK,
+        "429 轮换到未试过的 key 后应恢复"
+    );
     assert_eq!(
         request().send().await.expect("后续请求应成功").status(),
-        200
+        reqwest::StatusCode::OK
     );
 
     let keys = ups[0].received_api_keys();
-    assert_eq!(keys.len(), 3, "首试、429 重试与后续请求都应到达上游");
-    assert!(keys.iter().all(|key| key == &keys[0]));
+    assert_eq!(
+        keys,
+        vec![
+            Some("Bearer sk-a".to_string()),
+            Some("Bearer sk-b".to_string()),
+            Some("Bearer sk-a".to_string()),
+            Some("Bearer sk-b".to_string()),
+        ],
+        "每次请求先试粘性首选 a、429 后轮换 b，粘性首选跨请求不变"
+    );
+}
+
+/// 429 整池试完后按重试预算计次退避并轮回，预算耗尽切下一渠道。
+///
+/// 首渠道双 key（a、b）都恒定 429，max_retries=1：免退避轮换试完整池
+/// （a、b）后按预算计次轮回（a），预算耗尽切渠道。
+#[tokio::test]
+async fn rate_limit_pool_exhaustion_counts_against_retries_then_fails_over() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = two_channel_seed(bases);
+        two_key_channel(&mut seed.channels[0]);
+        seed.channels[0].max_retries = 1;
+        seed
+    })
+    .await;
+    ups[0].set_key_behavior("sk-a", UpstreamBehavior::Status429);
+    ups[0].set_key_behavior("sk-b", UpstreamBehavior::Status429);
+    ups[1].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "渠道切换后应成功");
+    assert_eq!(
+        ups[0].received_api_keys(),
+        vec![
+            Some("Bearer sk-a".to_string()),
+            Some("Bearer sk-b".to_string()),
+            Some("Bearer sk-a".to_string()),
+        ],
+        "免退避轮换整池一次，之后按预算计次轮回"
+    );
+    assert_eq!(
+        ups[0].received().len(),
+        3,
+        "首渠道共 3 次尝试（2 计次 + 1 轮换）"
+    );
+    assert_eq!(ups[1].received().len(), 1, "预算耗尽后应切下一渠道");
+}
+
+/// 401 请求级失效当前 key 并轮换：渠道内还有可用 key 就能恢复。
+///
+/// （旧语义 401 直接把错误返回下游，不轮换。）
+#[tokio::test]
+async fn auth_failure_rotates_to_next_key_within_request() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        two_key_channel(&mut seed.channels[0]);
+        seed
+    })
+    .await;
+    ups[0].set_key_behavior("sk-a", UpstreamBehavior::for_status(402));
+    ups[0].set_key_behavior("sk-b", UpstreamBehavior::Json(ok_response()));
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "失效 key 轮换后应恢复"
+    );
+    assert_eq!(
+        ups[0].received_api_keys(),
+        vec![
+            Some("Bearer sk-a".to_string()),
+            Some("Bearer sk-b".to_string()),
+        ],
+        "401 后应换下一把 key，不再复用失效 key"
+    );
+}
+
+/// 渠道内全部 key 认证失效才切下一渠道；结算归接手渠道。
+#[tokio::test]
+async fn all_keys_auth_dead_fails_over_to_next_channel() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = two_channel_seed(bases);
+        two_key_channel(&mut seed.channels[0]);
+        seed
+    })
+    .await;
+    ups[0].set_key_behavior("sk-a", UpstreamBehavior::for_status(401));
+    ups[0].set_key_behavior("sk-b", UpstreamBehavior::for_status(403));
+    ups[1].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "全失效切渠道后应成功"
+    );
+    assert_eq!(
+        ups[0].received_api_keys(),
+        vec![
+            Some("Bearer sk-a".to_string()),
+            Some("Bearer sk-b".to_string()),
+        ],
+        "渠道内每把 key 恰好尝试一次（请求级失效）"
+    );
+    assert_eq!(ups[1].received().len(), 1, "全失效后才切下一渠道");
+
+    let channel: (String,) =
+        sqlx::query_as("SELECT channel FROM request_log WHERE status_code = 200")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应落结算");
+    assert_eq!(channel.0, "ch-1", "结算应归接手渠道");
+}
+
+/// 5xx 与 key 无关：同 key 退避重试，不轮换；预算耗尽返回错误。
+#[tokio::test]
+async fn server_error_retries_same_key_then_returns() {
+    let (gw, mut ups) = TestGateway::start_with_multi(1, |bases| {
+        let mut seed = common::test_seed(&bases[0]);
+        two_key_channel(&mut seed.channels[0]);
+        seed.channels[0].max_retries = 1;
+        seed
+    })
+    .await;
+    ups[0].set_key_behavior("sk-a", UpstreamBehavior::Status5xx(500));
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        ups[0].received_api_keys(),
+        vec![
+            Some("Bearer sk-a".to_string()),
+            Some("Bearer sk-a".to_string()),
+        ],
+        "5xx 重试维持同一把 key，不轮换"
+    );
 }
 
 /// 不带会话头时，IR 前缀相同的请求也复用同一把密钥。

@@ -87,6 +87,9 @@ pub struct MockUpstream {
     pub addr: SocketAddr,
     /// 行为队列，逐请求消费；`set_behavior` 追加，`push_behavior` 也追加。
     behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>>,
+    /// 按出站认证头匹配的持久行为：命中的 key 恒定返回对应行为，不消费
+    /// 行为队列（key 级故障对同一 key 的重试是稳定的）。
+    keyed: Arc<Mutex<Vec<(String, UpstreamBehavior)>>>,
     received: Arc<Mutex<ReceivedLog>>,
 }
 
@@ -95,6 +98,7 @@ impl MockUpstream {
     pub async fn start() -> Self {
         let behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>> =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let keyed: Arc<Mutex<Vec<(String, UpstreamBehavior)>>> = Arc::new(Mutex::new(Vec::new()));
         let received: Arc<Mutex<ReceivedLog>> = Arc::new(Mutex::new(ReceivedLog::default()));
 
         let app = Router::new()
@@ -112,6 +116,7 @@ impl MockUpstream {
             .layer(DefaultBodyLimit::disable())
             .with_state(MockDeps {
                 behavior: behavior.clone(),
+                keyed: keyed.clone(),
                 received: received.clone(),
             });
 
@@ -128,6 +133,7 @@ impl MockUpstream {
         Self {
             addr,
             behavior,
+            keyed,
             received,
         }
     }
@@ -143,6 +149,18 @@ impl MockUpstream {
     /// 追加一个行为到队列末尾（与 `set_behavior` 等价，语义更明确）。
     pub fn push_behavior(&mut self, behavior: UpstreamBehavior) {
         self.set_behavior(behavior);
+    }
+
+    /// 登记按出站认证头匹配的持久行为：认证头含 `pattern` 子串的请求恒定返回
+    /// `behavior`（优先于行为队列，不消费队列）。
+    ///
+    /// key 级故障（429/401/403）对同一 key 的重试是稳定的，用队列表达需要逐次
+    /// 展开，按 key 登记更贴近真实上游的行为。
+    pub fn set_key_behavior(&mut self, pattern: &str, behavior: UpstreamBehavior) {
+        self.keyed
+            .lock()
+            .expect("keyed 锁不应被污染")
+            .push((pattern.to_string(), behavior));
     }
 
     /// base URL，供网关作为上游地址。
@@ -220,7 +238,25 @@ impl MockUpstream {
 #[derive(Clone)]
 struct MockDeps {
     behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>>,
+    keyed: Arc<Mutex<Vec<(String, UpstreamBehavior)>>>,
     received: Arc<Mutex<ReceivedLog>>,
+}
+
+/// 按本次请求的出站认证头查 keyed 行为登记表；命中即直接响应（不消费队列）。
+fn keyed_response(deps: &MockDeps) -> Option<Response> {
+    let key = deps
+        .received
+        .lock()
+        .expect("received 锁不应被污染")
+        .api_keys
+        .last()
+        .cloned()
+        .flatten()?;
+    let keyed = deps.keyed.lock().expect("keyed 锁不应被污染");
+    keyed
+        .iter()
+        .find(|(pattern, _)| key.contains(pattern.as_str()))
+        .map(|(_, behavior)| behavior.clone().into_response())
 }
 
 /// 请求路径（含查询串）的文本形态。
@@ -296,6 +332,9 @@ async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Respon
         .requests
         .push(body);
 
+    if let Some(response) = keyed_response(&deps) {
+        return response;
+    }
     respond_next(&deps, UpstreamBehavior::Sse(vec![])).await
 }
 

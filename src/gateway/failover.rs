@@ -1,5 +1,7 @@
-//! 渠道 failover 编排：统一处理重试预算、可重试错误与最终错误归因。
+//! 渠道 failover 编排：统一处理重试预算、可重试错误、渠道内密钥轮换与最终
+//! 错误归因。
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use axum::{
@@ -11,7 +13,8 @@ use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
 use crate::config::Protocol;
-use crate::store::resources::ChannelRecord;
+use crate::store::channel_keys::eligible_channel_keys;
+use crate::store::resources::{ChannelRecord, StoredChannelKey};
 
 use super::{protocol, routing};
 
@@ -88,29 +91,81 @@ fn jitter_delay(base: Duration) -> Duration {
     base.mul_f64(factor)
 }
 
-/// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover。
+/// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover；渠道内密钥按
+/// 请求级轮换状态在 key 粒度上恢复失败（[`KeyRotation`]）。
 ///
-/// `log_failure` 接收（渠道名、状态码、是否已 failover、返回下游的错误响应体
-/// wire 字节）：wire 字节先于日志构造，保证 full_body 开启时失败日志也能记录
-/// 实际返回下游的入站响应。
+/// `attempt` 每次收到渠道记录与本次要用的密钥；`log_failure` 接收（渠道名、
+/// 状态码、是否已 failover、返回下游的错误响应体 wire 字节、失败尝试的密钥
+/// 名）：wire 字节先于日志构造，保证 full_body 开启时失败日志也能记录实际
+/// 返回下游的入站响应。
+/// 全部候选渠道耗尽后返回下游的最后一次失败归因。
+struct FinalFailure {
+    channel: String,
+    status: Option<u16>,
+    message: String,
+    /// 最后一次失败尝试所用的密钥名；无密钥上下文（无候选渠道）时为空。
+    key_name: String,
+}
+
+/// 认证类失败（401/402/403）：是密钥的问题而非请求的问题。
+fn is_auth_failure(status: u16) -> bool {
+    (401..=403).contains(&status)
+}
+
 pub(super) async fn run_failover<'a, A, L>(
     route: &'a routing::Route,
+    model: &str,
     mut attempt: A,
     log_failure: L,
     inbound_protocol: Protocol,
     backoff: RetryBackoff,
 ) -> Response
 where
-    A: FnMut(&ChannelRecord) -> BoxFuture<'a, Outbound>,
-    L: Fn(&str, u16, bool, &[u8]) -> BoxFuture<'a, ()>,
+    A: FnMut(&ChannelRecord, &StoredChannelKey) -> BoxFuture<'a, Outbound>,
+    L: Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()>,
 {
-    let mut last_retryable: Option<(String, Option<u16>, String)> = None;
+    let mut last_failure: Option<FinalFailure> = None;
 
     for record in &route.channels {
+        let Some(first) = route.selected_key(record.id) else {
+            continue;
+        };
+        // 轮换池：启用且允许该模型的密钥按存储顺序，旋转到粘性首选开头。
+        // 准入已保证非空；快照在准入后变更时兜底跳过该渠道。
+        let mut pool = eligible_channel_keys(&record.keys, model);
+        if let Some(position) = pool.iter().position(|key| key.id == first.id) {
+            pool.rotate_left(position);
+        }
+        if pool.is_empty() {
+            continue;
+        }
+        let mut rotation = KeyRotation::new(pool);
         let max_attempts = (record.channel.max_retries + 1) as usize;
-        for attempt_no in 0..max_attempts {
-            match attempt(record).await {
+        let mut attempt_no = 0usize;
+
+        loop {
+            rotation.mark_attempted();
+            let key = rotation.current();
+            match attempt(record, key).await {
                 Outbound::Success(response) => return response,
+                Outbound::Fatal {
+                    channel,
+                    status,
+                    message,
+                } if is_auth_failure(status) => {
+                    // 认证失效是该 key 的问题而非请求的问题：请求级标记后换
+                    // 下一把立即重试；渠道内全失效才切渠道。不消耗重试预算
+                    // （上限是池大小，每把 key 至多失效一次）。
+                    if matches!(rotation.invalidate_current(), Rotation::Depleted) {
+                        last_failure = Some(FinalFailure {
+                            channel,
+                            status: Some(status),
+                            message,
+                            key_name: key.name.clone(),
+                        });
+                        break;
+                    }
+                }
                 Outbound::Fatal {
                     channel,
                     status,
@@ -119,7 +174,7 @@ where
                     let body =
                         upstream_error_body(status, &message, &channel, false, inbound_protocol);
                     let wire = serde_json::to_vec(&body).unwrap_or_default();
-                    log_failure(&channel, status, false, &wire).await;
+                    log_failure(&channel, status, false, &wire, &key.name).await;
                     return (
                         StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                         Json(body),
@@ -132,28 +187,139 @@ where
                     message,
                     retry_after,
                 } => {
-                    last_retryable = Some((channel, status, message));
-                    if attempt_no + 1 < max_attempts {
-                        tokio::time::sleep(retry_delay(attempt_no, retry_after, backoff)).await;
+                    // 429 换下一把未试过的 key 重试可免除当次退避；整池试完
+                    // 才按同渠道重试语义计次退避并轮回。after_rate_limit 的
+                    // Depleted（其余 key 全部认证失效）在此按 Exhausted 处理：
+                    // 当前 key 仍存活，计次重试它即可，边界由 auth 分支兜底。
+                    let advanced = if status == Some(429) {
+                        rotation.after_rate_limit()
+                    } else {
+                        Rotation::Exhausted
+                    };
+                    if matches!(advanced, Rotation::Fresh) {
                         continue;
                     }
-                    break;
+                    attempt_no += 1;
+                    last_failure = Some(FinalFailure {
+                        channel,
+                        status,
+                        message,
+                        key_name: key.name.clone(),
+                    });
+                    if attempt_no >= max_attempts {
+                        break;
+                    }
+                    tokio::time::sleep(retry_delay(attempt_no - 1, retry_after, backoff)).await;
                 }
             }
         }
     }
 
-    let (channel, status, message) = last_retryable
-        .unwrap_or_else(|| ("unknown".to_string(), None, "所有渠道均不可用".to_string()));
+    let FinalFailure {
+        channel,
+        status,
+        message,
+        key_name,
+    } = last_failure.unwrap_or_else(|| FinalFailure {
+        channel: "unknown".to_string(),
+        status: None,
+        message: "所有渠道均不可用".to_string(),
+        key_name: String::new(),
+    });
     let status_code = status.unwrap_or(502);
     let body = upstream_error_body(status_code, &message, &channel, true, inbound_protocol);
     let wire = serde_json::to_vec(&body).unwrap_or_default();
-    log_failure(&channel, status_code, true, &wire).await;
+    log_failure(&channel, status_code, true, &wire, &key_name).await;
     (
         StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
         Json(body),
     )
         .into_response()
+}
+
+/// 渠道内密钥轮换的去向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rotation {
+    /// 轮换到一把可用的密钥：立即重试。
+    Fresh,
+    /// 池内密钥本轮已全部试过（或无可轮换目标）：按重试预算计次退避。
+    Exhausted,
+    /// 池内已无可用密钥：切下一渠道。
+    Depleted,
+}
+
+/// 请求级渠道内密钥轮换状态。
+///
+/// 池为该模型可用（启用且允许该模型）的密钥，按存储顺序、起点是粘性首选。
+/// 两本账：`tried` 记本轮已尝试（429 轮换在整池试完前免退避、不消耗重试
+/// 预算），`dead` 记认证失效（请求级，不再使用）。粘性缓存由准入维护，
+/// 本状态不回写——首选 key 的职责保持在粘性选择器。
+struct KeyRotation<'k> {
+    pool: Vec<&'k StoredChannelKey>,
+    index: usize,
+    tried: HashSet<i64>,
+    dead: HashSet<i64>,
+}
+
+impl<'k> KeyRotation<'k> {
+    fn new(pool: Vec<&'k StoredChannelKey>) -> Self {
+        Self {
+            pool,
+            index: 0,
+            tried: HashSet::new(),
+            dead: HashSet::new(),
+        }
+    }
+
+    /// 当前应使用的密钥。
+    ///
+    /// # Panics
+    ///
+    /// 池为空时 panic；[`KeyRotation::new`] 的调用方（`run_failover`）在构造
+    /// 前已保证池非空（准入同时保证每条候选渠道至少有一把可用密钥）。
+    fn current(&self) -> &'k StoredChannelKey {
+        self.pool[self.index]
+    }
+
+    fn mark_attempted(&mut self) {
+        self.tried.insert(self.current().id);
+    }
+
+    /// 429 后的轮换：换下一把未试过的可用 key（免退避）；整池试过则轮回并
+    /// 要求计次；全部认证失效则切渠道。
+    fn after_rate_limit(&mut self) -> Rotation {
+        match self.next_alive() {
+            Some(next) if !self.tried.contains(&self.pool[next].id) => {
+                self.index = next;
+                Rotation::Fresh
+            }
+            Some(next) => {
+                self.index = next;
+                Rotation::Exhausted
+            }
+            None => Rotation::Depleted,
+        }
+    }
+
+    /// 认证失效（401/402/403）：标记当前 key 并换下一把可用 key；全部失效
+    /// 返回 [`Rotation::Depleted`]。
+    fn invalidate_current(&mut self) -> Rotation {
+        self.dead.insert(self.current().id);
+        match self.next_alive() {
+            Some(next) => {
+                self.index = next;
+                Rotation::Fresh
+            }
+            None => Rotation::Depleted,
+        }
+    }
+
+    /// 从当前位置 cyclic 后找一个未失效的 key；无则 `None`。
+    fn next_alive(&self) -> Option<usize> {
+        (1..=self.pool.len())
+            .map(|step| (self.index + step) % self.pool.len())
+            .find(|&index| !self.dead.contains(&self.pool[index].id))
+    }
 }
 
 /// 构造带网关归因的错误响应体。
@@ -244,5 +410,266 @@ mod tests {
             seen.insert(got);
         }
         assert!(seen.len() > 1, "±20% 抖动应产生多于一个等待值");
+    }
+
+    // ---- 渠道内密钥轮换 ----
+
+    use super::routing;
+    use super::{KeyRotation, Outbound, Rotation, run_failover};
+    use crate::config::Protocol;
+    use crate::store::resources::{ChannelRecord, StoredChannelKey};
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use futures_util::future::BoxFuture;
+
+    fn key(id: i64, name: &str) -> StoredChannelKey {
+        StoredChannelKey::new(
+            id,
+            1,
+            name.into(),
+            format!("k-{name}"),
+            1,
+            true,
+            None,
+            None,
+            0,
+        )
+    }
+
+    fn pool(keys: &[StoredChannelKey]) -> Vec<&StoredChannelKey> {
+        keys.iter().collect()
+    }
+
+    #[test]
+    fn rate_limit_rotates_fresh_then_counts_after_pool_exhausted() {
+        let keys = [key(1, "a"), key(2, "b")];
+        let mut rotation = KeyRotation::new(pool(&keys));
+        rotation.mark_attempted();
+        assert_eq!(rotation.current().name, "a");
+
+        // 整池试完前：轮换免退避。
+        assert_eq!(rotation.after_rate_limit(), Rotation::Fresh);
+        rotation.mark_attempted();
+        assert_eq!(rotation.current().name, "b");
+
+        // 整池试完：轮回 + 计次。
+        assert_eq!(rotation.after_rate_limit(), Rotation::Exhausted);
+        rotation.mark_attempted();
+        assert_eq!(rotation.current().name, "a");
+        assert_eq!(rotation.after_rate_limit(), Rotation::Exhausted);
+    }
+
+    #[test]
+    fn auth_invalidated_keys_are_skipped_until_pool_depleted() {
+        let keys = [key(1, "a"), key(2, "b")];
+        let mut rotation = KeyRotation::new(pool(&keys));
+        rotation.mark_attempted();
+
+        // a 认证失效 → 轮换到 b。
+        assert_eq!(rotation.invalidate_current(), Rotation::Fresh);
+        rotation.mark_attempted();
+        assert_eq!(rotation.current().name, "b");
+
+        // b 也失效 → 渠道内无可用密钥，切渠道。
+        assert_eq!(rotation.invalidate_current(), Rotation::Depleted);
+    }
+
+    #[test]
+    fn auth_rotation_skips_previously_dead_keys_on_cycle() {
+        let keys = [key(1, "a"), key(2, "b")];
+        let mut rotation = KeyRotation::new(pool(&keys));
+        rotation.mark_attempted();
+        // a 先因认证失效退场，随后 429 的轮换不得再落到 a。
+        assert_eq!(rotation.invalidate_current(), Rotation::Fresh);
+        rotation.mark_attempted();
+        assert_eq!(rotation.after_rate_limit(), Rotation::Exhausted);
+        assert_eq!(rotation.current().name, "b");
+    }
+
+    #[test]
+    fn single_key_pool_behaves_as_plain_same_key_retry() {
+        let keys = [key(1, "a")];
+        let mut rotation = KeyRotation::new(pool(&keys));
+        rotation.mark_attempted();
+        // 单 key 渠道：429 轮换原地踏步（走计次退避路径），auth 失效直接切渠道。
+        assert_eq!(rotation.after_rate_limit(), Rotation::Exhausted);
+        assert_eq!(rotation.current().name, "a");
+        assert_eq!(rotation.invalidate_current(), Rotation::Depleted);
+    }
+
+    // ---- run_failover 的轮换语义（attempt 闭包驱动）----
+
+    use axum::body::Body;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    fn record_with_keys(id: i64, keys: Vec<StoredChannelKey>, max_retries: u32) -> ChannelRecord {
+        ChannelRecord {
+            id,
+            keys: keys.clone(),
+            channel: crate::store::resources::Channel {
+                name: format!("ch-{id}"),
+                protocol: Protocol::OpenAiChat,
+                base_url: "http://localhost".to_string(),
+                keys: Vec::new(),
+                models: vec!["m".to_string()],
+                model_aliases: Default::default(),
+                timeout_ms: 1000,
+                max_retries,
+                enabled: true,
+                model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
+            },
+        }
+    }
+
+    fn route_of(
+        records: Vec<ChannelRecord>,
+        first_picks: &[(i64, StoredChannelKey)],
+    ) -> routing::Route {
+        routing::Route {
+            selected_keys: first_picks
+                .iter()
+                .map(|(id, key)| (*id, key.clone()))
+                .collect(),
+            channels: records,
+        }
+    }
+
+    fn ok_response() -> Response {
+        (StatusCode::OK, Body::empty()).into_response()
+    }
+
+    /// 无侧害的失败日志闭包。
+    async fn no_log() {}
+
+    fn no_failure_log() -> impl Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'static, ()> {
+        |_channel, _status, _failover, _wire, _key| Box::pin(no_log())
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rotation_is_free_until_pool_exhausted() {
+        let keys = vec![key(1, "a"), key(2, "b")];
+        let route: &'static routing::Route = Box::leak(Box::new(route_of(
+            vec![record_with_keys(1, keys.clone(), 0)],
+            &[(1, keys[0].clone())],
+        )));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_for_attempt = seen.clone();
+
+        // max_retries=0：a 的 429 轮换到未试过的 b 恢复，不消耗重试预算。
+        let response = run_failover(
+            route,
+            "m",
+            move |_record, key| {
+                seen_for_attempt.lock().unwrap().push(key.name.clone());
+                let key_name = key.name.clone();
+                Box::pin(async move {
+                    if key_name == "a" {
+                        Outbound::Retryable {
+                            channel: "ch-1".to_string(),
+                            status: Some(429),
+                            message: "rate limited".to_string(),
+                            retry_after: None,
+                        }
+                    } else {
+                        Outbound::Success(ok_response())
+                    }
+                })
+            },
+            no_failure_log(),
+            Protocol::OpenAiChat,
+            RetryBackoff::from_ms(10_000, 10_000, 10),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_retries_same_key_within_budget() {
+        let keys = vec![key(1, "a"), key(2, "b")];
+        let route: &'static routing::Route = Box::leak(Box::new(route_of(
+            vec![record_with_keys(1, keys.clone(), 1)],
+            &[(1, keys[0].clone())],
+        )));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+
+        // 5xx 与 key 无关：同 key 退避重试（b 不出场），预算耗尽返回错误。
+        let seen_for_attempt = seen.clone();
+        let response = run_failover(
+            route,
+            "m",
+            move |_record, key| {
+                seen_for_attempt.lock().unwrap().push(key.name.clone());
+                Box::pin(async {
+                    Outbound::Retryable {
+                        channel: "ch-1".to_string(),
+                        status: Some(500),
+                        message: "boom".to_string(),
+                        retry_after: None,
+                    }
+                })
+            },
+            no_failure_log(),
+            Protocol::OpenAiChat,
+            RetryBackoff::from_ms(1, 1, 1),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["a".to_string(), "a".to_string()],
+            "5xx 重试维持同一把 key，不轮换"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_depleted_channel_switches_to_next_record() {
+        let first = vec![key(1, "a"), key(2, "b")];
+        let second = vec![key(3, "c")];
+        let route: &'static routing::Route = Box::leak(Box::new(route_of(
+            vec![
+                record_with_keys(1, first.clone(), 0),
+                record_with_keys(2, second.clone(), 0),
+            ],
+            &[(1, first[0].clone()), (2, second[0].clone())],
+        )));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+
+        // 渠道内全部 key 认证失效才切下一渠道；结算/日志归接手渠道。
+        let seen_for_attempt = seen.clone();
+        let response = run_failover(
+            route,
+            "m",
+            move |_record, key| {
+                seen_for_attempt.lock().unwrap().push(key.name.clone());
+                let key_name = key.name.clone();
+                Box::pin(async move {
+                    if key_name == "c" {
+                        Outbound::Success(ok_response())
+                    } else {
+                        Outbound::Fatal {
+                            channel: "ch-1".to_string(),
+                            status: 403,
+                            message: "forbidden".to_string(),
+                        }
+                    }
+                })
+            },
+            no_failure_log(),
+            Protocol::OpenAiChat,
+            RetryBackoff::from_ms(10_000, 10_000, 10),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }

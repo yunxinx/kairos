@@ -1133,8 +1133,10 @@ async fn outbound_with_failover(
 ) -> Response {
     run_failover(
         route,
-        |record| {
+        routed_model,
+        |record, key| {
             let record = record.clone();
+            let key = key.clone();
             let request_body_for_log = request_body_for_log.clone();
             Box::pin(async move {
                 let mut ctx = CallCtx {
@@ -1151,26 +1153,18 @@ async fn outbound_with_failover(
                     request_id,
                     session_identity,
                 };
-                let key = route
-                    .selected_key(record.id)
-                    .expect("准入已为每个渠道选出密钥");
                 if request.stream {
-                    stream_completion(&mut ctx, &record.channel, key).await
+                    stream_completion(&mut ctx, &record.channel, &key).await
                 } else {
-                    non_stream_completion(&mut ctx, &record.channel, key).await
+                    non_stream_completion(&mut ctx, &record.channel, &key).await
                 }
             })
         },
-        |channel, status, _failover, body_wire| {
+        |channel, status, _failover, body_wire, key_name| {
             let outbound_model =
                 outbound_model_for_channel_name(route, channel, routed_model).map(str::to_string);
             let channel = channel.to_string();
-            let channel_key = route
-                .channels
-                .iter()
-                .find(|record| record.channel.name == channel)
-                .and_then(|record| route.selected_key(record.id))
-                .map(|key| key.name.clone());
+            let channel_key = (!key_name.is_empty()).then(|| key_name.to_string());
             let request_body = request_body_for_log.clone();
             let response_body = snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = request_id.to_string();
@@ -1234,28 +1228,23 @@ struct PassthroughCtx<'a> {
 async fn passthrough_with_failover(ctx: &PassthroughCtx<'_>, route: &routing::Route) -> Response {
     run_failover(
         route,
-        |record| {
+        ctx.routed_model,
+        |record, key| {
             let record = record.clone();
+            let key = key.clone();
             Box::pin(async move {
                 if ctx.request.stream {
-                    let key = route.selected_key(record.id).expect("直通路由已选密钥");
-                    passthrough_stream_completion(ctx, &record, key).await
+                    passthrough_stream_completion(ctx, &record, &key).await
                 } else {
-                    let key = route.selected_key(record.id).expect("直通路由已选密钥");
-                    passthrough_non_stream_completion(ctx, &record, key).await
+                    passthrough_non_stream_completion(ctx, &record, &key).await
                 }
             })
         },
-        |channel, status, _failover, body_wire| {
+        |channel, status, _failover, body_wire, key_name| {
             let outbound_model = outbound_model_for_channel_name(route, channel, ctx.routed_model)
                 .map(str::to_string);
             let channel = channel.to_string();
-            let channel_key = route
-                .channels
-                .iter()
-                .find(|record| record.channel.name == channel)
-                .and_then(|record| route.selected_key(record.id))
-                .map(|key| key.name.clone());
+            let channel_key = (!key_name.is_empty()).then(|| key_name.to_string());
             let request_body = ctx.request_body.clone();
             let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
             let request_id = ctx.request_id.to_string();
