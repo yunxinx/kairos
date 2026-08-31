@@ -179,6 +179,7 @@ const saveMutation = useMutation({
     return await apiClient.updateToken(payload.id, payload.body);
   },
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },

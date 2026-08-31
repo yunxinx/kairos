@@ -333,6 +333,44 @@ pub(super) struct TokenEnabledUpdate {
     enabled: bool,
 }
 
+/// 记录令牌启停变更；事件与实际写入共用同一事务。
+async fn record_enabled_change(
+    conn: &mut SqliteConnection,
+    identity: &ManagementIdentity,
+    existing: &TokenRecord,
+    enabled: bool,
+) -> Result<(), AdminError> {
+    store::record_audit(
+        conn,
+        identity.actor(),
+        "tokens",
+        &store::SystemLogEvent::new(
+            "tokens.enabled_changed",
+            serde_json::json!({
+                "user_id": existing.token.user_id,
+                "token_id": existing.id,
+                "token_name": existing.token.name,
+                "before_enabled": existing.token.enabled,
+                "enabled": enabled,
+            }),
+            format!(
+                "修改用户 {} 的令牌 {}（{}）状态 {} → {}",
+                existing.token.user_id,
+                existing.id,
+                existing.token.name,
+                if existing.token.enabled {
+                    "启用"
+                } else {
+                    "停用"
+                },
+                if enabled { "启用" } else { "停用" }
+            ),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TokenCreate {
@@ -438,6 +476,9 @@ pub(super) async fn update_token(
     crate::store::resources::update_token_attributes(&mut tx, id, &attributes)
         .await
         .map_err(AdminError::Store)?;
+    if existing.token.enabled != attributes.enabled {
+        record_enabled_change(&mut tx, &identity, &existing, attributes.enabled).await?;
+    }
     if let Some(command) = balance_change {
         super::token_balance::apply_token_balance_command(
             &mut tx,
@@ -478,37 +519,7 @@ pub(super) async fn set_token_enabled(
         store::resources::set_token_enabled(&mut tx, id, enabled)
             .await
             .map_err(AdminError::Store)?;
-        if cross_owner {
-            store::record_audit(
-                &mut tx,
-                identity.actor(),
-                "tokens",
-                &store::SystemLogEvent::new(
-                    "tokens.enabled_changed",
-                    serde_json::json!({
-                        "user_id": existing.token.user_id,
-                        "token_id": id,
-                        "token_name": existing.token.name,
-                        "before_enabled": existing.token.enabled,
-                        "enabled": enabled,
-                    }),
-                    format!(
-                        "修改用户 {} 的令牌 {}（{}）状态 {} → {}",
-                        existing.token.user_id,
-                        id,
-                        existing.token.name,
-                        if existing.token.enabled {
-                            "启用"
-                        } else {
-                            "停用"
-                        },
-                        if enabled { "启用" } else { "停用" }
-                    ),
-                ),
-            )
-            .await
-            .map_err(AdminError::Store)?;
-        }
+        record_enabled_change(&mut tx, &identity, &existing, enabled).await?;
     }
     tx.commit().await.map_err(db_err)?;
     if existing.token.enabled != enabled {

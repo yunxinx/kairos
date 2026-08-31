@@ -60,6 +60,7 @@ const saveMutation = useMutation({
       reason: 'manual_adjustment',
     }),
   onSuccess: async () => {
+    emit('dirty-change', false);
     success(t('users.rechargeSuccess'));
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['users'] });

@@ -215,9 +215,9 @@ const deleteMutation = useMutation({
       targets.map((target) => inventoryRowKey({ channelId: target.channelId, name: target.name })),
     );
     for (const item of [...windows.value]) {
-      if (item.payload.kind === 'bulk-delete') closeWindow(item.id);
+      if (item.payload.kind === 'bulk-delete') closeWindow(item.id, true);
       if (item.payload.kind === 'delete' && keys.has(inventoryRowKey(item.payload.row))) {
-        closeWindow(item.id);
+        closeWindow(item.id, true);
       }
     }
     selection.setMany([...keys], false);
@@ -252,7 +252,7 @@ const deletePriceMutation = useMutation({
         item.payload.row.channelId === target.channelId &&
         item.payload.row.name === target.model
       ) {
-        closeWindow(item.id);
+        closeWindow(item.id, true);
       }
     }
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
@@ -658,7 +658,7 @@ function loadErrorMessage(): string {
         confirm-test-id="inventory-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="
           deleteMutation.mutate([
             {
@@ -693,7 +693,7 @@ function loadErrorMessage(): string {
         confirm-test-id="pricing-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="
           deletePriceMutation.mutate({
             channelId: win.payload.row.channelId,
@@ -715,7 +715,7 @@ function loadErrorMessage(): string {
         confirm-test-id="inventory-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(visibleDeleteTargets())"
       />
     </template>

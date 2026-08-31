@@ -199,7 +199,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (win) => win.payload.kind === 'delete' && win.payload.plan.id === plan.id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await queryClient.invalidateQueries({ queryKey: ['plans'] });
   },
   onError: (err, plan) => {
@@ -283,7 +283,7 @@ watch(plans, (rows) => {
     const planId = payload.kind === 'editor' ? payload.plan?.id : payload.plan.id;
     const latest = rows.find((plan) => plan.id === planId);
     if (!latest && payload.kind === 'delete') continue;
-    if (!latest && payload.kind === 'editor') closeWindow(entry.id);
+    if (!latest && payload.kind === 'editor') closeWindow(entry.id, true);
     else if (latest && payload.kind === 'editor') payload.plan = latest;
   }
 });
@@ -574,7 +574,7 @@ watch(plans, (rows) => {
         confirm-test-id="plan-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.plan)"
       />
       <ConfirmWindow
@@ -591,7 +591,7 @@ watch(plans, (rows) => {
         confirm-test-id="plan-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>

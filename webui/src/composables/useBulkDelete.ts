@@ -15,7 +15,7 @@ interface BulkDeleteWindowEntry {
 
 interface BulkDeleteWindowStack {
   windows: Ref<BulkDeleteWindowEntry[]>;
-  close(id: number): void;
+  close(id: number, force?: boolean): boolean;
 }
 
 export interface BulkDeleteOptions<K extends string | number> {
@@ -72,7 +72,7 @@ export function useBulkDelete<K extends string | number>(
     mutationFn: (keys: K[]) => options.deleteMany(keys),
     onSuccess: async () => {
       const entry = bulkWindow();
-      if (entry) options.windowStack.close(entry.id);
+      if (entry) options.windowStack.close(entry.id, true);
       error.value = '';
       options.selection.clear();
       await invalidateAll();

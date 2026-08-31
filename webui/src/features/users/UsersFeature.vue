@@ -326,7 +326,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (win) => win.payload.kind === 'delete' && win.payload.user.id === user.id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await queryClient.invalidateQueries({ queryKey: ['users'] });
   },
   onError: (err, user) => {
@@ -394,7 +394,7 @@ watch(users, (rows) => {
     const payload = entry.payload;
     if (payload.kind === 'bulk-delete' || payload.kind === 'create') continue;
     const latest = rows.find((user) => user.id === payload.user.id);
-    if (!latest) closeWindow(entry.id);
+    if (!latest) closeWindow(entry.id, true);
     else payload.user = latest;
   }
 });
@@ -723,7 +723,7 @@ watch(users, (rows) => {
         confirm-test-id="user-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.user)"
       />
       <ConfirmWindow
@@ -740,7 +740,7 @@ watch(users, (rows) => {
         confirm-test-id="user-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>

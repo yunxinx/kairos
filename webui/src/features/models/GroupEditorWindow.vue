@@ -178,6 +178,7 @@ const saveMutation = useMutation({
       ? apiClient.createModelGroup(body)
       : apiClient.updateModelGroup(props.initial.name, body),
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
   },

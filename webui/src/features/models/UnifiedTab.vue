@@ -168,7 +168,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.model.id === id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },
   onError: (err, id) => {
@@ -411,7 +411,7 @@ function openBulkDelete() {
         confirm-test-id="unified-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.model.id)"
       />
       <ConfirmWindow
@@ -428,7 +428,7 @@ function openBulkDelete() {
         confirm-test-id="unified-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>

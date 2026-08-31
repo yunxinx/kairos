@@ -277,6 +277,7 @@ const saveMutation = useMutation({
       ? apiClient.createChannel(body)
       : apiClient.updateChannel(props.initial.id, body),
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await invalidateChannelCaches(queryClient);
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
@@ -720,23 +721,11 @@ function handleSave(removalConfirmed = false) {
                     :error="fieldError(`keyApi${index}`)"
                   >
                     <template #default="{ hintId, invalid }">
-                      <FormTextInput
-                        v-if="initial === null"
-                        :id="`${uid}-channel-editor-key-apikey-${index}`"
-                        v-model="key.api_key"
-                        type="text"
-                        autocomplete="off"
-                        :invalid="invalid"
-                        :hint-id="hintId"
-                        data-testid="channel-key-api"
-                        v-on="fieldInputHandlers(`keyApi${index}`)"
-                      />
                       <FormPasswordInput
-                        v-else
                         :id="`${uid}-channel-editor-key-apikey-${index}`"
                         v-model="key.api_key"
                         autocomplete="off"
-                        mask-while-hidden
+                        :mask-while-hidden="initial !== null"
                         :invalid="invalid"
                         :hint-id="hintId"
                         data-testid="channel-key-api"

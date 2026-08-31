@@ -172,6 +172,7 @@ const saveMutation = useMutation({
   },
   onSuccess: async () => {
     success(t('users.updateSuccess'));
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['users'] });
   },

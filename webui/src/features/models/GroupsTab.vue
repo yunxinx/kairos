@@ -153,7 +153,7 @@ const deleteMutation = useMutation({
       const payload = item.payload;
       return payload.kind === 'delete' && payload.group.name === name;
     });
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
     await invalidateChannelCaches(queryClient);
@@ -388,7 +388,7 @@ function openBulkDelete() {
         confirm-test-id="group-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.group.name)"
       />
       <ConfirmWindow
@@ -405,7 +405,7 @@ function openBulkDelete() {
         confirm-test-id="group-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>

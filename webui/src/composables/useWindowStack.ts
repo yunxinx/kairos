@@ -1,4 +1,5 @@
 import { computed, onScopeDispose, ref, type ComputedRef, type Ref } from 'vue';
+import { useI18n } from 'vue-i18n';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
 /** 单页浮窗上限；超出时按打开顺序淘汰最旧窗口。 */
@@ -8,8 +9,10 @@ export interface WindowStackEntry<T> {
   id: number;
   /** 层叠序号，越大越靠前；渲染时叠加在 --z-window 之上。 */
   z: number;
-  /** 草稿是否有未保存更改，决定淘汰时能否直接关闭。 */
+  /** 窗口是否有需要保留的未完成状态，决定 FIFO 淘汰策略。 */
   dirty: boolean;
+  /** 是否在用户关闭时要求确认；操作确认窗只需防止淘汰，不拦正常关闭。 */
+  closeGuard: boolean;
   /** 淘汰被阻止时的短暂提示动画。 */
   attention: boolean;
   anchor: FloatingWindowAnchor | null;
@@ -19,17 +22,19 @@ export interface WindowStackEntry<T> {
 /**
  * 浮窗栈：按打开顺序维护窗口列表，支持置顶、脏检查与 FIFO 淘汰。
  * 打开第 6 个窗口时，最旧窗口干净则直接关闭腾位；脏则置顶并提示，
- * 打开请求被拒绝，由用户处理旧窗口后再次触发。
+ * 打开请求被拒绝，由用户处理旧窗口后再次触发。用户主动关闭带草稿的
+ * 编辑窗口时，调用方会收到统一的放弃确认。
  */
 export function useWindowStack<T>(): {
   windows: Ref<WindowStackEntry<T>[]>;
   topmostId: ComputedRef<number | null>;
   open: (anchor: FloatingWindowAnchor | null, payload: T) => WindowStackEntry<T> | null;
-  close: (id: number) => void;
-  setDirty: (id: number, dirty: boolean) => void;
+  close: (id: number, force?: boolean) => boolean;
+  setDirty: (id: number, dirty: boolean, closeGuard?: boolean) => void;
   bringToFront: (id: number) => void;
 } {
   const windows = ref<WindowStackEntry<T>[]>([]) as Ref<WindowStackEntry<T>[]>;
+  const { t } = useI18n();
   let nextId = 1;
   let nextZ = 1;
   const attentionTimers = new Map<number, ReturnType<typeof setTimeout>>();
@@ -61,15 +66,30 @@ export function useWindowStack<T>(): {
     normalizeZOrder();
   }
 
-  function close(id: number): void {
+  function close(id: number, force = false): boolean {
+    const entry = findEntry(id);
+    if (!entry) return false;
+    if (
+      !force &&
+      entry.dirty &&
+      entry.closeGuard &&
+      !window.confirm(t('common.discardUnsavedChanges'))
+    ) {
+      bringToFront(id);
+      return false;
+    }
     clearTimeout(attentionTimers.get(id));
     attentionTimers.delete(id);
     windows.value = windows.value.filter((entry) => entry.id !== id);
+    return true;
   }
 
-  function setDirty(id: number, dirty: boolean): void {
+  function setDirty(id: number, dirty: boolean, closeGuard = true): void {
     const entry = findEntry(id);
-    if (entry) entry.dirty = dirty;
+    if (entry) {
+      entry.dirty = dirty;
+      entry.closeGuard = closeGuard;
+    }
   }
 
   function open(anchor: FloatingWindowAnchor | null, payload: T): WindowStackEntry<T> | null {
@@ -95,6 +115,7 @@ export function useWindowStack<T>(): {
       id: nextId++,
       z: nextZ++,
       dirty: false,
+      closeGuard: true,
       attention: false,
       anchor,
       payload,

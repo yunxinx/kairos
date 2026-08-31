@@ -146,7 +146,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.channel.id === id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await invalidateChannels();
   },
   onError: (err, id) => {
@@ -448,7 +448,7 @@ function openProbe(channel: ChannelView) {
         confirm-test-id="channel-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.channel.id)"
       />
       <ConfirmWindow
@@ -465,7 +465,7 @@ function openProbe(channel: ChannelView) {
         confirm-test-id="channel-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>

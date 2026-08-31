@@ -97,6 +97,7 @@ const saveMutation = useMutation({
       ? apiClient.createPrice(body)
       : apiClient.updatePrice(props.channelId, props.model, body),
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
     await queryClient.invalidateQueries({ queryKey: ['unified-models'] });

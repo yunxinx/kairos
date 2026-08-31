@@ -207,6 +207,7 @@ const saveMutation = useMutation({
       ? apiClient.createPlan(payload.body)
       : apiClient.updatePlan(payload.id, payload.body),
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['plans'] });
   },

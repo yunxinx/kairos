@@ -225,7 +225,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.token.id === id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
   onError: (err, id) => {
@@ -362,9 +362,8 @@ function openBulkDelete() {
           <template v-else>
             <TableRow
               v-for="token in filteredTokens"
-              :key="token.token_key"
+              :key="token.id"
               data-testid="token-row"
-              :data-token-key="token.token_key"
               :data-state="selection.isSelected(token.id) ? 'selected' : undefined"
             >
               <SelectCell
@@ -441,7 +440,13 @@ function openBulkDelete() {
                 class="text-fg-muted font-mono text-xs"
                 data-testid="token-rpm"
               >
-                {{ token.rate_limit_rpm !== null ? token.rate_limit_rpm : t('common.unlimited') }}
+                {{
+                  token.rate_limit_rpm === null
+                    ? t('tokens.rateLimitInherited')
+                    : token.rate_limit_rpm === 0
+                      ? t('common.unlimited')
+                      : token.rate_limit_rpm
+                }}
               </TableCell>
               <TableCell align="center">
                 <button
@@ -549,7 +554,7 @@ function openBulkDelete() {
         confirm-test-id="token-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.token.id)"
       />
       <ConfirmWindow
@@ -566,7 +571,7 @@ function openBulkDelete() {
         confirm-test-id="token-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>

@@ -140,6 +140,12 @@ impl KeyCooldowns {
         }
     }
 
+    /// 清理已结束的冷却记录，避免长期不再命中的密钥让表持续增长。
+    fn prune_expired(&self, now: Instant) {
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, until| *until > now);
+    }
+
     fn mark_auth_failure(&self, key_id: i64, now: Instant) {
         let until = now.checked_add(AUTH_FAILURE_COOLDOWN).unwrap_or(now);
         self.inner
@@ -176,6 +182,7 @@ where
     L: Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()>,
 {
     let mut last_failure: Option<FinalFailure> = None;
+    policy.key_cooldowns.prune_expired(Instant::now());
 
     for index in &route.channel_indices {
         let Some(record) = channels.get(*index) else {
@@ -433,7 +440,7 @@ mod tests {
     use super::{
         FailoverPolicy, KeyCooldowns, RetryBackoff, exponential_delay, jitter_delay, retry_delay,
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn default_backoff() -> RetryBackoff {
         RetryBackoff::from_ms(200, 5_000, 60)
@@ -483,6 +490,34 @@ mod tests {
             retry_delay(0, Some(Duration::from_secs(30)), backoff),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn expired_key_cooldowns_are_pruned() {
+        let cooldowns = KeyCooldowns::new();
+        let now = Instant::now();
+        let live_until = now
+            .checked_add(Duration::from_secs(10))
+            .expect("测试时间应可计算");
+        cooldowns
+            .inner
+            .lock()
+            .expect("冷却表锁不应被污染")
+            .insert(1, now);
+        cooldowns
+            .inner
+            .lock()
+            .expect("冷却表锁不应被污染")
+            .insert(2, live_until);
+
+        cooldowns.prune_expired(
+            now.checked_add(Duration::from_secs(1))
+                .expect("测试时间应可计算"),
+        );
+
+        let entries = cooldowns.inner.lock().expect("冷却表锁不应被污染");
+        assert!(!entries.contains_key(&1));
+        assert_eq!(entries.get(&2), Some(&live_until));
     }
 
     #[test]

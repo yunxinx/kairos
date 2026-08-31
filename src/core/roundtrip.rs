@@ -139,17 +139,23 @@ fn response_survives(a: Protocol, b: Protocol, ir: &ChatResponse) {
 /// 基线语义面同时要求每次编码零 warning——投影相保有告警即说明语义面选取
 /// 有误，应把该字段移出基线或在 dedicated 用例中声明其有损性。
 fn request_survives(a: Protocol, b: Protocol, request: &ChatRequest) {
+    request_survives_with_projection(a, b, request, project_request);
+}
+
+/// 与 [`request_survives`] 相同，但允许专用用例声明协议整形后的等价投影。
+fn request_survives_with_projection(
+    a: Protocol,
+    b: Protocol,
+    request: &ChatRequest,
+    project: fn(&ChatRequest) -> Value,
+) {
     let (wire_a, warnings_a) = encode_request_wire(a, request);
     assert!(
         warnings_a.is_empty(),
         "{a:?} 基线编码不应有 warning: {warnings_a:?}"
     );
     let via_a = decode_request_wire(a, &wire_a);
-    assert_eq!(
-        project_request(&via_a),
-        project_request(request),
-        "{a:?} 自往返"
-    );
+    assert_eq!(project(&via_a), project(request), "{a:?} 自往返");
 
     let (wire_b, warnings_b) = encode_request_wire(b, &via_a);
     assert!(
@@ -157,11 +163,7 @@ fn request_survives(a: Protocol, b: Protocol, request: &ChatRequest) {
         "{b:?} 基线编码不应有 warning: {warnings_b:?}"
     );
     let via_b = decode_request_wire(b, &wire_b);
-    assert_eq!(
-        project_request(&via_b),
-        project_request(request),
-        "经 {b:?} 中转"
-    );
+    assert_eq!(project(&via_b), project(request), "经 {b:?} 中转");
 
     let (wire_back, warnings_back) = encode_request_wire(a, &via_b);
     assert!(
@@ -169,11 +171,7 @@ fn request_survives(a: Protocol, b: Protocol, request: &ChatRequest) {
         "{a:?} 基线编码不应有 warning: {warnings_back:?}"
     );
     let back = decode_request_wire(a, &wire_back);
-    assert_eq!(
-        project_request(&back),
-        project_request(request),
-        "回到 {a:?}"
-    );
+    assert_eq!(project(&back), project(request), "回到 {a:?}");
 }
 
 /// 响应的语义投影：跨协议可表达的语义面，投影相等即往返无损。
@@ -229,6 +227,17 @@ fn project_request(request: &ChatRequest) -> Value {
         "tool_choice": request.tool_choice,
         "reasoning": request.reasoning,
     })
+}
+
+/// `ToolChoice::None` 在 Anthropic 上通过省略工具声明承载；此时工具定义不再
+/// 对模型可见，故专用往返投影把显式禁用与「无工具可用」归为同一有效语义。
+fn project_request_with_tools_disabled(request: &ChatRequest) -> Value {
+    let mut projected = project_request(request);
+    if matches!(request.tool_choice, Some(ToolChoice::None)) {
+        projected["tools"] = json!([]);
+        projected["tool_choice"] = Value::Null;
+    }
+    projected
 }
 
 fn project_usage(usage: &Usage) -> Value {
@@ -636,14 +645,25 @@ fn tool_choice_typed_encodes_to_each_protocol_shape() {
     ] {
         for (canonical, choice) in tool_choice_wire_shapes(protocol) {
             let mut request = base_request();
-            request.tool_choice = Some(choice);
+            request.tool_choice = Some(choice.clone());
             let (wire, warnings) = encode_request_wire(protocol, &request);
             assert!(warnings.is_empty(), "{protocol:?} 编码不应有 warning");
-            assert_eq!(
-                wire[tool_choice_field(protocol)],
-                canonical,
-                "{protocol:?} 编码形状"
-            );
+            if protocol == Protocol::AnthropicMessages && choice == ToolChoice::None {
+                assert!(
+                    wire.get("tools").is_none(),
+                    "Anthropic 禁用工具时不应发送 tools"
+                );
+                assert!(
+                    wire.get("tool_choice").is_none(),
+                    "Anthropic 禁用工具时不应发送 tool_choice"
+                );
+            } else {
+                assert_eq!(
+                    wire[tool_choice_field(protocol)],
+                    canonical,
+                    "{protocol:?} 编码形状"
+                );
+            }
         }
     }
 }
@@ -664,7 +684,18 @@ fn tool_choice_all_variants_survive_all_six_pairs() {
         for (a, b) in directed_pairs() {
             let mut request = base_request();
             request.tool_choice = Some(variant.clone());
-            request_survives(a, b, &request);
+            if variant == ToolChoice::None
+                && (a == Protocol::AnthropicMessages || b == Protocol::AnthropicMessages)
+            {
+                request_survives_with_projection(
+                    a,
+                    b,
+                    &request,
+                    project_request_with_tools_disabled,
+                );
+            } else {
+                request_survives(a, b, &request);
+            }
         }
     }
 }

@@ -94,6 +94,35 @@ async fn user_and_balance_mutations_are_audited() {
     .await;
     assert_eq!(disabled.status(), StatusCode::OK);
 
+    let token = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({
+            "name": "audited-token",
+            "balance_usd_micros": null,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(token.status(), StatusCode::CREATED);
+    let token_id = token.json::<Value>().await.expect("令牌应可解析")["id"]
+        .as_i64()
+        .expect("令牌应有 id");
+    let token_disabled = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/tokens/{token_id}"),
+        json!({
+            "name": "audited-token",
+            "enabled": false
+        }),
+    )
+    .await;
+    assert_eq!(token_disabled.status(), StatusCode::OK);
+
     // 重复提交已经生效的值不应制造伪变更或新的审计行。
     let before_noop = audit_rows(&gw).await.len();
     let noop = admin_json(
@@ -143,6 +172,10 @@ async fn user_and_balance_mutations_are_audited() {
     assert!(
         joined.contains("users|修改用户") && joined.contains("enabled true → false"),
         "改动审计应记字段前后值，实际:\n{joined}"
+    );
+    assert!(
+        joined.contains("tokens|修改用户") && joined.contains("状态 启用 → 停用"),
+        "通用令牌更新的启停变更也应留痕，实际:\n{joined}"
     );
 }
 

@@ -348,7 +348,7 @@ const closeMutation = useMutation({
         win.payload.entry.id === vars.id &&
         win.payload.action === vars.action
       ) {
-        closeWindow(win.id);
+        closeWindow(win.id, true);
       }
     }
     await queryClient.invalidateQueries({ queryKey: ['logs'] });
@@ -793,7 +793,7 @@ function onFilterToken(tokenName: string) {
         "
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="
           closeMutation.mutate({ id: win.payload.entry.id, action: settlementAction(win.payload) })
         "

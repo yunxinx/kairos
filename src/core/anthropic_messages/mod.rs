@@ -328,14 +328,15 @@ struct WireStreamError {
     message: Option<String>,
 }
 
-/// `message_start` 的 message 首部：id/model（usage 为输入侧早期值，非最终，
-/// 此处不消费，由 `sniff_usage` 在直通路径处理）。
+/// `message_start` 的 message 首部：id/model 与输入侧 usage 早期值。
 #[derive(Debug, Clone, Deserialize)]
 struct WireStreamMessage {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
 }
 
 /// `content_block_start` 的内容块。`Text`/`Thinking` 的文本以单元变体判别
@@ -1063,7 +1064,13 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if request.stream {
         obj.insert("stream".into(), Value::Bool(true));
     }
-    if !request.tools.is_empty() {
+    // Anthropic 没有 `none` 的 tool_choice 形状；禁用工具时同时省略工具声明与
+    // 选择字段，避免把不可接受的组合发送给上游。
+    let tools_enabled = !request
+        .tool_choice
+        .as_ref()
+        .is_some_and(|choice| matches!(choice, ToolChoice::None));
+    if tools_enabled && !request.tools.is_empty() {
         obj.insert(
             "tools".into(),
             Value::Array(
@@ -1098,22 +1105,24 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             ),
         );
     }
-    if let Some(choice) = &request.tool_choice {
-        obj.insert(
-            "tool_choice".into(),
-            encode_tool_choice(
-                choice,
-                &request.provider_options,
-                request.parallel_tool_calls,
-            ),
-        );
-    } else if request.parallel_tool_calls == Some(false) && !request.tools.is_empty() {
-        // Anthropic 的禁并行语义只挂在 tool_choice 上：请求未显式选择工具时
-        // 按 auto 兜底合成（允许并行是缺省语义，true 不合成）。
-        obj.insert(
-            "tool_choice".into(),
-            json!({ "type": "auto", "disable_parallel_tool_use": true }),
-        );
+    if tools_enabled {
+        if let Some(choice) = &request.tool_choice {
+            obj.insert(
+                "tool_choice".into(),
+                encode_tool_choice(
+                    choice,
+                    &request.provider_options,
+                    request.parallel_tool_calls,
+                ),
+            );
+        } else if request.parallel_tool_calls == Some(false) && !request.tools.is_empty() {
+            // Anthropic 的禁并行语义只挂在 tool_choice 上：请求未显式选择工具时
+            // 按 auto 兜底合成（允许并行是缺省语义，true 不合成）。
+            obj.insert(
+                "tool_choice".into(),
+                json!({ "type": "auto", "disable_parallel_tool_use": true }),
+            );
+        }
     }
     // 请求级缓存断点原样回传（ttl/scope 等子字段随值透传）。
     if let Some(cache_control) = anthropic_options.and_then(|o| o.get("cache_control")) {
@@ -1127,6 +1136,12 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     }
     // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
     apply_provider_extra(&mut obj, request, "anthropic", warnings);
+    if !tools_enabled {
+        // `ToolChoice::None` 的协议承载是完全不发送工具面；逃生舱不能重新
+        // 注入 Anthropic 不接受的 `tools`/`tool_choice` 字段。
+        obj.remove("tools");
+        obj.remove("tool_choice");
+    }
     // 缓存断点预算钳制：超限时按 render order 保后弃前，动作可观测。
     let dropped = clamp_cache_breakpoints(&mut obj);
     if dropped > 0 {
@@ -2284,6 +2299,8 @@ fn encode_usage(usage: &Usage) -> Value {
 pub struct StreamDecoder {
     /// 按块 index 维护进行中的块状态。
     blocks: HashMap<usize, OpenBlock>,
+    /// 分散在 message_start/message_delta 的 usage，按分量取最大值合并。
+    usage: Usage,
 }
 
 /// 进行中的内容块。
@@ -2323,7 +2340,11 @@ impl StreamDecoder {
                 if let (Some(id), Some(model)) = (message.id, message.model) {
                     events.push(StreamEvent::ResponseMetadata { id, model });
                 }
-                // message_start 的 usage 是输入侧早期值，非最终；不在此产出 Finish。
+                if let Some(usage) = message.usage {
+                    let usage = convert_usage(usage);
+                    self.usage.union_max(usage.clone());
+                    self.usage.raw = usage.raw;
+                }
             }
             WireStreamEvent::ContentBlockStart {
                 index,
@@ -2458,12 +2479,17 @@ impl StreamDecoder {
             WireStreamEvent::MessageDelta { delta, usage } => {
                 let raw = delta.stop_reason;
                 let unified = map_stop_reason(raw.as_deref());
+                if let Some(usage) = usage {
+                    let usage = convert_usage(usage);
+                    self.usage.union_max(usage.clone());
+                    self.usage.raw = usage.raw;
+                }
                 events.push(StreamEvent::Finish {
                     finish_reason: FinishReason {
                         unified,
                         raw: raw.clone(),
                     },
-                    usage: usage.map(convert_usage).unwrap_or_default(),
+                    usage: self.usage.clone(),
                     provider_metadata: HashMap::new(),
                 });
             }
@@ -3851,6 +3877,24 @@ mod tests {
         ));
     }
 
+    /// `none` 表示禁用工具；Anthropic 不接受对应的 wire 形状，故连同工具声明
+    /// 一并省略。
+    #[test]
+    fn tool_choice_none_omits_tools_and_choice() {
+        let mut request = bare_request(Vec::new());
+        request.tools = vec![Tool {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: Some(json!({ "type": "object" })),
+            provider_options: HashMap::new(),
+        }];
+        request.tool_choice = Some(ToolChoice::None);
+
+        let encoded = encode_request(&request, &mut Vec::new());
+        assert!(encoded.get("tools").is_none());
+        assert!(encoded.get("tool_choice").is_none());
+    }
+
     /// `event: error`（200 后流内错误，如 overloaded_error）解码为 IR Error
     /// 事件，不再静默吞掉；错误不贡献内容，累积器照常保留已累积 usage。
     #[test]
@@ -3914,6 +3958,45 @@ mod tests {
 
         // 同构：流式累积结果与非流式解码一致（含 thinking 的 signature 逃生舱）。
         assert_eq!(streamed, non_stream);
+    }
+
+    /// 流式 usage 分布在首部和收尾时，必须合并输入、缓存与输出各分量。
+    #[test]
+    fn stream_usage_merges_message_start_and_delta() {
+        let mut decoder = StreamDecoder::default();
+        let start = json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "model": "claude-sonnet",
+                "usage": {
+                    "input_tokens": 120,
+                    "cache_read_input_tokens": 30,
+                    "cache_creation_input_tokens": 10
+                }
+            }
+        });
+        let delta = json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" },
+            "usage": { "output_tokens": 45 }
+        });
+
+        let start_chunk = decoder.process(&start);
+        assert!(start_chunk.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ResponseMetadata { id, model }
+                if id == "msg_1" && model == "claude-sonnet"
+        )));
+        let finish = decoder.process(&delta).events;
+        assert!(matches!(
+            finish.as_slice(),
+            [StreamEvent::Finish { usage, .. }]
+                if usage.input_tokens == 120
+                    && usage.output_tokens == 45
+                    && usage.cache_read_tokens == 30
+                    && usage.cache_write_tokens == 10
+        ));
     }
 
     /// 流式 tool_use 输入跨帧累积，`content_block_stop` 收尾为完整 tool-call。

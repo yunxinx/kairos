@@ -2295,7 +2295,13 @@ async fn stream_completion(
     // failover 对下游零痕迹。正常流只多读首个内容帧，peek 受空闲超时约束。
     let idle = channel_idle(channel.timeout_ms);
     let byte_stream: UpstreamByteStream = Box::pin(resp.bytes_stream());
-    let (peek, byte_stream) = peek_stream_head(byte_stream, channel.protocol, idle).await;
+    let (peek, byte_stream) = peek_stream_head(
+        byte_stream,
+        channel.protocol,
+        idle,
+        ctx.snapshot.sse_reassembly_max(),
+    )
+    .await;
     let peeked = match peek {
         PeekHead::Content(frames) => frames,
         PeekHead::UpstreamError(message) => {
@@ -2414,6 +2420,7 @@ async fn peek_stream_head(
     byte_stream: UpstreamByteStream,
     protocol: Protocol,
     idle: Duration,
+    max_bytes: usize,
 ) -> (PeekHead, UpstreamByteStream) {
     use futures_util::StreamExt as _;
 
@@ -2421,6 +2428,7 @@ async fn peek_stream_head(
     let mut decoder = protocol::make_decoder(protocol);
     let mut buffer: Vec<u8> = Vec::new();
     let mut peeked: Vec<Value> = Vec::new();
+    let mut peeked_bytes = 0usize;
     // Anthropic 的 message_start 对应 IR ResponseMetadata；内容帧先于它出现
     // 属协议破坏。
     let mut saw_message_start = false;
@@ -2428,6 +2436,13 @@ async fn peek_stream_head(
         if let Some((event_name, frame)) = take_frame(&mut buffer) {
             if frame.is_empty() {
                 continue;
+            }
+            peeked_bytes = peeked_bytes.saturating_add(frame.len());
+            if peeked_bytes > max_bytes {
+                return (
+                    PeekHead::Interrupted(SSE_REASSEMBLY_OVERFLOW_MESSAGE.to_string()),
+                    byte_stream,
+                );
             }
             let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
             let decoded = decoder.process(&chunk);
@@ -2471,7 +2486,15 @@ async fn peek_stream_head(
             continue;
         }
         match tokio::time::timeout(idle, byte_stream.as_mut().next()).await {
-            Ok(Some(Ok(bytes))) => buffer.extend_from_slice(&bytes),
+            Ok(Some(Ok(bytes))) => {
+                if buffer.len().saturating_add(bytes.len()) > max_bytes {
+                    return (
+                        PeekHead::Interrupted(SSE_REASSEMBLY_OVERFLOW_MESSAGE.to_string()),
+                        byte_stream,
+                    );
+                }
+                buffer.extend_from_slice(&bytes);
+            }
             Ok(Some(Err(_))) => {
                 return (
                     PeekHead::Interrupted("上游流读取失败".to_string()),
@@ -3226,6 +3249,7 @@ mod tests {
             stream,
             Protocol::AnthropicMessages,
             std::time::Duration::from_millis(100),
+            4096,
         )
         .await;
         assert!(matches!(peek, super::PeekHead::UpstreamError(m) if m == "Overloaded"));
@@ -3239,6 +3263,7 @@ mod tests {
             stream,
             Protocol::AnthropicMessages,
             std::time::Duration::from_millis(100),
+            4096,
         )
         .await;
         assert!(matches!(peek, super::PeekHead::Interrupted(m) if m.contains("空流")));
@@ -3252,6 +3277,7 @@ mod tests {
             stream,
             Protocol::AnthropicMessages,
             std::time::Duration::from_millis(100),
+            4096,
         )
         .await;
         assert!(
@@ -3275,6 +3301,7 @@ mod tests {
             stream,
             Protocol::AnthropicMessages,
             std::time::Duration::from_millis(100),
+            4096,
         )
         .await;
         match peek {
@@ -3306,8 +3333,25 @@ mod tests {
             stream,
             Protocol::AnthropicMessages,
             std::time::Duration::from_millis(100),
+            4096,
         )
         .await;
         assert!(matches!(peek, super::PeekHead::Content(_)));
+    }
+
+    /// 首帧探测与流水阶段使用同一字节上限，避免控制帧或超大首帧持续累积。
+    #[tokio::test]
+    async fn peek_rejects_buffer_overflow() {
+        let stream = sse_stream(vec![anthropic_message_start()]);
+        let (peek, _rest) = super::peek_stream_head(
+            stream,
+            Protocol::AnthropicMessages,
+            std::time::Duration::from_millis(100),
+            16,
+        )
+        .await;
+        assert!(
+            matches!(peek, super::PeekHead::Interrupted(message) if message.contains("超过上限"))
+        );
     }
 }
