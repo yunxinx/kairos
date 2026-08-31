@@ -7,7 +7,7 @@ import { toggleLocale } from '@/app/providers/i18n';
 import { getStoredTheme, resolveDark, toggleTheme } from '@/lib/theme';
 import { navTabsFor } from '@/lib/nav';
 import { prefetchAdminRoute } from '@/lib/prefetch-admin';
-import { clearAdminKey, useCurrentUser } from '@/lib/session';
+import { clearSession, useCurrentUser } from '@/lib/session';
 import { apiClient } from '@/api/client';
 import { useResolvedDarkTheme } from '@/composables/useResolvedDarkTheme';
 
@@ -62,7 +62,7 @@ watch(menuOpen, (open) => {
 async function handleLogout() {
   closeMenu();
   const revoke = apiClient.logout();
-  clearAdminKey();
+  clearSession();
   try {
     await revoke;
   } catch {

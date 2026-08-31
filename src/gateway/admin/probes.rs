@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::config::Protocol;
 use crate::core::ir::{ChatRequest, ContentPart, Message, Role};
 use crate::gateway::http::{OutboundAuth, upstream_error_message};
+use crate::gateway::network::validate_target;
 use crate::gateway::protocol;
 use crate::store::resources::{Channel, StoredChannelKey, select_channel_key};
 
@@ -93,6 +94,7 @@ async fn test_channel(
     let model = resolve_probe_model(channel, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("模型 {requested} 不在渠道 {id} 的清单中"))
     })?;
+    let allow_private_networks = deps.snapshot.read().await.allow_private_networks;
     let key = select_channel_key(&record.keys, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("渠道 {id} 没有可用于模型 {requested} 的启用密钥"))
     })?;
@@ -105,10 +107,13 @@ async fn test_channel(
         channel.base_url.trim_end_matches('/'),
         protocol::upstream_path(channel.protocol, &model, false)
     );
+    validate_target(&upstream_url, allow_private_networks)
+        .map_err(|err| AdminError::InvalidBody(err.to_string()))?;
 
     let started = Instant::now();
     let send = deps
-        .client
+        .outbound_clients
+        .for_policy(allow_private_networks)
         .post(&upstream_url)
         .timeout(Duration::from_millis(channel.timeout_ms))
         .apply_outbound_auth(channel.protocol, key)
@@ -265,8 +270,12 @@ async fn list_upstream_models(
         _ => UPSTREAM_MODELS_PATH,
     };
     let url = format!("{}{}", draft.base_url.trim_end_matches('/'), models_path);
+    let allow_private_networks = deps.snapshot.read().await.allow_private_networks;
+    validate_target(&url, allow_private_networks)
+        .map_err(|err| AdminError::InvalidBody(err.to_string()))?;
     let send = deps
-        .client
+        .outbound_clients
+        .for_policy(allow_private_networks)
         .get(&url)
         .timeout(Duration::from_millis(draft.timeout_ms))
         .apply_outbound_auth(draft.protocol, &key)

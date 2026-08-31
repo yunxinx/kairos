@@ -18,7 +18,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -28,7 +29,8 @@ async fn admin_json(
 async fn first_channel_id(gw: &TestGateway) -> i64 {
     let channels: Value = reqwest::Client::new()
         .get(format!("{}/channels", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("渠道列表应可达")

@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -25,7 +26,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await

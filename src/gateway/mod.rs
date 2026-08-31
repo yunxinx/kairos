@@ -7,6 +7,7 @@ mod admin;
 mod failover;
 mod http;
 mod logging;
+mod network;
 mod protocol;
 mod rate_limit;
 mod rectifier;

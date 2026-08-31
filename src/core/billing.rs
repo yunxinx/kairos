@@ -8,6 +8,7 @@
 
 use crate::core::ir::Usage;
 use crate::store::resources::Price;
+use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
 
 /// 费用计算失败；任何一种错误都必须阻止结算，不能截断或饱和后继续扣款。
@@ -34,7 +35,7 @@ pub struct Charge {
 ///
 /// `cache_write_1h_micros` 为 0 表示价格行未配置 1h TTL 档，1h 写入明细随
 /// 其余写入按 `cache_write_micros` 计。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PriceSnapshot {
     pub input_micros: i64,
     pub output_micros: i64,

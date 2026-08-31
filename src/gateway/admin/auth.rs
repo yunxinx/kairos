@@ -1,12 +1,12 @@
 //! 管理面认证与会话授权。
 //!
-//! 这个模块把凭证解析、会话查验和角色中间件集中在一个窄接口后面；资源处理器只
-//! 接收已经解析好的 [`ManagementIdentity`]，不再重复理解 Bearer 或限流细节。
+//! 这个模块把 Cookie 会话解析、会话查验和角色中间件集中在一个窄接口后面；资源
+//! 处理器只接收已经解析好的 [`ManagementIdentity`]，不再重复理解凭证或限流细节。
 
 use axum::{
     Json,
     extract::{Request, State},
-    http::StatusCode,
+    http::{Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -18,7 +18,8 @@ use crate::store::plans::{self, PlanCapabilities};
 use crate::store::users::{self, ManagementRole, UserRecord};
 
 use super::AdminError;
-use crate::gateway::http::extract_bearer;
+
+pub(super) const SESSION_COOKIE: &str = "kairos_session";
 
 /// 管理认证中间件状态：会话查库。
 #[derive(Clone)]
@@ -154,7 +155,7 @@ impl ManagementIdentity {
     }
 }
 
-/// 管理认证：Bearer 仅为未吊销的会话，失败统一返回 401。
+/// 管理认证：Cookie 仅接受未吊销的会话，失败统一返回 401。
 ///
 /// 会话令牌是高熵凭证；无效、过期、吊销与 GC 后的旧令牌都不能消耗密码登录的
 /// 失败预算。密码爆破限流只存在于 `/login`，两类凭证不共享状态。
@@ -163,12 +164,7 @@ pub(super) async fn admin_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let provided = request
-        .headers()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(extract_bearer)
-        .unwrap_or("");
+    let provided = session_from_request(&request).unwrap_or("");
     let now = logging::unix_millis();
     match users::user_for_session(&auth.pool, provided, now).await {
         Ok(users::SessionLookup::Valid(user)) => {
@@ -207,6 +203,84 @@ pub(super) async fn admin_auth(
         ) => unauthorized_response(),
         Err(err) => AdminError::Store(err).into_response(),
     }
+}
+
+pub(super) fn session_from_request(request: &Request) -> Option<&str> {
+    session_from_headers(request.headers())
+}
+
+pub(super) fn session_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
+    for value in headers.get_all(header::COOKIE) {
+        let Ok(cookies) = value.to_str() else {
+            continue;
+        };
+        if let Some(session) = cookies.split(';').find_map(|part| {
+            let part = part.trim();
+            let (name, value) = part.split_once('=')?;
+            if name == SESSION_COOKIE && !value.is_empty() {
+                Some(value)
+            } else {
+                None
+            }
+        }) {
+            return Some(session);
+        }
+    }
+    None
+}
+
+pub(super) fn request_is_secure(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
+}
+
+fn has_same_origin(headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(source) = headers
+        .get(header::ORIGIN)
+        .or_else(|| headers.get(header::REFERER))
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let scheme = if request_is_secure(headers) {
+        "https"
+    } else {
+        "http"
+    };
+    let Ok(expected) = reqwest::Url::parse(&format!("{scheme}://{host}")) else {
+        return false;
+    };
+    let Ok(source) = reqwest::Url::parse(source) else {
+        return false;
+    };
+    source.scheme() == expected.scheme()
+        && source.host_str() == expected.host_str()
+        && source.port_or_known_default() == expected.port_or_known_default()
+}
+
+/// 管理面的写请求必须带同源浏览器信号，避免 Cookie 被跨站请求自动携带。
+pub(super) async fn same_origin_guard(request: Request, next: Next) -> Response {
+    let requires_check = matches!(
+        request.method(),
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    );
+    if requires_check && !has_same_origin(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": { "code": "forbidden", "message": "请求来源不受信任" } })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 pub(super) fn unauthorized_response() -> Response {

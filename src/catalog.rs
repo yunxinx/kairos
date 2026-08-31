@@ -4,7 +4,8 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{Value, value::RawValue};
 use sqlx::SqlitePool;
 use thiserror::Error;
 
@@ -24,8 +25,6 @@ const SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// 拉取公开目录的超时：JSON 约 1MB，一分钟足够。
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-const MICROS_PER_USD: f64 = 1_000_000.0;
-
 /// 目录拉取或解析失败。
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -41,43 +40,49 @@ pub enum CatalogError {
 
 /// 把 models.dev `api.json` 展开为扁平目录行；没有 `cost` 的模型跳过。
 fn parse_models_dev(json: &str) -> Result<Vec<CatalogModel>, CatalogError> {
-    let root: Value = serde_json::from_str(json).map_err(|_| CatalogError::InvalidJson)?;
-    let providers = root.as_object().ok_or(CatalogError::InvalidJson)?;
+    let providers: std::collections::HashMap<String, Box<RawValue>> =
+        serde_json::from_str(json).map_err(|_| CatalogError::InvalidJson)?;
     let mut models = Vec::new();
     for (provider_key, provider) in providers {
+        let Ok(provider) = serde_json::from_str::<ProviderWire>(provider.get()) else {
+            continue;
+        };
         let provider_id = provider
-            .get("id")
+            .id
+            .as_ref()
             .and_then(Value::as_str)
-            .unwrap_or(provider_key);
+            .unwrap_or(provider_key.as_str());
         let provider_name = provider
-            .get("name")
+            .name
+            .as_ref()
             .and_then(Value::as_str)
             .unwrap_or(provider_id);
-        let Some(listed) = provider.get("models").and_then(Value::as_object) else {
+        let Some(listed) = provider.models else {
             continue;
         };
         for (model_key, model) in listed {
-            let Some(cost) = model.get("cost") else {
+            let Ok(model) = serde_json::from_str::<ModelWire>(model.get()) else {
                 continue;
             };
-            if !cost.is_object() {
+            let Some(cost) = model.cost else {
                 continue;
-            }
-            let model_id = model.get("id").and_then(Value::as_str).unwrap_or(model_key);
+            };
+            let Ok(cost) = serde_json::from_str::<CostWire>(cost.get()) else {
+                continue;
+            };
+            let model_id = model
+                .id
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap_or(model_key.as_str());
             models.push(CatalogModel {
                 provider_id: provider_id.to_string(),
                 provider_name: provider_name.to_string(),
                 model_id: model_id.to_string(),
-                input_micros: catalog_dollars_to_micros(cost.get("input").and_then(Value::as_f64)),
-                output_micros: catalog_dollars_to_micros(
-                    cost.get("output").and_then(Value::as_f64),
-                ),
-                cache_read_micros: catalog_dollars_to_micros(
-                    cost.get("cache_read").and_then(Value::as_f64),
-                ),
-                cache_write_micros: catalog_dollars_to_micros(
-                    cost.get("cache_write").and_then(Value::as_f64),
-                ),
+                input_micros: catalog_dollars_to_micros(cost.input.as_deref()),
+                output_micros: catalog_dollars_to_micros(cost.output.as_deref()),
+                cache_read_micros: catalog_dollars_to_micros(cost.cache_read.as_deref()),
+                cache_write_micros: catalog_dollars_to_micros(cost.cache_write.as_deref()),
             });
         }
     }
@@ -89,17 +94,87 @@ fn parse_models_dev(json: &str) -> Result<Vec<CatalogModel>, CatalogError> {
     Ok(models)
 }
 
-/// 目录美元/1M tokens → micro-USD；非法或负值视为缺档。
-fn catalog_dollars_to_micros(value: Option<f64>) -> Option<i64> {
-    let value = value?;
-    if !value.is_finite() || value < 0.0 {
+#[derive(Debug, Deserialize)]
+struct ProviderWire {
+    id: Option<Value>,
+    name: Option<Value>,
+    models: Option<std::collections::HashMap<String, Box<RawValue>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelWire {
+    id: Option<Value>,
+    cost: Option<Box<RawValue>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CostWire {
+    input: Option<Box<RawValue>>,
+    output: Option<Box<RawValue>>,
+    cache_read: Option<Box<RawValue>>,
+    cache_write: Option<Box<RawValue>>,
+}
+
+/// 目录美元/1M tokens → micro-USD；按十进制原文四舍五入，负值与超界值视为缺档。
+fn catalog_dollars_to_micros(value: Option<&RawValue>) -> Option<i64> {
+    decimal_dollars_to_micros(value?.get())
+}
+
+fn decimal_dollars_to_micros(raw: &str) -> Option<i64> {
+    if raw.starts_with('-') {
         return None;
     }
-    let micros = (value * MICROS_PER_USD).round();
-    if micros >= i64::MAX as f64 {
+    let (mantissa, exponent) = match raw.find('e').or_else(|| raw.find('E')) {
+        Some(index) => {
+            let exponent = raw.get(index + 1..)?.parse::<i64>().ok()?;
+            (&raw[..index], exponent)
+        }
+        None => (raw, 0),
+    };
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut coefficient = 0u128;
+    for byte in integer.bytes().chain(fraction.bytes()) {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        let digit = byte - b'0';
+        coefficient = coefficient
+            .checked_mul(10)?
+            .checked_add(u128::from(digit))?;
+    }
+    if coefficient == 0 {
+        return Some(0);
+    }
+    let fraction_digits = i64::try_from(fraction.len()).ok()?;
+    let scale = fraction_digits.checked_sub(exponent)?.checked_sub(6)?;
+    let micros = if scale > 0 {
+        let divisor = match power_of_ten(u32::try_from(scale).ok()?) {
+            Some(divisor) => divisor,
+            None => return Some(0),
+        };
+        let whole = coefficient / divisor;
+        let remainder = coefficient % divisor;
+        if remainder >= divisor / 2 {
+            whole.checked_add(1)?
+        } else {
+            whole
+        }
+    } else {
+        let multiplier = power_of_ten(u32::try_from(scale.checked_neg()?).ok()?)?;
+        coefficient.checked_mul(multiplier)?
+    };
+    i64::try_from(micros).ok()
+}
+
+fn power_of_ten(exponent: u32) -> Option<u128> {
+    if exponent > 38 {
         return None;
     }
-    Some(micros as i64)
+    let mut value = 1u128;
+    for _ in 0..exponent {
+        value = value.checked_mul(10)?;
+    }
+    Some(value)
 }
 
 /// 当前 unix 毫秒。
@@ -129,7 +204,10 @@ pub async fn fetch_and_replace(
     let body = response.text().await.map_err(CatalogError::Fetch)?;
     let models = parse_models_dev(&body)?;
     let synced_at = unix_millis();
-    let mut tx = pool.begin().await.map_err(StoreError::Query)?;
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
     replace_catalog_models(&mut tx, &models).await?;
     set_catalog_synced_at(&mut tx, synced_at).await?;
     tx.commit().await.map_err(StoreError::Query)?;
@@ -231,15 +309,30 @@ mod tests {
     }
 
     #[test]
-    fn catalog_dollars_rejects_negative_and_nan() {
-        assert_eq!(catalog_dollars_to_micros(Some(-1.0)), None);
-        assert_eq!(catalog_dollars_to_micros(Some(f64::NAN)), None);
+    fn catalog_dollars_rejects_negative_and_out_of_range_values() {
+        let negative: Box<RawValue> = serde_json::from_str("-1").expect("应能解析数字");
+        let max: Box<RawValue> =
+            serde_json::from_str("9223372036854.775807").expect("应能解析上界数字");
+        let overflow: Box<RawValue> =
+            serde_json::from_str("9223372036854.775808").expect("应能解析越界数字");
+        assert_eq!(catalog_dollars_to_micros(Some(&negative)), None);
         assert_eq!(catalog_dollars_to_micros(None), None);
-        assert_eq!(catalog_dollars_to_micros(Some(0.0)), Some(0));
-        assert_eq!(
-            catalog_dollars_to_micros(Some(i64::MAX as f64 / MICROS_PER_USD)),
-            None,
-            "不能把超出 i64 的 2^63 饱和成 i64::MAX"
-        );
+        assert_eq!(catalog_dollars_to_micros(Some(&max)), Some(i64::MAX));
+        assert_eq!(catalog_dollars_to_micros(Some(&overflow)), None);
+    }
+
+    #[test]
+    fn catalog_dollars_rounds_decimal_source_exactly() {
+        for (raw, expected) in [
+            ("0", 0),
+            ("0.0000004", 0),
+            ("0.0000005", 1),
+            ("1.2345674", 1_234_567),
+            ("1.2345675", 1_234_568),
+            ("2.5e-6", 3),
+        ] {
+            let value: Box<RawValue> = serde_json::from_str(raw).expect("应能解析目录数字");
+            assert_eq!(catalog_dollars_to_micros(Some(&value)), Some(expected));
+        }
     }
 }

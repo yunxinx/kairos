@@ -51,6 +51,8 @@ pub(super) struct MyModelView {
     cache_read: Option<PriceRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_write: Option<PriceRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_write_1h: Option<PriceRange>,
 }
 
 /// 一个模型组一段。同一个名字可以出现在多段里（组是允许名单，不是分区）。
@@ -234,6 +236,11 @@ fn model_view(
         output: range(&candidates, |price| Some(price.output_micros), discount_bp),
         cache_read: range(&candidates, |price| price.cache_read_micros, discount_bp),
         cache_write: range(&candidates, |price| price.cache_write_micros, discount_bp),
+        cache_write_1h: range(
+            &candidates,
+            |price| price.cache_write_1h_micros,
+            discount_bp,
+        ),
     }
 }
 

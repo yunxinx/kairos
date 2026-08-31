@@ -338,6 +338,7 @@ async fn chat_inbound_reaches_gemini_upstream_model_in_path() {
     assert_eq!(body["usage"]["prompt_tokens"], 10);
     assert_eq!(body["usage"]["completion_tokens"], 2);
     // 非流式完整转换的计费对账：input 10*2.5 + output 2*10 = 45。
+    common::wait_for_request_persistence(&gw.pool).await;
     assert_eq!(billed_rows(&gw.pool).await[0], (10, 2, 0, 45));
 }
 
@@ -378,6 +379,7 @@ async fn gemini_passthrough_zero_rewrite_and_alias_forces_ir() {
     assert_eq!(body["usageMetadata"]["promptTokenCount"], json!(1250));
     // input = 1250 - 200（缓存）= 1050；output = 100（思维链是子集不另计价）。
     // 费用 = 1050*2.5 + 100*10 + 200*1.25 = 3875。
+    common::wait_for_request_persistence(&gw.pool).await;
     assert_eq!(
         billed_rows(&gw.pool).await[0],
         (1050, 100, 200, 3875),
@@ -406,6 +408,7 @@ async fn gemini_passthrough_zero_rewrite_and_alias_forces_ir() {
     );
 
     // 别名请求按 request.model（fast）计价；微元按分量整数截断：
+    common::wait_for_request_persistence(&gw.pool).await;
     // input 150_000*10/1M = 1，output 600_000*2/1M = 1，合计 2。
     assert_eq!(billed_rows(&gw.pool).await[1], (10, 2, 0, 2));
 

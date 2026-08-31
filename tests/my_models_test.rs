@@ -13,25 +13,27 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
     format!("{}{path}", gw.admin_base_url())
 }
 
-async fn bearer_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn bearer_json(
+async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -53,7 +55,7 @@ fn channel_body_with_keys(name: &str, base_url: &str, models: Value, keys: Value
 }
 
 async fn first_channel_id(gw: &TestGateway) -> i64 {
-    let channels: Value = bearer_get(gw, &gw.session, "/channels")
+    let channels: Value = admin_get(gw, &gw.session, "/channels")
         .await
         .json()
         .await
@@ -74,7 +76,7 @@ async fn create_channel(gw: &TestGateway, name: &str, models: Value) -> i64 {
 }
 
 async fn create_channel_with_keys(gw: &TestGateway, name: &str, models: Value, keys: Value) -> i64 {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -89,7 +91,7 @@ async fn create_channel_with_keys(gw: &TestGateway, name: &str, models: Value, k
 }
 
 async fn set_price(gw: &TestGateway, channel_id: i64, model: &str, input: i64, output: i64) {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -113,7 +115,7 @@ async fn create_group(gw: &TestGateway, name: &str, pins: Vec<(i64, &str)>) {
         .into_iter()
         .map(|(channel_id, model)| json!({ "kind": "source", "channel_id": channel_id, "model": model }))
         .collect();
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -126,7 +128,7 @@ async fn create_group(gw: &TestGateway, name: &str, pins: Vec<(i64, &str)>) {
 
 /// 建一档带指定组名单的套餐，返回 id。
 async fn create_plan(gw: &TestGateway, name: &str, groups: &[&str], discount_bp: i64) -> i64 {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -142,7 +144,7 @@ async fn create_plan(gw: &TestGateway, name: &str, groups: &[&str], discount_bp:
 
 /// 整体替换套餐的组名单（用于验证撤组语义）。
 async fn set_plan_groups(gw: &TestGateway, plan_id: i64, name: &str, groups: &[&str]) {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -155,7 +157,7 @@ async fn set_plan_groups(gw: &TestGateway, plan_id: i64, name: &str, groups: &[&
 
 /// 建一个普通用户并挂到指定套餐，返回其 id。
 async fn create_user(gw: &TestGateway, email: &str, plan_id: i64) -> i64 {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -177,7 +179,7 @@ async fn create_user(gw: &TestGateway, email: &str, plan_id: i64) -> i64 {
 
 /// 建一个带管理员套餐的管理员；模型页的查看范围应与 root 一致。
 async fn create_admin(gw: &TestGateway, email: &str, plan_id: i64) -> i64 {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -205,15 +207,12 @@ async fn login(gw: &TestGateway, email: &str) -> String {
         .await
         .expect("登录应可达");
     assert_eq!(response.status(), StatusCode::OK);
-    response.json::<Value>().await.expect("登录应可解析")["token"]
-        .as_str()
-        .expect("应有会话")
-        .to_string()
+    common::session_cookie(&response)
 }
 
 /// 以某个会话拉 `/me/models`。
 async fn my_models(gw: &TestGateway, session: &str) -> Value {
-    let response = bearer_get(gw, session, "/me/models").await;
+    let response = admin_get(gw, session, "/me/models").await;
     assert_eq!(response.status(), StatusCode::OK, "自己的模型页应可读");
     response.json().await.expect("响应应可解析")
 }
@@ -286,7 +285,7 @@ async fn admin_model_view_is_unrestricted_but_token_binding_remains_restricted()
     let channel_id = first_channel_id(&gw).await;
     create_group(&gw, "coding", vec![(channel_id, TEST_MODEL)]).await;
 
-    let plan = bearer_json(
+    let plan = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -313,7 +312,7 @@ async fn admin_model_view_is_unrestricted_but_token_binding_remains_restricted()
         "查看范围放开但价格仍按管理员套餐折扣"
     );
 
-    let token = bearer_json(
+    let token = admin_json(
         &gw,
         &admin_session,
         reqwest::Method::POST,
@@ -377,7 +376,7 @@ async fn response_carries_no_channel_topology() {
     let plan_id = create_plan(&gw, "coder", &["default", "coding"], 10_000).await;
     create_user(&gw, "opaque@example.com", plan_id).await;
 
-    let response = bearer_get(&gw, &login(&gw, "opaque@example.com").await, "/me/models").await;
+    let response = admin_get(&gw, &login(&gw, "opaque@example.com").await, "/me/models").await;
     assert_eq!(response.status(), StatusCode::OK);
     let raw = response.text().await.expect("响应应可读");
 
@@ -427,7 +426,7 @@ async fn withdrawing_a_group_removes_its_section() {
 async fn unified_model_occupies_one_row_and_hides_members() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let channel_id = first_channel_id(&gw).await;
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -479,7 +478,7 @@ async fn matches_downstream_model_list_for_the_same_group() {
     let session = login(&gw, "parity@example.com").await;
 
     // 该用户自己的令牌绑 coding，下游列表应与页面里的 coding 段逐字相同。
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &session,
         reqwest::Method::POST,
@@ -623,7 +622,7 @@ async fn unified_price_range_ignores_members_without_eligible_keys() {
             json!([{"channel_id": disabled, "model": "member-disabled"}]),
         ),
     ] {
-        let response = bearer_json(
+        let response = admin_json(
             &gw,
             &gw.session,
             reqwest::Method::POST,

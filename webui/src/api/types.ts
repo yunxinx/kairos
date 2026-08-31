@@ -236,6 +236,7 @@ export interface Settings {
   /** 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。 */
   rate_limit_rpm: number;
   request_rectify: boolean;
+  allow_private_networks: boolean;
 }
 
 /** 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。 */
@@ -421,6 +422,7 @@ export interface MyModelView {
   output?: PriceRange;
   cache_read?: PriceRange;
   cache_write?: PriceRange;
+  cache_write_1h?: PriceRange;
 }
 
 /** 一个模型组一段；同一个名字可以出现在多段里（组是允许名单，不是分区）。 */
@@ -449,7 +451,6 @@ export interface LoginRequest {
 }
 
 export interface LoginView {
-  token: string;
   expires_at: number;
   user: UserView;
 }

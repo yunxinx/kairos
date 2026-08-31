@@ -285,7 +285,7 @@ async fn create_price(
             )));
         }
     }
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_price(&mut tx, &price)
         .await
         .map_err(AdminError::Store)?;
@@ -330,7 +330,7 @@ async fn update_price(
             .price_for_channel(price.channel_id, &price.model)
             .cloned()
     };
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_price(&mut tx, &price)
         .await
         .map_err(AdminError::Store)?;
@@ -365,7 +365,7 @@ async fn delete_price(
 ) -> Result<Json<Price>, AdminError> {
     identity.require_capability(ManagementCapability::EditPrices)?;
     let deleted = read_price(&deps, channel_id, &model).await?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::delete_price(&mut tx, channel_id, &model)
         .await
         .map_err(AdminError::Store)?;
@@ -418,7 +418,7 @@ async fn create_model_group(
             )));
         }
     }
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_model_group(&mut tx, &group)
         .await
         .map_err(AdminError::Store)?;
@@ -459,7 +459,7 @@ async fn update_model_group(
             .cloned()
             .ok_or_else(|| AdminError::NotFound(format!("模型组 {} 不存在", group.name)))?
     };
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_model_group(&mut tx, &group)
         .await
         .map_err(AdminError::Store)?;
@@ -494,7 +494,7 @@ async fn delete_model_group(
         return Err(AdminError::Conflict("内置组 default 不能删除".to_string()));
     }
     let deleted = read_model_group(&deps, &name).await?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::rebind_channels_to_default(&mut tx, &name)
         .await
         .map_err(AdminError::Store)?;
@@ -609,7 +609,7 @@ async fn create_unified_model(
             Some(&model),
         )?;
     }
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_unified_model(&mut tx, &model)
         .await
         .map_err(AdminError::Store)?;
@@ -658,7 +658,7 @@ async fn update_unified_model(
         )?;
         previous
     };
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_unified_model(&mut tx, &model)
         .await
         .map_err(AdminError::Store)?;
@@ -690,7 +690,7 @@ async fn delete_unified_model(
 ) -> Result<Json<UnifiedModel>, AdminError> {
     identity.require_capability(ManagementCapability::EditUnifiedModels)?;
     let deleted = read_unified_model(&deps, &id).await?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::delete_unified_model(&mut tx, &id)
         .await
         .map_err(AdminError::Store)?;

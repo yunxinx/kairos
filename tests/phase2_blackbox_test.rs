@@ -98,6 +98,7 @@ async fn post_responses_stream(base: &str) -> reqwest::Response {
 ///
 /// 只取 2xx：失败尝试当前不落日志，按状态码过滤可免受该可观测性现状变化的影响。
 async fn logged_channels(pool: &sqlx::SqlitePool) -> Vec<String> {
+    common::wait_for_request_persistence(pool).await;
     sqlx::query_as("SELECT channel FROM request_log WHERE status_code = 200 ORDER BY id")
         .fetch_all(pool)
         .await
@@ -509,6 +510,7 @@ async fn mixed_protocol_candidates_keep_downstream_shape_and_attribution() {
     assert_eq!(second_body["content"][0]["text"], json!("ok"));
     assert_eq!(second_body["stop_reason"], json!("end_turn"));
     assert_eq!(second_body["usage"]["output_tokens"], 2, "usage 随响应回传");
+    common::wait_for_request_persistence(&gw.pool).await;
 
     let to_anthropic = ups[0].received();
     assert_eq!(to_anthropic.len(), 2, "两次请求都先打同一渠道");

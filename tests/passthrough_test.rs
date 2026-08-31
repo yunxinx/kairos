@@ -149,6 +149,7 @@ async fn stream_passthrough_forwards_and_bills_usage() {
     // 直通计费：usage 10o/100 等 → 与 IR 路径同一口径。
     // usage：input 1000 / output 100 / cache_read 200 / cache_write 50。
     // 费用 = 1000*2.5 + 100*10 + 200*1.25 + 50*10 = 2500+1000+250+500 = 4250。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT ub.balance_usd_micros, tb.settled_usd_micros, input_tokens, output_tokens, cost_usd_micros \
          FROM tokens t \
@@ -329,12 +330,14 @@ async fn stream_passthrough_replaces_upstream_done_after_settlement() {
     .concat();
     assert_eq!(downstream.as_ref(), expected, "终止哨兵只能出现一次");
 
-    let settled: i64 =
+    let settled: i64 = {
+        common::wait_for_request_persistence(&gw.pool).await;
         sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
             .bind(TEST_TOKEN_KEY)
             .fetch_one(&gw.pool)
             .await
-            .expect("读到哨兵时结算应已落库");
+            .expect("读到哨兵时结算应已落库")
+    };
     assert_eq!(settled, 45);
 }
 

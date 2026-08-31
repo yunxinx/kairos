@@ -2,7 +2,7 @@
 //!
 //! 管理面与协议面物理隔离：配置文件中可选的管理监听地址（`admin_listen`）配置了
 //! 才启动，未配置即管理面整体关闭，协议监听不注册任何管理路由。资源 API **只**
-//! 接受登录签发的会话（`ksess_…` Bearer）。配置里的 `admin_password` 是 root 的
+//! 接受登录签发的 HttpOnly Cookie 会话。配置里的 `admin_password` 是 root 的
 //! Web UI 登录口令种子，哈希后进库；把它原样放进 `Authorization` 不会通过认证。
 //! `webui/dist` 静态资源与 SPA 回退挂在 fallback 上、免认证。产物缺失时管理面
 //! 退化为纯 API。
@@ -42,13 +42,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::{
-    gateway::http::extract_bearer,
     runtime,
     store::StoreError,
     store::users::{ManagementRole, UserRecord},
 };
 
 use self::auth::{AdminAuth, ManagementIdentity};
+use super::network::OutboundClients;
 use super::throttle::AuthThrottle;
 
 const MAX_BULK_TARGETS: usize = 500;
@@ -122,6 +122,7 @@ pub(super) struct AdminDeps {
     pub(super) pool: SqlitePool,
     pub(super) snapshot: crate::runtime::SnapshotHandle,
     pub(super) client: reqwest::Client,
+    pub(super) outbound_clients: OutboundClients,
     pub(super) throttle: AuthThrottle,
     /// 数据库文件路径：日志维护的磁盘占用统计需要读主库与 WAL 边车的实际大小，
     /// SQL 层拿不到 WAL 文件尺寸，只能走文件系统。
@@ -156,6 +157,7 @@ pub fn router(
     // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
     // builder 事先记下错误时失败；本路径未设置会失败的选项。
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("未配置会失败的 ClientBuilder 选项，rustls 客户端应能构建");
     let throttle = AuthThrottle::new();
@@ -163,6 +165,7 @@ pub fn router(
         pool: pool.clone(),
         snapshot: snapshot.clone(),
         client,
+        outbound_clients: OutboundClients::new(),
         throttle: throttle.clone(),
         db_path,
         reload_lock: Arc::new(Mutex::new(())),
@@ -199,6 +202,7 @@ pub fn router(
         .merge(root_only)
         .merge(admin_plus)
         .merge(signed_in)
+        .route_layer(middleware::from_fn(auth::same_origin_guard))
         .route_layer(middleware::from_fn_with_state(
             AdminAuth { pool },
             auth::admin_auth,
@@ -295,14 +299,6 @@ pub(super) fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
 /// 此处只提供事务开启/提交的 sqlx 错误到 `AdminError` 的映射。
 pub(super) fn db_err(err: sqlx::Error) -> AdminError {
     AdminError::Store(StoreError::Query(err))
-}
-
-/// 从请求头取当前管理会话明文，供只保留当前会话的凭据更新使用。
-pub(super) fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(extract_bearer)
 }
 
 /// 提交后全量重载快照并原子替换，使新资源即时生效且与库一致。

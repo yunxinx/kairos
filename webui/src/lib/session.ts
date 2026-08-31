@@ -2,43 +2,29 @@ import { computed, ref } from 'vue';
 import { queryClient } from '@/app/providers/query';
 import type { MeView } from '@/api/types';
 
-/** 历史键名未改，避免已登录浏览器被踢下线；值已是 `ksess_…` 会话，不是登录口令。 */
-const STORAGE_KEY = 'kairos-admin-key';
-
-const adminKey = ref<string | null>(readStored());
+const isSessionActive = ref(false);
 const currentUser = ref<MeView | null>(null);
 const sessionGeneration = ref(0);
 
 let onInvalidated: (() => void) | undefined;
 
-function readStored(): string | null {
-  return localStorage.getItem(STORAGE_KEY);
+/** 当前页面是否已经确认存在有效的 Cookie 会话。 */
+export function hasSession(): boolean {
+  return isSessionActive.value;
 }
 
-/** 当前持有的管理会话令牌（`ksess_…`）；未登录为 `null`。 */
-export function getAdminKey(): string | null {
-  return adminKey.value;
-}
-
-/** 是否已在本地持有管理凭证。在 computed 内调用可追踪响应式。 */
-export function hasAdminKey(): boolean {
-  return Boolean(adminKey.value);
-}
-
-/** 登录成功后写入 localStorage。 */
-export function setAdminKey(key: string): void {
-  if (adminKey.value !== key) {
+/** 登录或会话恢复成功后建立新的身份边界。 */
+export function markSessionActive(): void {
+  if (!isSessionActive.value) {
     resetIdentityBoundary();
   }
-  localStorage.setItem(STORAGE_KEY, key);
-  adminKey.value = key;
+  isSessionActive.value = true;
 }
 
-/** 退出：清除本地凭据与当前用户。 */
-export function clearAdminKey(): void {
+/** 退出：清除当前页面的会话投影与用户数据。 */
+export function clearSession(): void {
   resetIdentityBoundary();
-  localStorage.removeItem(STORAGE_KEY);
-  adminKey.value = null;
+  isSessionActive.value = false;
 }
 
 /**
@@ -50,15 +36,17 @@ function resetIdentityBoundary(): void {
   sessionGeneration.value += 1;
 }
 
-/** 注册凭据失效回调（401 时跳转登录页）。 */
-export function onAdminKeyInvalidated(callback: () => void): void {
+/** 注册会话失效回调（401 时跳转登录页）。 */
+export function onSessionInvalidated(callback: () => void): void {
   onInvalidated = callback;
 }
 
-/** API 返回 401 时清除凭据并通知路由。 */
-export function invalidateAdminKey(): void {
-  clearAdminKey();
+/** 仅让发起于当前身份代次的 401 使会话失效。 */
+export function invalidateSession(generation: number): boolean {
+  if (generation !== sessionGeneration.value || !isSessionActive.value) return false;
+  clearSession();
   onInvalidated?.();
+  return true;
 }
 
 /** 当前登录用户；尚未 hydrate 时为 `null`。 */
@@ -73,7 +61,7 @@ export function captureSessionGeneration(): number {
 
 /** 仅允许当前身份发起的异步请求回写用户投影。 */
 export function setMeForSession(user: MeView, generation: number): boolean {
-  if (generation !== sessionGeneration.value || !adminKey.value) return false;
+  if (generation !== sessionGeneration.value || !isSessionActive.value) return false;
   currentUser.value = user;
   return true;
 }

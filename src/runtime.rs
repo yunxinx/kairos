@@ -19,19 +19,20 @@ use crate::store::StoreError;
 use crate::store::plans;
 pub use crate::store::plans::PlanCapabilities;
 use crate::store::resources::{
-    self, SETTING_AUTH_THROTTLE_MAX_FAILURES, SETTING_AUTH_THROTTLE_WINDOW_SECS,
-    SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_LOG_BODY_MAX_BYTES,
-    SETTING_MAX_REQUEST_BYTES, SETTING_MAX_RESPONSE_BYTES, SETTING_RATE_LIMIT_RPM,
-    SETTING_REQUEST_RECTIFY, SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS,
-    SETTING_RETRY_BACKOFF_MS, SETTING_SSE_REASSEMBLY_MAX_BYTES,
+    self, SETTING_ALLOW_PRIVATE_NETWORKS, SETTING_AUTH_THROTTLE_MAX_FAILURES,
+    SETTING_AUTH_THROTTLE_WINDOW_SECS, SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY,
+    SETTING_LOG_BODY_MAX_BYTES, SETTING_MAX_REQUEST_BYTES, SETTING_MAX_RESPONSE_BYTES,
+    SETTING_RATE_LIMIT_RPM, SETTING_REQUEST_RECTIFY, SETTING_RETRY_AFTER_CAP_SECS,
+    SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS, SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
 use crate::store::users::{self, ManagementRole};
 
 pub use crate::store::resources::{
-    DEFAULT_AUTH_THROTTLE_MAX_FAILURES, DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
-    DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
-    DEFAULT_RATE_LIMIT_RPM, DEFAULT_REQUEST_RECTIFY, DEFAULT_RETRY_AFTER_CAP_SECS,
-    DEFAULT_RETRY_BACKOFF_CAP_MS, DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+    DEFAULT_ALLOW_PRIVATE_NETWORKS, DEFAULT_AUTH_THROTTLE_MAX_FAILURES,
+    DEFAULT_AUTH_THROTTLE_WINDOW_SECS, DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_RATE_LIMIT_RPM, DEFAULT_REQUEST_RECTIFY,
+    DEFAULT_RETRY_AFTER_CAP_SECS, DEFAULT_RETRY_BACKOFF_CAP_MS, DEFAULT_RETRY_BACKOFF_MS,
+    DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
 };
 
 /// 网关运行时资源的内存快照：不可变整体，原子替换。
@@ -44,6 +45,8 @@ pub struct RuntimeSnapshot {
     pub channels: Vec<resources::ChannelRecord>,
     /// 同名可调用名的显式渠道尝试顺序；缺少行的候选由路由按渠道 id 兜底。
     pub channel_model_order: Vec<resources::ChannelModelOrder>,
+    /// 已启用渠道按可调用名预排的候选下标，请求路由直接索引。
+    pub routing_candidates: HashMap<String, Vec<usize>>,
     /// 令牌定义，按 `token_key` 索引（认证查找）。
     pub tokens: HashMap<String, resources::Token>,
     /// 价格表，外层按渠道稳定 id、内层按可调用名索引（计费准入）。
@@ -82,6 +85,10 @@ pub struct RuntimeSnapshot {
     pub rate_limit_rpm: u64,
     /// 上游 400 的请求整流重试（错误模式匹配 + 最小修正后重试一次）。
     pub request_rectify: bool,
+    /// 是否允许私网、环回与链路本地上游地址。
+    pub allow_private_networks: bool,
+    /// 实例级密钥，仅用于派生出站缓存亲和标识。
+    pub session_cache_secret: [u8; 32],
 }
 
 /// 用户与套餐的绑定：root 不挂档，用类型把「没有套餐」这个合法状态表达出来。
@@ -188,6 +195,7 @@ impl RuntimeSnapshot {
             retry_after_cap_secs: self.retry_after_cap_secs,
             rate_limit_rpm: self.rate_limit_rpm,
             request_rectify: self.request_rectify,
+            allow_private_networks: self.allow_private_networks,
         }
     }
 }
@@ -211,6 +219,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
     let unified_rows = resources::list_unified_models(pool).await?;
     let plan_rows = plans::list_plans_for_snapshot(pool).await?;
     let settings = resources::list_settings(pool).await?;
+    let session_cache_secret = resources::load_or_create_session_cache_secret(pool).await?;
 
     let tokens = token_rows
         .into_iter()
@@ -272,9 +281,11 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         );
     }
 
+    let routing_candidates = build_routing_candidates(&channels, &channel_model_order);
     Ok(RuntimeSnapshot {
         channels,
         channel_model_order,
+        routing_candidates,
         tokens,
         prices,
         model_groups,
@@ -326,7 +337,42 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         ),
         rate_limit_rpm: load_u64(&settings, SETTING_RATE_LIMIT_RPM, DEFAULT_RATE_LIMIT_RPM),
         request_rectify: load_bool(&settings, SETTING_REQUEST_RECTIFY, DEFAULT_REQUEST_RECTIFY),
+        allow_private_networks: load_bool(
+            &settings,
+            SETTING_ALLOW_PRIVATE_NETWORKS,
+            DEFAULT_ALLOW_PRIVATE_NETWORKS,
+        ),
+        session_cache_secret,
     })
+}
+
+fn build_routing_candidates(
+    channels: &[resources::ChannelRecord],
+    order: &[resources::ChannelModelOrder],
+) -> HashMap<String, Vec<usize>> {
+    let positions: HashMap<(&str, i64), i64> = order
+        .iter()
+        .map(|entry| ((entry.model.as_str(), entry.channel_id), entry.position))
+        .collect();
+    let mut candidates: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, record) in channels.iter().enumerate() {
+        if !record.channel.enabled {
+            continue;
+        }
+        for model in resources::channel_callable_names(&record.channel) {
+            candidates.entry(model).or_default().push(index);
+        }
+    }
+    for (model, indices) in &mut candidates {
+        indices.sort_unstable_by_key(|index| {
+            let record = &channels[*index];
+            match positions.get(&(model.as_str(), record.id)) {
+                Some(position) => (0, *position, record.id),
+                None => (1, 0, record.id),
+            }
+        });
+    }
+    candidates
 }
 
 /// 从开关表解析布尔值：缺键或非布尔时用 `default`。

@@ -27,7 +27,7 @@ fn chat_upstream_response() -> Value {
 }
 
 /// always 渠道 + 跨协议入站（Anthropic → OpenAI chat）：显式会话头回写为
-/// 上游 prompt_cache_key，多轮跨协议请求获得上游自动缓存亲和。
+/// 仅在网关内部可复现、且不会暴露原文的上游 prompt_cache_key。
 #[tokio::test]
 async fn always_channel_writes_session_identity_cross_protocol() {
     let (mut gw, _upstreams) = TestGateway::start_with_multi(1, |bases| {
@@ -54,11 +54,11 @@ async fn always_channel_writes_session_identity_cross_protocol() {
 
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    assert_eq!(
-        received[0]["prompt_cache_key"],
-        json!("conv-abc"),
-        "always 渠道应把显式会话头回写为上游缓存亲和键"
-    );
+    let cache_key = received[0]["prompt_cache_key"]
+        .as_str()
+        .expect("always 渠道应写入缓存亲和键");
+    assert_eq!(cache_key.len(), 64, "缓存键应为固定长度摘要");
+    assert_ne!(cache_key, "conv-abc", "上游不应收到下游原始会话标识");
 }
 
 /// auto 渠道：下游显式携带的 prompt_cache_key 保留不覆盖；缺席时回写会话头。
@@ -112,11 +112,11 @@ async fn auto_channel_keeps_explicit_key_and_fills_absent() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let received = gw.upstream.received();
     assert_eq!(received.len(), 2);
-    assert_eq!(
-        received[1]["prompt_cache_key"],
-        json!("sess-2"),
-        "auto 应在下游缺席时回写会话头标识"
-    );
+    let cache_key = received[1]["prompt_cache_key"]
+        .as_str()
+        .expect("auto 应在下游缺席时写入缓存亲和键");
+    assert_eq!(cache_key.len(), 64, "缓存键应为固定长度摘要");
+    assert_ne!(cache_key, "sess-2", "上游不应收到下游原始会话标识");
 }
 
 /// off 渠道（缺省）：不出站回写；下游显式键仍经类型化字段照常透传。
@@ -285,10 +285,140 @@ async fn streaming_path_writes_session_identity() {
 
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
+    let cache_key = received[0]["prompt_cache_key"]
+        .as_str()
+        .expect("流式路径应写入会话缓存键");
+    assert_eq!(cache_key.len(), 64, "缓存键应为固定长度摘要");
+    assert_ne!(cache_key, "sess-stream", "上游不应收到下游原始会话标识");
+}
+
+#[tokio::test]
+async fn session_identity_is_scoped_by_user() {
+    let mut gw =
+        TestGateway::start_with_admin(|base| seed_with_mode(base, SessionCacheKeyMode::Always))
+            .await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+    gw.upstream
+        .push_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+    let origin = gw.admin_origin();
+    let admin = |method: reqwest::Method, path: &str| {
+        reqwest::Client::new()
+            .request(method, format!("{}{path}", gw.admin_base_url()))
+            .header(reqwest::header::COOKIE, &gw.session)
+            .header(reqwest::header::ORIGIN, &origin)
+    };
+
+    let created = admin(reqwest::Method::POST, "/users")
+        .json(&json!({
+            "email": "cache-scope@example.com",
+            "display_name": "cache-scope",
+            "password": "password1",
+            "role": "user"
+        }))
+        .send()
+        .await
+        .expect("用户创建应可达");
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let user_id = created.json::<Value>().await.expect("用户应可解析")["id"]
+        .as_i64()
+        .expect("应有用户 id");
+    let recharged = admin(
+        reqwest::Method::POST,
+        &format!("/users/{user_id}/balance-adjustments"),
+    )
+    .json(&json!({
+        "operation_id": "cache-scope-balance",
+        "delta_usd_micros": 5_000_000,
+        "reason": "manual_adjustment"
+    }))
+    .send()
+    .await
+    .expect("充值应可达");
+    assert_eq!(recharged.status(), reqwest::StatusCode::OK);
+
+    let login = reqwest::Client::new()
+        .post(format!("{}/login", gw.admin_base_url()))
+        .json(&json!({
+            "email": "cache-scope@example.com",
+            "password": "password1"
+        }))
+        .send()
+        .await
+        .expect("登录应可达");
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let user_session = common::session_cookie(&login);
+    let token = reqwest::Client::new()
+        .post(format!("{}/tokens", gw.admin_base_url()))
+        .header(reqwest::header::COOKIE, user_session)
+        .header(reqwest::header::ORIGIN, &origin)
+        .json(&json!({
+            "name": "cache-scope-token",
+            "model_group": "default",
+            "enabled": true
+        }))
+        .send()
+        .await
+        .expect("令牌创建应可达");
+    assert_eq!(token.status(), reqwest::StatusCode::CREATED);
+    let user_token = token.json::<Value>().await.expect("令牌应可解析")["token_key"]
+        .as_str()
+        .expect("应有令牌 key")
+        .to_string();
+
+    for token in [TEST_TOKEN_KEY, user_token.as_str()] {
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", gw.base_url()))
+            .bearer_auth(token)
+            .header("x-kairos-session-id", "shared-signal")
+            .json(&json!({
+                "model": "fast",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .send()
+            .await
+            .expect("下游请求应可达");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 2);
+    assert_ne!(
+        received[0]["prompt_cache_key"], received[1]["prompt_cache_key"],
+        "不同用户不能共享上游缓存亲和键"
+    );
+}
+
+#[tokio::test]
+async fn session_identity_survives_process_reload() {
+    let mut gw =
+        TestGateway::start_with(|base| seed_with_mode(base, SessionCacheKeyMode::Always)).await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+    gw.upstream
+        .push_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+    let reloaded = gw.spawn_reloaded_protocol().await;
+
+    for base in [gw.base_url(), reloaded] {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(TEST_TOKEN_KEY)
+            .header("x-kairos-session-id", "stable-after-reload")
+            .json(&json!({
+                "model": "fast",
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .send()
+            .await
+            .expect("下游请求应可达");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 2);
     assert_eq!(
-        received[0]["prompt_cache_key"],
-        json!("sess-stream"),
-        "流式路径应同样回写会话缓存键"
+        received[0]["prompt_cache_key"], received[1]["prompt_cache_key"],
+        "同一数据库重载后应保持缓存亲和键稳定"
     );
 }
 

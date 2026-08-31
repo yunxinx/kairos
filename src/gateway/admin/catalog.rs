@@ -12,7 +12,7 @@ use crate::gateway::logging;
 use crate::store::catalog::{CatalogMeta, CatalogModel, CatalogView};
 
 use super::auth::{ManagementCapability, ManagementIdentity};
-use super::{AdminDeps, AdminError, db_err, parse_comma_list};
+use super::{AdminDeps, AdminError, begin_write, db_err, parse_comma_list};
 
 pub(super) fn routes() -> Router<AdminDeps> {
     Router::new()
@@ -82,7 +82,7 @@ async fn put_catalog(
     identity.require_capability(ManagementCapability::EditPriceCatalog)?;
     let Json(CatalogPut { models }) = body.map_err(AdminError::bad_body)?;
     let synced_at = logging::unix_millis();
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::catalog::replace_catalog_models(&mut tx, &models)
         .await
         .map_err(AdminError::Store)?;

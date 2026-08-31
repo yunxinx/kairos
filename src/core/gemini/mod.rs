@@ -910,13 +910,7 @@ fn resolve_result_name(part: &ContentPart, call_names: &HashMap<String, String>)
 
 /// 消息内文本 part 拼接（system 合并用）。
 fn text_parts(parts: &[ContentPart]) -> String {
-    parts
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+    crate::core::ir::text_content(parts).unwrap_or_default()
 }
 
 /// 编码单个 IR part 为 wire part；无法表达的类别返回 `None`（并告警）。

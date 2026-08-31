@@ -60,6 +60,7 @@ async fn openai_inbound_to_anthropic_channel_non_stream() {
 
     // 计费：input 25 + output 12。
     // 费用 = 25*2.5/1M + 12*10/1M = 62 + 120 = 182 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64) = sqlx::query_as(
         "SELECT settled_usd_micros, input_tokens FROM token_balance JOIN request_log \
          ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
@@ -143,6 +144,7 @@ async fn anthropic_inbound_to_openai_channel() {
     }));
 
     // 日志 inbound_protocol 落 anthropic_messages。
+    common::wait_for_request_persistence(&gw.pool).await;
     let protocol: String = sqlx::query_scalar("SELECT inbound_protocol FROM request_log")
         .fetch_one(&gw.pool)
         .await
@@ -188,6 +190,7 @@ async fn anthropic_passthrough_forwards_and_bills() {
     assert_eq!(received[0]["messages"][0]["content"], "hi");
 
     // 计费：input 100 + output 20 = 100*2.5/1M + 20*10/1M = 250 + 200 = 450 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64) = sqlx::query_as(
         "SELECT settled_usd_micros, input_tokens FROM token_balance JOIN request_log \
          ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
@@ -237,6 +240,7 @@ async fn anthropic_passthrough_bills_1h_cache_write_tier() {
 
     // 1h 写入 200 × 20.0 + 5m 写入 100 × 10.0 + input 100 × 2.5 + output 20 × 10.0
     // + read 40 × 1.25（micro-USD / 1M tokens）= 4000 + 1000 + 250 + 200 + 50 = 5500。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT settled_usd_micros, cache_write_1h_tokens, cache_write_1h_price_usd_micros, \
          cache_write_tokens FROM token_balance JOIN request_log \
@@ -320,6 +324,7 @@ async fn openai_inbound_to_anthropic_channel_streaming() {
     assert_eq!(finish.data["usage"]["completion_tokens"], 2);
 
     // 计费：input 10 + output 2 = 10*2.5/1M + 2*10/1M = 25 + 20 = 45 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
             .bind(TEST_TOKEN_KEY)
@@ -379,6 +384,7 @@ async fn anthropic_passthrough_streaming_bills_split_usage() {
 
     // 计费：input 50 + output 5 = 50*2.5/1M + 5*10/1M = 125 + 50 = 175 微元
     // （message_start 的 input 与 message_delta 的 output 逐分量 max 合并）。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
             .bind(TEST_TOKEN_KEY)

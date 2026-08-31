@@ -83,7 +83,7 @@ impl SessionStickyCache {
         model: &str,
         session: u64,
         keys: &[StoredChannelKey],
-    ) -> Option<StoredChannelKey> {
+    ) -> Option<i64> {
         let candidates = eligible_channel_keys(keys, model);
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -99,18 +99,18 @@ impl SessionStickyCache {
         if candidates.len() == 1 {
             // 单密钥渠道不使用粘性；清掉旧的多密钥缓存，避免恢复后错误复用。
             map.pop(&cache_key);
-            return Some(candidates[0].clone());
+            return Some(candidates[0].id);
         }
 
         if let Some(entry) = map.get_mut(&cache_key)
             && entry.expires_at > now
             && let Some(key) = candidates.iter().find(|key| key.id == entry.key_id)
         {
-            return Some((*key).clone());
+            return Some(key.id);
         }
         map.pop(&cache_key);
 
-        let selected = select_weighted_channel_key(&candidates)?.clone();
+        let selected = select_weighted_channel_key(&candidates)?;
         map.put(
             cache_key,
             StickyEntry {
@@ -118,7 +118,7 @@ impl SessionStickyCache {
                 expires_at: now.checked_add(STICKY_TTL).unwrap_or(now),
             },
         );
-        Some(selected)
+        Some(selected.id)
     }
 }
 
@@ -144,16 +144,55 @@ enum RateKey {
     Plan(i64),
 }
 
+const RATE_LIMIT_SHARDS: usize = 64;
+
+impl RateKey {
+    fn shard_index(&self) -> usize {
+        let hash = match self {
+            Self::Token(token) => token.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                hash.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(byte)
+            }),
+            Self::User(id) => (*id as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            Self::Plan(id) => (*id as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f),
+        };
+        hash as usize & (RATE_LIMIT_SHARDS - 1)
+    }
+}
+
 /// 可在网关依赖间克隆共享的请求计数器。
 #[derive(Clone)]
 pub(super) struct RequestRateLimiter {
-    inner: Arc<Mutex<HashMap<RateKey, VecDeque<Instant>>>>,
+    inner: Arc<RateLimiterInner>,
+}
+
+struct RateLimiterInner {
+    shards: Vec<Mutex<RateBuckets>>,
+}
+
+struct RateBuckets {
+    entries: HashMap<RateKey, VecDeque<Instant>>,
+    acquisitions: u64,
+}
+
+struct RateConstraint {
+    key: RateKey,
+    limit: u64,
+    shard_index: usize,
 }
 
 impl RequestRateLimiter {
     pub(super) fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(RateLimiterInner {
+                shards: (0..RATE_LIMIT_SHARDS)
+                    .map(|_| {
+                        Mutex::new(RateBuckets {
+                            entries: HashMap::new(),
+                            acquisitions: 0,
+                        })
+                    })
+                    .collect(),
+            }),
         }
     }
 
@@ -176,38 +215,101 @@ impl RequestRateLimiter {
         if token_limit == 0 && user.is_none() && plan.is_none() {
             return Ok(());
         }
-        let now = Instant::now();
-        let mut map = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        prune_expired(&mut map, now);
-        // 先判容量再入队：借用两段分开，避免判定的可变借用跨过其它 entry。
-        if let Some((user_id, user_limit)) = &user
-            && bucket_full(&map, &RateKey::User(*user_id), *user_limit, now)
-        {
-            return Err(retry_after(&map, &RateKey::User(*user_id), now));
+        let mut constraints = Vec::with_capacity(3);
+        if let Some((user_id, limit)) = user {
+            constraints.push(RateConstraint::new(RateKey::User(user_id), limit));
         }
-        if let Some((plan_id, plan_limit)) = &plan
-            && bucket_full(&map, &RateKey::Plan(*plan_id), *plan_limit, now)
-        {
-            return Err(retry_after(&map, &RateKey::Plan(*plan_id), now));
-        }
-        let token_key = RateKey::Token(token_key.to_string());
-        if token_limit > 0 && bucket_full(&map, &token_key, token_limit, now) {
-            return Err(retry_after(&map, &token_key, now));
-        }
-        if let Some((user_id, _)) = &user {
-            map.entry(RateKey::User(*user_id))
-                .or_default()
-                .push_back(now);
-        }
-        if let Some((plan_id, _)) = &plan {
-            map.entry(RateKey::Plan(*plan_id))
-                .or_default()
-                .push_back(now);
+        if let Some((plan_id, limit)) = plan {
+            constraints.push(RateConstraint::new(RateKey::Plan(plan_id), limit));
         }
         if token_limit > 0 {
-            map.entry(token_key).or_default().push_back(now);
+            constraints.push(RateConstraint::new(
+                RateKey::Token(token_key.to_string()),
+                token_limit,
+            ));
+        }
+        constraints.sort_unstable_by_key(|constraint| constraint.shard_index);
+
+        let mut shard_indices: Vec<usize> = constraints
+            .iter()
+            .map(|constraint| constraint.shard_index)
+            .collect();
+        shard_indices.dedup();
+        let mut locked_shards = shard_indices
+            .iter()
+            .map(|index| {
+                (
+                    *index,
+                    self.inner.shards[*index]
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let now = Instant::now();
+        for (_, buckets) in &mut locked_shards {
+            buckets.acquisitions = buckets.acquisitions.wrapping_add(1);
+            if buckets.acquisitions.is_multiple_of(1024) {
+                prune_expired(&mut buckets.entries, now);
+            }
+        }
+        for constraint in &constraints {
+            let map = locked_entries(&mut locked_shards, constraint.shard_index);
+            prune_bucket(map, &constraint.key, now);
+        }
+        for constraint in &constraints {
+            let map = locked_entries(&mut locked_shards, constraint.shard_index);
+            if bucket_full(map, &constraint.key, constraint.limit, now) {
+                return Err(retry_after(map, &constraint.key, now));
+            }
+        }
+        for constraint in constraints {
+            locked_entries(&mut locked_shards, constraint.shard_index)
+                .entry(constraint.key)
+                .or_default()
+                .push_back(now);
         }
         Ok(())
+    }
+}
+
+impl RateConstraint {
+    fn new(key: RateKey, limit: u64) -> Self {
+        let shard_index = key.shard_index();
+        Self {
+            key,
+            limit,
+            shard_index,
+        }
+    }
+}
+
+fn locked_entries<'a>(
+    locked_shards: &'a mut [(usize, std::sync::MutexGuard<'_, RateBuckets>)],
+    shard_index: usize,
+) -> &'a mut HashMap<RateKey, VecDeque<Instant>> {
+    locked_shards
+        .iter_mut()
+        .find(|(index, _)| *index == shard_index)
+        .map(|(_, buckets)| &mut buckets.entries)
+        .expect("每个约束对应的限流分片均已按序加锁")
+}
+
+fn prune_bucket(map: &mut HashMap<RateKey, VecDeque<Instant>>, key: &RateKey, now: Instant) {
+    let should_remove = if let Some(queue) = map.get_mut(key) {
+        while queue
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= WINDOW)
+        {
+            queue.pop_front();
+        }
+        queue.is_empty()
+    } else {
+        false
+    };
+    if should_remove {
+        map.remove(key);
     }
 }
 
@@ -369,7 +471,7 @@ mod tests {
         let keys = [key(1, 1, true), key(2, 1, true)];
         let first = cache.select(7, "model", 42, &keys).expect("应选出密钥");
         let second = cache.select(7, "model", 42, &keys).expect("应复用密钥");
-        assert_eq!(first.id, second.id);
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -384,9 +486,9 @@ mod tests {
         let other_model = cache
             .select(7, "model-b", 42, &other_keys)
             .expect("应选出密钥");
-        assert_eq!(cache.select(7, "model-a", 42, &keys).unwrap().id, first.id);
-        assert!(other_channel.id == 3 || other_channel.id == 4);
-        assert!(other_model.id == 3 || other_model.id == 4);
+        assert_eq!(cache.select(7, "model-a", 42, &keys).unwrap(), first);
+        assert!(other_channel == 3 || other_channel == 4);
+        assert!(other_model == 3 || other_model == 4);
     }
 
     #[test]
@@ -395,11 +497,11 @@ mod tests {
         let keys = [key(1, 1, true), key(2, 1, true)];
         let first = cache.select(7, "model", 42, &keys).expect("应选出密钥");
         let disabled = [
-            key(first.id, first.weight, false),
-            key(if first.id == 1 { 2 } else { 1 }, 1, true),
+            key(first, 1, false),
+            key(if first == 1 { 2 } else { 1 }, 1, true),
         ];
         let selected = cache.select(7, "model", 42, &disabled).expect("应重选");
-        assert_ne!(selected.id, first.id);
+        assert_ne!(selected, first);
     }
 
     #[test]
@@ -407,15 +509,15 @@ mod tests {
         let cache = SessionStickyCache::new();
         let keys = [key(1, 1, true), key(2, 1, true)];
         let first = cache.select(7, "model", 42, &keys).expect("应选出密钥");
-        let remaining_id = if first.id == 1 { 2 } else { 1 };
+        let remaining_id = if first == 1 { 2 } else { 1 };
         let remaining = [key(remaining_id, 1, true)];
         assert_eq!(
-            cache.select(7, "model", 42, &remaining).unwrap().id,
+            cache.select(7, "model", 42, &remaining).unwrap(),
             remaining_id
         );
         assert!(cache.inner.lock().expect("缓存锁不应被污染").is_empty());
         let restored = cache.select(7, "model", 42, &keys).expect("应重新随机选取");
-        assert!(restored.id == 1 || restored.id == 2);
+        assert!(restored == 1 || restored == 2);
     }
 
     #[test]
@@ -435,7 +537,7 @@ mod tests {
         );
         let keys = [key(1, 0, true), key(2, 100, true)];
         let selected = cache.select(7, "model", 42, &keys).expect("应重选");
-        assert_eq!(selected.id, 2);
+        assert_eq!(selected, 2);
     }
 
     #[test]

@@ -10,26 +10,28 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
     format!("{}{path}", gw.admin_base_url())
 }
 
-async fn bearer_json(
+async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn bearer_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -58,7 +60,7 @@ async fn seed_request_log(gw: &TestGateway, created_at: i64, settled: bool, note
 async fn cleanup_removes_only_old_settled_rows() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     // admin 角色用于验证非 root 被拒。
-    let admin = bearer_json(
+    let admin = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -81,10 +83,7 @@ async fn cleanup_removes_only_old_settled_rows() {
         .send()
         .await
         .expect("登录应可达");
-    let admin_session = admin_login.json::<Value>().await.expect("json")["token"]
-        .as_str()
-        .expect("token")
-        .to_string();
+    let admin_session = common::session_cookie(&admin_login);
 
     let now = kairos::gateway::unix_millis();
     let day = 86_400_000i64;
@@ -103,9 +102,9 @@ async fn cleanup_removes_only_old_settled_rows() {
     }
 
     // 非 root 被拒（读与写都拦）。
-    let size_as_admin = bearer_get(&gw, &admin_session, "/logs/size").await;
+    let size_as_admin = admin_get(&gw, &admin_session, "/logs/size").await;
     assert_eq!(size_as_admin.status(), StatusCode::FORBIDDEN);
-    let cleanup_as_admin = bearer_json(
+    let cleanup_as_admin = admin_json(
         &gw,
         &admin_session,
         reqwest::Method::POST,
@@ -117,7 +116,7 @@ async fn cleanup_removes_only_old_settled_rows() {
 
     // 非法窗口被拒（0 与超上限同样属于误操作防护）。
     for bad_days in [0u64, 3651] {
-        let rejected = bearer_json(
+        let rejected = admin_json(
             &gw,
             &gw.session,
             reqwest::Method::POST,
@@ -133,7 +132,7 @@ async fn cleanup_removes_only_old_settled_rows() {
     }
 
     // root 执行 7 天窗口清理。
-    let cleanup = bearer_json(
+    let cleanup = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -159,7 +158,7 @@ async fn cleanup_removes_only_old_settled_rows() {
     assert_eq!(unsettled, 1, "对账队列不可被清理");
 
     // 体积统计反映清理后行数；system_log 含测试自身的审计行，不断言绝对值。
-    let size = bearer_get(&gw, &gw.session, "/logs/size").await;
+    let size = admin_get(&gw, &gw.session, "/logs/size").await;
     assert_eq!(size.status(), StatusCode::OK);
     let size_body: Value = size.json().await.expect("json");
     assert_eq!(size_body["request_log_rows"], 2, "{size_body}");

@@ -1,6 +1,6 @@
 //! 管理会话与 RBAC 端到端黑盒：登录、越权 403、最后 root 保护。
 //!
-//! 登录口令不能当作管理 API 的 Bearer；管理面只认 `POST /login` 签发的 `ksess_…`。
+//! 管理面只认 `POST /login` 签发的 HttpOnly Cookie；请求来源与角色能力独立校验。
 
 mod common;
 
@@ -12,25 +12,27 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
     format!("{}{path}", gw.admin_base_url())
 }
 
-async fn bearer_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn bearer_json(
+async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -38,7 +40,7 @@ async fn bearer_json(
 }
 
 async fn create_user(gw: &TestGateway, email: &str, rate_limit_rpm: Option<u64>) -> i64 {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -66,14 +68,11 @@ async fn login_user(gw: &TestGateway, email: &str) -> String {
         .await
         .expect("用户登录应可达");
     assert_eq!(response.status(), StatusCode::OK);
-    response.json::<Value>().await.expect("登录响应应可解析")["token"]
-        .as_str()
-        .expect("应有会话令牌")
-        .to_string()
+    common::session_cookie(&response)
 }
 
 async fn create_user_token(gw: &TestGateway, session: &str, name: &str) -> String {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         session,
         reqwest::Method::POST,
@@ -124,28 +123,130 @@ async fn seeded_root_can_login_and_logout() {
         .await
         .expect("登录应可达");
     assert_eq!(login.status(), StatusCode::OK);
+    let session = common::session_cookie(&login);
     let body: Value = login.json().await.expect("登录响应应可解析");
-    let token = body["token"].as_str().expect("应有会话令牌");
-    assert!(token.starts_with("ksess_"));
+    assert!(body.get("token").is_none(), "响应体不应包含会话令牌");
     assert_eq!(body["user"]["role"], "root");
 
-    let me = bearer_get(&gw, token, "/me").await;
+    let me = admin_get(&gw, &session, "/me").await;
     assert_eq!(me.status(), StatusCode::OK);
     let me_body: Value = me.json().await.expect("me 应可解析");
     assert_eq!(me_body["email"], "root@localhost");
 
-    let tokens = bearer_get(&gw, token, "/tokens").await;
+    let tokens = admin_get(&gw, &session, "/tokens").await;
     assert_eq!(tokens.status(), StatusCode::OK);
 
     let logout = reqwest::Client::new()
         .post(admin_url(&gw, "/logout"))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, &session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("登出应可达");
     assert_eq!(logout.status(), StatusCode::NO_CONTENT);
-    let after = bearer_get(&gw, token, "/tokens").await;
+    let after = admin_get(&gw, &session, "/tokens").await;
     assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn session_cookie_is_http_only_and_secure_for_https() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let login = |forwarded_proto: Option<&str>| {
+        let mut request = reqwest::Client::new()
+            .post(admin_url(&gw, "/login"))
+            .json(&json!({
+                "email": common::TEST_ROOT_EMAIL,
+                "password": common::TEST_ROOT_PASSWORD
+            }));
+        if let Some(value) = forwarded_proto {
+            request = request.header("x-forwarded-proto", value);
+        }
+        request
+    };
+
+    let http = login(None).send().await.expect("HTTP 登录应可达");
+    assert_eq!(http.status(), StatusCode::OK);
+    let http_cookie = http
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("登录应返回 Cookie");
+    assert!(http_cookie.contains("Path=/api"));
+    assert!(http_cookie.contains("HttpOnly"));
+    assert!(http_cookie.contains("SameSite=Strict"));
+    assert!(!http_cookie.contains("; Secure"));
+    let body: Value = http.json().await.expect("登录响应应可解析");
+    assert!(body.get("token").is_none());
+
+    let https = login(Some("https"))
+        .send()
+        .await
+        .expect("HTTPS 代理登录应可达");
+    assert_eq!(https.status(), StatusCode::OK);
+    let session = common::session_cookie(&https);
+    let https_cookie = https
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("登录应返回 Cookie");
+    assert!(https_cookie.contains("; Secure"));
+
+    let origin = format!("https://{}", gw.admin_addr.expect("管理面应启用"));
+    let logout = reqwest::Client::new()
+        .post(admin_url(&gw, "/logout"))
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, origin)
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .expect("登出应可达");
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    let cleared = logout
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("登出应清理 Cookie");
+    assert!(cleared.contains("Max-Age=0"));
+    assert!(cleared.contains("; Secure"));
+}
+
+#[tokio::test]
+async fn unsafe_management_requests_require_same_origin() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let missing = reqwest::Client::new()
+        .post(admin_url(&gw, "/logout"))
+        .header(reqwest::header::COOKIE, &gw.session)
+        .send()
+        .await
+        .expect("请求应可达");
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+    let cross_origin = reqwest::Client::new()
+        .post(admin_url(&gw, "/logout"))
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, "https://attacker.invalid")
+        .send()
+        .await
+        .expect("请求应可达");
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        admin_get(&gw, &gw.session, "/me").await.status(),
+        StatusCode::OK,
+        "被拒的跨站请求不能吊销会话"
+    );
+
+    let logout = reqwest::Client::new()
+        .post(admin_url(&gw, "/logout"))
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(
+            reqwest::header::REFERER,
+            format!("{}/settings", gw.admin_origin()),
+        )
+        .send()
+        .await
+        .expect("同源请求应可达");
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
 }
 
 /// 登录口令不能当管理 Bearer，也不能当模型令牌；会话同样不能调模型路由。
@@ -153,7 +254,7 @@ async fn seeded_root_can_login_and_logout() {
 async fn login_password_is_not_a_bearer_and_cannot_call_models() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    let as_admin = bearer_get(&gw, TEST_ROOT_PASSWORD, "/tokens").await;
+    let as_admin = admin_get(&gw, TEST_ROOT_PASSWORD, "/tokens").await;
     assert_eq!(
         as_admin.status(),
         StatusCode::UNAUTHORIZED,
@@ -196,7 +297,7 @@ async fn login_password_is_not_a_bearer_and_cannot_call_models() {
 #[tokio::test]
 async fn update_me_email_and_password_with_current() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
-    let missing_current = bearer_json(
+    let missing_current = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -210,7 +311,7 @@ async fn update_me_email_and_password_with_current() {
         "改邮箱必须提供当前密码"
     );
 
-    let wrong_current = bearer_json(
+    let wrong_current = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -223,7 +324,7 @@ async fn update_me_email_and_password_with_current() {
     .await;
     assert_eq!(wrong_current.status(), StatusCode::BAD_REQUEST);
 
-    let email = bearer_json(
+    let email = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -238,7 +339,7 @@ async fn update_me_email_and_password_with_current() {
     let body: Value = email.json().await.expect("应可解析");
     assert_eq!(body["email"], "root-renamed@example.com");
 
-    let missing_current = bearer_json(
+    let missing_current = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -248,7 +349,7 @@ async fn update_me_email_and_password_with_current() {
     .await;
     assert_eq!(missing_current.status(), StatusCode::BAD_REQUEST);
 
-    let wrong_current = bearer_json(
+    let wrong_current = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -261,7 +362,7 @@ async fn update_me_email_and_password_with_current() {
     .await;
     assert_eq!(wrong_current.status(), StatusCode::BAD_REQUEST);
 
-    let changed = bearer_json(
+    let changed = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -277,7 +378,7 @@ async fn update_me_email_and_password_with_current() {
     // 位图 data URL 可以存。SVG 不在允许名单：它能内联脚本与外链资源，一旦哪天
     // 被 v-html/object 渲染就成了 XSS，头像不值得冒这个险。
     const AVATAR_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    let avatar_update = bearer_json(
+    let avatar_update = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -286,14 +387,14 @@ async fn update_me_email_and_password_with_current() {
     )
     .await;
     assert_eq!(avatar_update.status(), StatusCode::OK);
-    let me: Value = bearer_get(&gw, &gw.session, "/me")
+    let me: Value = admin_get(&gw, &gw.session, "/me")
         .await
         .json()
         .await
         .expect("json");
     assert_eq!(me["avatar"], AVATAR_PNG);
 
-    let svg_rejected = bearer_json(
+    let svg_rejected = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -307,7 +408,7 @@ async fn update_me_email_and_password_with_current() {
         "SVG 头像应被拒绝"
     );
 
-    let oversized = bearer_json(
+    let oversized = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -349,7 +450,7 @@ async fn update_me_email_and_password_with_current() {
 async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -367,7 +468,7 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
         .as_i64()
         .expect("应有用户 id");
 
-    let admin_created = bearer_json(
+    let admin_created = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -388,8 +489,7 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
         .send()
         .await
         .expect("登录应可达");
-    let user_body: Value = user_login.json().await.expect("登录应可解析");
-    let user_token = user_body["token"].as_str().expect("应有会话");
+    let user_session = common::session_cookie(&user_login);
 
     let admin_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
@@ -397,24 +497,23 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
         .send()
         .await
         .expect("登录应可达");
-    let admin_body: Value = admin_login.json().await.expect("登录应可解析");
-    let admin_token = admin_body["token"].as_str().expect("应有会话");
+    let admin_session = common::session_cookie(&admin_login);
 
-    let user_channels = bearer_get(&gw, user_token, "/channels").await;
+    let user_channels = admin_get(&gw, &user_session, "/channels").await;
     assert_eq!(user_channels.status(), StatusCode::FORBIDDEN);
-    let user_groups = bearer_get(&gw, user_token, "/model-groups").await;
+    let user_groups = admin_get(&gw, &user_session, "/model-groups").await;
     assert_eq!(user_groups.status(), StatusCode::FORBIDDEN);
 
-    let admin_channels = bearer_get(&gw, admin_token, "/channels").await;
+    let admin_channels = admin_get(&gw, &admin_session, "/channels").await;
     assert_eq!(admin_channels.status(), StatusCode::FORBIDDEN);
-    let admin_groups = bearer_get(&gw, admin_token, "/model-groups").await;
+    let admin_groups = admin_get(&gw, &admin_session, "/model-groups").await;
     assert_eq!(admin_groups.status(), StatusCode::OK);
-    let admin_settings = bearer_get(&gw, admin_token, "/settings").await;
+    let admin_settings = admin_get(&gw, &admin_session, "/settings").await;
     assert_eq!(admin_settings.status(), StatusCode::FORBIDDEN);
 
-    let user_creates = bearer_json(
+    let user_creates = admin_json(
         &gw,
-        user_token,
+        &user_session,
         reqwest::Method::POST,
         "/users",
         json!({
@@ -427,9 +526,9 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     .await;
     assert_eq!(user_creates.status(), StatusCode::FORBIDDEN);
 
-    let user_escalates_self = bearer_json(
+    let user_escalates_self = admin_json(
         &gw,
-        user_token,
+        &user_session,
         reqwest::Method::PUT,
         &format!("/users/{user_id}"),
         json!({ "role": "root" }),
@@ -437,9 +536,9 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     .await;
     assert_eq!(user_escalates_self.status(), StatusCode::FORBIDDEN);
 
-    let user_resets_self_without_current = bearer_json(
+    let user_resets_self_without_current = admin_json(
         &gw,
-        user_token,
+        &user_session,
         reqwest::Method::PUT,
         &format!("/users/{user_id}"),
         json!({ "password": "stolen-session-reset" }),
@@ -450,9 +549,9 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
         StatusCode::FORBIDDEN
     );
 
-    let admin_creates_admin = bearer_json(
+    let admin_creates_admin = admin_json(
         &gw,
-        admin_token,
+        &admin_session,
         reqwest::Method::POST,
         "/users",
         json!({
@@ -465,7 +564,7 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
     .await;
     assert_eq!(admin_creates_admin.status(), StatusCode::FORBIDDEN);
 
-    let demote = bearer_json(
+    let demote = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -479,7 +578,8 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
 
     let delete_last = reqwest::Client::new()
         .delete(admin_url(&gw, "/users/1"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删除应可达");
@@ -500,7 +600,7 @@ async fn malformed_management_credentials_do_not_throttle_login() {
             .expect("请求应可达");
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
-        let malformed = bearer_get(&gw, "not-a-session", "/me").await;
+        let malformed = admin_get(&gw, "not-a-session", "/me").await;
         assert_eq!(malformed.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -520,7 +620,7 @@ async fn malformed_management_credentials_do_not_throttle_login() {
 async fn user_rate_limit_and_stats_roundtrip() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    let user_res = bearer_json(
+    let user_res = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -539,7 +639,7 @@ async fn user_rate_limit_and_stats_roundtrip() {
     let user_id = user_view["id"].as_i64().expect("user_id");
 
     // 给用户钱包充值
-    let recharge = bearer_json(
+    let recharge = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -560,14 +660,11 @@ async fn user_rate_limit_and_stats_roundtrip() {
         .await
         .expect("登录");
     assert_eq!(login.status(), StatusCode::OK);
-    let session_token = login.json::<Value>().await.expect("json")["token"]
-        .as_str()
-        .expect("token")
-        .to_string();
+    let session = common::session_cookie(&login);
 
-    let token_res = bearer_json(
+    let token_res = admin_json(
         &gw,
-        &session_token,
+        &session,
         reqwest::Method::POST,
         "/tokens",
         json!({
@@ -624,7 +721,7 @@ async fn user_rate_limit_and_stats_roundtrip() {
     assert_eq!(call3.status(), StatusCode::TOO_MANY_REQUESTS);
 
     // Root 查询 /users 列表，验证统计数据已聚合
-    let users_list: Vec<Value> = bearer_get(&gw, &gw.session, "/users")
+    let users_list: Vec<Value> = admin_get(&gw, &gw.session, "/users")
         .await
         .json()
         .await
@@ -698,7 +795,7 @@ async fn login_rejects_oversized_and_control_char_input() {
 async fn second_root_cannot_be_created_or_promoted() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -718,7 +815,7 @@ async fn second_root_cannot_be_created_or_promoted() {
     );
 
     // 晋升同样被拒：先建一个 admin，再试图提成 root。
-    let admin = bearer_json(
+    let admin = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -736,7 +833,7 @@ async fn second_root_cannot_be_created_or_promoted() {
         .as_i64()
         .expect("id");
 
-    let promoted = bearer_json(
+    let promoted = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::PUT,
@@ -756,7 +853,7 @@ async fn second_root_cannot_be_created_or_promoted() {
 async fn user_rate_limit_bucket_is_shared_across_tokens() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    let user_res = bearer_json(
+    let user_res = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -774,7 +871,7 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
     let user_id = user_res.json::<Value>().await.expect("json")["id"]
         .as_i64()
         .expect("id");
-    let _ = bearer_json(
+    let _ = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -792,17 +889,14 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
         .send()
         .await
         .expect("登录");
-    let session_token = login.json::<Value>().await.expect("json")["token"]
-        .as_str()
-        .expect("token")
-        .to_string();
+    let session = common::session_cookie(&login);
 
     // 两把令牌都显式不限速（rate_limit_rpm: 0），只能被用户桶约束。
     let mut keys = Vec::new();
     for name in ["key-a", "key-b"] {
-        let token_res = bearer_json(
+        let token_res = admin_json(
             &gw,
-            &session_token,
+            &session,
             reqwest::Method::POST,
             "/tokens",
             json!({
@@ -909,7 +1003,7 @@ async fn plan_default_and_shared_rpm_apply_to_protocol_requests() {
 async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
 
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -930,16 +1024,16 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
 
     // 内置 admin 档默认开启六项能力；同一会话不需要重新登录。
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/users").await.status(),
+        admin_get(&gw, &admin_token, "/users").await.status(),
         StatusCode::OK
     );
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/logs").await.status(),
+        admin_get(&gw, &admin_token, "/logs").await.status(),
         StatusCode::OK
     );
 
     // 创建用户时显式挂载非默认套餐也属于套餐分配，不能只凭 ManageUsers 绕过 AssignPlan。
-    let custom_plan = bearer_json(
+    let custom_plan = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -959,7 +1053,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         .execute(&gw.pool)
         .await
         .expect("应能只打开用户管理能力");
-    let explicit_assignment = bearer_json(
+    let explicit_assignment = admin_json(
         &gw,
         &admin_token,
         reqwest::Method::POST,
@@ -981,16 +1075,16 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         .await
         .expect("应能关闭能力");
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/users").await.status(),
+        admin_get(&gw, &admin_token, "/users").await.status(),
         StatusCode::FORBIDDEN,
         "关闭能力后已有会话也应立即失效"
     );
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/logs").await.status(),
+        admin_get(&gw, &admin_token, "/logs").await.status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/stats").await.status(),
+        admin_get(&gw, &admin_token, "/stats").await.status(),
         StatusCode::FORBIDDEN
     );
     for path in [
@@ -1001,13 +1095,13 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         "/channel-model-orders",
     ] {
         assert_eq!(
-            bearer_get(&gw, &admin_token, path).await.status(),
+            admin_get(&gw, &admin_token, path).await.status(),
             StatusCode::OK,
             "零能力管理员仍应可读模型运营资源: {path}"
         );
     }
     assert_eq!(
-        bearer_json(
+        admin_json(
             &gw,
             &admin_token,
             reqwest::Method::POST,
@@ -1019,7 +1113,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        bearer_json(
+        admin_json(
             &gw,
             &admin_token,
             reqwest::Method::DELETE,
@@ -1031,7 +1125,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        bearer_json(
+        admin_json(
             &gw,
             &admin_token,
             reqwest::Method::PUT,
@@ -1043,7 +1137,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        bearer_json(
+        admin_json(
             &gw,
             &admin_token,
             reqwest::Method::DELETE,
@@ -1061,16 +1155,14 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         .execute(&gw.pool)
         .await
         .expect("应能打开改价");
-    let prices = bearer_get(&gw, &admin_token, "/prices").await;
+    let prices = admin_get(&gw, &admin_token, "/prices").await;
     assert_eq!(prices.status(), StatusCode::OK);
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/users").await.status(),
+        admin_get(&gw, &admin_token, "/users").await.status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/model-groups")
-            .await
-            .status(),
+        admin_get(&gw, &admin_token, "/model-groups").await.status(),
         StatusCode::OK
     );
 
@@ -1078,7 +1170,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
     let price = prices_body[0].clone();
     let channel_id = price["channel_id"].as_i64().expect("应有渠道 id");
     let model = price["model"].as_str().expect("应有模型名");
-    let changed_price = bearer_json(
+    let changed_price = admin_json(
         &gw,
         &admin_token,
         reqwest::Method::PUT,
@@ -1107,12 +1199,12 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         .await
         .expect("应能打开全部开关");
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/channels").await.status(),
+        admin_get(&gw, &admin_token, "/channels").await.status(),
         StatusCode::FORBIDDEN
     );
     // 完整定义仍 root-only，但名录必须可读：模型页要靠它判断某个已登记名挂在哪条
     // 渠道、渠道还在不在。缺这一条时前端渠道表为空，会把「看不到」画成「已失效」。
-    let summary = bearer_get(&gw, &admin_token, "/channels/summary").await;
+    let summary = admin_get(&gw, &admin_token, "/channels/summary").await;
     assert_eq!(summary.status(), StatusCode::OK);
     let listed: Value = summary.json().await.expect("名录应可解析");
     let first = &listed.as_array().expect("名录应为数组")[0];
@@ -1123,18 +1215,18 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         "名录不得泄露密钥与出站地址，实际 {first}"
     );
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/settings").await.status(),
+        admin_get(&gw, &admin_token, "/settings").await.status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        bearer_get(&gw, &admin_token, &format!("/users/{admin_id}"))
+        admin_get(&gw, &admin_token, &format!("/users/{admin_id}"))
             .await
             .status(),
         StatusCode::FORBIDDEN,
         "能力开关不能让 admin 读取 admin 账号"
     );
     assert_eq!(
-        bearer_json(
+        admin_json(
             &gw,
             &admin_token,
             reqwest::Method::PUT,
@@ -1150,12 +1242,12 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         "套餐目录写入仍应由 root-only 路由守住"
     );
     assert_eq!(
-        bearer_get(&gw, &gw.session, "/channels").await.status(),
+        admin_get(&gw, &gw.session, "/channels").await.status(),
         StatusCode::OK,
         "root 不受套餐开关约束"
     );
     assert_eq!(
-        bearer_get(&gw, &gw.session, "/settings").await.status(),
+        admin_get(&gw, &gw.session, "/settings").await.status(),
         StatusCode::OK
     );
 }
@@ -1164,7 +1256,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
 #[tokio::test]
 async fn cross_audience_plan_binding_cannot_grant_management_capabilities() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -1195,11 +1287,11 @@ async fn cross_audience_plan_binding_cannot_grant_management_capabilities() {
         .expect("应能构造跨受众脏绑定");
 
     assert_eq!(
-        bearer_get(&gw, &admin_token, "/users").await.status(),
+        admin_get(&gw, &admin_token, "/users").await.status(),
         StatusCode::FORBIDDEN,
         "admin 不能继承 user 受众套餐中的 manage_users"
     );
-    let me = bearer_get(&gw, &admin_token, "/me").await;
+    let me = admin_get(&gw, &admin_token, "/me").await;
     assert_eq!(me.status(), StatusCode::OK);
     let me: Value = me.json().await.expect("me 应可解析");
     assert_eq!(me["capabilities"]["manage_users"], false);

@@ -14,24 +14,26 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
 
 async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -45,8 +47,7 @@ async fn login(gw: &TestGateway, email: &str, password: &str) -> String {
         .await
         .expect("登录应可达");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.expect("登录应可解析");
-    body["token"].as_str().expect("应有会话").to_string()
+    common::session_cookie(&resp)
 }
 
 fn completion_body() -> Value {
@@ -432,7 +433,8 @@ async fn delete_group_clears_assignments_and_root_can_use_any_group() {
 
     let deleted = reqwest::Client::new()
         .delete(admin_url(&gw, "/model-groups/coding"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删组应可达");

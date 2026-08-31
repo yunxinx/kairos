@@ -14,10 +14,11 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
     format!("{}{path}", gw.admin_base_url())
 }
 
-async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -25,14 +26,15 @@ async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Respon
 
 async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -47,10 +49,7 @@ async fn login(gw: &TestGateway, email: &str) -> String {
         .await
         .expect("登录应可达");
     assert_eq!(resp.status(), StatusCode::OK);
-    resp.json::<Value>().await.expect("登录应可解析")["token"]
-        .as_str()
-        .expect("应有会话")
-        .to_string()
+    common::session_cookie(&resp)
 }
 
 /// 建一个指定角色的用户并登录，返回 `(id, 会话)`。
@@ -297,6 +296,7 @@ async fn settling_requires_admin() {
         "root-key",
     )
     .await;
+    common::wait_for_request_persistence(&gw.pool).await;
     let root_page: Value = admin_get(&gw, &gw.session, "/logs?token_name=root-key")
         .await
         .json()

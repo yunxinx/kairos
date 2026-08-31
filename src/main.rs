@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         });
         let catalog_pool = pool.clone();
         let catalog_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("未配置会失败的 ClientBuilder 选项，rustls 客户端应能构建");
         tokio::spawn(async move {

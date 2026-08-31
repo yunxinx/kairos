@@ -156,6 +156,7 @@ async fn streaming_usage_is_billed() {
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     // 消费完流，确保结算已落库。
     collect_sse_frames(resp).await;
+    common::wait_for_request_persistence(&gw.pool).await;
 
     // 期望费用 = 1000*2.5 + 100*10 + 200*1.25 + 50*10 = 2500+1000+250+500 = 4250。
     let row: (i64, i64, i64, i64) = sqlx::query_as(
@@ -254,6 +255,7 @@ async fn midstream_error_delivers_error_frame_and_settles() {
     );
 
     // 结算按已累积 usage 落账（错误前无 usage 上报 → 零费用），日志落一行。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64) = sqlx::query_as(
         "SELECT ub.balance_usd_micros, rl.cost_usd_micros \
          FROM tokens t \
@@ -362,6 +364,7 @@ async fn pre_first_chunk_error_fails_over_to_next_channel() {
     // 两个渠道都被请求过；只有次渠道成功落账。
     assert_eq!(ups[0].received().len(), 1);
     assert_eq!(ups[1].received().len(), 1);
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (String, i64) = sqlx::query_as("SELECT channel, cost_usd_micros FROM request_log")
         .fetch_one(&gw.pool)
         .await
@@ -435,6 +438,7 @@ async fn unterminated_stream_delivers_error_frame_and_settles() {
             .all(|f| f.data["choices"][0]["finish_reason"].is_null())
     );
 
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) = sqlx::query_as(
         "SELECT rl.cost_usd_micros FROM tokens t \
          JOIN request_log rl ON rl.token_key = t.token_key WHERE t.token_key = ?",

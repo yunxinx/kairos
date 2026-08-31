@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -69,7 +70,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -78,7 +80,7 @@ async fn admin_json(
 
 /// 以指定令牌向网关发一条 Chat Completions 请求。
 async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Response {
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base_url()))
         .bearer_auth(token)
         .json(&json!({
@@ -87,7 +89,9 @@ async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Re
         }))
         .send()
         .await
-        .expect("下游请求应能到达网关")
+        .expect("下游请求应能到达网关");
+    common::wait_for_request_persistence(&gw.pool).await;
+    response
 }
 
 /// mock 上游返回的合法 Chat Completions 成功体。
@@ -126,7 +130,8 @@ async fn fetch_bodies(pool: &sqlx::SqlitePool) -> (Option<Vec<u8>>, Option<Vec<u
 async fn admin_put(gw: &TestGateway, path: &str, body: Value) -> reqwest::Response {
     reqwest::Client::new()
         .put(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -227,18 +232,18 @@ async fn unauthenticated_admin_request_is_401() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
-/// 管理面 Bearer scheme 大小写不敏感。
+/// 管理面不接受 Authorization 中的会话值。
 #[tokio::test]
-async fn admin_accepts_lowercase_bearer_scheme() {
+async fn admin_rejects_bearer_session() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let client = reqwest::Client::new();
     let resp = client
         .get(format!("{}/tokens", gw.admin_base_url()))
-        .header("Authorization", format!("bearer {}", gw.session))
+        .header("Authorization", "Bearer ksess_not_a_cookie")
         .send()
         .await
         .expect("应可请求管理面");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
 
 /// 令牌 CRUD 往返 + 写后即时生效：新建立刻可用、删除立刻失效；key 由系统生成。
@@ -301,7 +306,8 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     let new_id = common::token_id(&gw.pool, &new_key).await;
     let resp = reqwest::Client::new()
         .delete(format!("{}/tokens/{new_id}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可删除令牌");
@@ -547,7 +553,8 @@ async fn channel_and_price_immediate_effect() {
             "{}/prices/{mini_id}/gpt-4o-mini",
             gw.admin_base_url()
         ))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可删除价格");
@@ -562,11 +569,14 @@ async fn channel_and_price_immediate_effect() {
     // 删除渠道：模型失去路由，请求 503（无渠道）。
     let resp = client
         .delete(format!("{}/channels/{mini_id}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可删除渠道");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let status = resp.status();
+    let body = resp.text().await.expect("删除渠道响应应可读取");
+    assert_eq!(status, reqwest::StatusCode::OK, "删除渠道失败: {body}");
     let resp = chat_request(&gw, TEST_TOKEN_KEY, "gpt-4o-mini").await;
     assert_eq!(
         resp.status(),
@@ -758,9 +768,9 @@ async fn posting_existing_channel_model_price_is_409() {
     assert_eq!(error["error"]["code"], "conflict");
 }
 
-/// 渠道 PUT 拿掉已登记名时，该渠道对应价格被收掉；另一渠道同名价格仍在。
+/// 渠道 PUT 拿掉已登记名时保留该渠道价格；另一渠道同名价格仍在。
 #[tokio::test]
-async fn dropping_listed_name_retains_other_channel_price() {
+async fn dropping_listed_name_retains_channel_prices() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let left_id = channel_id_by_name(&gw, "test-channel").await;
 
@@ -806,8 +816,8 @@ async fn dropping_listed_name_retains_other_channel_price() {
 
     let listed = listed_prices(&gw).await;
     assert!(
-        !prices_contain(&listed, left_id, TEST_MODEL),
-        "拿掉清单名后该渠道价格应被收掉"
+        prices_contain(&listed, left_id, TEST_MODEL),
+        "拿掉清单名后该渠道价格仍应保留"
     );
     assert!(
         prices_contain(&listed, right_id, TEST_MODEL),
@@ -857,7 +867,8 @@ async fn deleting_channel_cascades_its_prices() {
 
     let resp = reqwest::Client::new()
         .delete(format!("{}/channels/{channel_id}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可删除渠道");
@@ -882,7 +893,8 @@ async fn unpriced_sibling_is_skipped_not_503() {
             "{}/prices/{seed_id}/{TEST_MODEL}",
             gw.admin_base_url()
         ))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可删除播种价格");
@@ -926,6 +938,8 @@ async fn unpriced_sibling_is_skipped_not_503() {
         reqwest::StatusCode::OK,
         "有价渠道在后也应跳过未定价 hop，不得 503"
     );
+
+    common::wait_for_request_persistence(&gw.pool).await;
 
     let log: (i64, String) =
         sqlx::query_as("SELECT cost_usd_micros, channel FROM request_log ORDER BY id DESC LIMIT 1")
@@ -1128,7 +1142,8 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     // 畸形 JSON body → 400 结构化错误。
     let resp = client
         .post(format!("{admin}/tokens"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .header("content-type", "application/json")
         .body("{ not json")
         .send()
@@ -1223,7 +1238,8 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     // 删除不存在的资源 → 404。
     let resp = client
         .delete(format!("{admin}/tokens/does-not-exist"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可请求管理面");
@@ -1254,7 +1270,8 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     for path in PROTOCOL_FORBIDDEN_ADMIN_GETS {
         let resp = client
             .get(format!("{}{path}", gw.base_url()))
-            .bearer_auth(&gw.session)
+            .header(reqwest::header::COOKIE, &gw.session)
+            .header(reqwest::header::ORIGIN, gw.admin_origin())
             .send()
             .await
             .expect("协议监听应可请求");
@@ -1266,7 +1283,8 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     }
     let resp = client
         .post(format!("{}/channels/1/test", gw.base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("协议监听应可请求");
@@ -1279,7 +1297,8 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
     // 管理监听无协议端点。
     let resp = client
         .post(format!("{}/v1/chat/completions", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "model": TEST_MODEL,
             "messages": [{ "role": "user", "content": "hi" }]
@@ -1408,6 +1427,7 @@ async fn inflight_request_keeps_admission_snapshot() {
     })));
     let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    common::wait_for_request_persistence(&gw.pool).await;
     let new_cost: (i64,) =
         sqlx::query_as("SELECT cost_usd_micros FROM request_log ORDER BY id DESC LIMIT 1")
             .fetch_one(&gw.pool)
@@ -1437,7 +1457,8 @@ async fn runtime_resources_survive_process_restart() {
         .to_string();
     let resp = reqwest::Client::new()
         .post(format!("{}/users/1/balance-adjustments", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "operation_id": "admin-balance-1", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
@@ -1578,7 +1599,8 @@ async fn empty_db_bootstraps_via_admin_api() {
 
     let resp = reqwest::Client::new()
         .post(format!("{}/users/1/balance-adjustments", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "operation_id": "admin-balance-2", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
@@ -1629,7 +1651,8 @@ async fn deleting_token_clears_balance_row() {
     let cycle_id = common::token_id(&gw.pool, &cycle_key).await;
     let resp = client
         .delete(format!("{}/tokens/{cycle_id}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可删除令牌");
@@ -1654,7 +1677,8 @@ async fn settings_write_takes_effect_immediately() {
     // 缺省设置：full_body 关闭、body 上限为正。
     let resp = client
         .get(format!("{admin}/settings"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可读设置");
@@ -1787,6 +1811,45 @@ async fn settings_gateway_knobs_roundtrip_and_validation() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn private_network_policy_takes_effect_immediately() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let disabled = admin_put(
+        &gw,
+        "/settings",
+        json!({
+            "full_body": false,
+            "max_request_bytes": 1_000_000,
+            "allow_private_networks": false
+        }),
+    )
+    .await;
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+    let channel_id = channel_id_by_name(&gw, "test-channel").await;
+
+    let probe = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        &format!("/channels/{channel_id}/test"),
+        json!({ "model": TEST_MODEL }),
+    )
+    .await;
+    assert_eq!(probe.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = probe.json().await.expect("拒绝响应应可解析");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("安全策略"))
+    );
+
+    let response = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert!(
+        gw.upstream.received().is_empty(),
+        "策略拒绝不应建立上游连接"
+    );
+}
+
 /// 认证失败限流次数写入后对新请求即时生效。
 #[tokio::test]
 async fn settings_auth_throttle_takes_effect_immediately() {
@@ -1857,7 +1920,8 @@ async fn settings_toggle_full_body_enables_body_logging() {
     // 列表不带 body；详情按 id 以 base64 返回。
     let resp = client
         .get(format!("{admin}/logs?page_size=1"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可查日志");
@@ -1867,7 +1931,8 @@ async fn settings_toggle_full_body_enables_body_logging() {
     let id = entry["id"].as_i64().expect("应有日志 id");
     let resp = client
         .get(format!("{admin}/logs/{id}"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可查日志详情");
@@ -1905,7 +1970,8 @@ async fn balance_adjustment_reflected_in_admission() {
     // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
     let resp = client
         .post(format!("{admin}/users/1/balance-adjustments"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "operation_id": "admin-balance-3", "delta_usd_micros": -5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
@@ -1925,7 +1991,8 @@ async fn balance_adjustment_reflected_in_admission() {
     // 充值后恢复可用。
     let resp = client
         .post(format!("{admin}/users/1/balance-adjustments"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "operation_id": "admin-balance-4", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
@@ -1945,7 +2012,8 @@ async fn token_attr_update_does_not_reset_balance() {
     // 充值 1 USD（初始 5 USD → 6 USD）。
     let resp = client
         .post(format!("{admin}/users/1/balance-adjustments"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "operation_id": "admin-balance-5", "delta_usd_micros": 1_000_000, "reason": "manual_adjustment" }))
         .send()
         .await
@@ -1985,7 +2053,8 @@ async fn logs_paginate_and_filter() {
     // 全量：total 反映日志总数，默认每页 20 条。
     let resp = client
         .get(format!("{admin}/logs"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可查日志");
@@ -2003,7 +2072,8 @@ async fn logs_paginate_and_filter() {
     // 按模型过滤：命中全部 3 条。
     let resp = client
         .get(format!("{admin}/logs?model={TEST_MODEL}"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可过滤日志");
@@ -2020,7 +2090,8 @@ async fn logs_paginate_and_filter() {
     // 按令牌 key 过滤：命中全部 3 条（同一令牌）。
     let resp = client
         .get(format!("{admin}/logs?token_key={TEST_TOKEN_KEY}"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可过滤日志");
@@ -2030,7 +2101,8 @@ async fn logs_paginate_and_filter() {
     // 按令牌名精确过滤：子串不命中。
     let resp = client
         .get(format!("{admin}/logs?token_name=dev"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可按令牌名过滤");
@@ -2038,7 +2110,8 @@ async fn logs_paginate_and_filter() {
     assert_eq!(page["total"], 3);
     let resp = client
         .get(format!("{admin}/logs?token_name=de"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可按令牌名精确过滤");
@@ -2048,7 +2121,8 @@ async fn logs_paginate_and_filter() {
     // 按渠道精确过滤：子串不命中。
     let resp = client
         .get(format!("{admin}/logs?channel=test-channel"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可按渠道过滤");
@@ -2056,7 +2130,8 @@ async fn logs_paginate_and_filter() {
     assert_eq!(page["total"], 3);
     let resp = client
         .get(format!("{admin}/logs?channel=test"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可按渠道精确过滤");
@@ -2066,7 +2141,8 @@ async fn logs_paginate_and_filter() {
     // 综合关键字：模型子串命中全部 3 条。
     let resp = client
         .get(format!("{admin}/logs?keyword={TEST_MODEL}"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可过滤日志");
@@ -2076,7 +2152,8 @@ async fn logs_paginate_and_filter() {
     // 综合关键字：无命中时 total 为 0。
     let resp = client
         .get(format!("{admin}/logs?keyword=no-such-keyword"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可过滤日志");
@@ -2086,7 +2163,8 @@ async fn logs_paginate_and_filter() {
     // 分页：page_size=2 → 第一页 2 条、第二页 1 条。
     let resp = client
         .get(format!("{admin}/logs?page=1&page_size=2"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可分页");
@@ -2097,7 +2175,8 @@ async fn logs_paginate_and_filter() {
 
     let resp = client
         .get(format!("{admin}/logs?page=2&page_size=2"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可分页");
@@ -2107,7 +2186,8 @@ async fn logs_paginate_and_filter() {
     // 分页 + 时间过滤：from_created_at 远在过去 → 仍命中全部。
     let resp = client
         .get(format!("{admin}/logs?from_created_at=1&page_size=2"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可过滤日志");
@@ -2116,7 +2196,8 @@ async fn logs_paginate_and_filter() {
 
     let resp = client
         .get(format!("{admin}/logs?page_size=10"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可查日志");
@@ -2132,7 +2213,8 @@ async fn logs_paginate_and_filter() {
         .get(format!(
             "{admin}/logs?sort_by=created&sort_dir=asc&page_size=10"
         ))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可按时间正序查日志");
@@ -2468,7 +2550,8 @@ async fn unsettled_log_can_be_settled_or_waived() {
 
     let resp = reqwest::Client::new()
         .post(format!("{}/logs/{settle_id}/settle", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应能补扣");
@@ -2485,7 +2568,8 @@ async fn unsettled_log_can_be_settled_or_waived() {
 
     let again = reqwest::Client::new()
         .post(format!("{}/logs/{settle_id}/settle", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应能再请求");
@@ -2493,7 +2577,8 @@ async fn unsettled_log_can_be_settled_or_waived() {
 
     let resp = reqwest::Client::new()
         .post(format!("{}/logs/{waive_id}/waive", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应能豁免");
@@ -2538,7 +2623,7 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
     .await;
     assert_eq!(recharge.status(), reqwest::StatusCode::OK);
 
-    let session = reqwest::Client::new()
+    let login = reqwest::Client::new()
         .post(format!("{}/login", gw.admin_base_url()))
         .json(&json!({
             "email": "historical-debt@example.com",
@@ -2546,16 +2631,13 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
         }))
         .send()
         .await
-        .expect("登录应可达")
-        .json::<Value>()
-        .await
-        .expect("登录应可解析")["token"]
-        .as_str()
-        .expect("应有会话")
-        .to_string();
+        .expect("登录应可达");
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session = common::session_cookie(&login);
     let token = reqwest::Client::new()
         .post(format!("{}/tokens", gw.admin_base_url()))
-        .bearer_auth(&session)
+        .header(reqwest::header::COOKIE, &session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "temporary",
             "model_group": "default",
@@ -2607,7 +2689,8 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
 
     let deleted = reqwest::Client::new()
         .delete(format!("{}/tokens/{token_id}", gw.admin_base_url()))
-        .bearer_auth(&session)
+        .header(reqwest::header::COOKIE, &session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("令牌删除应可达");
@@ -2617,7 +2700,8 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
         if log_id == archived_user_log {
             let archived = reqwest::Client::new()
                 .delete(format!("{}/users/{user_id}", gw.admin_base_url()))
-                .bearer_auth(&gw.session)
+                .header(reqwest::header::COOKIE, &gw.session)
+                .header(reqwest::header::ORIGIN, gw.admin_origin())
                 .send()
                 .await
                 .expect("归档应可达");
@@ -2625,7 +2709,8 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
         }
         let settled = reqwest::Client::new()
             .post(format!("{}/logs/{log_id}/settle", gw.admin_base_url()))
-            .bearer_auth(&gw.session)
+            .header(reqwest::header::COOKIE, &gw.session)
+            .header(reqwest::header::ORIGIN, gw.admin_origin())
             .send()
             .await
             .expect("补扣应可达");
@@ -2806,7 +2891,8 @@ async fn new_endpoints_structured_errors() {
     // 余额：不存在的令牌 → 404。
     let resp = client
         .post(format!("{admin}/users/999999/balance-adjustments"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "operation_id": "admin-balance-7", "delta_usd_micros": 100, "reason": "manual_adjustment" }))
         .send()
         .await
@@ -2816,7 +2902,8 @@ async fn new_endpoints_structured_errors() {
     // 日志：非法查询参数 → 400 结构化错误。
     let resp = client
         .get(format!("{admin}/logs?page=abc"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可查日志");
@@ -2827,7 +2914,8 @@ async fn new_endpoints_structured_errors() {
     // 日志：未知查询参数 → 400（deny_unknown_fields，拼写错误不静默返回未过滤结果）。
     let resp = client
         .get(format!("{admin}/logs?tokne_key=sk-x"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可查日志");
@@ -2836,7 +2924,8 @@ async fn new_endpoints_structured_errors() {
     // 日志：未知排序列 → 400（只接受白名单）。
     let resp = client
         .get(format!("{admin}/logs?sort_by=nope"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可查日志");
@@ -3074,7 +3163,8 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
     // 非数字 → 400 结构化错误。
     let resp = client
         .get(format!("{admin}/stats?days=abc"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可请求 stats");
@@ -3085,7 +3175,8 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
     // 未知查询参数 → 400。
     let resp = client
         .get(format!("{admin}/stats?dayz=7"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("应可请求 stats");
@@ -3163,7 +3254,8 @@ async fn channel_probe_success_skips_billing_and_logging() {
             "{}/channels/{channel_id}/test",
             gw.admin_base_url()
         ))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -3270,7 +3362,8 @@ async fn channel_probe_upstream_error_is_reachable_with_status() {
             "{}/channels/{channel_id}/test",
             gw.admin_base_url()
         ))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -3318,7 +3411,8 @@ async fn channel_probe_timeout_is_unreachable() {
             "{}/channels/{timeout_id}/test",
             gw.admin_base_url()
         ))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -3541,7 +3635,8 @@ async fn stats_and_probe_auth_and_unknown_channel() {
 
     let resp = client
         .post(format!("{admin}/channels/999999/test"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "model": TEST_MODEL }))
         .send()
         .await
@@ -3622,7 +3717,8 @@ async fn unknown_api_path_returns_json_404_not_spa() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let resp = reqwest::Client::new()
         .get(format!("{}/does-not-exist", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理监听应可达");
@@ -3685,7 +3781,8 @@ async fn admin_root_never_5xx_and_api_still_works() {
 
     let tokens = client
         .get(format!("{admin}/tokens"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理 API 应可达");

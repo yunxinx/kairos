@@ -6,24 +6,28 @@
 
 use std::collections::HashMap;
 
-use crate::store::resources::{Channel, ChannelModelOrder, ChannelRecord, StoredChannelKey};
+use crate::store::resources::Channel;
+#[cfg(test)]
+use crate::store::resources::ChannelModelOrder;
+#[cfg(test)]
+use crate::store::resources::ChannelRecord;
 
-/// 一次路由的结果：按 failover 顺序排列的候选渠道。
+/// 一次路由的结果：按 failover 顺序排列的运行时渠道下标。
 ///
 /// 出站模型名不在此共享：轮到某渠道时用 [`outbound_model`] 查该渠道自己的
 /// 别名表，禁止全体套用第一个候选的出站名。
 #[derive(Debug, Clone)]
 pub struct Route {
-    /// 按尝试顺序排列的候选渠道记录（含稳定 id，克隆自配置）。
-    pub channels: Vec<ChannelRecord>,
+    /// 按尝试顺序排列的渠道下标，指向本次请求持有的运行时快照。
+    pub channel_indices: Vec<usize>,
     /// 已在准入阶段为每个候选渠道选定的密钥；同渠道重试复用该结果。
-    pub selected_keys: HashMap<i64, StoredChannelKey>,
+    pub selected_key_ids: HashMap<i64, i64>,
 }
 
 impl Route {
-    /// 取该渠道本次请求已选定的密钥。
-    pub fn selected_key(&self, channel_id: i64) -> Option<&StoredChannelKey> {
-        self.selected_keys.get(&channel_id)
+    /// 取该渠道本次请求已选定的密钥 id。
+    pub fn selected_key_id(&self, channel_id: i64) -> Option<i64> {
+        self.selected_key_ids.get(&channel_id).copied()
     }
 }
 
@@ -86,41 +90,48 @@ pub fn find_alias_conflict(channels: &[&Channel]) -> Option<AliasConflict> {
 /// 候选须处于启用状态（禁用的渠道不参与路由与失败切换）。同名的显式顺序行按
 /// `position` 升序；没有显式行的候选全部排在其后，再按渠道 id 升序。顺序表只
 /// 决定尝试顺序，不会滤掉候选；无任何候选时返回 `None`。
+#[cfg(test)]
 pub fn route(
     channels: &[ChannelRecord],
     channel_model_order: &[ChannelModelOrder],
     model: &str,
 ) -> Option<Route> {
-    let mut candidates: Vec<(&ChannelRecord, Option<i64>)> = channels
+    let mut candidates: Vec<(usize, &ChannelRecord, Option<i64>)> = channels
         .iter()
+        .enumerate()
         .filter(|record| {
-            let c = &record.channel;
+            let c = &record.1.channel;
             c.enabled
                 && (c.models.iter().any(|m| m == model) || c.model_aliases.contains_key(model))
         })
-        .map(|record| {
+        .map(|(index, record)| {
             let position = channel_model_order
                 .iter()
                 .find(|entry| entry.model == model && entry.channel_id == record.id)
                 .map(|entry| entry.position);
-            (record, position)
+            (index, record, position)
         })
         .collect();
     if candidates.is_empty() {
         return None;
     }
 
-    candidates.sort_unstable_by_key(|(record, position)| match position {
+    candidates.sort_unstable_by_key(|(_, record, position)| match position {
         Some(position) => (0, *position, record.id),
         None => (1, 0, record.id),
     });
 
     Some(Route {
-        channels: candidates
-            .into_iter()
-            .map(|(record, _)| record.clone())
-            .collect(),
-        selected_keys: HashMap::new(),
+        channel_indices: candidates.into_iter().map(|(index, _, _)| index).collect(),
+        selected_key_ids: HashMap::new(),
+    })
+}
+
+/// 从运行时预排索引构造路由。
+pub fn indexed_route(candidates: &HashMap<String, Vec<usize>>, model: &str) -> Option<Route> {
+    Some(Route {
+        channel_indices: candidates.get(model)?.clone(),
+        selected_key_ids: HashMap::new(),
     })
 }
 
@@ -186,9 +197,9 @@ mod tests {
         let route = route(&channels, &order, "gpt-4o").expect("应有候选");
         assert_eq!(
             route
-                .channels
+                .channel_indices
                 .iter()
-                .map(|record| record.id)
+                .map(|index| channels[*index].id)
                 .collect::<Vec<_>>(),
             vec![1, 3, 2, 4]
         );
@@ -205,9 +216,9 @@ mod tests {
         let route = route(&channels, &[], "gpt-4o").expect("应有候选");
         assert_eq!(
             route
-                .channels
+                .channel_indices
                 .iter()
-                .map(|record| record.id)
+                .map(|index| channels[*index].id)
                 .collect::<Vec<_>>(),
             vec![2, 5, 8]
         );
@@ -227,8 +238,8 @@ mod tests {
         disabled.enabled = false;
         let channels = vec![record(1, disabled), record(2, channel("on", &["gpt-4o"]))];
         let route = route(&channels, &[], "gpt-4o").expect("启用渠道应可命中");
-        assert_eq!(route.channels.len(), 1, "禁用渠道不应进入候选");
-        assert_eq!(route.channels[0].channel.name, "on");
+        assert_eq!(route.channel_indices.len(), 1, "禁用渠道不应进入候选");
+        assert_eq!(channels[route.channel_indices[0]].channel.name, "on");
     }
 
     /// 全部候选都被禁用 → 与无候选同等处理，返回 None。
@@ -245,9 +256,10 @@ mod tests {
         let mut c = channel("c", &["gpt-4o"]);
         c.model_aliases
             .insert("fast".to_string(), "gpt-4o-mini".to_string());
-        let route = route(&[record(1, c)], &[], "fast").expect("别名短名应命中");
+        let channels = [record(1, c)];
+        let route = route(&channels, &[], "fast").expect("别名短名应命中");
         assert_eq!(
-            outbound_model(&route.channels[0].channel, "fast"),
+            outbound_model(&channels[route.channel_indices[0]].channel, "fast"),
             "gpt-4o-mini"
         );
     }
@@ -258,7 +270,7 @@ mod tests {
         let channels = vec![record(1, channel("c", &["gpt-4o"]))];
         let route = route(&channels, &[], "gpt-4o").expect("应有候选");
         assert_eq!(
-            outbound_model(&route.channels[0].channel, "gpt-4o"),
+            outbound_model(&channels[route.channel_indices[0]].channel, "gpt-4o"),
             "gpt-4o"
         );
     }
@@ -276,15 +288,14 @@ mod tests {
             channel_id: 2,
             position: 0,
         }];
-        let route =
-            route(&[record(1, aliased), record(2, plain)], &order, "fast").expect("应有候选");
-        assert_eq!(route.channels[0].channel.name, "plain");
-        assert_eq!(outbound_model(&route.channels[0].channel, "fast"), "fast");
-        assert_eq!(route.channels[1].channel.name, "aliased");
-        assert_eq!(
-            outbound_model(&route.channels[1].channel, "fast"),
-            "gpt-4o-mini"
-        );
+        let channels = [record(1, aliased), record(2, plain)];
+        let route = route(&channels, &order, "fast").expect("应有候选");
+        let first = &channels[route.channel_indices[0]].channel;
+        let second = &channels[route.channel_indices[1]].channel;
+        assert_eq!(first.name, "plain");
+        assert_eq!(outbound_model(first, "fast"), "fast");
+        assert_eq!(second.name, "aliased");
+        assert_eq!(outbound_model(second, "fast"), "gpt-4o-mini");
     }
 
     /// 两条启用渠道同一别名指向不同真名 → 冲突。

@@ -31,6 +31,7 @@ const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } 
 
 const fullBody = ref(false);
 const requestRectify = ref(true);
+const allowPrivateNetworks = ref(true);
 const maxRequestMb = ref('');
 const maxResponseMb = ref('');
 const logBodyMb = ref('');
@@ -85,6 +86,7 @@ function applySettings(settings: Settings) {
   retryAfterCapSecs.value = String(settings.retry_after_cap_secs);
   rateLimitRpm.value = String(settings.rate_limit_rpm);
   requestRectify.value = settings.request_rectify;
+  allowPrivateNetworks.value = settings.allow_private_networks;
 }
 
 const saveMutation = useMutation({
@@ -246,6 +248,7 @@ function handleSave() {
     retry_after_cap_secs: Number(retryAfterCapSecs.value.trim()),
     rate_limit_rpm: Number(rateLimitRpm.value.trim()),
     request_rectify: requestRectify.value,
+    allow_private_networks: allowPrivateNetworks.value,
   });
 }
 
@@ -702,6 +705,21 @@ const tabsAria = computed(() => t('settings.sections'));
                     id="settings-request-rectify"
                     v-model="requestRectify"
                     data-testid="settings-request-rectify"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="allowPrivateNetworks"
+                layout="inline"
+                :label="t('settings.allowPrivateNetworks')"
+                input-id="settings-allow-private-networks"
+                :guide="t('settings.allowPrivateNetworksGuide')"
+              >
+                <template #default>
+                  <FormSwitch
+                    id="settings-allow-private-networks"
+                    v-model="allowPrivateNetworks"
+                    data-testid="settings-allow-private-networks"
                   />
                 </template>
               </FormField>

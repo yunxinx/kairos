@@ -1136,18 +1136,7 @@ fn encode_user_part(part: &ContentPart, warnings: &mut Vec<Warning>) -> Option<V
 
 /// 聚合消息中所有 text part 为一个字符串。
 fn text_parts(parts: &[ContentPart]) -> Option<String> {
-    let texts: Vec<&str> = parts
-        .iter()
-        .filter_map(|p| match p {
-            ContentPart::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    if texts.is_empty() {
-        None
-    } else {
-        Some(texts.concat())
-    }
+    crate::core::ir::text_content(parts)
 }
 
 // ---- 上游响应解码：wire → IR ----

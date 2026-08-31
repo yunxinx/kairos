@@ -1,4 +1,5 @@
 import { expect, test } from './fixtures';
+import { E2E_ADMIN_ORIGIN } from './helpers/gateway';
 import { e2eRootHeaders } from './helpers/session';
 import { seedModelGroup } from './helpers/models';
 import type { Page } from '@playwright/test';
@@ -122,9 +123,8 @@ test.describe('role navigation', () => {
       data: { email: 'nav-withdraw@example.com', password: 'password1' },
     });
     expect(session.ok(), await session.text()).toBeTruthy();
-    const sessionBody = (await session.json()) as { token: string };
     const created = await page.request.post('/api/tokens', {
-      headers: { Authorization: `Bearer ${sessionBody.token}` },
+      headers: { Origin: E2E_ADMIN_ORIGIN },
       data: {
         name: 'withdraw-me',
         balance_usd_micros: null,

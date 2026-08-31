@@ -54,6 +54,7 @@ async fn valid_token_routes_request_and_logs() {
     assert_eq!(received[0]["messages"][0]["content"], "hi");
 
     // SQLite 落一条请求日志。
+    common::wait_for_request_persistence(&gw.pool).await;
     let rows = sqlx::query_as::<_, (String, String, String, String, i64, i64)>(
         "SELECT token_name, inbound_protocol, model, channel, status_code, latency_ms \
          FROM request_log",
@@ -220,6 +221,7 @@ async fn upstream_error_status_is_passthrough() {
     );
 
     // 日志记录的是上游状态码。
+    common::wait_for_request_persistence(&gw.pool).await;
     let rows = sqlx::query_as::<_, (i64,)>("SELECT status_code FROM request_log")
         .fetch_all(&gw.pool)
         .await
@@ -312,6 +314,7 @@ async fn stream_request_returns_sse_and_logs() {
     assert!(saw_finish_usage, "finish 帧应携带 usage");
 
     // 流式计费落库：usage 10/2 → input 10 × 2.5 + output 2 × 10 = 25 + 20 = 45 micro-USD。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_micros \
          FROM request_log",

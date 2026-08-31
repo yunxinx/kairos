@@ -1,4 +1,8 @@
-import { invalidateAdminKey, getAdminKey } from '@/lib/session';
+import {
+  captureSessionGeneration,
+  hasSession,
+  invalidateSession,
+} from '@/lib/session';
 import { ApiClientError, type ApiErrorBody } from '@/api/types';
 import type {
   BalanceAdjustmentResult,
@@ -73,25 +77,24 @@ function deleteMany<T>(path: string, targets: T[]): Promise<BulkDeleteResult<T>>
 
 /**
  * 调用管理 API。各方法传领域路径（如 `/tokens`），此处统一拼 `/api` 前缀；
- * 认证为 `Authorization: Bearer <会话令牌>`。
- * 会话来自 `POST /login`，不是配置里的登录密码。
- *
- * `keyOverride` 用于登录试探：失败时不清除已持有的凭据。
+ * 管理会话由同源 HttpOnly Cookie 承载。
  */
-async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: string): Promise<T> {
-  const key = keyOverride ?? getAdminKey();
+async function apiFetch<T>(
+  path: string,
+  init?: RequestInit,
+  options?: { ignoreUnauthorized?: boolean },
+): Promise<T> {
+  const generation = captureSessionGeneration();
+  const sessionWasActive = hasSession();
   const headers = new Headers(init?.headers);
   if (init?.body !== undefined && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  if (key) {
-    headers.set('Authorization', `Bearer ${key}`);
-  }
 
-  const response = await fetch(`/api${path}`, { ...init, headers });
+  const response = await fetch(`/api${path}`, { ...init, headers, credentials: 'same-origin' });
   if (!response.ok) {
-    if (response.status === 401 && key && keyOverride === undefined && getAdminKey() === key) {
-      invalidateAdminKey();
+    if (response.status === 401 && sessionWasActive && !options?.ignoreUnauthorized) {
+      invalidateSession(generation);
     }
     const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
     const message = body.error?.message ?? response.statusText;
@@ -105,7 +108,11 @@ async function apiFetch<T>(path: string, init?: RequestInit, keyOverride?: strin
 
 export const apiClient = {
   login(body: LoginRequest): Promise<LoginView> {
-    return apiFetch('/login', { method: 'POST', body: JSON.stringify(body) }, '');
+    return apiFetch(
+      '/login',
+      { method: 'POST', body: JSON.stringify(body) },
+      { ignoreUnauthorized: true },
+    );
   },
 
   logout(): Promise<void> {
@@ -191,8 +198,8 @@ export const apiClient = {
     return apiFetch(`/users/${id}/tokens`);
   },
 
-  listTokens(keyOverride?: string): Promise<TokenView[]> {
-    return apiFetch('/tokens', { method: 'GET' }, keyOverride);
+  listTokens(): Promise<TokenView[]> {
+    return apiFetch('/tokens');
   },
 
   createToken(body: TokenCreate): Promise<TokenView> {

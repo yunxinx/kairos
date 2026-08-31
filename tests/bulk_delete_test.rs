@@ -10,25 +10,27 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
     format!("{}{path}", gw.admin_base_url())
 }
 
-async fn bearer_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn bearer_json(
+async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -36,7 +38,7 @@ async fn bearer_json(
 }
 
 async fn create_user(gw: &TestGateway, email: &str, role: &str) -> i64 {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -63,14 +65,11 @@ async fn login(gw: &TestGateway, email: &str, password: &str) -> String {
         .await
         .expect("登录应可达");
     assert_eq!(response.status(), StatusCode::OK);
-    response.json::<Value>().await.expect("登录应可解析")["token"]
-        .as_str()
-        .expect("应有会话令牌")
-        .to_string()
+    common::session_cookie(&response)
 }
 
 async fn create_plan(gw: &TestGateway, name: &str, is_default: bool) -> i64 {
-    let response = bearer_json(
+    let response = admin_json(
         gw,
         &gw.session,
         reqwest::Method::POST,
@@ -111,7 +110,7 @@ async fn active_user_exists(gw: &TestGateway, id: i64) -> bool {
 #[tokio::test]
 async fn model_group_bulk_delete_validates_before_writing() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::POST,
@@ -122,7 +121,7 @@ async fn model_group_bulk_delete_validates_before_writing() {
     assert_eq!(created.status(), StatusCode::CREATED);
 
     for targets in [json!([]), json!(["bulk-keep", "bulk-keep"])] {
-        let rejected = bearer_json(
+        let rejected = admin_json(
             &gw,
             &gw.session,
             reqwest::Method::DELETE,
@@ -132,7 +131,7 @@ async fn model_group_bulk_delete_validates_before_writing() {
         .await;
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
     }
-    let missing = bearer_json(
+    let missing = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::DELETE,
@@ -141,7 +140,7 @@ async fn model_group_bulk_delete_validates_before_writing() {
     )
     .await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    let builtin = bearer_json(
+    let builtin = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::DELETE,
@@ -151,7 +150,7 @@ async fn model_group_bulk_delete_validates_before_writing() {
     .await;
     assert_eq!(builtin.status(), StatusCode::CONFLICT);
 
-    let groups: Value = bearer_get(&gw, &gw.session, "/model-groups")
+    let groups: Value = admin_get(&gw, &gw.session, "/model-groups")
         .await
         .json()
         .await
@@ -172,7 +171,7 @@ async fn token_bulk_delete_cannot_cross_owner() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     create_user(&gw, "bulk-token-owner@example.com", "user").await;
     let owner_session = login(&gw, "bulk-token-owner@example.com", "password1").await;
-    let created = bearer_json(
+    let created = admin_json(
         &gw,
         &owner_session,
         reqwest::Method::POST,
@@ -186,7 +185,7 @@ async fn token_bulk_delete_cannot_cross_owner() {
         .expect("应有令牌 id");
     let root_id = common::token_id(&gw.pool, TEST_TOKEN_KEY).await;
 
-    let rejected = bearer_json(
+    let rejected = admin_json(
         &gw,
         &owner_session,
         reqwest::Method::DELETE,
@@ -208,7 +207,7 @@ async fn user_bulk_archive_rejects_higher_roles_atomically() {
     let protected_id = create_user(&gw, "bulk-admin-target@example.com", "admin").await;
     let operator_session = login(&gw, "bulk-operator@example.com", "password1").await;
 
-    let rejected = bearer_json(
+    let rejected = admin_json(
         &gw,
         &operator_session,
         reqwest::Method::DELETE,
@@ -229,7 +228,7 @@ async fn plan_bulk_delete_chooses_a_live_default_outside_the_batch() {
     let also_deleted = create_plan(&gw, "bulk-other", false).await;
     let user_id = create_user(&gw, "bulk-plan-user@example.com", "user").await;
 
-    let deleted = bearer_json(
+    let deleted = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::DELETE,
@@ -247,7 +246,7 @@ async fn plan_bulk_delete_chooses_a_live_default_outside_the_batch() {
     assert_ne!(plan_id, deleted_default);
     assert_ne!(plan_id, also_deleted, "迁移目标不能属于同批删除目标");
 
-    let plans: Value = bearer_get(&gw, &gw.session, "/plans")
+    let plans: Value = admin_get(&gw, &gw.session, "/plans")
         .await
         .json()
         .await
@@ -267,14 +266,14 @@ async fn plan_bulk_delete_chooses_a_live_default_outside_the_batch() {
 #[tokio::test]
 async fn channel_model_bulk_delete_is_atomic() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
-    let channels: Value = bearer_get(&gw, &gw.session, "/channels")
+    let channels: Value = admin_get(&gw, &gw.session, "/channels")
         .await
         .json()
         .await
         .expect("渠道列表应可解析");
     let channel_id = channels[0]["id"].as_i64().expect("应有渠道 id");
 
-    let rejected = bearer_json(
+    let rejected = admin_json(
         &gw,
         &gw.session,
         reqwest::Method::DELETE,
@@ -289,14 +288,14 @@ async fn channel_model_bulk_delete_is_atomic() {
     .await;
     assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
 
-    let channels: Value = bearer_get(&gw, &gw.session, "/channels")
+    let channels: Value = admin_get(&gw, &gw.session, "/channels")
         .await
         .json()
         .await
         .expect("渠道列表应可解析");
     assert_eq!(channels[0]["models"], json!(["gpt-4o"]));
     assert_eq!(channels[0]["model_aliases"]["fast"], "gpt-4o-mini");
-    let prices: Value = bearer_get(&gw, &gw.session, "/prices")
+    let prices: Value = admin_get(&gw, &gw.session, "/prices")
         .await
         .json()
         .await

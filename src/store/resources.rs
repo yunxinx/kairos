@@ -426,6 +426,10 @@ pub const SETTING_RETRY_AFTER_CAP_SECS: &str = "retry_after_cap_secs";
 pub const SETTING_RATE_LIMIT_RPM: &str = "rate_limit_rpm";
 /// 运行时开关键：上游 400 的请求整流重试（错误模式匹配 + 最小修正）。
 pub const SETTING_REQUEST_RECTIFY: &str = "request_rectify";
+/// 运行时开关键：是否允许向解析为私网/环回/链路本地地址的上游发起请求。
+pub const SETTING_ALLOW_PRIVATE_NETWORKS: &str = "allow_private_networks";
+/// 进程实例密钥：用于派生出站缓存亲和标识；不属于管理 API 设置契约。
+pub(crate) const SETTING_SESSION_CACHE_SECRET: &str = "session_cache_secret";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
 pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
@@ -454,6 +458,8 @@ pub const DEFAULT_RATE_LIMIT_RPM: u64 = 0;
 /// 请求整流重试缺省开启：只作用于原本必败的 400 请求，动作可审计且随
 /// warnings 回传下游，风险低于让请求直接失败。
 pub const DEFAULT_REQUEST_RECTIFY: bool = true;
+/// 默认允许私网目标，便于企业内网部署；可由 root 在设置中关闭。
+pub const DEFAULT_ALLOW_PRIVATE_NETWORKS: bool = true;
 
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_auth_throttle_max_failures() -> u64 {
@@ -482,6 +488,9 @@ fn default_retry_after_cap_secs() -> u64 {
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_request_rectify() -> bool {
     DEFAULT_REQUEST_RECTIFY
+}
+fn default_allow_private_networks() -> bool {
+    DEFAULT_ALLOW_PRIVATE_NETWORKS
 }
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_log_body_max_bytes() -> u64 {
@@ -538,6 +547,9 @@ pub struct Settings {
     /// 上游 400 的请求整流重试（错误模式匹配 + 最小修正后重试一次）。
     #[serde(default = "default_request_rectify")]
     pub request_rectify: bool,
+    /// 是否允许私网、环回与链路本地上游地址。
+    #[serde(default = "default_allow_private_networks")]
+    pub allow_private_networks: bool,
 }
 
 impl Default for Settings {
@@ -556,6 +568,7 @@ impl Default for Settings {
             retry_after_cap_secs: DEFAULT_RETRY_AFTER_CAP_SECS,
             rate_limit_rpm: DEFAULT_RATE_LIMIT_RPM,
             request_rectify: DEFAULT_REQUEST_RECTIFY,
+            allow_private_networks: DEFAULT_ALLOW_PRIVATE_NETWORKS,
         }
     }
 }
@@ -1012,6 +1025,34 @@ pub async fn update_channel(
 
 /// 按 `id` 删除渠道；不存在视为成功（幂等）。
 pub async fn delete_channel(conn: &mut SqliteConnection, id: i64) -> Result<(), StoreError> {
+    let unified = list_unified_models_on_conn(conn).await?;
+    let mut deleted_unified_ids = Vec::new();
+    for mut model in unified {
+        let before = model.models.len();
+        model.models.retain(|member| member.channel_id != id);
+        if model.models.len() == before {
+            continue;
+        }
+        if model.models.is_empty() {
+            delete_unified_model(conn, &model.id).await?;
+            deleted_unified_ids.push(model.id);
+        } else {
+            upsert_unified_model(conn, &model).await?;
+        }
+    }
+
+    let mut groups = list_model_groups_on_conn(conn).await?;
+    for group in &mut groups {
+        let before = group.models.len();
+        group.models.retain(|entry| match entry {
+            GroupModel::Source { channel_id, .. } => *channel_id != id,
+            GroupModel::Unified { id } => !deleted_unified_ids.iter().any(|deleted| deleted == id),
+        });
+        if group.models.len() != before {
+            upsert_model_group(conn, group).await?;
+        }
+    }
+
     sqlx::query("DELETE FROM channels WHERE id = ?")
         .bind(id)
         .execute(&mut *conn)
@@ -1269,6 +1310,16 @@ pub async fn list_model_groups(pool: &SqlitePool) -> Result<Vec<ModelGroup>, Sto
     rows.iter().map(map_model_group).collect()
 }
 
+async fn list_model_groups_on_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ModelGroup>, StoreError> {
+    let rows = sqlx::query("SELECT name, models_json FROM model_groups")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    rows.iter().map(map_model_group).collect()
+}
+
 /// 把模型组行映射为 `ModelGroup`。
 fn map_model_group(row: &sqlx::sqlite::SqliteRow) -> Result<ModelGroup, StoreError> {
     let name: String = row.try_get("name").map_err(StoreError::Query)?;
@@ -1473,33 +1524,6 @@ pub async fn delete_price(
     Ok(())
 }
 
-/// 删掉该渠道上已不在可调用名集合中的价格行。
-pub async fn retain_channel_prices(
-    conn: &mut SqliteConnection,
-    channel_id: i64,
-    names: &HashSet<String>,
-) -> Result<(), StoreError> {
-    if names.is_empty() {
-        sqlx::query("DELETE FROM prices WHERE channel_id = ?")
-            .bind(channel_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(StoreError::Query)?;
-        return Ok(());
-    }
-    let listed = serde_json::to_string(names).map_err(serde_error)?;
-    sqlx::query(
-        "DELETE FROM prices WHERE channel_id = ? \
-         AND model NOT IN (SELECT value FROM json_each(?))",
-    )
-    .bind(channel_id)
-    .bind(&listed)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    Ok(())
-}
-
 /// 写入一个运行时开关（`setting_value` 以 JSON 编码），幂等。
 pub async fn set_setting(
     conn: &mut SqliteConnection,
@@ -1535,6 +1559,82 @@ pub async fn list_settings(pool: &SqlitePool) -> Result<HashMap<String, Value>, 
         settings.insert(key, value);
     }
     Ok(settings)
+}
+
+/// 读取或创建实例级会话派生密钥。
+pub(crate) async fn load_or_create_session_cache_secret(
+    pool: &SqlitePool,
+) -> Result<[u8; 32], StoreError> {
+    let settings = list_settings(pool).await?;
+    if let Some(value) = settings.get(SETTING_SESSION_CACHE_SECRET) {
+        let encoded = value
+            .as_str()
+            .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥格式非法".to_string()))?;
+        return decode_session_cache_secret(encoded);
+    }
+
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let encoded = hex_encode(&secret);
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    sqlx::query(
+        "INSERT INTO settings (setting_key, setting_value) VALUES (?, ?) \
+         ON CONFLICT(setting_key) DO NOTHING",
+    )
+    .bind(SETTING_SESSION_CACHE_SECRET)
+    .bind(serde_json::to_string(&Value::String(encoded)).map_err(serde_error)?)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    let stored: String =
+        sqlx::query_scalar("SELECT setting_value FROM settings WHERE setting_key = ?")
+            .bind(SETTING_SESSION_CACHE_SECRET)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+    let value: Value = serde_json::from_str(&stored)
+        .map_err(|_| StoreError::InvalidResource("会话缓存密钥值非法".to_string()))?;
+    let encoded = value
+        .as_str()
+        .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥格式非法".to_string()))?;
+    decode_session_cache_secret(encoded)
+}
+
+fn decode_session_cache_secret(encoded: &str) -> Result<[u8; 32], StoreError> {
+    if encoded.len() != 64 {
+        return Err(StoreError::InvalidResource(
+            "会话缓存密钥长度非法".to_string(),
+        ));
+    }
+    let mut secret = [0u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_digit(pair[0])
+            .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥包含非法字符".to_string()))?;
+        let low = hex_digit(pair[1])
+            .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥包含非法字符".to_string()))?;
+        secret[index] = (high << 4) | low;
+    }
+    Ok(secret)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 /// 按 `key` 删除一个运行时开关；不存在视为成功（幂等）。
@@ -1626,6 +1726,12 @@ pub async fn upsert_settings(
         conn,
         SETTING_REQUEST_RECTIFY,
         &Value::Bool(settings.request_rectify),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_ALLOW_PRIVATE_NETWORKS,
+        &Value::Bool(settings.allow_private_networks),
     )
     .await?;
     Ok(())
@@ -2686,13 +2792,13 @@ mod tests {
         assert_eq!(listed_left.input_micros, 3_000_000);
         assert_eq!(listed_right.input_micros, 9_000_000);
 
-        retain_channel_prices(&mut conn, left_id, &HashSet::new())
+        delete_price(&mut conn, left_id, "gpt-4o")
             .await
-            .expect("应能清掉左渠道价格");
+            .expect("应能删除左渠道价格");
         let prices = list_prices(&pool).await.expect("应能读价格");
         assert!(
             prices.iter().all(|price| price.channel_id != left_id),
-            "左渠道价格应被 retain 清掉"
+            "左渠道价格应被显式删除"
         );
         assert!(
             prices
@@ -2739,6 +2845,43 @@ mod tests {
         let settings = list_settings(&pool).await.expect("应能读开关");
         assert!(!settings.contains_key(SETTING_FULL_BODY));
         assert!(settings.contains_key(SETTING_MAX_REQUEST_BYTES));
+    }
+
+    #[tokio::test]
+    async fn session_cache_secret_is_persistent_and_validated() {
+        let (_dir, pool) = test_pool().await;
+        let first = load_or_create_session_cache_secret(&pool)
+            .await
+            .expect("首次加载应创建实例密钥");
+        let second = load_or_create_session_cache_secret(&pool)
+            .await
+            .expect("再次加载应读取实例密钥");
+        assert_eq!(first, second, "同一数据库应保持实例密钥稳定");
+
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        set_setting(
+            &mut conn,
+            SETTING_SESSION_CACHE_SECRET,
+            &Value::String("short".to_string()),
+        )
+        .await
+        .expect("应能写入损坏样例");
+        assert!(matches!(
+            load_or_create_session_cache_secret(&pool).await,
+            Err(StoreError::InvalidResource(_))
+        ));
+
+        set_setting(
+            &mut conn,
+            SETTING_SESSION_CACHE_SECRET,
+            &Value::String("z".repeat(64)),
+        )
+        .await
+        .expect("应能写入损坏样例");
+        assert!(matches!(
+            load_or_create_session_cache_secret(&pool).await,
+            Err(StoreError::InvalidResource(_))
+        ));
     }
 
     /// 设置成对写入 → 读回往返一致；覆盖后单份值更新。

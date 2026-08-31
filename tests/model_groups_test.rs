@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -27,7 +28,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -38,7 +40,8 @@ async fn admin_json(
 async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -46,7 +49,7 @@ async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> re
 
 /// 以指定令牌向网关发一条 Chat Completions 请求。
 async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Response {
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base_url()))
         .bearer_auth(token)
         .json(&json!({
@@ -55,7 +58,9 @@ async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Re
         }))
         .send()
         .await
-        .expect("下游请求应能到达网关")
+        .expect("下游请求应能到达网关");
+    common::wait_for_request_persistence(&gw.pool).await;
+    response
 }
 
 /// mock 上游返回的合法 Chat Completions 成功体。

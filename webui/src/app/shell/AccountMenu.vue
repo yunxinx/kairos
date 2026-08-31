@@ -19,7 +19,7 @@ import UiIcon from '@/components/ui/UiIcon.vue';
 import { useResolvedDarkTheme } from '@/composables/useResolvedDarkTheme';
 import { formatUsdMicros } from '@/lib/format';
 import { useNavAvatarPreference, useNavNamePreference } from '@/lib/preferences';
-import { clearAdminKey, useCurrentUser } from '@/lib/session';
+import { clearSession, useCurrentUser } from '@/lib/session';
 import { getStoredTheme, resolveDark, toggleTheme } from '@/lib/theme';
 
 const { t, locale } = useI18n();
@@ -79,7 +79,7 @@ function handleToggleTheme() {
 
 async function handleLogout() {
   const revoke = apiClient.logout();
-  clearAdminKey();
+  clearSession();
   try {
     await revoke;
   } catch {

@@ -6,6 +6,7 @@ export const E2E_ADMIN_EMAIL = 'root@localhost';
 export const E2E_ADMIN_PASSWORD = 'sk-e2e-admin';
 export const E2E_ADMIN_PORT = 18787;
 export const E2E_PROTOCOL_PORT = 18786;
+export const E2E_ADMIN_ORIGIN = `http://127.0.0.1:${E2E_ADMIN_PORT}`;
 
 const E2E_WORK_DIR = path.join(os.tmpdir(), 'kairos-e2e-webui');
 

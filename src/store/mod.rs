@@ -125,7 +125,7 @@ pub async fn insert_smoke(pool: &SqlitePool, note: &str) -> Result<i64, StoreErr
 }
 
 /// 一条请求日志的可持久化字段。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLog {
     /// 时间有序主键：新增时由存储层分配，插入构造时填 0。
     pub id: i64,
@@ -178,6 +178,14 @@ pub struct RequestLog {
     pub response_body: Option<Vec<u8>>,
 }
 
+/// 已持久化、等待后台完成结算与写入最终日志的请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingRequestLog {
+    pub(crate) log: RequestLog,
+    /// 费用计算阶段已失败时保留原因；此类记录不得执行扣费。
+    pub(crate) settlement_error: Option<String>,
+}
+
 /// 落一条请求日志，返回时间有序 id。
 pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i64, StoreError> {
     let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
@@ -189,13 +197,23 @@ pub async fn insert_request_log_on(
     conn: &mut SqliteConnection,
     log: &RequestLog,
 ) -> Result<i64, StoreError> {
+    let id = ids::next_id()?;
+    insert_request_log_with_id_on(conn, log, id).await?;
+    Ok(id)
+}
+
+/// 使用预先分配的 id 插入请求日志，供持久化队列原子完成“入日志并出队”。
+pub(crate) async fn insert_request_log_with_id_on(
+    conn: &mut SqliteConnection,
+    log: &RequestLog,
+    id: i64,
+) -> Result<(), StoreError> {
     let input_tokens = persisted_token_count("input_tokens", log.input_tokens)?;
     let output_tokens = persisted_token_count("output_tokens", log.output_tokens)?;
     let cache_read_tokens = persisted_token_count("cache_read_tokens", log.cache_read_tokens)?;
     let cache_write_tokens = persisted_token_count("cache_write_tokens", log.cache_write_tokens)?;
     let cache_write_1h_tokens =
         persisted_token_count("cache_write_1h_tokens", log.cache_write_1h_tokens)?;
-    let id = ids::next_id()?;
     sqlx::query(
         "INSERT INTO request_log \
          (id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
@@ -239,13 +257,93 @@ pub async fn insert_request_log_on(
     .await
     .map_err(StoreError::Query)?;
 
-    Ok(id)
+    Ok(())
 }
 
 fn persisted_token_count(field: &str, count: u64) -> Result<i64, StoreError> {
     i64::try_from(count).map_err(|_| {
         StoreError::InvalidResource(format!("请求日志 {field} 超出 SQLite INTEGER 范围"))
     })
+}
+
+fn validate_request_log(log: &RequestLog) -> Result<(), StoreError> {
+    persisted_token_count("input_tokens", log.input_tokens)?;
+    persisted_token_count("output_tokens", log.output_tokens)?;
+    persisted_token_count("cache_read_tokens", log.cache_read_tokens)?;
+    persisted_token_count("cache_write_tokens", log.cache_write_tokens)?;
+    persisted_token_count("cache_write_1h_tokens", log.cache_write_1h_tokens)?;
+    Ok(())
+}
+
+/// 把待结算请求持久化到短事务队列；正文独立保存为 BLOB。
+pub(crate) async fn enqueue_pending_request_log(
+    pool: &SqlitePool,
+    mut pending: PendingRequestLog,
+) -> Result<i64, StoreError> {
+    validate_request_log(&pending.log)?;
+    let id = ids::next_id()?;
+    pending.log.id = 0;
+    let request_body = pending.log.request_body.take();
+    let response_body = pending.log.response_body.take();
+    let metadata = serde_json::to_vec(&pending)
+        .map_err(|err| StoreError::InvalidResource(format!("待结算请求无法编码: {err}")))?;
+    sqlx::query(
+        "INSERT INTO request_log_outbox \
+         (id, token_key, user_id, cost_usd_micros, metadata, request_body, response_body) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(id)
+    .bind(&pending.log.token_key)
+    .bind(pending.log.user_id)
+    .bind(pending.log.cost_usd_micros)
+    .bind(metadata)
+    .bind(request_body)
+    .bind(response_body)
+    .execute(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(id)
+}
+
+/// 按 id 读取一批待结算请求；后台按该顺序处理，避免旧记录长期滞留。
+pub(crate) async fn load_pending_request_logs(
+    pool: &SqlitePool,
+    limit: i64,
+) -> Result<Vec<PendingRequestLog>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT id, metadata, request_body, response_body \
+         FROM request_log_outbox ORDER BY id LIMIT ?",
+    )
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    let mut pending = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.try_get("id").map_err(StoreError::Query)?;
+        let metadata: Vec<u8> = row.try_get("metadata").map_err(StoreError::Query)?;
+        let mut item: PendingRequestLog = serde_json::from_slice(&metadata).map_err(|err| {
+            StoreError::InvalidResource(format!("待结算请求 {id} 无法解码: {err}"))
+        })?;
+        item.log.id = id;
+        item.log.request_body = row.try_get("request_body").map_err(StoreError::Query)?;
+        item.log.response_body = row.try_get("response_body").map_err(StoreError::Query)?;
+        pending.push(item);
+    }
+    Ok(pending)
+}
+
+/// 在结算事务内删除已写入最终日志的队列项。
+pub(crate) async fn delete_pending_request_log_on(
+    conn: &mut SqliteConnection,
+    id: i64,
+) -> Result<(), StoreError> {
+    sqlx::query("DELETE FROM request_log_outbox WHERE id = ?")
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(())
 }
 
 /// 所属用户的钱包余额。
@@ -334,12 +432,28 @@ pub async fn get_admission_snapshot(
     token_key: &str,
 ) -> Result<Option<AdmissionSnapshot>, StoreError> {
     let row = sqlx::query_as::<_, (i64, i64, i64)>(
-        "SELECT ub.balance_usd_micros, ub.settled_usd_micros, \
-                COALESCE(tb.settled_usd_micros, 0) \
-         FROM tokens t \
-         INNER JOIN user_balance ub ON ub.user_id = t.user_id \
-         LEFT JOIN token_balance tb ON tb.token_key = t.token_key \
-         WHERE t.token_key = ?",
+        "SELECT balance_usd_micros - pending_user_cost, \
+                user_settled_usd_micros + pending_user_cost, \
+                token_settled_usd_micros + pending_token_cost \
+         FROM ( \
+             SELECT ub.balance_usd_micros, \
+                    ub.settled_usd_micros AS user_settled_usd_micros, \
+                    COALESCE(tb.settled_usd_micros, 0) AS token_settled_usd_micros, \
+                    COALESCE(( \
+                        SELECT SUM(pending.cost_usd_micros) \
+                        FROM request_log_outbox pending \
+                        WHERE pending.user_id = t.user_id \
+                    ), 0) AS pending_user_cost, \
+                    COALESCE(( \
+                        SELECT SUM(pending.cost_usd_micros) \
+                        FROM request_log_outbox pending \
+                        WHERE pending.token_key = t.token_key \
+                    ), 0) AS pending_token_cost \
+             FROM tokens t \
+             INNER JOIN user_balance ub ON ub.user_id = t.user_id \
+             LEFT JOIN token_balance tb ON tb.token_key = t.token_key \
+             WHERE t.token_key = ? \
+         )",
     )
     .bind(token_key)
     .fetch_optional(&mut *conn)
@@ -1668,6 +1782,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pending_charge_is_visible_to_admission_before_background_settlement() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-a").await;
+        initialize_token_settlement(&mut conn, "sk-a", 1_000, resources::ROOT_USER_ID)
+            .await
+            .expect("应能初始化余额");
+        drop(conn);
+
+        let mut log = sample_log(1, false);
+        log.cost_usd_micros = 100;
+        log.request_body = Some(b"request".to_vec());
+        log.response_body = Some(b"response".to_vec());
+        enqueue_pending_request_log(
+            &pool,
+            PendingRequestLog {
+                log,
+                settlement_error: None,
+            },
+        )
+        .await
+        .expect("应能持久化待结算请求");
+
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        let admission = get_admission_snapshot(&mut conn, "sk-a")
+            .await
+            .expect("应能读取准入快照")
+            .expect("令牌应有准入快照");
+        assert_eq!(admission.wallet.balance_usd_micros, 900);
+        assert_eq!(admission.wallet.settled_usd_micros, 100);
+        assert_eq!(admission.token.settled_usd_micros, 100);
+
+        let pending = load_pending_request_logs(&pool, 16)
+            .await
+            .expect("应能读取待结算请求");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].log.request_body.as_deref(),
+            Some(&b"request"[..])
+        );
+        assert_eq!(
+            pending[0].log.response_body.as_deref(),
+            Some(&b"response"[..])
+        );
+    }
+
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
     async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
@@ -1923,6 +2084,12 @@ mod tests {
                 "INSERT INTO request_log (token_name, inbound_protocol, model, channel, \
                      status_code, latency_ms, created_at) \
                  VALUES ('t', 'openai_chat', 'm', 'c', 200, 10, 'not-a-number')",
+            ),
+            (
+                "request_log_outbox",
+                "INSERT INTO request_log_outbox \
+                     (id, token_key, user_id, cost_usd_micros, metadata) \
+                 VALUES ('not-a-number', 'k', 1, 0, x'00')",
             ),
             (
                 "channels",

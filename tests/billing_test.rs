@@ -6,6 +6,7 @@ mod common;
 
 use common::{
     SEED_PRICE_ATTACH_LISTING_CHANNELS, TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior,
+    wait_for_request_persistence,
 };
 use kairos::store::resources::Price;
 use serde_json::{Value, json};
@@ -27,6 +28,7 @@ fn ok_response(usage: Value) -> Value {
 
 /// 读取令牌所属用户的钱包剩余（micro-USD）。
 async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
+    wait_for_request_persistence(&gw.pool).await;
     sqlx::query_scalar(
         "SELECT ub.balance_usd_micros \
          FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id \
@@ -40,6 +42,7 @@ async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
 
 /// 读取令牌累计结算（micro-USD）。
 async fn settled_micros(gw: &TestGateway, key: &str) -> i64 {
+    wait_for_request_persistence(&gw.pool).await;
     sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
         .bind(key)
         .fetch_one(&gw.pool)
@@ -370,6 +373,8 @@ async fn log_records_price_snapshot() {
     let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
+    wait_for_request_persistence(&gw.pool).await;
+
     let row: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT input_price_usd_micros, output_price_usd_micros, \
                 cache_read_price_usd_micros, cache_write_price_usd_micros \
@@ -617,6 +622,8 @@ async fn plan_discount_applies_to_charge_and_log() {
     let resp = send_completion(&base, TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
+    wait_for_request_persistence(&gw.pool).await;
+
     let balance: i64 =
         sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")
             .bind(user.id)
@@ -674,6 +681,8 @@ async fn zero_discount_allows_zero_balance_and_logs_settled() {
         }))));
     let resp = send_completion(&base, TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "免费档零余额应放行");
+
+    wait_for_request_persistence(&gw.pool).await;
 
     let balance: i64 =
         sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")

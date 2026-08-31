@@ -12,24 +12,26 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
 
 async fn json_req(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn get_req(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn get_req(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -43,10 +45,7 @@ async fn login(gw: &TestGateway, email: &str, password: &str) -> String {
         .await
         .expect("登录应可达");
     assert_eq!(resp.status(), StatusCode::OK);
-    resp.json::<Value>().await.expect("登录应可解析")["token"]
-        .as_str()
-        .expect("应有会话")
-        .to_string()
+    common::session_cookie(&resp)
 }
 
 async fn create_role(gw: &TestGateway, email: &str, role: &str) -> (i64, String) {
@@ -274,7 +273,8 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
 
     let delete_others = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/tokens/{mine_id}")))
-        .bearer_auth(&admin_token)
+        .header(reqwest::header::COOKIE, &admin_token)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删除应可达");
@@ -417,7 +417,8 @@ async fn deleting_user_archives_and_keeps_usage_history() {
 
     let deleted = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/users/{user_id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("归档应可达");
@@ -514,7 +515,8 @@ async fn last_root_cannot_be_archived() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let resp = reqwest::Client::new()
         .delete(admin_url(&gw, "/users/1"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("请求应可达");
@@ -597,10 +599,7 @@ async fn changing_password_revokes_other_sessions() {
         .await
         .expect("应可登录");
     assert_eq!(login2.status(), StatusCode::OK);
-    let session2 = login2.json::<Value>().await.expect("应可解析")["token"]
-        .as_str()
-        .expect("应有 token")
-        .to_string();
+    let session2 = common::session_cookie(&login2);
 
     // 两条会话都能访问 /me。
     assert_eq!(

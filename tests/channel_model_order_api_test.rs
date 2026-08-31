@@ -19,7 +19,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(session)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -29,7 +30,8 @@ async fn admin_json(
 async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(session)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -101,10 +103,7 @@ async fn create_admin_session(gw: &TestGateway) -> String {
         .await
         .expect("管理员应能登录");
     assert_eq!(response.status(), StatusCode::OK);
-    response.json::<Value>().await.expect("登录响应应可解析")["token"]
-        .as_str()
-        .expect("登录应返回会话")
-        .to_string()
+    common::session_cookie(&response)
 }
 
 /// 默认顺序按渠道 id；替换后立即读到新快照，持久化与审计均与该顺序一致。

@@ -225,6 +225,17 @@ pub enum ContentPart {
     },
 }
 
+/// 拼接内容中的文本段，忽略媒体与工具段。
+pub(crate) fn text_content(parts: &[ContentPart]) -> Option<String> {
+    let mut text = String::new();
+    for part in parts {
+        if let ContentPart::Text { text: value, .. } = part {
+            text.push_str(value);
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
 /// 一条消息：角色 + 有序 content parts + 逃生舱。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {

@@ -6,7 +6,7 @@ use crate::store;
 use crate::store::resources::Settings;
 
 use super::auth::ManagementIdentity;
-use super::{AdminDeps, AdminError, db_err, reload_and_swap};
+use super::{AdminDeps, AdminError, begin_write, db_err, reload_and_swap};
 
 pub(super) fn routes() -> Router<AdminDeps> {
     Router::new().route("/settings", get(get_settings).put(update_settings))
@@ -32,7 +32,7 @@ async fn update_settings(
     let settings = body.map_err(AdminError::bad_body)?;
     validate_settings(&settings)?;
     let before = read_settings(&deps).await?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_settings(&mut tx, &settings)
         .await
         .map_err(AdminError::Store)?;
@@ -86,6 +86,7 @@ fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
     diff!(retry_after_cap_secs);
     diff!(rate_limit_rpm);
     diff!(request_rectify);
+    diff!(allow_private_networks);
     changes
 }
 

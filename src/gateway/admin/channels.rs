@@ -243,13 +243,6 @@ async fn update_channel(
     crate::store::resources::update_channel(&mut tx, id, &channel)
         .await
         .map_err(AdminError::Store)?;
-    crate::store::resources::retain_channel_prices(
-        &mut tx,
-        id,
-        &crate::store::resources::channel_callable_names(&channel),
-    )
-    .await
-    .map_err(AdminError::Store)?;
     enroll_channel_models(&mut tx, id, Some(&previous), &channel).await?;
     store::record_audit(
         &mut tx,
@@ -306,7 +299,7 @@ async fn delete_channel(
 ) -> Result<Json<ChannelView>, AdminError> {
     let id = parse_channel_id(raw_id)?;
     let deleted = read_channel_record(&deps, id).await?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::delete_channel(&mut tx, id)
         .await
         .map_err(AdminError::Store)?;
@@ -424,13 +417,6 @@ async fn delete_channel_models(
         crate::store::resources::update_channel(&mut tx, record.id, &record.channel)
             .await
             .map_err(AdminError::Store)?;
-        crate::store::resources::retain_channel_prices(
-            &mut tx,
-            record.id,
-            &crate::store::resources::channel_callable_names(&record.channel),
-        )
-        .await
-        .map_err(AdminError::Store)?;
     }
     store::record_audit(
         &mut tx,

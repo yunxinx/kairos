@@ -59,6 +59,7 @@ async fn responses_passthrough_forwards_and_bills() {
     assert_eq!(received[0]["input"][0]["role"], "user");
 
     // 计费：input 100 + output 20 = 100*2.5/1M + 20*10/1M = 250 + 200 = 450 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
             .bind(TEST_TOKEN_KEY)
@@ -106,6 +107,7 @@ async fn responses_inbound_to_openai_chat_channel() {
     }));
 
     // 日志 inbound_protocol 落 openai_responses。
+    common::wait_for_request_persistence(&gw.pool).await;
     let protocol: String = sqlx::query_scalar("SELECT inbound_protocol FROM request_log")
         .fetch_one(&gw.pool)
         .await
@@ -361,6 +363,7 @@ async fn responses_passthrough_streaming_bills() {
     );
 
     // 计费：input 50 + output 5 = 50*2.5/1M + 5*10/1M = 125 + 50 = 175 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
             .bind(TEST_TOKEN_KEY)

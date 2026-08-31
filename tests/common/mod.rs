@@ -38,6 +38,21 @@ use kairos::{config, gateway, runtime, store};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
+/// 等待请求结果从持久化队列进入最终日志与余额表。
+pub async fn wait_for_request_persistence(pool: &sqlx::SqlitePool) {
+    for _ in 0..200 {
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_log_outbox")
+            .fetch_one(pool)
+            .await
+            .expect("应能读取请求持久化队列");
+        if pending == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("请求持久化队列未在期限内清空");
+}
+
 /// mock 上游的响应行为，按请求逐次消费。
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpstreamBehavior {
@@ -655,7 +670,7 @@ pub struct TestGateway {
     pub db_dir: tempfile::TempDir,
     /// 独立管理监听地址；未启用管理面时为 `None`。
     pub admin_addr: Option<SocketAddr>,
-    /// 管理面 root 会话（`ksess_…`）。未启用管理面时为空串。
+    /// 管理面 root 会话 Cookie。未启用管理面时为空串。
     pub session: String,
 }
 
@@ -675,7 +690,7 @@ impl TestGateway {
     }
 
     /// 带独立管理监听启动：协议面与 `start_with` 相同，另起管理监听。
-    /// 内置 root 用 `TEST_ROOT_EMAIL` / `TEST_ROOT_PASSWORD` 播种后登录，`session` 为会话 Bearer。
+    /// 内置 root 用 `TEST_ROOT_EMAIL` / `TEST_ROOT_PASSWORD` 播种后登录。
     pub async fn start_with_admin(make_seed: impl Fn(&str) -> Seed) -> Self {
         Self::start_with_opts(make_seed, true).await
     }
@@ -702,7 +717,7 @@ impl TestGateway {
         // 新资源，端到端断言「写后即时生效」。
         let (admin_addr, session) = if with_admin {
             // 测试不走 config.json：直接调用与进程启动相同的播种入口，再 `/login` 换会话。
-            // `session` 才是管理 API Bearer；`TEST_ROOT_PASSWORD` 只用于登录，不能当 Authorization。
+            // `TEST_ROOT_PASSWORD` 只用于登录，管理 API 由会话 Cookie 认证。
             kairos::store::users::seed_builtin_root(
                 &pool,
                 Some(TEST_ROOT_EMAIL),
@@ -874,16 +889,30 @@ async fn login_root_session(admin_base: &str) -> String {
         .await
         .expect("测试 root 登录应可达");
     let status = resp.status();
+    let session = session_cookie(&resp);
     let body: Value = resp.json().await.expect("登录响应应可解析");
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
         "测试 root 应能登录: {body}"
     );
-    body["token"]
-        .as_str()
-        .expect("登录应返回会话令牌")
-        .to_string()
+    assert!(body.get("token").is_none(), "登录响应不应暴露会话令牌");
+    session
+}
+
+/// 从登录响应提取管理会话的 Cookie 请求头值。
+pub fn session_cookie(response: &reqwest::Response) -> String {
+    let value = response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("登录应返回 Set-Cookie");
+    let pair = value.split(';').next().expect("Set-Cookie 应包含名称和值");
+    assert!(
+        pair.starts_with("kairos_session=ksess_"),
+        "登录应返回管理会话 Cookie"
+    );
+    pair.to_string()
 }
 
 // ---- 下游 SSE 响应解析 ----

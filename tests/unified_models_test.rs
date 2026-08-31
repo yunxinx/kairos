@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -31,7 +32,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -42,7 +44,8 @@ async fn admin_json(
 async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -50,7 +53,7 @@ async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> re
 
 /// 以指定令牌向网关发一条 Chat Completions 请求。
 async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Response {
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base_url()))
         .bearer_auth(token)
         .json(&json!({
@@ -59,7 +62,9 @@ async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Re
         }))
         .send()
         .await
-        .expect("下游请求应能到达网关")
+        .expect("下游请求应能到达网关");
+    common::wait_for_request_persistence(&gw.pool).await;
+    response
 }
 
 fn completion_body(model: &str, prompt: u64, completion: u64) -> Value {
@@ -615,9 +620,9 @@ async fn stale_member_is_skipped_then_next_serves() {
     assert_eq!(ups[1].received().len(), 0);
 }
 
-/// 删除钉住的渠道后，GET 统一模型把该成员标为 `available: false`。
+/// 删除渠道时同步移除统一模型和模型组中的引用。
 #[tokio::test]
-async fn deleted_channel_marks_unified_member_unavailable() {
+async fn deleting_channel_removes_dependent_model_references() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let channel_id = first_channel_id(&gw).await;
     let created = admin_json(
@@ -632,6 +637,21 @@ async fn deleted_channel_marks_unified_member_unavailable() {
     )
     .await;
     assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let group = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({
+            "name": "channel-dependent",
+            "models": [
+                { "kind": "source", "channel_id": channel_id, "model": TEST_MODEL },
+                { "kind": "unified", "id": "bundle" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(group.status(), reqwest::StatusCode::CREATED);
 
     let listed: Value = admin_get(&gw, "/unified-models")
         .await
@@ -653,12 +673,20 @@ async fn deleted_channel_marks_unified_member_unavailable() {
         .json()
         .await
         .expect("列表应可解析");
-    assert_eq!(listed[0]["id"], "bundle");
-    assert_eq!(listed[0]["models"][0]["channel_id"], channel_id);
-    assert_eq!(
-        listed[0]["models"][0]["available"], false,
-        "渠道删除后成员应标为不可用"
-    );
+    assert_eq!(listed, json!([]), "空统一模型应随最后一个成员一并删除");
+
+    let groups: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("模型组列表应可解析");
+    let dependent = groups
+        .as_array()
+        .expect("模型组列表应为数组")
+        .iter()
+        .find(|group| group["name"] == "channel-dependent")
+        .expect("模型组本身应保留");
+    assert_eq!(dependent["models"], json!([]));
 }
 
 /// 统一成员只有在渠道启用、登记、具备密钥且已定价时才标为可用。

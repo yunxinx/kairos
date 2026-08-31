@@ -1,4 +1,5 @@
 import { authedTest as test, expect } from './fixtures';
+import { E2E_ADMIN_ORIGIN } from './helpers/gateway';
 import { e2eRootHeaders } from './helpers/session';
 import { seedModelGroup } from './helpers/models';
 import { clickRowAction } from './helpers/table';
@@ -72,9 +73,8 @@ test.describe('users page', () => {
       data: { email: 'e2e-tokens@example.com', password: 'password1' },
     });
     expect(session.ok()).toBeTruthy();
-    const sessionBody = (await session.json()) as { token: string };
     const own = await page.request.post('/api/tokens', {
-      headers: { Authorization: `Bearer ${sessionBody.token}` },
+      headers: { Origin: E2E_ADMIN_ORIGIN },
       data: { name: 'owned', balance_usd_micros: null, enabled: true },
     });
     expect(own.ok()).toBeTruthy();

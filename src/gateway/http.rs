@@ -32,7 +32,9 @@ use axum::{
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::Stream;
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use sqlx::SqlitePool;
 use thiserror::Error;
 
@@ -47,8 +49,11 @@ use crate::{
     store::resources::{Channel, ChannelRecord, StoredChannelKey, Token, protocol_to_wire},
 };
 
-use super::failover::{Outbound, RetryBackoff, run_failover};
-use super::logging::{Billing, UsageWarningGate, log_request, new_request_id, unix_millis};
+use super::failover::{FailoverPolicy, KeyCooldowns, Outbound, RetryBackoff, run_failover};
+use super::logging::{
+    Billing, RequestLogDraft, RequestLogWriter, new_request_id, queue_request_log, unix_millis,
+};
+use super::network::{OutboundClients, validate_target};
 use super::rate_limit::{RequestRateLimiter, SessionStickyCache};
 use super::rectifier;
 use super::sse::{
@@ -63,12 +68,13 @@ use super::{protocol, routing};
 #[derive(Clone)]
 pub struct Deps {
     pub(super) pool: SqlitePool,
-    pub(super) client: reqwest::Client,
+    pub(super) outbound_clients: OutboundClients,
     pub(super) snapshot: SnapshotHandle,
     pub(super) auth_throttle: AuthThrottle,
     pub(super) request_rate: RequestRateLimiter,
     pub(super) sticky: SessionStickyCache,
-    pub(super) usage_warning_gate: UsageWarningGate,
+    pub(super) key_cooldowns: KeyCooldowns,
+    pub(super) request_log_writer: RequestLogWriter,
 }
 
 /// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
@@ -76,18 +82,16 @@ pub struct Deps {
 pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
     // 不设客户端级 timeout：reqwest 的 timeout 覆盖到响应体读完，会截断长流式
     // 响应；超时统一按渠道在请求级施加（非流式 `.timeout`，流式仅约束到响应头）。
-    let client = reqwest::Client::builder()
-        .build()
-        .expect("reqwest client 构建不应失败");
-
+    let request_log_writer = RequestLogWriter::start(pool.clone());
     let deps = Deps {
         pool,
-        client,
+        outbound_clients: OutboundClients::new(),
         snapshot,
         auth_throttle: AuthThrottle::new(),
         request_rate: RequestRateLimiter::new(),
         sticky: SessionStickyCache::new(),
-        usage_warning_gate: UsageWarningGate::new(),
+        key_cooldowns: KeyCooldowns::new(),
+        request_log_writer,
     };
 
     // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
@@ -612,8 +616,8 @@ async fn handle_request(
 
     // 4. 准入：解析出站跳（普通模型一条；统一模型按成员顺序，只收已定价可路由的）。
     // IR 已解码，此处才能稳定计算无头请求的前缀亲和标识。
-    let session = request_session(&headers, &request);
-    let session_identity = session_cache_identity(&headers, &request);
+    let session = request_session(&headers, &request, token, &snapshot);
+    let session_identity = session_cache_identity(&headers, &request, token, &snapshot);
     let hops = match resolve_route_hops(
         &snapshot,
         &request.model,
@@ -852,10 +856,11 @@ fn hop_for_member(
     sticky: &SessionStickyCache,
     session: u64,
 ) -> Result<RouteHop, HopDeny> {
-    let Some(record) = snapshot
+    let Some((channel_index, record)) = snapshot
         .channels
         .iter()
-        .find(|record| record.id == member.channel_id)
+        .enumerate()
+        .find(|(_, record)| record.id == member.channel_id)
     else {
         return Err(HopDeny::NoRoute);
     };
@@ -870,14 +875,14 @@ fn hop_for_member(
     {
         return Err(HopDeny::NoPrice);
     }
-    let key = sticky
+    let key_id = sticky
         .select(record.id, &member.model, session, &record.keys)
         .ok_or(HopDeny::NoRoute)?;
     Ok(RouteHop {
         routed_model: member.model.clone(),
         route: routing::Route {
-            channels: vec![record.clone()],
-            selected_keys: std::collections::HashMap::from([(record.id, key)]),
+            channel_indices: vec![channel_index],
+            selected_key_ids: std::collections::HashMap::from([(record.id, key_id)]),
         },
     })
 }
@@ -892,31 +897,35 @@ fn hop_for_callable(
     sticky: &SessionStickyCache,
     session: u64,
 ) -> Result<RouteHop, HopDeny> {
-    let mut route = routing::route(&snapshot.channels, &snapshot.channel_model_order, model)
-        .ok_or(HopDeny::NoRoute)?;
+    let mut route =
+        routing::indexed_route(&snapshot.routing_candidates, model).ok_or(HopDeny::NoRoute)?;
     if let Some(group) = snapshot.model_groups.get(group_name)
         && let Some(pinned) = store::resources::pinned_channel_ids(group, model)
     {
-        route.channels.retain(|record| pinned.contains(&record.id));
-        if route.channels.is_empty() {
+        route
+            .channel_indices
+            .retain(|index| pinned.contains(&snapshot.channels[*index].id));
+        if route.channel_indices.is_empty() {
             return Err(HopDeny::NoRoute);
         }
     }
-    let had_price = route
-        .channels
-        .iter()
-        .any(|record| snapshot.price_for_channel(record.id, model).is_some());
-    route.channels.retain(|record| {
+    let had_price = route.channel_indices.iter().any(|index| {
+        snapshot
+            .price_for_channel(snapshot.channels[*index].id, model)
+            .is_some()
+    });
+    route.channel_indices.retain(|index| {
+        let record = &snapshot.channels[*index];
         if snapshot.price_for_channel(record.id, model).is_none() {
             return false;
         }
-        let Some(key) = sticky.select(record.id, model, session, &record.keys) else {
+        let Some(key_id) = sticky.select(record.id, model, session, &record.keys) else {
             return false;
         };
-        route.selected_keys.insert(record.id, key.clone());
+        route.selected_key_ids.insert(record.id, key_id);
         true
     });
-    if route.channels.is_empty() {
+    if route.channel_indices.is_empty() {
         return Err(if had_price {
             HopDeny::NoRoute
         } else {
@@ -946,8 +955,8 @@ fn estimate_admission_cost_micros(
 ) -> Result<i64, billing::Error> {
     let mut max_output = 0i64;
     for hop in hops {
-        for record in &hop.route.channels {
-            let price = billed_price(snapshot, record, &hop.routed_model);
+        for index in &hop.route.channel_indices {
+            let price = billed_price(snapshot, &snapshot.channels[*index], &hop.routed_model);
             if price.output_micros < 0 {
                 return Err(billing::Error::NegativePrice);
             }
@@ -1010,30 +1019,79 @@ fn resolve_route_hops(
 }
 
 /// 取请求级会话标识：显式头优先，缺失时使用解码后 IR 的稳定前缀哈希。
-fn request_session(headers: &HeaderMap, request: &ChatRequest) -> u64 {
-    headers
-        .get("x-kairos-session-id")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            std::hash::Hasher::write(&mut hasher, value.as_bytes());
-            std::hash::Hasher::finish(&hasher)
-        })
-        .unwrap_or_else(|| prefix_hash(request))
-}
-
-/// 解析会话标识原文，供会话缓存键回写：显式 `x-kairos-session-id` 头优先，
-/// 缺失时用 IR 稳定前缀哈希的十六进制兜底（与粘性路由同源，仅形态不同）。
-fn session_cache_identity(headers: &HeaderMap, request: &ChatRequest) -> String {
-    headers
+fn request_session(
+    headers: &HeaderMap,
+    request: &ChatRequest,
+    token: &Token,
+    snapshot: &RuntimeSnapshot,
+) -> u64 {
+    let signal = headers
         .get("x-kairos-session-id")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("{:016x}", prefix_hash(request)))
+        .unwrap_or_else(|| format!("prefix:{:016x}", prefix_hash(request)));
+    let digest = session_digest(snapshot, token, "sticky", &signal);
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
+}
+
+/// 解析会话标识原文，供会话缓存键回写：显式 `x-kairos-session-id` 头优先，
+/// 缺失时用 IR 稳定前缀哈希的十六进制兜底（与粘性路由同源，仅形态不同）。
+fn session_cache_identity(
+    headers: &HeaderMap,
+    request: &ChatRequest,
+    token: &Token,
+    snapshot: &RuntimeSnapshot,
+) -> String {
+    let signal = headers
+        .get("x-kairos-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("prefix:{:016x}", prefix_hash(request)));
+    session_digest_hex(snapshot, token, "prompt-cache", &signal)
+}
+
+/// 使用实例级秘密派生用途隔离、按用户作用域的出站缓存标识。
+fn session_digest(
+    snapshot: &RuntimeSnapshot,
+    token: &Token,
+    purpose: &str,
+    signal: &str,
+) -> [u8; 32] {
+    // HMAC 接受任意长度密钥；固定 32 字节实例密钥不会触发长度错误。
+    let mut mac = Hmac::<Sha256>::new_from_slice(&snapshot.session_cache_secret)
+        .expect("HMAC 应接受固定长度实例密钥");
+    mac.update(b"kairos/session/v1/");
+    mac.update(purpose.as_bytes());
+    mac.update(b"/");
+    mac.update(token.user_id.to_string().as_bytes());
+    mac.update(b"/");
+    mac.update(signal.as_bytes());
+    let output = mac.finalize().into_bytes();
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&output);
+    digest
+}
+
+fn session_digest_hex(
+    snapshot: &RuntimeSnapshot,
+    token: &Token,
+    purpose: &str,
+    signal: &str,
+) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = session_digest(snapshot, token, purpose, signal);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// 单次出站调用的请求侧上下文：入站请求、认证令牌与计费/日志所需的
@@ -1053,7 +1111,7 @@ struct OutboundCall<'a> {
     request_body: Option<Bytes>,
     inbound_headers: &'a HeaderMap,
     request_id: &'a str,
-    /// 解析出的会话标识原文（显式头优先、前缀哈希兜底），供会话缓存键回写。
+    /// 按调用者隔离的会话缓存标识，供出站缓存亲和使用。
     session_identity: &'a str,
 }
 
@@ -1113,7 +1171,7 @@ struct HopDispatch<'a> {
     inbound_anthropic_version: Option<&'a HeaderValue>,
     inbound_headers: &'a HeaderMap,
     request_id: &'a str,
-    /// 解析出的会话标识原文（显式头优先、前缀哈希兜底），供会话缓存键回写。
+    /// 按调用者隔离的会话缓存标识，供出站缓存亲和使用。
     session_identity: &'a str,
 }
 
@@ -1135,17 +1193,16 @@ impl<'a> HopDispatch<'a> {
 async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Response {
     run_failover(
         route,
+        &ctx.snapshot.channels,
         ctx.routed_model,
         |record, key| {
             let passthrough = ctx.channel_is_passthrough(record);
-            let record = record.clone();
-            let key = key.clone();
             Box::pin(async move {
                 if passthrough {
                     if ctx.request.stream {
-                        passthrough_stream_completion(ctx, &record, &key).await
+                        passthrough_stream_completion(ctx, record, key).await
                     } else {
-                        passthrough_non_stream_completion(ctx, &record, &key).await
+                        passthrough_non_stream_completion(ctx, record, key).await
                     }
                 } else {
                     let mut call_ctx = OutboundCall {
@@ -1153,7 +1210,7 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
                         snapshot: ctx.snapshot,
                         routed_model: ctx.routed_model,
                         token: ctx.token,
-                        price: billed_price(ctx.snapshot, &record, ctx.routed_model),
+                        price: billed_price(ctx.snapshot, record, ctx.routed_model),
                         started: ctx.started,
                         inbound_protocol: ctx.inbound_protocol,
                         request_body: ctx.request_body.clone(),
@@ -1162,14 +1219,14 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
                         session_identity: ctx.session_identity,
                     };
                     if ctx.request.stream {
-                        stream_completion(&mut call_ctx, ctx.request, &record.channel, &key, true)
+                        stream_completion(&mut call_ctx, ctx.request, &record.channel, key, true)
                             .await
                     } else {
                         non_stream_completion(
                             &mut call_ctx,
                             ctx.request,
                             &record.channel,
-                            &key,
+                            key,
                             true,
                         )
                         .await
@@ -1178,8 +1235,13 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
             })
         },
         |channel, status, _failover, body_wire, key_name| {
-            let outbound_model = outbound_model_for_channel_name(route, channel, ctx.routed_model)
-                .map(str::to_string);
+            let outbound_model = outbound_model_for_channel_name(
+                route,
+                &ctx.snapshot.channels,
+                channel,
+                ctx.routed_model,
+            )
+            .map(str::to_string);
             let channel = channel.to_string();
             let channel_key = (!key_name.is_empty()).then(|| key_name.to_string());
             let request_body = ctx.request_body.clone();
@@ -1187,29 +1249,34 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
             let request_id = ctx.request_id.to_string();
             Box::pin(async move {
                 let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
-                log_request(
+                let _ = queue_request_log(
                     ctx.deps,
-                    ctx.token,
-                    &ctx.request.model,
-                    outbound_model.as_deref(),
-                    &channel,
-                    channel_key.as_deref(),
-                    status,
-                    ctx.started,
-                    Billing {
-                        discount_bp,
-                        request_body,
-                        response_body,
-                        ..Default::default()
+                    RequestLogDraft {
+                        token: ctx.token,
+                        model: &ctx.request.model,
+                        outbound_model: outbound_model.as_deref(),
+                        channel: &channel,
+                        channel_key: channel_key.as_deref(),
+                        status,
+                        started: ctx.started,
+                        billing: Billing {
+                            discount_bp,
+                            request_body,
+                            response_body,
+                            ..Default::default()
+                        },
+                        inbound_protocol: ctx.inbound_protocol,
+                        request_id: &request_id,
                     },
-                    ctx.inbound_protocol,
-                    &request_id,
                 )
                 .await;
             })
         },
-        ctx.inbound_protocol,
-        retry_backoff(ctx.snapshot),
+        FailoverPolicy {
+            inbound_protocol: ctx.inbound_protocol,
+            retry_backoff: retry_backoff(ctx.snapshot),
+            key_cooldowns: &ctx.deps.key_cooldowns,
+        },
     )
     .await
 }
@@ -1228,11 +1295,20 @@ async fn passthrough_stream_completion(
     let outbound = passthrough_patch_request(ctx.raw_body, true, channel.protocol);
     // 直通的前提是出站模型名与入站一致，URL 路径上的模型名无需改写。
     let upstream_url = passthrough_upstream_url(channel, &ctx.request.model, true);
+    if let Err(err) = validate_target(&upstream_url, ctx.snapshot.allow_private_networks) {
+        return Outbound::Retryable {
+            channel: channel.name.clone(),
+            status: None,
+            retry_after: None,
+            message: err.to_string(),
+        };
+    }
 
     let upstream = tokio::time::timeout(
         Duration::from_millis(channel.timeout_ms),
         ctx.deps
-            .client
+            .outbound_clients
+            .for_policy(ctx.snapshot.allow_private_networks)
             .post(&upstream_url)
             .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
@@ -1370,11 +1446,20 @@ async fn passthrough_non_stream_completion(
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, false, channel.protocol);
     let upstream_url = passthrough_upstream_url(channel, &ctx.request.model, false);
+    if let Err(err) = validate_target(&upstream_url, ctx.snapshot.allow_private_networks) {
+        return Outbound::Retryable {
+            channel: channel.name.clone(),
+            status: None,
+            retry_after: None,
+            message: err.to_string(),
+        };
+    }
 
     let upstream = tokio::time::timeout(
         Duration::from_millis(channel.timeout_ms),
         ctx.deps
-            .client
+            .outbound_clients
+            .for_policy(ctx.snapshot.allow_private_networks)
             .post(&upstream_url)
             .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
@@ -1464,20 +1549,29 @@ async fn passthrough_non_stream_completion(
                 };
             }
         };
-        log_request(
+        if let Err(err) = queue_request_log(
             ctx.deps,
-            ctx.token,
-            &ctx.request.model,
-            outbound_model_for_log(channel, ctx.routed_model),
-            &channel.name,
-            Some(&key.name),
-            status_code,
-            ctx.started,
-            billing,
-            ctx.inbound_protocol,
-            ctx.request_id,
+            RequestLogDraft {
+                token: ctx.token,
+                model: &ctx.request.model,
+                outbound_model: outbound_model_for_log(channel, ctx.routed_model),
+                channel: &channel.name,
+                channel_key: Some(&key.name),
+                status: status_code,
+                started: ctx.started,
+                billing,
+                inbound_protocol: ctx.inbound_protocol,
+                request_id: ctx.request_id,
+            },
         )
-        .await;
+        .await
+        {
+            return Outbound::Fatal {
+                channel: channel.name.clone(),
+                status: 500,
+                message: format!("请求结果无法持久化: {err}"),
+            };
+        }
         let mut response = Response::new(Body::from(upstream_body));
         response
             .headers_mut()
@@ -1787,26 +1881,31 @@ async fn pipe_passthrough_stream<S>(
     }
     // 流结束：按嗅探累积的 usage 结算并落日志。
     let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
-    log_request(
+    if let Err(err) = queue_request_log(
         &ctx.deps,
-        &ctx.token,
-        &ctx.request_model,
-        outbound_model_for_log(&ctx.channel, &ctx.routed_model),
-        &ctx.channel.name,
-        Some(&ctx.channel_key_name),
-        ctx.status_code,
-        ctx.started,
-        Billing::calculated(
-            usage,
-            ctx.price,
-            discount_bp,
-            ctx.request_body.clone(),
-            ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
-        ),
-        ctx.protocol,
-        &ctx.request_id,
+        RequestLogDraft {
+            token: &ctx.token,
+            model: &ctx.request_model,
+            outbound_model: outbound_model_for_log(&ctx.channel, &ctx.routed_model),
+            channel: &ctx.channel.name,
+            channel_key: Some(&ctx.channel_key_name),
+            status: ctx.status_code,
+            started: ctx.started,
+            billing: Billing::calculated(
+                usage,
+                ctx.price,
+                discount_bp,
+                ctx.request_body.clone(),
+                ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
+            ),
+            inbound_protocol: ctx.protocol,
+            request_id: &ctx.request_id,
+        },
     )
-    .await;
+    .await
+    {
+        tracing::error!(error = %err, request_id = %ctx.request_id, "流式请求结果无法持久化");
+    }
     // OpenAI 协议约定以 `data: [DONE]` 终止；Anthropic 以上游
     // message_stop 收尾，无需哨兵。
     if downstream_open && ctx.protocol == Protocol::OpenAiChat {
@@ -1894,9 +1993,18 @@ async fn non_stream_completion(
         channel.base_url.trim_end_matches('/'),
         protocol::upstream_path(channel.protocol, outbound_model, false)
     );
+    if let Err(err) = validate_target(&upstream_url, snapshot.allow_private_networks) {
+        return Outbound::Retryable {
+            channel: channel.name.clone(),
+            status: None,
+            retry_after: None,
+            message: err.to_string(),
+        };
+    }
 
     let upstream = deps
-        .client
+        .outbound_clients
+        .for_policy(snapshot.allow_private_networks)
         .post(&upstream_url)
         .timeout(Duration::from_millis(channel.timeout_ms))
         .apply_outbound_auth(channel.protocol, key)
@@ -1977,20 +2085,29 @@ async fn non_stream_completion(
                         };
                     }
                 };
-                log_request(
+                if let Err(err) = queue_request_log(
                     deps,
-                    token,
-                    &request.model,
-                    Some(outbound_model),
-                    &channel.name,
-                    Some(&key.name),
-                    status_code,
-                    started,
-                    billing,
-                    inbound_protocol,
-                    ctx.request_id,
+                    RequestLogDraft {
+                        token,
+                        model: &request.model,
+                        outbound_model: Some(outbound_model),
+                        channel: &channel.name,
+                        channel_key: Some(&key.name),
+                        status: status_code,
+                        started,
+                        billing,
+                        inbound_protocol,
+                        request_id: ctx.request_id,
+                    },
                 )
-                .await;
+                .await
+                {
+                    return Outbound::Fatal {
+                        channel: channel.name.clone(),
+                        status: 500,
+                        message: format!("请求结果无法持久化: {err}"),
+                    };
+                }
                 Outbound::Success(Json(inbound).into_response())
             }
             Err(err) => {
@@ -2044,6 +2161,7 @@ async fn stream_completion(
     allow_rectify: bool,
 ) -> Outbound {
     let deps = ctx.deps;
+    let snapshot = ctx.snapshot;
     let token = ctx.token;
     let price = ctx.price;
     let started = ctx.started;
@@ -2087,12 +2205,21 @@ async fn stream_completion(
         channel.base_url.trim_end_matches('/'),
         protocol::upstream_path(channel.protocol, outbound_model, true)
     );
+    if let Err(err) = validate_target(&upstream_url, snapshot.allow_private_networks) {
+        return Outbound::Retryable {
+            channel: channel.name.clone(),
+            status: None,
+            retry_after: None,
+            message: err.to_string(),
+        };
+    }
 
     // 渠道 timeout 只约束到响应头（send 返回）：reqwest 的 `.timeout` 覆盖到
     // 响应体读完，会把长流式响应截断；流一旦开始，时长不受 timeout 限制。
     let upstream = tokio::time::timeout(
         Duration::from_millis(channel.timeout_ms),
-        deps.client
+        deps.outbound_clients
+            .for_policy(snapshot.allow_private_networks)
             .post(&upstream_url)
             .apply_outbound_auth(channel.protocol, key)
             .apply_feature_headers(ctx.inbound_headers)
@@ -2558,26 +2685,31 @@ fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
 /// 结算流式请求费用并落日志。
 async fn settle_and_log(ctx: &StreamTask, usage: Usage) {
     let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
-    log_request(
+    if let Err(err) = queue_request_log(
         &ctx.deps,
-        &ctx.token,
-        &ctx.request_model,
-        outbound_model_for_log(&ctx.channel, &ctx.routed_model),
-        &ctx.channel.name,
-        Some(&ctx.channel_key_name),
-        ctx.status_code,
-        ctx.started,
-        Billing::calculated(
-            usage,
-            ctx.price,
-            discount_bp,
-            ctx.request_body.clone(),
-            ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
-        ),
-        ctx.inbound_protocol,
-        &ctx.request_id,
+        RequestLogDraft {
+            token: &ctx.token,
+            model: &ctx.request_model,
+            outbound_model: outbound_model_for_log(&ctx.channel, &ctx.routed_model),
+            channel: &ctx.channel.name,
+            channel_key: Some(&ctx.channel_key_name),
+            status: ctx.status_code,
+            started: ctx.started,
+            billing: Billing::calculated(
+                usage,
+                ctx.price,
+                discount_bp,
+                ctx.request_body.clone(),
+                ctx.snapshot.full_body.then(|| ctx.response_body.clone()),
+            ),
+            inbound_protocol: ctx.inbound_protocol,
+            request_id: &ctx.request_id,
+        },
     )
-    .await;
+    .await
+    {
+        tracing::error!(error = %err, request_id = %ctx.request_id, "流式请求结果无法持久化");
+    }
 }
 
 /// 从请求头提取并校验令牌 key，返回匹配的令牌定义；禁用的令牌在此被拒绝。
@@ -2692,12 +2824,14 @@ fn outbound_model_for_log<'a>(channel: &'a Channel, inbound: &'a str) -> Option<
 /// 按渠道名从本次路由结果取出发给上游的模型名；未知渠道则尚未出站。
 fn outbound_model_for_channel_name<'a>(
     route: &'a routing::Route,
+    channels: &'a [ChannelRecord],
     channel_name: &str,
     inbound: &'a str,
 ) -> Option<&'a str> {
     route
-        .channels
+        .channel_indices
         .iter()
+        .filter_map(|index| channels.get(*index))
         .find(|record| record.channel.name == channel_name)
         .map(|record| routing::outbound_model(&record.channel, inbound))
 }
@@ -2829,29 +2963,34 @@ async fn error_response(
     if let (Some(token), Some(model)) = (token, model) {
         let response_wire = full_body.then(|| serde_json::to_vec(&body).unwrap_or_default());
         let discount_bp = deps.snapshot.read().await.discount_bp_for_token(token);
-        log_request(
+        if let Err(err) = queue_request_log(
             deps,
-            token,
-            model,
-            None,
-            "",
-            None,
-            status.as_u16(),
-            started,
-            Billing {
-                usage: Usage::default(),
-                price: PriceSnapshot::default(),
-                base_cost_usd_micros: 0,
-                discount_bp,
-                cost_usd_micros: 0,
-                calculation_error: None,
-                request_body,
-                response_body: response_wire,
+            RequestLogDraft {
+                token,
+                model,
+                outbound_model: None,
+                channel: "",
+                channel_key: None,
+                status: status.as_u16(),
+                started,
+                billing: Billing {
+                    usage: Usage::default(),
+                    price: PriceSnapshot::default(),
+                    base_cost_usd_micros: 0,
+                    discount_bp,
+                    cost_usd_micros: 0,
+                    calculation_error: None,
+                    request_body,
+                    response_body: response_wire,
+                },
+                inbound_protocol,
+                request_id,
             },
-            inbound_protocol,
-            request_id,
         )
-        .await;
+        .await
+        {
+            tracing::error!(error = %err, request_id, "错误响应日志无法持久化");
+        }
     }
     (status, Json(body)).into_response()
 }

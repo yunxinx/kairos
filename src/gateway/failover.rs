@@ -1,8 +1,9 @@
 //! 渠道 failover 编排：统一处理重试预算、可重试错误、渠道内密钥轮换与最终
 //! 错误归因。
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::{
     Json,
@@ -112,28 +113,85 @@ fn is_auth_failure(status: u16) -> bool {
     (401..=403).contains(&status)
 }
 
+const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+/// 上游密钥认证失败后的跨请求冷却表。
+#[derive(Clone)]
+pub(super) struct KeyCooldowns {
+    inner: Arc<Mutex<HashMap<i64, Instant>>>,
+}
+
+impl KeyCooldowns {
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn is_available(&self, key_id: i64, now: Instant) -> bool {
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        match entries.get(&key_id).copied() {
+            Some(until) if until > now => false,
+            Some(_) => {
+                entries.remove(&key_id);
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn mark_auth_failure(&self, key_id: i64, now: Instant) {
+        let until = now.checked_add(AUTH_FAILURE_COOLDOWN).unwrap_or(now);
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key_id, until);
+    }
+
+    fn clear(&self, key_id: i64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key_id);
+    }
+}
+
+/// 一次失败切换使用的协议编码、退避参数与跨请求密钥冷却。
+pub(super) struct FailoverPolicy<'a> {
+    pub(super) inbound_protocol: Protocol,
+    pub(super) retry_backoff: RetryBackoff,
+    pub(super) key_cooldowns: &'a KeyCooldowns,
+}
+
 pub(super) async fn run_failover<'a, A, L>(
     route: &'a routing::Route,
+    channels: &'a [ChannelRecord],
     model: &str,
     mut attempt: A,
     log_failure: L,
-    inbound_protocol: Protocol,
-    backoff: RetryBackoff,
+    policy: FailoverPolicy<'_>,
 ) -> Response
 where
-    A: FnMut(&ChannelRecord, &StoredChannelKey) -> BoxFuture<'a, Outbound>,
+    A: FnMut(&'a ChannelRecord, &'a StoredChannelKey) -> BoxFuture<'a, Outbound>,
     L: Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()>,
 {
     let mut last_failure: Option<FinalFailure> = None;
 
-    for record in &route.channels {
-        let Some(first) = route.selected_key(record.id) else {
+    for index in &route.channel_indices {
+        let Some(record) = channels.get(*index) else {
+            continue;
+        };
+        let Some(first_key_id) = route.selected_key_id(record.id) else {
             continue;
         };
         // 轮换池：启用且允许该模型的密钥按存储顺序，旋转到粘性首选开头。
         // 准入已保证非空；快照在准入后变更时兜底跳过该渠道。
-        let mut pool = eligible_channel_keys(&record.keys, model);
-        if let Some(position) = pool.iter().position(|key| key.id == first.id) {
+        let now = Instant::now();
+        let mut pool: Vec<&StoredChannelKey> = eligible_channel_keys(&record.keys, model)
+            .into_iter()
+            .filter(|key| policy.key_cooldowns.is_available(key.id, now))
+            .collect();
+        if let Some(position) = pool.iter().position(|key| key.id == first_key_id) {
             pool.rotate_left(position);
         }
         if pool.is_empty() {
@@ -146,7 +204,10 @@ where
             rotation.mark_attempted();
             let key = rotation.current();
             match attempt(record, key).await {
-                Outbound::Success(response) => return response,
+                Outbound::Success(response) => {
+                    policy.key_cooldowns.clear(key.id);
+                    return response;
+                }
                 Outbound::Fatal {
                     channel,
                     status,
@@ -155,6 +216,9 @@ where
                     // 认证失效是该 key 的问题而非请求的问题：请求级标记后换
                     // 下一把立即重试；渠道内全失效才切渠道。不消耗重试预算
                     // （上限是池大小，每把 key 至多失效一次）。
+                    policy
+                        .key_cooldowns
+                        .mark_auth_failure(key.id, Instant::now());
                     if matches!(rotation.invalidate_current(), Rotation::Depleted) {
                         last_failure = Some(FinalFailure {
                             channel,
@@ -170,8 +234,13 @@ where
                     status,
                     message,
                 } => {
-                    let body =
-                        upstream_error_body(status, &message, &channel, false, inbound_protocol);
+                    let body = upstream_error_body(
+                        status,
+                        &message,
+                        &channel,
+                        false,
+                        policy.inbound_protocol,
+                    );
                     let wire = serde_json::to_vec(&body).unwrap_or_default();
                     log_failure(&channel, status, false, &wire, &key.name).await;
                     return (
@@ -207,7 +276,12 @@ where
                     if retries_used >= record.channel.max_retries {
                         break;
                     }
-                    tokio::time::sleep(retry_delay(retries_used, retry_after, backoff)).await;
+                    tokio::time::sleep(retry_delay(
+                        retries_used,
+                        retry_after,
+                        policy.retry_backoff,
+                    ))
+                    .await;
                     retries_used += 1;
                 }
             }
@@ -225,8 +299,23 @@ where
         message: "所有渠道均不可用".to_string(),
         key_name: String::new(),
     });
-    let status_code = status.unwrap_or(502);
-    let body = upstream_error_body(status_code, &message, &channel, true, inbound_protocol);
+    let auth_exhausted = status.is_some_and(is_auth_failure);
+    let status_code = if auth_exhausted {
+        502
+    } else {
+        status.unwrap_or(502)
+    };
+    let body = if auth_exhausted {
+        protocol::encode_error(502, "没有可用的上游", policy.inbound_protocol)
+    } else {
+        upstream_error_body(
+            status_code,
+            &message,
+            &channel,
+            true,
+            policy.inbound_protocol,
+        )
+    };
     let wire = serde_json::to_vec(&body).unwrap_or_default();
     log_failure(&channel, status_code, true, &wire, &key_name).await;
     (
@@ -341,7 +430,9 @@ pub(super) fn upstream_error_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{RetryBackoff, exponential_delay, jitter_delay, retry_delay};
+    use super::{
+        FailoverPolicy, KeyCooldowns, RetryBackoff, exponential_delay, jitter_delay, retry_delay,
+    };
     use std::time::Duration;
 
     fn default_backoff() -> RetryBackoff {
@@ -523,16 +614,10 @@ mod tests {
         }
     }
 
-    fn route_of(
-        records: Vec<ChannelRecord>,
-        first_picks: &[(i64, StoredChannelKey)],
-    ) -> routing::Route {
+    fn route_of(records: &[ChannelRecord], first_picks: &[(i64, i64)]) -> routing::Route {
         routing::Route {
-            selected_keys: first_picks
-                .iter()
-                .map(|(id, key)| (*id, key.clone()))
-                .collect(),
-            channels: records,
+            selected_key_ids: first_picks.iter().copied().collect(),
+            channel_indices: (0..records.len()).collect(),
         }
     }
 
@@ -543,23 +628,22 @@ mod tests {
     /// 无侧害的失败日志闭包。
     async fn no_log() {}
 
-    fn no_failure_log() -> impl Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'static, ()> {
+    fn no_failure_log<'a>() -> impl Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()> {
         |_channel, _status, _failover, _wire, _key| Box::pin(no_log())
     }
 
     #[tokio::test]
     async fn rate_limit_rotation_is_free_until_pool_exhausted() {
         let keys = vec![key(1, "a"), key(2, "b")];
-        let route: &'static routing::Route = Box::leak(Box::new(route_of(
-            vec![record_with_keys(1, keys.clone(), 0)],
-            &[(1, keys[0].clone())],
-        )));
+        let records = vec![record_with_keys(1, keys.clone(), 0)];
+        let route = route_of(&records, &[(1, keys[0].id)]);
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let seen_for_attempt = seen.clone();
 
         // max_retries=0：a 的 429 轮换到未试过的 b 恢复，不消耗重试预算。
         let response = run_failover(
-            route,
+            &route,
+            &records,
             "m",
             move |_record, key| {
                 seen_for_attempt.lock().unwrap().push(key.name.clone());
@@ -578,8 +662,11 @@ mod tests {
                 })
             },
             no_failure_log(),
-            Protocol::OpenAiChat,
-            RetryBackoff::from_ms(10_000, 10_000, 10),
+            FailoverPolicy {
+                inbound_protocol: Protocol::OpenAiChat,
+                retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
+                key_cooldowns: &KeyCooldowns::new(),
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -592,16 +679,15 @@ mod tests {
     #[tokio::test]
     async fn server_error_retries_same_key_within_budget() {
         let keys = vec![key(1, "a"), key(2, "b")];
-        let route: &'static routing::Route = Box::leak(Box::new(route_of(
-            vec![record_with_keys(1, keys.clone(), 1)],
-            &[(1, keys[0].clone())],
-        )));
+        let records = vec![record_with_keys(1, keys.clone(), 1)];
+        let route = route_of(&records, &[(1, keys[0].id)]);
         let seen = Arc::new(StdMutex::new(Vec::new()));
 
         // 5xx 与 key 无关：同 key 退避重试（b 不出场），预算耗尽返回错误。
         let seen_for_attempt = seen.clone();
         let response = run_failover(
-            route,
+            &route,
+            &records,
             "m",
             move |_record, key| {
                 seen_for_attempt.lock().unwrap().push(key.name.clone());
@@ -615,8 +701,11 @@ mod tests {
                 })
             },
             no_failure_log(),
-            Protocol::OpenAiChat,
-            RetryBackoff::from_ms(1, 1, 1),
+            FailoverPolicy {
+                inbound_protocol: Protocol::OpenAiChat,
+                retry_backoff: RetryBackoff::from_ms(1, 1, 1),
+                key_cooldowns: &KeyCooldowns::new(),
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -631,19 +720,18 @@ mod tests {
     async fn auth_depleted_channel_switches_to_next_record() {
         let first = vec![key(1, "a"), key(2, "b")];
         let second = vec![key(3, "c")];
-        let route: &'static routing::Route = Box::leak(Box::new(route_of(
-            vec![
-                record_with_keys(1, first.clone(), 0),
-                record_with_keys(2, second.clone(), 0),
-            ],
-            &[(1, first[0].clone()), (2, second[0].clone())],
-        )));
+        let records = vec![
+            record_with_keys(1, first.clone(), 0),
+            record_with_keys(2, second.clone(), 0),
+        ];
+        let route = route_of(&records, &[(1, first[0].id), (2, second[0].id)]);
         let seen = Arc::new(StdMutex::new(Vec::new()));
 
         // 渠道内全部 key 认证失效才切下一渠道；结算/日志归接手渠道。
         let seen_for_attempt = seen.clone();
         let response = run_failover(
-            route,
+            &route,
+            &records,
             "m",
             move |_record, key| {
                 seen_for_attempt.lock().unwrap().push(key.name.clone());
@@ -661,8 +749,11 @@ mod tests {
                 })
             },
             no_failure_log(),
-            Protocol::OpenAiChat,
-            RetryBackoff::from_ms(10_000, 10_000, 10),
+            FailoverPolicy {
+                inbound_protocol: Protocol::OpenAiChat,
+                retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
+                key_cooldowns: &KeyCooldowns::new(),
+            },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);

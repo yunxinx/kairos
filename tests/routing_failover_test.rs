@@ -344,6 +344,7 @@ async fn all_keys_auth_dead_fails_over_to_next_channel() {
     );
     assert_eq!(ups[1].received().len(), 1, "全失效后才切下一渠道");
 
+    common::wait_for_request_persistence(&gw.pool).await;
     let channel: (String,) =
         sqlx::query_as("SELECT channel FROM request_log WHERE status_code = 200")
             .fetch_one(&gw.pool)
@@ -563,6 +564,7 @@ async fn failover_bills_succeeding_channel_price_once() {
     assert_eq!(ups[0].received().len(), 1, "首渠道应收一次请求");
     assert_eq!(ups[1].received().len(), 1, "次渠道应收一次请求");
 
+    common::wait_for_request_persistence(&gw.pool).await;
     let cost: (i64,) =
         sqlx::query_as("SELECT cost_usd_micros FROM request_log ORDER BY id DESC LIMIT 1")
             .fetch_one(&gw.pool)

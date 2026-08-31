@@ -3,7 +3,7 @@ import { ref } from 'vue';
 import { useNavigate } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
-import { captureSessionGeneration, setAdminKey, setMeForSession } from '@/lib/session';
+import { captureSessionGeneration, markSessionActive, setMeForSession } from '@/lib/session';
 import MarketingSiteHeader from '@/app/shell/MarketingSiteHeader.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormPasswordInput from '@/components/ui/FormPasswordInput.vue';
@@ -37,11 +37,11 @@ async function handleSubmit() {
 
   loading.value = true;
   try {
-    const loggedIn = await apiClient.login({
+    await apiClient.login({
       email: email.value.trim(),
       password: password.value,
     });
-    setAdminKey(loggedIn.token);
+    markSessionActive();
     const generation = captureSessionGeneration();
     setMeForSession(await apiClient.getMe(), generation);
     await navigate({ to: '/overview' });

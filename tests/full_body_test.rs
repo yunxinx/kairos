@@ -22,6 +22,7 @@ fn full_body_seed(base: &str) -> common::Seed {
 
 /// 读最近一条日志的两份 body 列。
 async fn fetch_bodies(pool: &sqlx::SqlitePool) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    common::wait_for_request_persistence(pool).await;
     sqlx::query_as("SELECT request_body, response_body FROM request_log ORDER BY id DESC LIMIT 1")
         .fetch_one(pool)
         .await

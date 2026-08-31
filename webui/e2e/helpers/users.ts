@@ -19,21 +19,16 @@ export async function seedUser(
   return (await resp.json()) as { id: number };
 }
 
-/** 写入会话到 localStorage 并进入概览。 */
+/** 登录并进入概览。 */
 export async function openSession(
   page: Page,
   email: string,
   password = 'password1',
 ): Promise<void> {
-  const resp = await page.request.post('/api/login', { data: { email, password } });
+  await page.context().clearCookies();
+  const resp = await page.request.post('/api/login', {
+    data: { email, password },
+  });
   expect(resp.ok(), await resp.text()).toBeTruthy();
-  const body = (await resp.json()) as { token: string };
-  await page.goto('/login');
-  await page.evaluate(
-    ({ storage, token }) => {
-      localStorage.setItem(storage, token);
-    },
-    { storage: 'kairos-admin-key', token: body.token },
-  );
   await page.goto('/overview');
 }

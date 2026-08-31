@@ -13,7 +13,8 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
 async fn post(gw: &TestGateway, path: &str, body: Value) -> reqwest::Response {
     reqwest::Client::new()
         .post(admin_url(gw, path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -110,7 +111,8 @@ async fn token_attributes_and_balance_commands_have_disjoint_write_surfaces() {
 
     let bad_update = reqwest::Client::new()
         .put(admin_url(&gw, &format!("/tokens/{id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "must-not-land",
             "enabled": true,
@@ -123,7 +125,8 @@ async fn token_attributes_and_balance_commands_have_disjoint_write_surfaces() {
 
     let updated = reqwest::Client::new()
         .put(admin_url(&gw, &format!("/tokens/{id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "name": "renamed", "enabled": true }))
         .send()
         .await
@@ -188,7 +191,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let updated = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "atomic-after",
             "rate_limit_rpm": 60,
@@ -211,7 +215,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let replay = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "replayed-attributes",
             "rate_limit_rpm": 90,
@@ -233,7 +238,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let failed = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "must-roll-back",
             "rate_limit_rpm": 120,
@@ -251,7 +257,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let conflict = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "must-also-roll-back",
             "rate_limit_rpm": 120,
@@ -381,7 +388,8 @@ async fn delete_token_returns_the_balance_observed_before_settlement_cleanup() {
 
     let deleted = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/tokens/{id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删除请求应可达");
