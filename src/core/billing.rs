@@ -338,7 +338,7 @@ mod tests {
     }
 
     proptest! {
-        /// 受检折扣要么等于 i128 参考值，要么只因超出 i64 上界而失败。
+        /// 受检折扣应与宽整数计算一致，超出 i64 上界时返回错误。
         #[test]
         fn discounted_cost_matches_wide_integer_reference(
             base in 0i64..=i64::MAX,

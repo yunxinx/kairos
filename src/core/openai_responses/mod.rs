@@ -1402,28 +1402,55 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     None
 }
 
+/// 判断非流式 Responses 对象是否明确以失败状态结束。
+pub fn response_is_failed(value: &Value) -> bool {
+    value.get("status").and_then(Value::as_str) == Some("failed")
+}
+
 /// 从 usage 对象解析 IR 四分量（input 不含缓存的减法约定）。
 fn parse_usage_object(usage: &serde_json::Map<String, Value>) -> Option<Usage> {
-    let input = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = usage
-        .get("input_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cache_write = usage
-        .get("input_tokens_details")
-        .and_then(|d| d.get("cache_write_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let mut has_metric = false;
+    let input = match usage.get("input_tokens") {
+        None => 0,
+        Some(value) => {
+            has_metric = true;
+            value.as_u64()?
+        }
+    };
+    let (cached, cache_write) = match usage.get("input_tokens_details") {
+        None | Some(Value::Null) => (0, 0),
+        Some(value) => {
+            let details = value.as_object()?;
+            let cached = match details.get("cached_tokens") {
+                None => 0,
+                Some(value) => {
+                    has_metric = true;
+                    value.as_u64()?
+                }
+            };
+            let cache_write = match details.get("cache_write_tokens") {
+                None => 0,
+                Some(value) => {
+                    has_metric = true;
+                    value.as_u64()?
+                }
+            };
+            (cached, cache_write)
+        }
+    };
+    let output = match usage.get("output_tokens") {
+        None => 0,
+        Some(value) => {
+            has_metric = true;
+            value.as_u64()?
+        }
+    };
+    if !has_metric {
+        return None;
+    }
     Some(Usage {
         input_tokens: input.saturating_sub(cached).saturating_sub(cache_write),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        output_tokens: output,
         cache_read_tokens: cached,
         cache_write_tokens: cache_write,
         cache_write_1h_tokens: 0,
@@ -2774,6 +2801,16 @@ mod tests {
                 .is_none(),
             "终端帧缺 usage 时应返回 None"
         );
+        assert!(sniff_usage(&json!({ "usage": { "input_tokens": "invalid" } })).is_none());
+        assert!(sniff_usage(&json!({ "usage": { "unrelated": 1 } })).is_none());
+    }
+
+    #[test]
+    fn response_is_failed_only_for_explicit_failed_status() {
+        assert!(response_is_failed(&json!({ "status": "failed" })));
+        assert!(!response_is_failed(&json!({ "status": "completed" })));
+        assert!(!response_is_failed(&json!({ "status": "incomplete" })));
+        assert!(!response_is_failed(&json!({ "status": 500 })));
     }
 
     /// 请求有状态特性（store/previous_response_id）出站时显式 warning 并丢弃。

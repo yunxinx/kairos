@@ -78,7 +78,9 @@ struct ChannelModelOrderView {
 /// 禁用渠道仍是配置候选，因此在顺序表里保留；缺少显式行时使用渠道 id 的默认顺序。
 async fn list_channel_model_orders(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<ChannelModelOrderView>>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewChannels)?;
     let snapshot = deps.snapshot.read().await;
     Ok(Json(channel_model_order_views(&snapshot)))
 }
@@ -246,7 +248,11 @@ fn validate_channel_model_order(
 // --- 价格 ---
 
 /// 列出全部价格（按渠道 id、模型名排序，保证确定性）。
-async fn list_prices(State(deps): State<AdminDeps>) -> Result<Json<Vec<Price>>, AdminError> {
+async fn list_prices(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+) -> Result<Json<Vec<Price>>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewPrices)?;
     let snapshot = deps.snapshot.read().await;
     let mut prices: Vec<Price> = snapshot
         .prices
@@ -391,7 +397,9 @@ async fn delete_price(
 /// 列出全部模型组（按 `name` 排序，保证确定性）。
 async fn list_model_groups(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<ModelGroup>>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewModelGroups)?;
     let mut groups: Vec<ModelGroup> = {
         let snapshot = deps.snapshot.read().await;
         snapshot.model_groups.values().cloned().collect()
@@ -573,7 +581,9 @@ async fn delete_model_groups(
 /// 读视图带 `available`：成员渠道需启用、登记该名、已定价且有可用密钥；写契约不含此字段。
 async fn list_unified_models(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<UnifiedModelView>>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewUnifiedModels)?;
     let snapshot = deps.snapshot.read().await;
     let mut models: Vec<UnifiedModelView> = snapshot
         .unified_models

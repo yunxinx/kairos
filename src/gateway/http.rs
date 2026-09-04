@@ -15,7 +15,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use sqlx::SqlitePool;
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     config::Protocol,
@@ -51,9 +52,10 @@ use crate::{
 
 use super::failover::{FailoverPolicy, KeyCooldowns, Outbound, RetryBackoff, run_failover};
 use super::logging::{
-    Billing, RequestLogDraft, RequestLogWriter, new_request_id, queue_request_log, unix_millis,
+    Billing, RequestLogDraft, RequestLogWriter, new_request_id, protocol_name, queue_request_log,
+    unix_millis,
 };
-use super::network::{OutboundClients, validate_target};
+use super::network::{NetworkPolicy, OutboundClients};
 use super::rate_limit::{RequestRateLimiter, SessionStickyCache};
 use super::rectifier;
 use super::sse::{
@@ -75,14 +77,24 @@ pub struct Deps {
     pub(super) sticky: SessionStickyCache,
     pub(super) key_cooldowns: KeyCooldowns,
     pub(super) request_log_writer: RequestLogWriter,
+    /// 进程级活动请求上限；permit 覆盖 provider 调用、下游断连处理和结算入队。
+    pub(super) active_requests: Arc<Semaphore>,
 }
 
 /// 组装网关路由。`snapshot` 为已加载的运行时资源快照句柄，请求路径从其中读取
 /// 当前资源；管理 API 写库后可原子替换该快照使新资源即时生效。
 pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
+    router_with_writer(pool.clone(), snapshot, RequestLogWriter::start(pool)).await
+}
+
+/// 组装网关路由并注入请求日志写入器。
+pub async fn router_with_writer(
+    pool: SqlitePool,
+    snapshot: SnapshotHandle,
+    request_log_writer: RequestLogWriter,
+) -> Router {
     // 不设客户端级 timeout：reqwest 的 timeout 覆盖到响应体读完，会截断长流式
     // 响应；超时统一按渠道在请求级施加（非流式 `.timeout`，流式仅约束到响应头）。
-    let request_log_writer = RequestLogWriter::start(pool.clone());
     let deps = Deps {
         pool,
         outbound_clients: OutboundClients::new(),
@@ -92,6 +104,7 @@ pub async fn router(pool: SqlitePool, snapshot: SnapshotHandle) -> Router {
         sticky: SessionStickyCache::new(),
         key_cooldowns: KeyCooldowns::new(),
         request_log_writer,
+        active_requests: Arc::new(Semaphore::new(128)),
     };
 
     // 禁用 axum 默认的 2MB 请求体上限：入站上限来自运行时开关 `max_request_bytes`，
@@ -215,6 +228,7 @@ async fn list_models_for(
     let request_id = new_request_id();
     if deps.auth_throttle.is_blocked(
         peer,
+        extract_key(&headers).as_deref(),
         snapshot.auth_throttle_max_failures,
         snapshot.auth_throttle_window(),
     ) {
@@ -237,6 +251,7 @@ async fn list_models_for(
         Err(err) => {
             deps.auth_throttle.record_failure(
                 peer,
+                extract_key(&headers).as_deref(),
                 snapshot.auth_throttle_max_failures,
                 snapshot.auth_throttle_window(),
             );
@@ -269,6 +284,7 @@ async fn list_models_for(
         )
         .await;
     }
+
     let ids = if snapshot.token_group_assigned(token) {
         store::resources::visible_model_ids(
             &snapshot.model_groups,
@@ -373,12 +389,12 @@ async fn take_upstream_body(
     }
 }
 
-/// 上游响应超过 `max_response_bytes`：可换渠道重试，不把超大体读进内存。
+/// 上游响应超过 `max_response_bytes`：这是本请求与当前策略共同决定的终局结果，
+/// 重试只会重新下载同一份超限内容，因此直接终止并保留明确归因。
 fn oversized_upstream_response(channel: &str, max_bytes: u64) -> Outbound {
-    Outbound::Retryable {
+    Outbound::Fatal {
         channel: channel.to_string(),
-        status: None,
-        retry_after: None,
+        status: 502,
         message: format!("上游响应超过上限 {max_bytes} 字节"),
     }
 }
@@ -423,6 +439,10 @@ async fn handle_request(
     // 协议模型名与流式标志都在请求体上，传 `None`。
     path_model: Option<(String, bool)>,
 ) -> Response {
+    const REQUEST_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now()
+        .checked_add(REQUEST_TOTAL_TIMEOUT)
+        .unwrap_or_else(tokio::time::Instant::now);
     let started = unix_millis();
     let request_id = new_request_id();
     // 准入时刻抓取快照引用：在途请求持有该引用直到结束，不受后续原子替换影响。
@@ -437,6 +457,7 @@ async fn handle_request(
     // 最多 `max_request_bytes` 的内存，也让失败计数不必等 body 读完。
     if deps.auth_throttle.is_blocked(
         peer,
+        extract_key(&headers).as_deref(),
         snapshot.auth_throttle_max_failures,
         snapshot.auth_throttle_window(),
     ) {
@@ -459,6 +480,7 @@ async fn handle_request(
         Err(err) => {
             deps.auth_throttle.record_failure(
                 peer,
+                extract_key(&headers).as_deref(),
                 snapshot.auth_throttle_max_failures,
                 snapshot.auth_throttle_window(),
             );
@@ -643,163 +665,49 @@ async fn handle_request(
         }
     };
 
-    // 5. 计费准入：用户钱包与令牌累计上限须通过（单价按实际跳在出站时选用）。
-    //
-    // 折扣率在准入时从当前用户所挂套餐取出；免费档（bp=0）不要求余额为正，
-    // 粗估也按折后金额比对，避免被原价门槛挡住。
-    let discount_bp = snapshot.discount_bp_for_token(token);
-    let mut conn = match deps.pool.acquire().await {
-        Ok(conn) => conn,
-        Err(err) => {
-            return db_error_response(
-                &deps,
-                full_body,
-                token,
-                &request.model,
-                started,
-                err,
-                inbound_protocol,
-                request_body_for_log,
-                &request_id,
-            )
-            .await;
-        }
-    };
-    // 剩余在用户钱包：建行发生在创建用户/令牌时，准入只读、不写。
-    // 令牌或钱包缺失视为 0，由后续 402 挡住，不在热路径 INSERT。
-    let balance = match store::get_admission_snapshot(&mut conn, &token.token_key).await {
-        Ok(Some(snapshot)) => snapshot,
-        Ok(None) => store::AdmissionSnapshot {
-            wallet: store::UserWallet {
-                balance_usd_micros: 0,
-                settled_usd_micros: 0,
-            },
-            token: store::TokenSettlement {
-                settled_usd_micros: 0,
-            },
-        },
-        Err(err) => {
-            return db_error_response(
-                &deps,
-                full_body,
-                token,
-                &request.model,
-                started,
-                err,
-                inbound_protocol,
-                request_body_for_log,
-                &request_id,
-            )
-            .await;
-        }
-    };
-    if balance.wallet.balance_usd_micros <= 0 && discount_bp != 0 {
-        let message = format!(
-            "用户余额不足（当前 {:.2} USD）",
-            balance.wallet.balance_usd_micros as f64 / 1_000_000.0
-        );
-        return error_response(
-            StatusCode::PAYMENT_REQUIRED,
-            &message,
-            &deps,
-            full_body,
-            Some(token),
-            Some(&request.model),
-            started,
-            inbound_protocol,
-            request_body_for_log,
-            &request_id,
-        )
-        .await;
-    }
-    if let Some(limit) = token.limit_usd_micros
-        && balance.token.settled_usd_micros >= limit
-    {
-        let message = format!(
-            "令牌 {} 累计结算已超上限（limit_usd_micros = {limit}）",
-            token.name
-        );
-        return error_response(
-            StatusCode::PAYMENT_REQUIRED,
-            &message,
-            &deps,
-            full_body,
-            Some(token),
-            Some(&request.model),
-            started,
-            inbound_protocol,
-            request_body_for_log,
-            &request_id,
-        )
-        .await;
-    }
-    if let Some(max_tokens) = request.max_tokens.filter(|&n| n > 0) {
-        let estimate =
-            match estimate_admission_cost_micros(&hops, &snapshot, discount_bp, max_tokens) {
-                Ok(estimate) => estimate,
-                Err(err) => {
-                    return billing_error_response(
-                        &deps,
-                        full_body,
-                        token,
-                        &request.model,
-                        started,
-                        err,
-                        inbound_protocol,
-                        request_body_for_log,
-                        &request_id,
-                    )
-                    .await;
-                }
-            };
-        if discount_bp != 0 && estimate > balance.wallet.balance_usd_micros {
-            let message = format!(
-                "用户余额不足以覆盖预估费用（预估 {:.2} USD，当前 {:.2} USD）",
-                estimate as f64 / 1_000_000.0,
-                balance.wallet.balance_usd_micros as f64 / 1_000_000.0
-            );
-            return error_response(
-                StatusCode::PAYMENT_REQUIRED,
-                &message,
-                &deps,
-                full_body,
-                Some(token),
-                Some(&request.model),
-                started,
-                inbound_protocol,
-                request_body_for_log,
-                &request_id,
-            )
-            .await;
-        }
-        if let Some(limit) = token.limit_usd_micros
-            && balance.token.settled_usd_micros.saturating_add(estimate) > limit
+    // 5. 活动请求容量与 RPM 是两类独立约束：RPM 控制时间窗口内的请求数，
+    // Semaphore 控制同时占用 provider、下游响应和结算资源的请求数。等待使用
+    // 本请求的绝对截止时间，避免排队后又重新获得完整的 provider 超时预算。
+    let active_permit =
+        match tokio::time::timeout_at(deadline, deps.active_requests.clone().acquire_owned()).await
         {
-            let message = format!(
-                "令牌 {} 预估费用将超过累计结算上限（limit_usd_micros = {limit}）",
-                token.name
-            );
-            return error_response(
-                StatusCode::PAYMENT_REQUIRED,
-                &message,
-                &deps,
-                full_body,
-                Some(token),
-                Some(&request.model),
-                started,
-                inbound_protocol,
-                request_body_for_log,
-                &request_id,
-            )
-            .await;
-        }
-    }
-    // 准入连接只服务余额读取；last_used 在落日志提交后尽力刷新。
-    drop(conn);
+            Ok(Ok(permit)) => Arc::new(Mutex::new(Some(permit))),
+            Ok(Err(_)) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "网关活动请求容量已关闭",
+                    &deps,
+                    full_body,
+                    Some(token),
+                    None,
+                    started,
+                    inbound_protocol,
+                    request_body_for_log,
+                    &request_id,
+                )
+                .await;
+            }
+            Err(_) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "网关活动请求容量暂时已满",
+                    &deps,
+                    full_body,
+                    Some(token),
+                    None,
+                    started,
+                    inbound_protocol,
+                    request_body_for_log,
+                    &request_id,
+                )
+                .await;
+            }
+        };
 
     let inbound_anthropic_version = headers.get("anthropic-version");
 
-    // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。
+    // 6. 出站：按跳顺序一次一条；该跳内再走渠道路由。费用在每次实际调用
+    // provider 前按当次渠道价格原子预留，重试和渠道切换各自拥有独立结算身份。
     //
     // 同渠道 failover 由 `run_failover` 处理（429/5xx 可重试，其它 4xx 为 Fatal
     // 立即返回）。统一模型 hop 之间：400 视为请求本身有问题，不再打后续成员；
@@ -821,6 +729,8 @@ async fn handle_request(
             &headers,
             &request_id,
             &session_identity,
+            active_permit.clone(),
+            deadline,
         )
         .await;
         if response.status().is_success() {
@@ -946,25 +856,51 @@ fn billed_price(snapshot: &RuntimeSnapshot, record: &ChannelRecord, model: &str)
         .expect("准入已过滤无价格渠道")
 }
 
-/// 候选跳里最高的 output 单价 × `max_tokens`，再按折扣率折成实收，挡住极端输出上限。
-fn estimate_admission_cost_micros(
-    hops: &[RouteHop],
-    snapshot: &RuntimeSnapshot,
+/// 用完整 IR 请求的序列化大小和保守输出上限估算一次实际出站尝试的费用。
+///
+/// IR 序列化包含消息、工具定义、JSON Schema、provider options 及所有类型化
+/// 请求字段，因此不会因转换路径遗漏工具或逃生舱而低估输入。UTF-8 字节数是
+/// 无 tokenizer 时可验证的保守上界；输入相关的多个价格档取最高单价，避免
+/// 把同一份输入字节重复计入缓存读取、缓存写入和 1h 写入。实际 usage 结算
+/// 后会释放未使用空间。
+fn estimate_attempt_cost_micros(
+    price: PriceSnapshot,
     discount_bp: i64,
-    max_tokens: u32,
-) -> Result<i64, billing::Error> {
-    let mut max_output = 0i64;
-    for hop in hops {
-        for index in &hop.route.channel_indices {
-            let price = billed_price(snapshot, &snapshot.channels[*index], &hop.routed_model);
-            if price.output_micros < 0 {
-                return Err(billing::Error::NegativePrice);
-            }
-            max_output = max_output.max(price.output_micros);
-        }
+    request: &ChatRequest,
+) -> Result<i64, String> {
+    const DEFAULT_OUTPUT_RESERVATION_TOKENS: u32 = 32_768;
+    let max_output_tokens = request
+        .max_tokens
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(DEFAULT_OUTPUT_RESERVATION_TOKENS);
+    let input_tokens = serde_json::to_vec(request)
+        .map_err(|err| format!("请求无法序列化以估算费用: {err}"))?
+        .len() as u64;
+    let mut input_price = price.input_micros;
+    if price.cache_read_micros > input_price {
+        input_price = price.cache_read_micros;
     }
-    let base = billing::estimate_max_output_cost_micros(max_tokens, max_output)?;
+    if price.cache_write_micros > input_price {
+        input_price = price.cache_write_micros;
+    }
+    if price.cache_write_1h_micros > input_price {
+        input_price = price.cache_write_1h_micros;
+    }
+    let base = billing::cost_micros(
+        &Usage {
+            input_tokens,
+            output_tokens: u64::from(max_output_tokens),
+            ..Usage::default()
+        },
+        &PriceSnapshot {
+            input_micros: input_price,
+            output_micros: price.output_micros,
+            ..PriceSnapshot::default()
+        },
+    )
+    .map_err(|err| format!("保守费用无法计算: {err}"))?;
     billing::discounted_cost_micros(base, discount_bp)
+        .map_err(|err| format!("折后保守费用无法计算: {err}"))
 }
 
 /// 解析本次请求的出站跳序列。
@@ -1113,6 +1049,237 @@ struct OutboundCall<'a> {
     request_id: &'a str,
     /// 按调用者隔离的会话缓存标识，供出站缓存亲和使用。
     session_identity: &'a str,
+    /// 由请求入口持有的活动容量许可；流式路径会把所有权转交给后台流水任务。
+    active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    /// 从入站开始计算的绝对截止时刻；重试、退避与响应读取共享同一预算。
+    deadline: tokio::time::Instant,
+}
+
+/// 一次即将发出的 provider 调用所需的账务与日志依赖。
+struct BillingAttemptStart<'a> {
+    deps: &'a Deps,
+    snapshot: &'a Arc<RuntimeSnapshot>,
+    request_id: &'a str,
+    request: &'a ChatRequest,
+    token: &'a Token,
+    routed_model: &'a str,
+    channel: &'a Channel,
+    channel_key: &'a StoredChannelKey,
+    started: i64,
+    price: PriceSnapshot,
+    inbound_protocol: Protocol,
+    request_body: Option<Bytes>,
+    /// 请求级绝对截止时刻；出站响应读取与结果持久化共享同一预算。
+    deadline: tokio::time::Instant,
+}
+
+/// 已持久化、等待进入出站阶段的一次物理尝试。
+///
+/// 创建成功后由调用方标记是否真正出站；进入出站后只能通过结果入队消费预留，
+/// 未进入出站时仍可释放。成功响应由调用路径使用 `attempt_id` 入队；失败响应
+/// 通过本类型的记录方法入队，使所有终止分支都消费同一条预留。
+struct BillingAttempt<'a> {
+    attempt_id: String,
+    start: BillingAttemptStart<'a>,
+}
+
+impl BillingAttempt<'_> {
+    fn id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    /// 在真正开始发送请求前标记物理尝试。
+    ///
+    /// 预留建立与 provider 发送之间存在一个取消窗口；只有发送即将开始时
+    /// 才把尝试转为 dispatched。标记失败时仍可释放未派发预留，避免把本地
+    /// 数据库故障误记成已经产生上游费用。
+    async fn mark_dispatched(&self) -> Result<(), Outbound> {
+        let mark_result = tokio::time::timeout_at(
+            self.start.deadline,
+            store::mark_billing_attempt_dispatched(&self.start.deps.pool, &self.attempt_id),
+        )
+        .await;
+        let mark_error = match mark_result {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => err.to_string(),
+            Err(_) => "计费尝试标记出站状态超时".to_string(),
+        };
+        match tokio::time::timeout_at(
+            self.start.deadline,
+            store::release_billing_attempt(&self.start.deps.pool, &self.attempt_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(release_error)) => tracing::error!(
+                error = %release_error,
+                attempt_id = %self.attempt_id,
+                "未派发的计费预留无法释放"
+            ),
+            Err(_) => tracing::error!(
+                attempt_id = %self.attempt_id,
+                "未派发的计费预留释放超时"
+            ),
+        }
+        Err(Outbound::Fatal {
+            channel: self.start.channel.name.clone(),
+            status: 500,
+            message: format!("计费尝试无法进入出站状态: {mark_error}"),
+        })
+    }
+
+    /// 记录一个已经发出的尝试的失败结果。未提供 usage 时按该尝试的保守预留结算。
+    async fn record_failure(
+        &self,
+        status: u16,
+        response_body: Option<Vec<u8>>,
+        usage: Option<Usage>,
+        outcome: Outbound,
+    ) -> Outbound {
+        let usage_reported = usage.is_some();
+        let billing = Billing::calculated(
+            usage.unwrap_or_default(),
+            usage_reported,
+            self.start.price,
+            self.start.snapshot.discount_bp_for_token(self.start.token),
+            self.start.request_body.clone(),
+            self.start
+                .snapshot
+                .full_body
+                .then_some(response_body)
+                .flatten(),
+        );
+        match queue_request_log(
+            self.start.deps,
+            RequestLogDraft {
+                token: self.start.token,
+                model: &self.start.request.model,
+                outbound_model: outbound_model_for_log(self.start.channel, self.start.routed_model),
+                channel: &self.start.channel.name,
+                channel_key: Some(&self.start.channel_key.name),
+                status,
+                started: self.start.started,
+                billing,
+                inbound_protocol: self.start.inbound_protocol,
+                request_id: self.start.request_id,
+                billing_attempt_id: Some(&self.attempt_id),
+                deadline: Some(self.start.deadline),
+            },
+        )
+        .await
+        {
+            Ok(()) => outcome,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    attempt_id = %self.attempt_id,
+                    "出站尝试结果无法立即持久化，将由恢复任务继续处理"
+                );
+                outcome
+            }
+        }
+    }
+}
+
+/// 为一次即将发出的 provider 调用建立独立计费身份并冻结额度。
+///
+/// 预留只在目标地址和出站请求已经构造完成后创建；因此地址校验、协议编码等
+/// 本地失败不会占用额度。标记为已发出后，调用方无论收到响应、网络错误还是
+/// 超时，都必须把同一个 `attempt_id` 随结果写入持久化队列，禁止走释放路径。
+async fn begin_billing_attempt(
+    start: BillingAttemptStart<'_>,
+) -> Result<BillingAttempt<'_>, Outbound> {
+    let discount_bp = start.snapshot.discount_bp_for_token(start.token);
+    let reserved_cost = estimate_attempt_cost_micros(start.price, discount_bp, start.request)
+        .map_err(|err| Outbound::Fatal {
+            channel: start.channel.name.clone(),
+            status: 500,
+            message: err,
+        })?;
+    let recovery_metadata = serde_json::to_vec(&store::BillingAttemptRecovery {
+        token_name: start.token.name.clone(),
+        model: start.request.model.clone(),
+        outbound_model: outbound_model_for_log(start.channel, start.routed_model)
+            .map(str::to_string),
+        channel: start.channel.name.clone(),
+        channel_key: Some(start.channel_key.name.clone()),
+        inbound_protocol: protocol_name(start.inbound_protocol).to_string(),
+        started: start.started,
+        price: start.price,
+        discount_bp,
+        request_body: start.request_body.as_ref().map(|body| body.to_vec()),
+        result: None,
+        result_settlement_error: None,
+    })
+    .map_err(|err| Outbound::Fatal {
+        channel: start.channel.name.clone(),
+        status: 500,
+        message: format!("计费恢复元数据无法编码: {err}"),
+    })?;
+    let attempt_id = new_request_id();
+    let reserved = tokio::time::timeout_at(
+        start.deadline,
+        store::reserve_billing_attempt(
+            &start.deps.pool,
+            store::BillingAttemptReservation {
+                attempt_id: &attempt_id,
+                request_id: start.request_id,
+                token_key: &start.token.token_key,
+                user_id: start.token.user_id,
+                cost_usd_micros: reserved_cost,
+                token_limit_usd_micros: start.token.limit_usd_micros,
+                recovery_metadata: &recovery_metadata,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| Outbound::Fatal {
+        channel: start.channel.name.clone(),
+        status: 504,
+        message: "计费预留持久化超时".to_string(),
+    })?
+    .map_err(|err| Outbound::Fatal {
+        channel: start.channel.name.clone(),
+        status: 500,
+        message: format!("计费预留无法持久化: {err}"),
+    })?;
+    if !reserved {
+        return Err(Outbound::Fatal {
+            channel: start.channel.name.clone(),
+            status: 402,
+            message: "余额或令牌累计上限不足以覆盖本次出站尝试".to_string(),
+        });
+    }
+    Ok(BillingAttempt { attempt_id, start })
+}
+
+/// 从一次出站调用上下文构造物理尝试账务记录。
+///
+/// 所有协议路径都经过这个组合点创建预留，保证请求标识、用户归属、价格快照
+/// 和恢复元数据的字段保持一致；具体发送时机仍由调用方显式标记 dispatched。
+async fn begin_attempt_for_call<'a>(
+    ctx: &'a OutboundCall<'a>,
+    request: &'a ChatRequest,
+    channel: &'a Channel,
+    key: &'a StoredChannelKey,
+    price: PriceSnapshot,
+) -> Result<BillingAttempt<'a>, Outbound> {
+    begin_billing_attempt(BillingAttemptStart {
+        deps: ctx.deps,
+        snapshot: ctx.snapshot,
+        request_id: ctx.request_id,
+        request,
+        token: ctx.token,
+        routed_model: ctx.routed_model,
+        channel,
+        channel_key: key,
+        started: ctx.started,
+        price,
+        inbound_protocol: ctx.inbound_protocol,
+        request_body: ctx.request_body.clone(),
+        deadline: ctx.deadline,
+    })
+    .await
 }
 
 /// 按一条跳的渠道路由发起出站：直通或 IR，遇可重试错误在该跳内 failover。
@@ -1131,6 +1298,8 @@ async fn dispatch_hop(
     inbound_headers: &HeaderMap,
     request_id: &str,
     session_identity: &str,
+    active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    deadline: tokio::time::Instant,
 ) -> Response {
     let hop_dispatch = HopDispatch {
         deps,
@@ -1146,6 +1315,8 @@ async fn dispatch_hop(
         inbound_headers,
         request_id,
         session_identity,
+        active_permit,
+        deadline,
     };
     hop_with_failover(&hop_dispatch, &hop.route).await
 }
@@ -1173,6 +1344,10 @@ struct HopDispatch<'a> {
     request_id: &'a str,
     /// 按调用者隔离的会话缓存标识，供出站缓存亲和使用。
     session_identity: &'a str,
+    /// 活动请求 permit 的所有权容器；流式任务创建后从此处取走并持有到结算结束。
+    active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    /// 整个下游请求的绝对截止时刻，不因切换渠道或密钥而重置。
+    deadline: tokio::time::Instant,
 }
 
 impl<'a> HopDispatch<'a> {
@@ -1181,6 +1356,9 @@ impl<'a> HopDispatch<'a> {
     fn channel_is_passthrough(&self, record: &ChannelRecord) -> bool {
         record.channel.protocol == self.inbound_protocol
             && routing::outbound_model(&record.channel, self.routed_model) == self.request.model
+            // Responses 的 failed/incomplete 终态需要转换为网关错误语义；流式
+            // 直通无法在已发送响应头后改变状态，因此统一走 IR 路径处理。
+            && !(self.request.stream && record.channel.protocol == Protocol::OpenAiResponses)
     }
 }
 
@@ -1217,6 +1395,8 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
                         inbound_headers: ctx.inbound_headers,
                         request_id: ctx.request_id,
                         session_identity: ctx.session_identity,
+                        active_permit: ctx.active_permit.clone(),
+                        deadline: ctx.deadline,
                     };
                     if ctx.request.stream {
                         stream_completion(&mut call_ctx, ctx.request, &record.channel, key, true)
@@ -1234,48 +1414,12 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
                 }
             })
         },
-        |channel, status, _failover, body_wire, key_name| {
-            let outbound_model = outbound_model_for_channel_name(
-                route,
-                &ctx.snapshot.channels,
-                channel,
-                ctx.routed_model,
-            )
-            .map(str::to_string);
-            let channel = channel.to_string();
-            let channel_key = (!key_name.is_empty()).then(|| key_name.to_string());
-            let request_body = ctx.request_body.clone();
-            let response_body = ctx.snapshot.full_body.then(|| body_wire.to_vec());
-            let request_id = ctx.request_id.to_string();
-            Box::pin(async move {
-                let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
-                let _ = queue_request_log(
-                    ctx.deps,
-                    RequestLogDraft {
-                        token: ctx.token,
-                        model: &ctx.request.model,
-                        outbound_model: outbound_model.as_deref(),
-                        channel: &channel,
-                        channel_key: channel_key.as_deref(),
-                        status,
-                        started: ctx.started,
-                        billing: Billing {
-                            discount_bp,
-                            request_body,
-                            response_body,
-                            ..Default::default()
-                        },
-                        inbound_protocol: ctx.inbound_protocol,
-                        request_id: &request_id,
-                    },
-                )
-                .await;
-            })
-        },
+        |_channel, _status, _failover, _body_wire, _key_name| Box::pin(async {}),
         FailoverPolicy {
             inbound_protocol: ctx.inbound_protocol,
             retry_backoff: retry_backoff(ctx.snapshot),
             key_cooldowns: &ctx.deps.key_cooldowns,
+            deadline: ctx.deadline,
         },
     )
     .await
@@ -1295,7 +1439,11 @@ async fn passthrough_stream_completion(
     let outbound = passthrough_patch_request(ctx.raw_body, true, channel.protocol);
     // 直通的前提是出站模型名与入站一致，URL 路径上的模型名无需改写。
     let upstream_url = passthrough_upstream_url(channel, &ctx.request.model, true);
-    if let Err(err) = validate_target(&upstream_url, ctx.snapshot.allow_private_networks) {
+    let network_policy = NetworkPolicy::new(
+        ctx.snapshot.allow_private_networks,
+        &ctx.snapshot.private_network_allowlist,
+    );
+    if let Err(err) = network_policy.validate_target(&upstream_url) {
         return Outbound::Retryable {
             channel: channel.name.clone(),
             status: None,
@@ -1304,11 +1452,39 @@ async fn passthrough_stream_completion(
         };
     }
 
+    let price = billed_price(ctx.snapshot, record, ctx.routed_model);
+    let billing_attempt_id = match begin_billing_attempt(BillingAttemptStart {
+        deps: ctx.deps,
+        snapshot: ctx.snapshot,
+        request_id: ctx.request_id,
+        request: ctx.request,
+        token: ctx.token,
+        routed_model: ctx.routed_model,
+        channel,
+        channel_key: key,
+        started: ctx.started,
+        price,
+        inbound_protocol: ctx.inbound_protocol,
+        request_body: ctx.request_body.clone(),
+        deadline: ctx.deadline,
+    })
+    .await
+    {
+        Ok(attempt) => attempt,
+        Err(outbound) => return outbound,
+    };
+
+    if let Err(outbound) = billing_attempt_id.mark_dispatched().await {
+        return outbound;
+    }
     let upstream = tokio::time::timeout(
-        Duration::from_millis(channel.timeout_ms),
+        remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
         ctx.deps
             .outbound_clients
-            .for_policy(ctx.snapshot.allow_private_networks)
+            .for_policy(
+                &network_policy,
+                network_policy.target_allowlisted(&upstream_url),
+            )
             .post(&upstream_url)
             .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
@@ -1321,81 +1497,150 @@ async fn passthrough_stream_completion(
     let resp = match upstream {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "直通流式上游不可达".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    502,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "直通流式上游不可达".to_string(),
+                    },
+                )
+                .await;
         }
         Err(_) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "直通流式上游响应超时".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    504,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "直通流式上游响应超时".to_string(),
+                    },
+                )
+                .await;
         }
     };
 
     let status_code = resp.status().as_u16();
     if !resp.status().is_success() {
         let retry_after = parse_retry_after(resp.headers());
-        let upstream_body = match take_upstream_body(
-            resp,
-            &channel.name,
-            ctx.snapshot.max_response_bytes,
-            "直通流式上游读体失败",
+        let upstream_body = match tokio::time::timeout(
+            remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
+            take_upstream_body(
+                resp,
+                &channel.name,
+                ctx.snapshot.max_response_bytes,
+                "直通流式上游读体失败",
+            ),
         )
         .await
         {
             Ok(body) => body,
-            Err(outbound) => return outbound,
+            Err(_) => {
+                return billing_attempt_id
+                    .record_failure(
+                        504,
+                        None,
+                        None,
+                        Outbound::Retryable {
+                            channel: channel.name.clone(),
+                            status: None,
+                            retry_after: None,
+                            message: "直通流式上游读体超时".to_string(),
+                        },
+                    )
+                    .await;
+            }
+        };
+        let upstream_body = match upstream_body {
+            Ok(body) => body,
+            Err(outbound) => {
+                return billing_attempt_id
+                    .record_failure(502, None, None, outbound)
+                    .await;
+            }
         };
         let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
+        let reported_usage = protocol::sniff_usage(&parsed, channel.protocol);
         if is_retryable_status(status_code) {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: Some(status_code),
-                retry_after,
-                message: "上游返回可重试错误".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    status_code,
+                    Some(upstream_body.to_vec()),
+                    reported_usage.clone(),
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: Some(status_code),
+                        retry_after,
+                        message: "上游返回可重试错误".to_string(),
+                    },
+                )
+                .await;
         }
-        return Outbound::Fatal {
-            channel: channel.name.clone(),
-            status: status_code,
-            message: upstream_error_message(&parsed, status_code),
-        };
+        return billing_attempt_id
+            .record_failure(
+                status_code,
+                Some(upstream_body.to_vec()),
+                reported_usage,
+                Outbound::Fatal {
+                    channel: channel.name.clone(),
+                    status: status_code,
+                    message: upstream_error_message(&parsed, status_code),
+                },
+            )
+            .await;
     }
 
     // 与 IR 流式路径保持相同的首帧语义：在向下游返回响应前先检查流内错误、
     // 空流与首帧超时。这样 200 + overloaded_error 也能在首字节前切换渠道。
     let idle = channel_idle(channel.timeout_ms);
     let byte_stream: UpstreamByteStream = Box::pin(resp.bytes_stream());
-    let (peek, byte_stream) = peek_passthrough_stream_head(
+    let (peek, byte_stream) = peek_passthrough_stream_head_until(
         byte_stream,
         channel.protocol,
         idle,
         ctx.snapshot.sse_reassembly_max(),
+        ctx.deadline,
     )
     .await;
     let peeked = match peek {
         PassthroughPeek::Content(chunks) => chunks,
         PassthroughPeek::UpstreamError(message) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: format!("上游流内错误：{message}"),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    502,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: format!("上游流内错误：{message}"),
+                    },
+                )
+                .await;
         }
         PassthroughPeek::Interrupted(reason) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: reason,
-            };
+            return billing_attempt_id
+                .record_failure(
+                    504,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: reason,
+                    },
+                )
+                .await;
         }
     };
 
@@ -1410,12 +1655,19 @@ async fn passthrough_stream_completion(
         channel_key_name: key.name.clone(),
         status_code,
         started: ctx.started,
-        price: billed_price(ctx.snapshot, record, ctx.routed_model),
+        price,
         protocol: channel.protocol,
         request_body: ctx.request_body.clone(),
         response_body: Vec::new(),
         request_id: ctx.request_id.to_string(),
+        billing_attempt_id: billing_attempt_id.attempt_id,
         peeked,
+        _active_permit: ctx
+            .active_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
+        deadline: ctx.deadline,
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
     tokio::spawn(async move {
@@ -1446,7 +1698,11 @@ async fn passthrough_non_stream_completion(
     let channel = &record.channel;
     let outbound = passthrough_patch_request(ctx.raw_body, false, channel.protocol);
     let upstream_url = passthrough_upstream_url(channel, &ctx.request.model, false);
-    if let Err(err) = validate_target(&upstream_url, ctx.snapshot.allow_private_networks) {
+    let network_policy = NetworkPolicy::new(
+        ctx.snapshot.allow_private_networks,
+        &ctx.snapshot.private_network_allowlist,
+    );
+    if let Err(err) = network_policy.validate_target(&upstream_url) {
         return Outbound::Retryable {
             channel: channel.name.clone(),
             status: None,
@@ -1455,11 +1711,39 @@ async fn passthrough_non_stream_completion(
         };
     }
 
+    let price = billed_price(ctx.snapshot, record, ctx.routed_model);
+    let billing_attempt_id = match begin_billing_attempt(BillingAttemptStart {
+        deps: ctx.deps,
+        snapshot: ctx.snapshot,
+        request_id: ctx.request_id,
+        request: ctx.request,
+        token: ctx.token,
+        routed_model: ctx.routed_model,
+        channel,
+        channel_key: key,
+        started: ctx.started,
+        price,
+        inbound_protocol: ctx.inbound_protocol,
+        request_body: ctx.request_body.clone(),
+        deadline: ctx.deadline,
+    })
+    .await
+    {
+        Ok(attempt) => attempt,
+        Err(outbound) => return outbound,
+    };
+
+    if let Err(outbound) = billing_attempt_id.mark_dispatched().await {
+        return outbound;
+    }
     let upstream = tokio::time::timeout(
-        Duration::from_millis(channel.timeout_ms),
+        remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
         ctx.deps
             .outbound_clients
-            .for_policy(ctx.snapshot.allow_private_networks)
+            .for_policy(
+                &network_policy,
+                network_policy.target_allowlisted(&upstream_url),
+            )
             .post(&upstream_url)
             .apply_outbound_auth_with_version(channel.protocol, key, ctx.inbound_anthropic_version)
             .apply_feature_headers(ctx.inbound_headers)
@@ -1472,20 +1756,34 @@ async fn passthrough_non_stream_completion(
     let resp = match upstream {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "直通非流式上游不可达".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    502,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "直通非流式上游不可达".to_string(),
+                    },
+                )
+                .await;
         }
         Err(_) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "直通非流式上游响应超时".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    504,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "直通非流式上游响应超时".to_string(),
+                    },
+                )
+                .await;
         }
     };
 
@@ -1500,55 +1798,100 @@ async fn passthrough_non_stream_completion(
     let idle = channel_idle(channel.timeout_ms);
     let max_bytes = ctx.snapshot.max_response_bytes;
     let upstream_body = match tokio::time::timeout(
-        idle,
+        remaining_timeout(ctx.deadline, idle),
         take_upstream_body(resp, &channel.name, max_bytes, "直通非流式上游读体失败"),
     )
     .await
     {
         Ok(Ok(body)) => body,
-        Ok(Err(outbound)) => return outbound,
+        Ok(Err(outbound)) => {
+            return billing_attempt_id
+                .record_failure(502, None, None, outbound)
+                .await;
+        }
         Err(_) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "直通非流式上游读体超时".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    504,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "直通非流式上游读体超时".to_string(),
+                    },
+                )
+                .await;
         }
     };
     let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
+    let reported_usage = protocol::sniff_usage(&parsed, channel.protocol);
 
-    if is_success {
-        // 响应体原样透传（字节级一致），从 JSON 嗅探 usage 计费。
-        let usage = protocol::sniff_usage(&parsed, channel.protocol).unwrap_or_default();
-        let price = billed_price(ctx.snapshot, record, ctx.routed_model);
+    let response_failed = is_success
+        && channel.protocol == Protocol::OpenAiResponses
+        && crate::core::openai_responses::response_is_failed(&parsed);
+    if response_failed {
+        // Responses 可用 HTTP 2xx 承载失败对象；直通时也要转换成明确的
+        // 网关错误，否则调用方会把失败响应当成成功结果继续处理。
+        let returned_status = StatusCode::BAD_GATEWAY;
+        let inbound = protocol::encode_error(
+            returned_status.as_u16(),
+            &upstream_error_message(&parsed, returned_status.as_u16()),
+            ctx.inbound_protocol,
+        );
         let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
-        let billing = match Billing::try_calculated(
+        let billing = Billing::calculated(
+            reported_usage.clone().unwrap_or_default(),
+            reported_usage.is_some(),
+            price,
+            discount_bp,
+            ctx.request_body.clone(),
+            ctx.snapshot
+                .full_body
+                .then(|| serde_json::to_vec(&inbound).unwrap_or_default()),
+        );
+        if let Err(err) = queue_request_log(
+            ctx.deps,
+            RequestLogDraft {
+                token: ctx.token,
+                model: &ctx.request.model,
+                outbound_model: outbound_model_for_log(channel, ctx.routed_model),
+                channel: &channel.name,
+                channel_key: Some(&key.name),
+                status: returned_status.as_u16(),
+                started: ctx.started,
+                billing,
+                inbound_protocol: ctx.inbound_protocol,
+                request_id: ctx.request_id,
+                billing_attempt_id: Some(billing_attempt_id.id()),
+                deadline: Some(ctx.deadline),
+            },
+        )
+        .await
+        {
+            tracing::error!(
+                error = %err,
+                attempt_id = %billing_attempt_id.id(),
+                "请求结果无法立即持久化，将由恢复任务继续处理"
+            );
+        }
+        Outbound::Success((returned_status, Json(inbound)).into_response())
+    } else if is_success {
+        // 响应体原样透传（字节级一致），从 JSON 嗅探 usage 计费。
+        let usage_reported = reported_usage.is_some();
+        let usage = reported_usage.unwrap_or_default();
+        let discount_bp = ctx.snapshot.discount_bp_for_token(ctx.token);
+        // 计费持久化与下游响应是两条独立结果：费用不可表示时原始响应仍应交付，
+        // outbox 以未结算状态保留完整计算错误，不能因是否流式而改变响应语义。
+        let billing = Billing::calculated(
             usage,
+            usage_reported,
             price,
             discount_bp,
             ctx.request_body.clone(),
             ctx.snapshot.full_body.then(|| upstream_body.to_vec()),
-        ) {
-            Ok(billing) => billing,
-            Err(err) => {
-                store::record_system_error(
-                    &ctx.deps.pool,
-                    "billing",
-                    &store::SystemLogEvent::new(
-                        "billing.calculation_failed",
-                        serde_json::json!({ "mode": "non_stream", "error": err.to_string() }),
-                        format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
-                    ),
-                )
-                .await;
-                return Outbound::Fatal {
-                    channel: channel.name.clone(),
-                    status: 500,
-                    message: "费用超出支持范围，未完成结算".to_string(),
-                };
-            }
-        };
+        );
         if let Err(err) = queue_request_log(
             ctx.deps,
             RequestLogDraft {
@@ -1562,15 +1905,17 @@ async fn passthrough_non_stream_completion(
                 billing,
                 inbound_protocol: ctx.inbound_protocol,
                 request_id: ctx.request_id,
+                billing_attempt_id: Some(billing_attempt_id.id()),
+                deadline: Some(ctx.deadline),
             },
         )
         .await
         {
-            return Outbound::Fatal {
-                channel: channel.name.clone(),
-                status: 500,
-                message: format!("请求结果无法持久化: {err}"),
-            };
+            tracing::error!(
+                error = %err,
+                attempt_id = %billing_attempt_id.id(),
+                "直通请求结果无法立即持久化，将由恢复任务继续处理"
+            );
         }
         let mut response = Response::new(Body::from(upstream_body));
         response
@@ -1578,18 +1923,32 @@ async fn passthrough_non_stream_completion(
             .insert(header::CONTENT_TYPE, content_type);
         Outbound::Success(response)
     } else if is_retryable_status(status_code) {
-        Outbound::Retryable {
-            channel: channel.name.clone(),
-            status: Some(status_code),
-            retry_after,
-            message: "上游返回可重试错误".to_string(),
-        }
+        billing_attempt_id
+            .record_failure(
+                status_code,
+                Some(upstream_body.to_vec()),
+                reported_usage.clone(),
+                Outbound::Retryable {
+                    channel: channel.name.clone(),
+                    status: Some(status_code),
+                    retry_after,
+                    message: "上游返回可重试错误".to_string(),
+                },
+            )
+            .await
     } else {
-        Outbound::Fatal {
-            channel: channel.name.clone(),
-            status: status_code,
-            message: upstream_error_message(&parsed, status_code),
-        }
+        billing_attempt_id
+            .record_failure(
+                status_code,
+                Some(upstream_body.to_vec()),
+                reported_usage,
+                Outbound::Fatal {
+                    channel: channel.name.clone(),
+                    status: status_code,
+                    message: upstream_error_message(&parsed, status_code),
+                },
+            )
+            .await
     }
 }
 
@@ -1629,7 +1988,6 @@ fn passthrough_upstream_url(channel: &Channel, model: &str, stream: bool) -> Str
 }
 
 /// 直通快路径流式请求的共享任务数据：出站目标、计费与日志所需的请求侧信息。
-#[derive(Clone)]
 struct PassthroughStreamTask {
     deps: Deps,
     snapshot: Arc<RuntimeSnapshot>,
@@ -1646,8 +2004,13 @@ struct PassthroughStreamTask {
     request_body: Option<Bytes>,
     response_body: Vec<u8>,
     request_id: String,
+    /// 本流对应的实际出站尝试；流结束后的 usage 只结算这一条预留。
+    billing_attempt_id: String,
     /// 首帧检查阶段已消费的原始字节块；流水任务先重放，再继续读取上游。
     peeked: Vec<Bytes>,
+    /// 由请求入口转移而来的活动请求 permit，流水和结算完成后自动释放。
+    _active_permit: Option<OwnedSemaphorePermit>,
+    deadline: tokio::time::Instant,
 }
 
 /// 直通流首帧检查结果。
@@ -1665,11 +2028,12 @@ enum PassthroughPeek {
 /// 直通路径不重编码响应，因此不能复用 IR 路径只保存 JSON 帧的 peek 结果；
 /// 这里保留已消费的网络块，并在流水任务开头先发送它们。检查同时受 SSE 重装
 /// 上限约束，避免上游长时间只发无法组成完整帧的字节时无限增长。
-async fn peek_passthrough_stream_head(
+async fn peek_passthrough_stream_head_until(
     byte_stream: UpstreamByteStream,
     protocol: Protocol,
     idle: Duration,
     max_bytes: usize,
+    deadline: tokio::time::Instant,
 ) -> (PassthroughPeek, UpstreamByteStream) {
     use futures_util::StreamExt as _;
 
@@ -1699,6 +2063,14 @@ async fn peek_passthrough_stream_head(
                     StreamEvent::Error { message } => {
                         return (PassthroughPeek::UpstreamError(message.clone()), byte_stream);
                     }
+                    StreamEvent::Finish { finish_reason, .. }
+                        if finish_reason.unified == crate::core::ir::FinishReasonUnified::Error =>
+                    {
+                        return (
+                            PassthroughPeek::UpstreamError("上游响应以失败状态结束".to_string()),
+                            byte_stream,
+                        );
+                    }
                     StreamEvent::Finish { .. } => content = true,
                     StreamEvent::ResponseMetadata { .. } => saw_message_start = true,
                     _ if is_content_event(event) => {
@@ -1721,7 +2093,12 @@ async fn peek_passthrough_stream_head(
             continue;
         }
 
-        match tokio::time::timeout(idle, byte_stream.as_mut().next()).await {
+        match tokio::time::timeout(
+            remaining_timeout(deadline, idle),
+            byte_stream.as_mut().next(),
+        )
+        .await
+        {
             Ok(Some(Ok(bytes))) => {
                 buffered_bytes = buffered_bytes.saturating_add(bytes.len());
                 buffer.extend_from_slice(&bytes);
@@ -1780,7 +2157,9 @@ async fn pipe_passthrough_stream<S>(
     use futures_util::StreamExt as _;
 
     let mut usage = Usage::default();
+    let mut usage_reported = false;
     let mut sse_buffer: Vec<u8> = Vec::new();
+    let mut decoder = protocol::make_decoder(ctx.protocol);
     let mut downstream_open = true;
     let mut truncated = false;
     let mut done_filter = OpenAiDoneFilter::default();
@@ -1793,7 +2172,9 @@ async fn pipe_passthrough_stream<S>(
         let chunk = if let Some(chunk) = pending.next() {
             chunk
         } else {
-            match tokio::time::timeout(idle, byte_stream.next()).await {
+            match tokio::time::timeout(remaining_timeout(ctx.deadline, idle), byte_stream.next())
+                .await
+            {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
             }
@@ -1813,6 +2194,7 @@ async fn pipe_passthrough_stream<S>(
                     ctx.snapshot.full_body,
                     log_body_max,
                     &mut ctx.response_body,
+                    ctx.deadline,
                 )
                 .await
                 {
@@ -1827,10 +2209,23 @@ async fn pipe_passthrough_stream<S>(
             if frame.is_empty() {
                 continue;
             }
-            if let Ok(value) = serde_json::from_slice::<Value>(&frame)
-                && let Some(sniffed) = protocol::sniff_usage(&value, ctx.protocol)
-            {
-                usage.union_max(sniffed);
+            if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+                if let Some(sniffed) = protocol::sniff_usage(&value, ctx.protocol) {
+                    usage_reported = true;
+                    usage.union_max(sniffed);
+                }
+                let decoded = decoder.process(&value);
+                if decoded.events.iter().any(|event| match event {
+                    StreamEvent::Error { .. } => true,
+                    StreamEvent::Finish { finish_reason, .. } => {
+                        finish_reason.unified == crate::core::ir::FinishReasonUnified::Error
+                    }
+                    _ => false,
+                }) {
+                    // 响应头已经发出后无法再改变 HTTP 状态；日志仍记录失败终态，
+                    // 避免 200 掩盖 provider 的明确失败。
+                    ctx.status_code = 502;
+                }
             }
         }
         if sse_buffer.len() > ctx.snapshot.sse_reassembly_max() {
@@ -1847,6 +2242,7 @@ async fn pipe_passthrough_stream<S>(
                 ctx.snapshot.full_body,
                 log_body_max,
                 &mut ctx.response_body,
+                ctx.deadline,
             )
             .await
             {
@@ -1864,6 +2260,7 @@ async fn pipe_passthrough_stream<S>(
             ctx.snapshot.full_body,
             log_body_max,
             &mut ctx.response_body,
+            ctx.deadline,
         )
         .await
         {
@@ -1893,6 +2290,7 @@ async fn pipe_passthrough_stream<S>(
             started: ctx.started,
             billing: Billing::calculated(
                 usage,
+                usage_reported,
                 ctx.price,
                 discount_bp,
                 ctx.request_body.clone(),
@@ -1900,6 +2298,8 @@ async fn pipe_passthrough_stream<S>(
             ),
             inbound_protocol: ctx.protocol,
             request_id: &ctx.request_id,
+            billing_attempt_id: Some(&ctx.billing_attempt_id),
+            deadline: Some(ctx.deadline),
         },
     )
     .await
@@ -1909,9 +2309,12 @@ async fn pipe_passthrough_stream<S>(
     // OpenAI 协议约定以 `data: [DONE]` 终止；Anthropic 以上游
     // message_stop 收尾，无需哨兵。
     if downstream_open && ctx.protocol == Protocol::OpenAiChat {
-        let _ = tx
-            .send(bytes::Bytes::from_static(b"data: [DONE]\n\n"))
-            .await;
+        let _ = send_before_deadline(
+            &tx,
+            bytes::Bytes::from_static(b"data: [DONE]\n\n"),
+            ctx.deadline,
+        )
+        .await;
     }
 }
 
@@ -1922,12 +2325,13 @@ async fn send_passthrough_chunk(
     full_body: bool,
     max_bytes: usize,
     response_body: &mut Vec<u8>,
+    deadline: tokio::time::Instant,
 ) -> bool {
     let response_body_len = response_body.len();
     if full_body {
         append_logged_body(response_body, &chunk, max_bytes);
     }
-    if tx.send(chunk).await.is_ok() {
+    if send_before_deadline(tx, chunk, deadline).await {
         true
     } else {
         response_body.truncate(response_body_len);
@@ -1935,10 +2339,23 @@ async fn send_passthrough_chunk(
     }
 }
 
+/// 在请求绝对截止时刻前把一帧交给下游响应通道。通道背压超过总预算时
+/// 视为下游已断开，调用方仍会继续消费上游并完成结算。
+async fn send_before_deadline<T>(
+    tx: &tokio::sync::mpsc::Sender<T>,
+    value: T,
+    deadline: tokio::time::Instant,
+) -> bool {
+    matches!(
+        tokio::time::timeout_at(deadline, tx.send(value)).await,
+        Ok(Ok(()))
+    )
+}
+
 /// 非流式出站调用单个渠道，返回可重试判定。
 ///
 /// 按渠道协议编码出站请求、调用上游、解码响应为 IR，再重编码为入站协议返回。
-/// 成功且 usage 非零才结算；失败或零输出不扣费。
+/// 已发出的尝试即使失败或缺失 usage，也由该尝试的预留金额完成结算。
 async fn non_stream_completion(
     ctx: &mut OutboundCall<'_>,
     request: &ChatRequest,
@@ -1961,9 +2378,10 @@ async fn non_stream_completion(
     let mut request_warnings = Vec::new();
     // 入站解码侧的兼容动作（如非法 arguments 兜底）随响应面回传，流式路径同。
     request_warnings.extend(request.warnings.iter().cloned());
-    let mut outbound_value = protocol::encode_request_with_reasoning(
+    let mut outbound_value = protocol::encode_request_with_model(
         request,
         channel.protocol,
+        outbound_model,
         reasoning_content,
         &mut request_warnings,
     );
@@ -1993,7 +2411,11 @@ async fn non_stream_completion(
         channel.base_url.trim_end_matches('/'),
         protocol::upstream_path(channel.protocol, outbound_model, false)
     );
-    if let Err(err) = validate_target(&upstream_url, snapshot.allow_private_networks) {
+    let network_policy = NetworkPolicy::new(
+        snapshot.allow_private_networks,
+        &snapshot.private_network_allowlist,
+    );
+    if let Err(err) = network_policy.validate_target(&upstream_url) {
         return Outbound::Retryable {
             channel: channel.name.clone(),
             status: None,
@@ -2002,11 +2424,24 @@ async fn non_stream_completion(
         };
     }
 
+    let billing_attempt_id = match begin_attempt_for_call(ctx, request, channel, key, price).await {
+        Ok(attempt) => attempt,
+        Err(outbound) => return outbound,
+    };
+    if let Err(outbound) = billing_attempt_id.mark_dispatched().await {
+        return outbound;
+    }
     let upstream = deps
         .outbound_clients
-        .for_policy(snapshot.allow_private_networks)
+        .for_policy(
+            &network_policy,
+            network_policy.target_allowlisted(&upstream_url),
+        )
         .post(&upstream_url)
-        .timeout(Duration::from_millis(channel.timeout_ms))
+        .timeout(remaining_timeout(
+            ctx.deadline,
+            channel_idle(channel.timeout_ms),
+        ))
         .apply_outbound_auth(channel.protocol, key)
         .apply_feature_headers(ctx.inbound_headers)
         .json(&outbound_value)
@@ -2016,30 +2451,60 @@ async fn non_stream_completion(
     let resp = match upstream {
         Ok(resp) => resp,
         Err(_) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "上游不可达".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    502,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "上游不可达".to_string(),
+                    },
+                )
+                .await;
         }
     };
 
     let status = resp.status();
     let status_code = status.as_u16();
     let retry_after = parse_retry_after(resp.headers());
-    let upstream_body = match take_upstream_body(
-        resp,
-        &channel.name,
-        snapshot.max_response_bytes,
-        "上游读体失败",
+    let upstream_body = match tokio::time::timeout(
+        remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
+        take_upstream_body(
+            resp,
+            &channel.name,
+            snapshot.max_response_bytes,
+            "上游读体失败",
+        ),
     )
     .await
     {
-        Ok(body) => body,
-        Err(outbound) => return outbound,
+        Ok(Ok(body)) => body,
+        Ok(Err(outbound)) => {
+            return billing_attempt_id
+                .record_failure(502, None, None, outbound)
+                .await;
+        }
+        Err(_) => {
+            return billing_attempt_id
+                .record_failure(
+                    504,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "上游读体超时".to_string(),
+                    },
+                )
+                .await;
+        }
     };
     let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
+    let reported_usage = protocol::sniff_usage(&parsed, channel.protocol);
 
     if status.is_success() {
         // 解码上游响应为 IR，结算费用，再重编码为入站协议返回。
@@ -2052,39 +2517,40 @@ async fn non_stream_completion(
                 // 请求侧转换的信息损失随响应回传，下游可感知而非莫名降级。
                 ir.warnings.extend(request_warnings);
                 let usage = &ir.usage;
+                let usage_reported = reported_usage.is_some();
                 let discount_bp = snapshot.discount_bp_for_token(token);
-                let inbound = protocol::encode_response(&ir, inbound_protocol);
+                // Responses 允许以 HTTP 2xx 承载 `status=failed`。该状态不是正常
+                // stop：保留已回报 usage 参与结算，但向下游返回明确失败，避免调用
+                // 方把空输出当成成功结果继续业务流程。
+                let response_failed = matches!(
+                    ir.finish_reason.unified,
+                    crate::core::ir::FinishReasonUnified::Error
+                );
+                let returned_status = if response_failed { 502 } else { status_code };
+                let inbound = if response_failed {
+                    protocol::encode_error(
+                        returned_status,
+                        &upstream_error_message(&parsed, returned_status),
+                        inbound_protocol,
+                    )
+                } else {
+                    protocol::encode_response(&ir, inbound_protocol)
+                };
                 // full_body 记录实际返回下游的入站响应字节（重编码结果）；
                 // 跨协议时它与上游响应体不同，不能拿上游字节顶替。
                 let inbound_wire = snapshot
                     .full_body
                     .then(|| serde_json::to_vec(&inbound).unwrap_or_default());
-                let billing = match Billing::try_calculated(
+                // 与直通及流式路径共用同一错误语义：交付 provider 结果，同时
+                // 把不可结算原因持久化隔离，避免协议模式影响调用结果。
+                let billing = Billing::calculated(
                     usage.clone(),
+                    usage_reported,
                     price,
                     discount_bp,
                     ctx.request_body.clone(),
                     inbound_wire,
-                ) {
-                    Ok(billing) => billing,
-                    Err(err) => {
-                        store::record_system_error(
-                            &deps.pool,
-                            "billing",
-                            &store::SystemLogEvent::new(
-                                "billing.calculation_failed",
-                                serde_json::json!({ "mode": "non_stream", "error": err.to_string() }),
-                                format!("非流式费用计算失败，拒绝返回成功响应: {err}"),
-                            ),
-                        )
-                        .await;
-                        return Outbound::Fatal {
-                            channel: channel.name.clone(),
-                            status: 500,
-                            message: "费用超出支持范围，未完成结算".to_string(),
-                        };
-                    }
-                };
+                );
                 if let Err(err) = queue_request_log(
                     deps,
                     RequestLogDraft {
@@ -2093,40 +2559,60 @@ async fn non_stream_completion(
                         outbound_model: Some(outbound_model),
                         channel: &channel.name,
                         channel_key: Some(&key.name),
-                        status: status_code,
+                        status: returned_status,
                         started,
                         billing,
                         inbound_protocol,
                         request_id: ctx.request_id,
+                        billing_attempt_id: Some(billing_attempt_id.id()),
+                        deadline: Some(ctx.deadline),
                     },
                 )
                 .await
                 {
-                    return Outbound::Fatal {
-                        channel: channel.name.clone(),
-                        status: 500,
-                        message: format!("请求结果无法持久化: {err}"),
-                    };
+                    tracing::error!(
+                        error = %err,
+                        attempt_id = %billing_attempt_id.id(),
+                        "请求结果无法立即持久化，将由恢复任务继续处理"
+                    );
                 }
-                Outbound::Success(Json(inbound).into_response())
+                if response_failed {
+                    Outbound::Success((StatusCode::BAD_GATEWAY, Json(inbound)).into_response())
+                } else {
+                    Outbound::Success(Json(inbound).into_response())
+                }
             }
             Err(err) => {
                 let message = format!("上游响应无法解析: {err}");
-                Outbound::Fatal {
-                    channel: channel.name.clone(),
-                    status: 502,
-                    message,
-                }
+                billing_attempt_id
+                    .record_failure(
+                        502,
+                        Some(upstream_body.to_vec()),
+                        reported_usage.clone(),
+                        Outbound::Fatal {
+                            channel: channel.name.clone(),
+                            status: 502,
+                            message,
+                        },
+                    )
+                    .await
             }
         }
     } else if is_retryable_status(status_code) {
         // 可重试错误（429/5xx）：failover 到下一渠道。
-        Outbound::Retryable {
-            channel: channel.name.clone(),
-            status: Some(status_code),
-            retry_after,
-            message: "上游返回可重试错误".to_string(),
-        }
+        billing_attempt_id
+            .record_failure(
+                status_code,
+                Some(upstream_body.to_vec()),
+                reported_usage.clone(),
+                Outbound::Retryable {
+                    channel: channel.name.clone(),
+                    status: Some(status_code),
+                    retry_after,
+                    message: "上游返回可重试错误".to_string(),
+                },
+            )
+            .await
     } else {
         let message = upstream_error_message(&parsed, status_code);
         // 上游 400 中可自动修正的一类：整流后重试一次，重试结果按常规语义
@@ -2137,14 +2623,37 @@ async fn non_stream_completion(
             && let Some(corrected) =
                 rectify_for_retry(deps, snapshot, request, channel, &message).await
         {
+            let recorded = billing_attempt_id
+                .record_failure(
+                    status_code,
+                    Some(upstream_body.to_vec()),
+                    reported_usage.clone(),
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: Some(status_code),
+                        retry_after: None,
+                        message: "请求已整流，准备重试".to_string(),
+                    },
+                )
+                .await;
+            if matches!(&recorded, Outbound::Fatal { status: 500, .. }) {
+                return recorded;
+            }
             return Box::pin(non_stream_completion(ctx, &corrected, channel, key, false)).await;
         }
         // 其余不可重试 4xx：直接返回，状态码原样 + 入站协议错误格式。
-        Outbound::Fatal {
-            channel: channel.name.clone(),
-            status: status_code,
-            message,
-        }
+        billing_attempt_id
+            .record_failure(
+                status_code,
+                Some(upstream_body.to_vec()),
+                reported_usage,
+                Outbound::Fatal {
+                    channel: channel.name.clone(),
+                    status: status_code,
+                    message,
+                },
+            )
+            .await
     }
 }
 
@@ -2169,8 +2678,17 @@ async fn stream_completion(
     let mut request_warnings = Vec::new();
     // 入站解码侧的兼容动作随流首下发，非流式路径同。
     request_warnings.extend(request.warnings.iter().cloned());
-    let mut outbound = protocol::encode_request(request, channel.protocol, &mut request_warnings);
     let outbound_model = routing::outbound_model(channel, ctx.routed_model);
+    let reasoning_content = channel
+        .reasoning_output
+        .enables_reasoning_content(outbound_model, &channel.base_url);
+    let mut outbound = protocol::encode_request_with_model(
+        request,
+        channel.protocol,
+        outbound_model,
+        reasoning_content,
+        &mut request_warnings,
+    );
     // 目标性 JSON 补丁：强制流式；OpenAI 另注入 stream_options.include_usage
     // （Anthropic 流式自带 usage）。别名重写用该渠道自己的出站模型名。
     // Gemini 的流式与否由路径端点决定，请求体无 stream/model 字段；
@@ -2205,7 +2723,11 @@ async fn stream_completion(
         channel.base_url.trim_end_matches('/'),
         protocol::upstream_path(channel.protocol, outbound_model, true)
     );
-    if let Err(err) = validate_target(&upstream_url, snapshot.allow_private_networks) {
+    let network_policy = NetworkPolicy::new(
+        snapshot.allow_private_networks,
+        &snapshot.private_network_allowlist,
+    );
+    if let Err(err) = network_policy.validate_target(&upstream_url) {
         return Outbound::Retryable {
             channel: channel.name.clone(),
             status: None,
@@ -2216,10 +2738,20 @@ async fn stream_completion(
 
     // 渠道 timeout 只约束到响应头（send 返回）：reqwest 的 `.timeout` 覆盖到
     // 响应体读完，会把长流式响应截断；流一旦开始，时长不受 timeout 限制。
+    let billing_attempt_id = match begin_attempt_for_call(ctx, request, channel, key, price).await {
+        Ok(attempt) => attempt,
+        Err(outbound) => return outbound,
+    };
+    if let Err(outbound) = billing_attempt_id.mark_dispatched().await {
+        return outbound;
+    }
     let upstream = tokio::time::timeout(
-        Duration::from_millis(channel.timeout_ms),
+        remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
         deps.outbound_clients
-            .for_policy(snapshot.allow_private_networks)
+            .for_policy(
+                &network_policy,
+                network_policy.target_allowlisted(&upstream_url),
+            )
             .post(&upstream_url)
             .apply_outbound_auth(channel.protocol, key)
             .apply_feature_headers(ctx.inbound_headers)
@@ -2231,20 +2763,34 @@ async fn stream_completion(
     let resp = match upstream {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "流式上游不可达".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    502,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "流式上游不可达".to_string(),
+                    },
+                )
+                .await;
         }
         Err(_) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: "流式上游响应超时".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    504,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: "流式上游响应超时".to_string(),
+                    },
+                )
+                .await;
         }
     };
 
@@ -2253,25 +2799,58 @@ async fn stream_completion(
     // 上游非 2xx：SSE 流此时尚未开始，直接按错误处理。
     if !status.is_success() {
         let retry_after = parse_retry_after(resp.headers());
-        let upstream_body = match take_upstream_body(
-            resp,
-            &channel.name,
-            ctx.snapshot.max_response_bytes,
-            "流式上游读体失败",
+        let upstream_body = match tokio::time::timeout(
+            remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
+            take_upstream_body(
+                resp,
+                &channel.name,
+                ctx.snapshot.max_response_bytes,
+                "流式上游读体失败",
+            ),
         )
         .await
         {
             Ok(body) => body,
-            Err(outbound) => return outbound,
+            Err(_) => {
+                return billing_attempt_id
+                    .record_failure(
+                        504,
+                        None,
+                        None,
+                        Outbound::Retryable {
+                            channel: channel.name.clone(),
+                            status: None,
+                            retry_after: None,
+                            message: "流式上游读体超时".to_string(),
+                        },
+                    )
+                    .await;
+            }
+        };
+        let upstream_body = match upstream_body {
+            Ok(body) => body,
+            Err(outbound) => {
+                return billing_attempt_id
+                    .record_failure(502, None, None, outbound)
+                    .await;
+            }
         };
         let parsed = serde_json::from_slice::<Value>(&upstream_body).unwrap_or(Value::Null);
+        let reported_usage = protocol::sniff_usage(&parsed, channel.protocol);
         if is_retryable_status(status_code) {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: Some(status_code),
-                retry_after,
-                message: "上游返回可重试错误".to_string(),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    status_code,
+                    Some(upstream_body.to_vec()),
+                    reported_usage.clone(),
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: Some(status_code),
+                        retry_after,
+                        message: "上游返回可重试错误".to_string(),
+                    },
+                )
+                .await;
         }
         let message = upstream_error_message(&parsed, status_code);
         // 与非流式路径同规：上游 400 的可修正类整流后重试一次（首帧尚未
@@ -2281,13 +2860,36 @@ async fn stream_completion(
             && let Some(corrected) =
                 rectify_for_retry(deps, ctx.snapshot, request, channel, &message).await
         {
+            let recorded = billing_attempt_id
+                .record_failure(
+                    status_code,
+                    Some(upstream_body.to_vec()),
+                    reported_usage.clone(),
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: Some(status_code),
+                        retry_after: None,
+                        message: "请求已整流，准备重试".to_string(),
+                    },
+                )
+                .await;
+            if matches!(&recorded, Outbound::Fatal { status: 500, .. }) {
+                return recorded;
+            }
             return Box::pin(stream_completion(ctx, &corrected, channel, key, false)).await;
         }
-        return Outbound::Fatal {
-            channel: channel.name.clone(),
-            status: status_code,
-            message,
-        };
+        return billing_attempt_id
+            .record_failure(
+                status_code,
+                Some(upstream_body.to_vec()),
+                reported_usage,
+                Outbound::Fatal {
+                    channel: channel.name.clone(),
+                    status: status_code,
+                    message,
+                },
+            )
+            .await;
     }
 
     // spawn 流任务前先 peek 首块：首块前的流内错误（200 下的 overloaded_error
@@ -2295,30 +2897,45 @@ async fn stream_completion(
     // failover 对下游零痕迹。正常流只多读首个内容帧，peek 受空闲超时约束。
     let idle = channel_idle(channel.timeout_ms);
     let byte_stream: UpstreamByteStream = Box::pin(resp.bytes_stream());
-    let (peek, byte_stream) = peek_stream_head(
+    let (peek, byte_stream) = peek_stream_head_until(
         byte_stream,
         channel.protocol,
         idle,
         ctx.snapshot.sse_reassembly_max(),
+        ctx.deadline,
     )
     .await;
     let peeked = match peek {
         PeekHead::Content(frames) => frames,
         PeekHead::UpstreamError(message) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: format!("上游流内错误：{message}"),
-            };
+            return billing_attempt_id
+                .record_failure(
+                    502,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: format!("上游流内错误：{message}"),
+                    },
+                )
+                .await;
         }
         PeekHead::Interrupted(reason) => {
-            return Outbound::Retryable {
-                channel: channel.name.clone(),
-                status: None,
-                retry_after: None,
-                message: reason,
-            };
+            return billing_attempt_id
+                .record_failure(
+                    504,
+                    None,
+                    None,
+                    Outbound::Retryable {
+                        channel: channel.name.clone(),
+                        status: None,
+                        retry_after: None,
+                        message: reason,
+                    },
+                )
+                .await;
         }
     };
 
@@ -2342,7 +2959,14 @@ async fn stream_completion(
         request_body: ctx.request_body.clone(),
         response_body: Vec::new(),
         request_id: ctx.request_id.to_string(),
+        billing_attempt_id: billing_attempt_id.attempt_id,
         peeked,
+        _active_permit: ctx
+            .active_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
+        deadline: ctx.deadline,
     };
     tokio::spawn(async move {
         pipe_stream(byte_stream, tx, ctx).await;
@@ -2353,7 +2977,6 @@ async fn stream_completion(
 }
 
 /// 流式请求的共享任务数据：出站目标、计费与日志所需的请求侧信息。
-#[derive(Clone)]
 struct StreamTask {
     deps: Deps,
     snapshot: Arc<RuntimeSnapshot>,
@@ -2374,9 +2997,14 @@ struct StreamTask {
     request_body: Option<Bytes>,
     response_body: Vec<u8>,
     request_id: String,
+    /// 本流对应的实际出站尝试；与同一入站请求的其它重试互不覆盖。
+    billing_attempt_id: String,
     /// 首块 peek 阶段缓存的原始上游帧，流水任务开头重放（peek 用独立解码器
     /// 消费过，重放还原同一事件序列与解码器状态）。
     peeked: Vec<Value>,
+    /// 流任务持有 permit 直到上游消费结束、费用日志入队完成。
+    _active_permit: Option<OwnedSemaphorePermit>,
+    deadline: tokio::time::Instant,
 }
 
 /// 上游 SSE 字节流的装箱形态：peek 与流水任务间传递所有权。
@@ -2416,11 +3044,25 @@ fn is_content_event(event: &StreamEvent) -> bool {
 /// 都在此归类为可重试——此刻尚未向下游转发任何帧，换渠道零痕迹。已读的
 /// 原始帧随 [`PeekHead::Content`] 返回，由流任务重放；未读完的字节流原样
 /// 交回，剩余部分由流水任务继续消费。
+#[cfg(test)]
 async fn peek_stream_head(
     byte_stream: UpstreamByteStream,
     protocol: Protocol,
     idle: Duration,
     max_bytes: usize,
+) -> (PeekHead, UpstreamByteStream) {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(120))
+        .unwrap_or_else(tokio::time::Instant::now);
+    peek_stream_head_until(byte_stream, protocol, idle, max_bytes, deadline).await
+}
+
+async fn peek_stream_head_until(
+    byte_stream: UpstreamByteStream,
+    protocol: Protocol,
+    idle: Duration,
+    max_bytes: usize,
+    deadline: tokio::time::Instant,
 ) -> (PeekHead, UpstreamByteStream) {
     use futures_util::StreamExt as _;
 
@@ -2485,7 +3127,12 @@ async fn peek_stream_head(
             }
             continue;
         }
-        match tokio::time::timeout(idle, byte_stream.as_mut().next()).await {
+        match tokio::time::timeout(
+            remaining_timeout(deadline, idle),
+            byte_stream.as_mut().next(),
+        )
+        .await
+        {
             Ok(Some(Ok(bytes))) => {
                 if buffer.len().saturating_add(bytes.len()) > max_bytes {
                     return (
@@ -2545,6 +3192,7 @@ async fn pipe_stream<S>(
     );
     let terminator = encoder.terminator();
     let mut usage = Usage::default();
+    let mut usage_reported = false;
     // 以字节缓冲、帧边界后再转文本：多字节 UTF-8 可能被拆在两个字节块里，
     // 提前转换会截坏字符。
     let mut sse_buffer: Vec<u8> = Vec::new();
@@ -2565,7 +3213,7 @@ async fn pipe_stream<S>(
     // warnings，让下游在任何内容之前就感知信息损失（跨协议族丢弃的 reasoning 等）。
     if let Some(frame) = encoder.message_start() {
         record_frame_wire(&mut ctx, &frame);
-        if tx.send(event_from_frame(&frame)).await.is_err() {
+        if !send_before_deadline(&tx, event_from_frame(&frame), ctx.deadline).await {
             downstream_open = false;
         }
     }
@@ -2576,7 +3224,7 @@ async fn pipe_stream<S>(
         if downstream_open {
             record_frame_wire(&mut ctx, &frame);
         }
-        if tx.send(event_from_frame(&frame)).await.is_err() {
+        if !send_before_deadline(&tx, event_from_frame(&frame), ctx.deadline).await {
             downstream_open = false;
             break;
         }
@@ -2590,19 +3238,51 @@ async fn pipe_stream<S>(
                 continue;
             }
             let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
+            if let Some(sniffed) = protocol::sniff_usage(&chunk, ctx.channel.protocol) {
+                usage_reported = true;
+                usage.union_max(sniffed);
+            }
             let decoded = decoder.process(&chunk);
             for event in &decoded.events {
+                let mut suppress_event = false;
                 if let StreamEvent::Finish {
-                    usage: reported, ..
+                    finish_reason,
+                    usage: reported,
+                    ..
                 } = event
                 {
-                    saw_finish = true;
-                    usage = reported.clone();
+                    // Finish 可能由 provider 的 failed/incomplete 事件产生。
+                    // 这不是正常收尾：保留已观察 usage，但向下游发错误帧，
+                    // 不再补成功终止哨兵，也不把 200 + failed 伪装成 stop。
+                    usage.union_max(reported.clone());
+                    if finish_reason.unified == crate::core::ir::FinishReasonUnified::Error {
+                        ctx.status_code = 502;
+                        stream_errored = true;
+                        suppress_event = true;
+                        if downstream_open {
+                            let frame = inbound_stream_error_frame(
+                                ctx.inbound_protocol,
+                                "上游响应以失败状态结束",
+                            );
+                            record_frame_wire(&mut ctx, &frame);
+                            if !send_before_deadline(&tx, event_from_frame(&frame), ctx.deadline)
+                                .await
+                            {
+                                downstream_open = false;
+                            }
+                        }
+                    } else {
+                        saw_finish = true;
+                    }
+                }
+                if suppress_event {
+                    break;
                 }
                 if downstream_open {
                     for frame in encoder.encode(event) {
                         record_frame_wire(&mut ctx, &frame);
-                        if tx.send(event_from_frame(&frame)).await.is_err() {
+                        if !send_before_deadline(&tx, event_from_frame(&frame), ctx.deadline).await
+                        {
                             // 下游断开：停止发送，但继续消费上游直至结算。
                             downstream_open = false;
                             break;
@@ -2621,7 +3301,8 @@ async fn pipe_stream<S>(
         }
 
         // 缓冲不足一帧：从上游读取更多字节。
-        match tokio::time::timeout(idle, byte_stream.next()).await {
+        match tokio::time::timeout(remaining_timeout(ctx.deadline, idle), byte_stream.next()).await
+        {
             Ok(Some(Ok(bytes))) => {
                 sse_buffer.extend_from_slice(&bytes);
                 if sse_buffer.len() > ctx.snapshot.sse_reassembly_max() {
@@ -2637,7 +3318,7 @@ async fn pipe_stream<S>(
         let frame =
             inbound_stream_error_frame(ctx.inbound_protocol, SSE_REASSEMBLY_OVERFLOW_MESSAGE);
         record_frame_wire(&mut ctx, &frame);
-        if tx.send(event_from_frame(&frame)).await.is_err() {
+        if !send_before_deadline(&tx, event_from_frame(&frame), ctx.deadline).await {
             downstream_open = false;
         }
     }
@@ -2648,7 +3329,7 @@ async fn pipe_stream<S>(
     if !saw_finish && downstream_open && !truncated && !stream_errored {
         let frame = inbound_stream_error_frame(ctx.inbound_protocol, STREAM_UNTERMINATED_MESSAGE);
         record_frame_wire(&mut ctx, &frame);
-        if tx.send(event_from_frame(&frame)).await.is_err() {
+        if !send_before_deadline(&tx, event_from_frame(&frame), ctx.deadline).await {
             downstream_open = false;
         }
     }
@@ -2665,10 +3346,10 @@ async fn pipe_stream<S>(
         );
     }
     // 先结算再发终止哨兵：下游读到终止时计费必定已落库。
-    settle_and_log(&ctx, usage).await;
+    settle_and_log(&ctx, usage, usage_reported).await;
     // OpenAI 协议约定以 `data: [DONE]` 结束；Anthropic 以 message_stop 收尾。
     if downstream_open && let Some(terminator) = terminator {
-        let _ = tx.send(SseEvent::default().data(terminator)).await;
+        let _ = send_before_deadline(&tx, SseEvent::default().data(terminator), ctx.deadline).await;
     }
 }
 
@@ -2706,7 +3387,7 @@ fn inbound_stream_error_frame(protocol: Protocol, message: &str) -> SseFrame {
 }
 
 /// 结算流式请求费用并落日志。
-async fn settle_and_log(ctx: &StreamTask, usage: Usage) {
+async fn settle_and_log(ctx: &StreamTask, usage: Usage, usage_reported: bool) {
     let discount_bp = ctx.snapshot.discount_bp_for_token(&ctx.token);
     if let Err(err) = queue_request_log(
         &ctx.deps,
@@ -2720,6 +3401,7 @@ async fn settle_and_log(ctx: &StreamTask, usage: Usage) {
             started: ctx.started,
             billing: Billing::calculated(
                 usage,
+                usage_reported,
                 ctx.price,
                 discount_bp,
                 ctx.request_body.clone(),
@@ -2727,6 +3409,8 @@ async fn settle_and_log(ctx: &StreamTask, usage: Usage) {
             ),
             inbound_protocol: ctx.inbound_protocol,
             request_id: &ctx.request_id,
+            billing_attempt_id: Some(&ctx.billing_attempt_id),
+            deadline: Some(ctx.deadline),
         },
     )
     .await
@@ -2836,7 +3520,15 @@ fn retry_backoff(snapshot: &RuntimeSnapshot) -> RetryBackoff {
 
 /// 流式空闲超时与非流式读体超时：渠道 `timeout_ms`，至少 1ms。
 fn channel_idle(timeout_ms: u64) -> Duration {
-    Duration::from_millis(timeout_ms.max(1))
+    Duration::from_millis(timeout_ms.clamp(1, crate::store::resources::MAX_CHANNEL_TIMEOUT_MS))
+}
+
+/// 把局部空闲/渠道超时夹进请求剩余总预算。截止时刻已过则返回零，让外层
+/// `timeout` 在下一次 poll 立即结束；切换渠道、密钥或进入流任务都不会重置预算。
+fn remaining_timeout(deadline: tokio::time::Instant, local: Duration) -> Duration {
+    deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(local)
 }
 
 /// 日志用的出站模型名：按该渠道自己的别名表改写。
@@ -2844,27 +3536,11 @@ fn outbound_model_for_log<'a>(channel: &'a Channel, inbound: &'a str) -> Option<
     Some(routing::outbound_model(channel, inbound))
 }
 
-/// 按渠道名从本次路由结果取出发给上游的模型名；未知渠道则尚未出站。
-fn outbound_model_for_channel_name<'a>(
-    route: &'a routing::Route,
-    channels: &'a [ChannelRecord],
-    channel_name: &str,
-    inbound: &'a str,
-) -> Option<&'a str> {
-    route
-        .channel_indices
-        .iter()
-        .filter_map(|index| channels.get(*index))
-        .find(|record| record.channel.name == channel_name)
-        .map(|record| routing::outbound_model(&record.channel, inbound))
-}
-
 /// Anthropic 出站在下游未带版本头时使用的官方默认。
 const DEFAULT_ANTHROPIC_VERSION: HeaderValue = HeaderValue::from_static("2023-06-01");
 
 /// 入站功能头白名单：直通与 IR 都原样转发出站，不含认证与 hop-by-hop。
-const FORWARDED_FEATURE_HEADERS: &[&str] =
-    &["anthropic-beta", "openai-organization", "openai-project"];
+const FORWARDED_FEATURE_HEADERS: &[&str] = &["anthropic-beta"];
 
 /// 按渠道协议设置出站认证头。
 ///
@@ -3003,11 +3679,14 @@ async fn error_response(
                     discount_bp,
                     cost_usd_micros: 0,
                     calculation_error: None,
+                    usage_reported: false,
                     request_body,
                     response_body: response_wire,
                 },
                 inbound_protocol,
                 request_id,
+                billing_attempt_id: None,
+                deadline: None,
             },
         )
         .await
@@ -3094,77 +3773,51 @@ async fn too_many_token_requests(
     response
 }
 
-/// 准入阶段数据库错误：500 + OpenAI 错误格式 + 落日志。
-#[allow(clippy::too_many_arguments)]
-async fn db_error_response(
-    deps: &Deps,
-    full_body: bool,
-    token: &Token,
-    model: &str,
-    started: i64,
-    err: impl std::fmt::Display,
-    inbound_protocol: Protocol,
-    request_body: Option<Bytes>,
-    request_id: &str,
-) -> Response {
-    let message = format!("计费状态读取失败: {err}");
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        &message,
-        deps,
-        full_body,
-        Some(token),
-        Some(model),
-        started,
-        inbound_protocol,
-        request_body,
-        request_id,
-    )
-    .await
-}
-
-/// 准入费用不可表示：拒绝出站、写系统错误，并按 500 记录本次请求。
-#[allow(clippy::too_many_arguments)]
-async fn billing_error_response(
-    deps: &Deps,
-    full_body: bool,
-    token: &Token,
-    model: &str,
-    started: i64,
-    err: billing::Error,
-    inbound_protocol: Protocol,
-    request_body: Option<Bytes>,
-    request_id: &str,
-) -> Response {
-    store::record_system_error(
-        &deps.pool,
-        "billing",
-        &store::SystemLogEvent::new(
-            "billing.admission_calculation_failed",
-            serde_json::json!({ "error": err.to_string() }),
-            format!("准入费用计算失败，已拒绝出站: {err}"),
-        ),
-    )
-    .await;
-    error_response(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "费用超出支持范围，未发起上游请求",
-        deps,
-        full_body,
-        Some(token),
-        Some(model),
-        started,
-        inbound_protocol,
-        request_body,
-        request_id,
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{append_logged_body, extract_bearer, inbound_stream_error_frame};
     use crate::config::Protocol;
+    use crate::core::billing::PriceSnapshot;
+    use serde_json::json;
+
+    #[test]
+    fn reservation_estimate_accounts_for_tools_and_provider_options() {
+        let price = PriceSnapshot {
+            input_micros: 1_000_000,
+            output_micros: 1_000_000,
+            cache_read_micros: 4_000_000,
+            cache_write_micros: 2_000_000,
+            cache_write_1h_micros: 3_000_000,
+        };
+        let plain: crate::core::ir::ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+        }))
+        .expect("基础请求应可解码");
+        let with_tool: crate::core::ir::ChatRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+            "tools": [{
+                "name": "lookup",
+                "description": "look up a record",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }
+            }],
+            "provider_options": {"provider": {"large_option": "retained"}}
+        }))
+        .expect("含工具的请求应可解码");
+        let plain_cost =
+            super::estimate_attempt_cost_micros(price, 10_000, &plain).expect("基础预留应可计算");
+        let tool_cost = super::estimate_attempt_cost_micros(price, 10_000, &with_tool)
+            .expect("工具预留应可计算");
+        assert!(
+            tool_cost > plain_cost,
+            "工具 schema 与 provider options 应提高预留"
+        );
+    }
 
     #[test]
     fn split_model_method_parses_official_actions() {

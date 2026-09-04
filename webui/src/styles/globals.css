@@ -106,7 +106,7 @@ body {
   scrollbar-color: var(--seed-border) transparent;
 }
 
-/* 对齐 shadcn-admin 全局滚动条：细轨道 + 边框色滑块 */
+/* 全局滚动条：细轨道与边框色滑块 */
 .seed-scrollbar {
   scrollbar-width: thin;
   scrollbar-color: var(--seed-border) transparent;
@@ -612,7 +612,7 @@ html[lang='zh-CN'] .font-serif {
   font-size: 10px;
 }
 
-/* 状态筛选触发按钮（参考 shadcn-admin faceted filter）：outline 细虚线、透明底、轻量小按钮 */
+/* 状态筛选触发按钮：outline 细虚线、透明底、轻量小按钮 */
 .filter-btn {
   display: inline-flex;
   align-items: center;
@@ -643,7 +643,7 @@ html[lang='zh-CN'] .font-serif {
   box-shadow: var(--focus-ring);
 }
 
-/* 同步视图状态筛选（参考 shadcn-admin faceted filter）：选项行 + 模拟复选框 + 右侧计数 */
+/* 同步视图状态筛选：选项行 + 模拟复选框 + 右侧计数 */
 .sync-filter-option {
   display: flex;
   align-items: center;
@@ -691,7 +691,7 @@ html[lang='zh-CN'] .font-serif {
   color: var(--fg-muted);
 }
 
-/* 分面筛选浮层：shadcn-admin Command 结构（顶栏搜索 + 选项列表） */
+/* 分面筛选浮层：顶栏搜索与选项列表 */
 .faceted-filter-menu {
   z-index: var(--z-popover);
   box-sizing: border-box;
@@ -1132,7 +1132,7 @@ html[lang='zh-CN'] .font-serif {
   padding-bottom: var(--height-topnav);
 }
 
-/* ── Table（shadcn / shadcn-admin 语义；结构见 components/ui/table/*）── */
+/* ── Table 语义；结构见 components/ui/table/* ── */
 .table-row-inactive {
   opacity: 0.58;
 }
@@ -1145,7 +1145,7 @@ html[lang='zh-CN'] .font-serif {
   min-height: 2.5rem;
 }
 
-/* ── Data table row menu（Reka DropdownMenu；视觉对齐 shadcn-admin）── */
+/* ── Data table row menu（Reka DropdownMenu）── */
 .data-table-menu {
   box-sizing: border-box;
   min-width: 10rem;

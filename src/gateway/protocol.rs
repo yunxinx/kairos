@@ -49,6 +49,27 @@ pub fn encode_request_with_reasoning(
     reasoning_content: bool,
     warnings: &mut Vec<Warning>,
 ) -> Value {
+    encode_request_with_model(
+        request,
+        protocol,
+        &request.model,
+        reasoning_content,
+        warnings,
+    )
+}
+
+/// 按最终出站模型编码请求。
+///
+/// 大多数协议把模型名作为请求字段补丁写回；Gemini 的 thinking budget
+/// 需要在编码阶段依据 URL 中的最终模型名裁剪，因此调用方必须传入已解析
+/// 别名后的名称。
+pub fn encode_request_with_model(
+    request: &ChatRequest,
+    protocol: Protocol,
+    outbound_model: &str,
+    reasoning_content: bool,
+    warnings: &mut Vec<Warning>,
+) -> Value {
     match protocol {
         Protocol::OpenAiChat => crate::core::openai_chat::encode_request_with(
             request,
@@ -61,7 +82,9 @@ pub fn encode_request_with_reasoning(
         Protocol::OpenAiResponses => {
             crate::core::openai_responses::encode_request(request, warnings)
         }
-        Protocol::Gemini => crate::core::gemini::encode_request(request, warnings),
+        Protocol::Gemini => {
+            crate::core::gemini::encode_request_for_model(request, outbound_model, warnings)
+        }
     }
 }
 

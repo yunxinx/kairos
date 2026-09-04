@@ -1058,7 +1058,7 @@ async fn anthropic_passthrough_defaults_version_when_inbound_omits_it() {
     );
 }
 
-/// 跨协议回落 IR：即使下游带了更新的版本头，出站仍钉适配器默认。
+/// 跨协议回落 IR：即使下游带了更新的版本头，出站仍钉适配器默认，且不转发归属头。
 #[tokio::test]
 async fn ir_path_keeps_default_anthropic_version() {
     let mut gw = TestGateway::start_with(|base| {
@@ -1099,19 +1099,11 @@ async fn ir_path_keeps_default_anthropic_version() {
         vec![Some("prompt-caching-2024-07-31".to_string())],
         "IR 路径仍应转发功能头"
     );
-    assert_eq!(
-        gw.upstream.received_openai_organizations(),
-        vec![Some("org-ir".to_string())],
-        "IR 路径应转发 openai-organization"
-    );
-    assert_eq!(
-        gw.upstream.received_openai_projects(),
-        vec![Some("proj-ir".to_string())],
-        "IR 路径应转发 openai-project"
-    );
+    assert_eq!(gw.upstream.received_openai_organizations(), vec![None]);
+    assert_eq!(gw.upstream.received_openai_projects(), vec![None]);
 }
 
-/// 同协议 OpenAI 直通：白名单功能头原样转发。
+/// 同协议 OpenAI 直通：下游归属头不会进入共享渠道凭证的出站请求。
 #[tokio::test]
 async fn openai_passthrough_forwards_org_and_project_headers() {
     let mut gw = TestGateway::start().await;
@@ -1135,14 +1127,6 @@ async fn openai_passthrough_forwards_org_and_project_headers() {
         .await
         .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        gw.upstream.received_openai_organizations(),
-        vec![Some("org-pt".to_string())],
-        "直通应转发 openai-organization"
-    );
-    assert_eq!(
-        gw.upstream.received_openai_projects(),
-        vec![Some("proj-pt".to_string())],
-        "直通应转发 openai-project"
-    );
+    assert_eq!(gw.upstream.received_openai_organizations(), vec![None]);
+    assert_eq!(gw.upstream.received_openai_projects(), vec![None]);
 }

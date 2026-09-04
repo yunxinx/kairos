@@ -1,4 +1,4 @@
-/** 分页页码带省略号，1-based；与 shadcn-admin `getPageNumbers` 同形。 */
+/** 生成带省略号的 1-based 分页页码。 */
 export function getPageNumbers(currentPage: number, totalPages: number): Array<number | '...'> {
   const maxVisiblePages = 5;
   const pages: Array<number | '...'> = [];

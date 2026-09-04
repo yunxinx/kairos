@@ -177,14 +177,15 @@ async fn streaming_usage_is_billed() {
     assert_eq!(row.3, 4250, "日志应记录费用 4250");
 }
 
-/// 流式上游返回非 2xx：状态码原样透传，不扣费。
+/// 流式上游返回非 2xx：状态码原样透传，已发出的尝试按预留金额结算。
 #[tokio::test]
-async fn streaming_upstream_error_is_passthrough_and_not_billed() {
+async fn streaming_upstream_error_is_passthrough_and_billed_by_reservation() {
     let mut gw = TestGateway::start().await;
     gw.upstream.set_behavior(UpstreamBehavior::Status429);
 
     let resp = send_stream(&gw.base_url()).await;
     assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    common::wait_for_request_persistence(&gw.pool).await;
 
     let row: (i64, i64) = sqlx::query_as(
         "SELECT ub.balance_usd_micros, tb.settled_usd_micros \
@@ -197,8 +198,8 @@ async fn streaming_upstream_error_is_passthrough_and_not_billed() {
     .fetch_one(&gw.pool)
     .await
     .expect("令牌余额应存在");
-    assert_eq!(row.0, 5_000_000, "流式失败不应扣费");
-    assert_eq!(row.1, 0);
+    assert!(row.0 < 5_000_000, "已发出的流式失败应按预留金额扣费");
+    assert!(row.1 > 0, "已发出的流式失败应增加累计结算");
 }
 
 /// 流中途上游报错（Anthropic 200 后 `event: error`）：错误以入站协议错误帧
@@ -267,8 +268,8 @@ async fn midstream_error_delivers_error_frame_and_settles() {
     .fetch_one(&gw.pool)
     .await
     .expect("应有结算日志");
-    assert_eq!(row.0, 5_000_000, "零累积 usage 不扣费");
-    assert_eq!(row.1, 0, "日志按已累积 usage 落账（零费用）");
+    assert!(row.1 > 0, "缺失 usage 时应使用保守预留");
+    assert_eq!(row.0, 5_000_000 - row.1, "钱包应扣除该尝试的结算费用");
 }
 
 /// anthropic 双渠道 seed（同一模型，供流式 failover 用例使用）。
@@ -361,16 +362,22 @@ async fn pre_first_chunk_error_fails_over_to_next_channel() {
         "下游应收次渠道的正常收尾"
     );
 
-    // 两个渠道都被请求过；只有次渠道成功落账。
+    // 两个渠道都被请求过；每个出站尝试都保留独立结算记录。
     assert_eq!(ups[0].received().len(), 1);
     assert_eq!(ups[1].received().len(), 1);
     common::wait_for_request_persistence(&gw.pool).await;
-    let row: (String, i64) = sqlx::query_as("SELECT channel, cost_usd_micros FROM request_log")
-        .fetch_one(&gw.pool)
-        .await
-        .expect("应有结算日志");
-    assert_eq!(row.0, "ch-1", "日志只记成功的次渠道");
-    assert!(row.1 > 0, "次渠道按 usage 计费");
+    let rows: Vec<(String, i64, i64)> =
+        sqlx::query_as("SELECT channel, status_code, cost_usd_micros FROM request_log ORDER BY id")
+            .fetch_all(&gw.pool)
+            .await
+            .expect("应有结算日志");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "ch-0");
+    assert_ne!(rows[0].1, 200);
+    assert!(rows[0].2 > 0, "无 usage 的首渠道应按预留结算");
+    assert_eq!(rows[1].0, "ch-1");
+    assert_eq!(rows[1].1, 200);
+    assert!(rows[1].2 > 0, "次渠道按 usage 计费");
 }
 
 /// 空流（200 后零帧即断）按可重试归类：failover 到下一渠道成功。
@@ -397,7 +404,7 @@ async fn empty_stream_fails_over_to_next_channel() {
 }
 
 /// 上游流缺收尾事件（内容后即断）归类为异常：下游收到错误帧而非合成
-/// 成功 Finish，结算按已累积 usage 落账（此处为零）。
+/// 缺少正常收尾时仍记录错误并按预留结算。
 #[tokio::test]
 async fn unterminated_stream_delivers_error_frame_and_settles() {
     let mut gw = TestGateway::start_with(|base| {
@@ -447,5 +454,5 @@ async fn unterminated_stream_delivers_error_frame_and_settles() {
     .fetch_one(&gw.pool)
     .await
     .expect("应有结算日志");
-    assert_eq!(row.0, 0, "零累积 usage 落账不扣费");
+    assert!(row.0 > 0, "缺失 usage 时应使用保守预留");
 }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 批量操作浮动条：选中行后视口底部居中浮出；Escape 清空选择。
-// 结构对齐 shadcn-admin bulk-actions：清除按钮 → 分隔线 → 计数 → 分隔线 → 操作按钮插槽。
+// 批量操作栏保持固定顺序：清除按钮、计数与操作按钮插槽。
 import { onBeforeUnmount, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import UiIcon from '@/components/ui/UiIcon.vue';

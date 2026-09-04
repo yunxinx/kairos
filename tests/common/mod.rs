@@ -550,7 +550,9 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             },
         ],
         unified_models: vec![],
-        settings: HashMap::new(),
+        settings: [("allow_private_networks".to_string(), Value::Bool(true))]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -561,7 +563,9 @@ pub fn empty_seed(_upstream_base: &str) -> Seed {
         tokens: vec![],
         prices: vec![],
         unified_models: vec![],
-        settings: HashMap::new(),
+        settings: [("allow_private_networks".to_string(), Value::Bool(true))]
+            .into_iter()
+            .collect(),
     }
 }
 

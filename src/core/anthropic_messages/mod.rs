@@ -2141,17 +2141,38 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
 
 /// 从 usage 对象解析 IR 四分量与 1h 写入明细。
 fn parse_usage_object(usage: &serde_json::Map<String, Value>) -> Option<Usage> {
-    let get = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let cache_write_1h = usage
-        .get("cache_creation")
-        .and_then(|c| c.get("ephemeral_1h_input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let mut has_metric = false;
+    let mut get = |key: &str| {
+        usage.get(key).map_or(Some(0), |value| {
+            has_metric = true;
+            value.as_u64()
+        })
+    };
+    let input_tokens = get("input_tokens")?;
+    let output_tokens = get("output_tokens")?;
+    let cache_read_tokens = get("cache_read_input_tokens")?;
+    let cache_write_tokens = get("cache_creation_input_tokens")?;
+    let cache_write_1h = match usage.get("cache_creation") {
+        None | Some(Value::Null) => 0,
+        Some(value) => {
+            let object = value.as_object()?;
+            match object.get("ephemeral_1h_input_tokens") {
+                None => 0,
+                Some(value) => {
+                    has_metric = true;
+                    value.as_u64()?
+                }
+            }
+        }
+    };
+    if !has_metric {
+        return None;
+    }
     Some(Usage {
-        input_tokens: get("input_tokens"),
-        output_tokens: get("output_tokens"),
-        cache_read_tokens: get("cache_read_input_tokens"),
-        cache_write_tokens: get("cache_creation_input_tokens"),
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         cache_write_1h_tokens: cache_write_1h,
         raw: Some(Value::Object(usage.clone())),
     })
@@ -4156,6 +4177,8 @@ mod tests {
 
         // 无 usage 的帧返回 None。
         assert!(sniff_usage(&json!({ "content_block_start": true })).is_none());
+        assert!(sniff_usage(&json!({ "usage": { "output_tokens": "invalid" } })).is_none());
+        assert!(sniff_usage(&json!({ "usage": { "unrelated": 1 } })).is_none());
     }
 
     /// Anthropic 强制要求 max_tokens：IR 缺省时补默认 4096，避免跨协议请求被拒。

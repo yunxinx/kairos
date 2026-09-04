@@ -118,8 +118,8 @@ fn gemini_ok() -> Value {
     })
 }
 
-/// 带缓存与思维链的 usage：prompt 含 cached 1250（缓存 200），输出 100
-/// （含思维链 40，不另计价）。
+/// 带缓存与思维链的 usage：prompt 含 cached 1250（缓存 200），输出由候选
+/// token 与思维 token 相加得到 140。
 fn billed_usage_metadata() -> Value {
     json!({
         "promptTokenCount": 1250,
@@ -377,12 +377,12 @@ async fn gemini_passthrough_zero_rewrite_and_alias_forces_ir() {
     );
     let body: Value = resp.json().await.expect("响应应可解析");
     assert_eq!(body["usageMetadata"]["promptTokenCount"], json!(1250));
-    // input = 1250 - 200（缓存）= 1050；output = 100（思维链是子集不另计价）。
-    // 费用 = 1050*2.5 + 100*10 + 200*1.25 = 3875。
+    // input = 1250 - 200（缓存）= 1050；output = 100 + 40 = 140。
+    // 费用 = 1050*2.5 + 140*10 + 200*1.25 = 4275。
     common::wait_for_request_persistence(&gw.pool).await;
     assert_eq!(
         billed_rows(&gw.pool).await[0],
-        (1050, 100, 200, 3875),
+        (1050, 140, 200, 4275),
         "非流式直通按减法约定折算计费"
     );
 
@@ -424,8 +424,8 @@ async fn gemini_passthrough_zero_rewrite_and_alias_forces_ir() {
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询余额与结算");
-    assert_eq!(balance, 5_000_000 - 3875 - 2, "余额应扣减两笔费用");
-    assert_eq!(settled, 3877, "累计结算应等于两笔费用之和");
+    assert_eq!(balance, 5_000_000 - 4275 - 2, "余额应扣减两笔费用");
+    assert_eq!(settled, 4277, "累计结算应等于两笔费用之和");
 }
 
 /// Gemini 同族流式直通：上游帧字节直搬，末 chunk 的 usageMetadata 旁路嗅探
@@ -470,10 +470,10 @@ async fn gemini_stream_passthrough_bills_final_chunk_usage() {
     assert_eq!(frames[0].data, content_chunk);
     assert_eq!(frames[1].data, finish_chunk);
 
-    // input = 1250 - 200 = 1050；output = 100；费用 = 3875（与非流式同口径）。
+    // input = 1250 - 200 = 1050；output = 100 + 40 = 140；费用 = 4275。
     assert_eq!(
         wait_for_billed_rows(&gw.pool, 1).await[0],
-        (1050, 100, 200, 3875),
+        (1050, 140, 200, 4275),
         "流式直通按末 chunk 的 usageMetadata 计费"
     );
 }
@@ -533,7 +533,7 @@ async fn chat_inbound_stream_bills_gemini_upstream_usage() {
     let last = frames.last().expect("应有收尾帧");
     assert_eq!(last.data["choices"][0]["finish_reason"], json!("stop"));
     assert_eq!(last.data["usage"]["prompt_tokens"], json!(1250));
-    assert_eq!(last.data["usage"]["completion_tokens"], json!(100));
+    assert_eq!(last.data["usage"]["completion_tokens"], json!(140));
     assert_eq!(
         last.data["usage"]["prompt_tokens_details"]["cached_tokens"],
         json!(200)
@@ -541,7 +541,7 @@ async fn chat_inbound_stream_bills_gemini_upstream_usage() {
 
     assert_eq!(
         wait_for_billed_rows(&gw.pool, 1).await[0],
-        (1050, 100, 200, 3875),
+        (1050, 140, 200, 4275),
         "完整转换路径与直通同口径计费"
     );
 }

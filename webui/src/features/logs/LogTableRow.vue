@@ -101,7 +101,6 @@ function handleRowClick(event: MouseEvent) {
     data-testid="log-row"
     :data-log-id="String(entry.id)"
     :data-model="entry.model"
-    :data-token-key="entry.token_key"
     :data-status-code="String(entry.status_code)"
     class="group cursor-pointer transition-colors"
     :class="rowClass"

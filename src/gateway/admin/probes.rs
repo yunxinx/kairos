@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::config::Protocol;
 use crate::core::ir::{ChatRequest, ContentPart, Message, Role};
 use crate::gateway::http::{OutboundAuth, upstream_error_message};
-use crate::gateway::network::validate_target;
+use crate::gateway::network::NetworkPolicy;
 use crate::gateway::protocol;
 use crate::store::resources::{Channel, StoredChannelKey, select_channel_key};
 
@@ -94,7 +94,10 @@ async fn test_channel(
     let model = resolve_probe_model(channel, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("模型 {requested} 不在渠道 {id} 的清单中"))
     })?;
-    let allow_private_networks = deps.snapshot.read().await.allow_private_networks;
+    let snapshot = deps.snapshot.read().await.clone();
+    let allow_private_networks = snapshot.allow_private_networks;
+    let network_policy =
+        NetworkPolicy::new(allow_private_networks, &snapshot.private_network_allowlist);
     let key = select_channel_key(&record.keys, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("渠道 {id} 没有可用于模型 {requested} 的启用密钥"))
     })?;
@@ -107,15 +110,23 @@ async fn test_channel(
         channel.base_url.trim_end_matches('/'),
         protocol::upstream_path(channel.protocol, &model, false)
     );
-    validate_target(&upstream_url, allow_private_networks)
+    network_policy
+        .validate_target(&upstream_url)
         .map_err(|err| AdminError::InvalidBody(err.to_string()))?;
 
     let started = Instant::now();
     let send = deps
         .outbound_clients
-        .for_policy(allow_private_networks)
+        .for_policy(
+            &network_policy,
+            network_policy.target_allowlisted(&upstream_url),
+        )
         .post(&upstream_url)
-        .timeout(Duration::from_millis(channel.timeout_ms))
+        .timeout(Duration::from_millis(
+            channel
+                .timeout_ms
+                .clamp(1, crate::store::resources::MAX_CHANNEL_TIMEOUT_MS),
+        ))
         .apply_outbound_auth(channel.protocol, key)
         .json(&outbound)
         .send()
@@ -251,8 +262,11 @@ async fn list_upstream_models(
     if draft.api_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
     }
-    if draft.timeout_ms < 1 {
-        return Err(AdminError::InvalidBody("timeout_ms 不能小于 1".to_string()));
+    if draft.timeout_ms < 1 || draft.timeout_ms > crate::store::resources::MAX_CHANNEL_TIMEOUT_MS {
+        return Err(AdminError::InvalidBody(format!(
+            "timeout_ms 必须在 1..={} 之间",
+            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+        )));
     }
     let key = StoredChannelKey::new(
         0,
@@ -270,12 +284,16 @@ async fn list_upstream_models(
         _ => UPSTREAM_MODELS_PATH,
     };
     let url = format!("{}{}", draft.base_url.trim_end_matches('/'), models_path);
-    let allow_private_networks = deps.snapshot.read().await.allow_private_networks;
-    validate_target(&url, allow_private_networks)
+    let snapshot = deps.snapshot.read().await.clone();
+    let allow_private_networks = snapshot.allow_private_networks;
+    let network_policy =
+        NetworkPolicy::new(allow_private_networks, &snapshot.private_network_allowlist);
+    network_policy
+        .validate_target(&url)
         .map_err(|err| AdminError::InvalidBody(err.to_string()))?;
     let send = deps
         .outbound_clients
-        .for_policy(allow_private_networks)
+        .for_policy(&network_policy, network_policy.target_allowlisted(&url))
         .get(&url)
         .timeout(Duration::from_millis(draft.timeout_ms))
         .apply_outbound_auth(draft.protocol, &key)

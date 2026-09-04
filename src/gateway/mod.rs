@@ -16,7 +16,7 @@ mod sse;
 mod throttle;
 mod webui;
 
-pub use admin::router as admin_router;
-pub use http::{Deps, router};
-pub use logging::unix_millis;
+pub use admin::{router as admin_router, router_with_writer as admin_router_with_writer};
+pub use http::{Deps, router, router_with_writer};
+pub use logging::{RequestLogWriter, unix_millis};
 pub use webui::is_available as webui_available;

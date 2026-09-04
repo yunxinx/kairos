@@ -17,7 +17,7 @@
 //! - 响应侧：`candidates[0].content.parts` + `finishReason` 双轨映射（含
 //!   functionCall part 时 finish 归 `ToolCalls`）；usage 输入侧为
 //!   「`promptTokenCount` 含缓存」的减法约定（与 OpenAI 系同口径），
-//!   `thoughtsTokenCount` 是输出侧子集，不另计价。
+//!   `thoughtsTokenCount` 由 Gemini 单独回报，但仍属于输出侧计费总量。
 //! - 流式：`alt=sse` 的逐 chunk 是完整响应的 part 级片段，流以服务器关闭收尾、
 //!   无哨兵行；末 chunk 携带 `finishReason` 与 `usageMetadata`，usage 逐 chunk
 //!   累计（取最近一次出现的为终值）。
@@ -621,6 +621,18 @@ fn decode_tool_config(config: &WireToolConfig) -> Result<Option<ToolChoice>, Dec
 ///
 /// 模型名不写进请求体（承载在 URL 路径上）。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
+    encode_request_for_model(request, &request.model, warnings)
+}
+
+/// 按最终出站模型编码 Gemini 请求。
+///
+/// 请求模型可能经过渠道别名或统一模型成员解析；thinking budget 的上限必须
+/// 依据实际 URL 使用的模型判断，否则别名路径会把较小模型的上限编码得过大。
+pub fn encode_request_for_model(
+    request: &ChatRequest,
+    outbound_model: &str,
+    warnings: &mut Vec<Warning>,
+) -> Value {
     let (system_instruction, contents) = encode_messages(&request.messages, warnings);
 
     let mut obj = Map::new();
@@ -666,7 +678,8 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     let hatch_thinking = google_options.and_then(|options| options.get(THINKING_CONFIG_KEY));
     if let Some(thinking) = hatch_thinking {
         generation.insert("thinkingConfig".into(), thinking.clone());
-    } else if let Some(config) = typed_thinking_config(request.reasoning) {
+    } else if let Some(config) = typed_thinking_config(outbound_model, request.reasoning, warnings)
+    {
         generation.insert("thinkingConfig".into(), config);
     }
 
@@ -768,8 +781,32 @@ fn generation_output_format(
 
 /// 类型化 effort 档位在本族逃生舱缺席时展开为 `thinkingConfig`
 /// （budget 阶梯，与跨族映射同一张换算表）。
-fn typed_thinking_config(reasoning: Option<ReasoningEffort>) -> Option<Value> {
-    let budget = reasoning?.budget_tokens()?;
+fn typed_thinking_config(
+    model: &str,
+    reasoning: Option<ReasoningEffort>,
+    warnings: &mut Vec<Warning>,
+) -> Option<Value> {
+    let effort = reasoning?;
+    let budget = match effort {
+        // 2.5 模型默认启用思考；显式 none 必须写 0 才能表达关闭。
+        ReasoningEffort::None => 0,
+        effort => effort.budget_tokens()?,
+    };
+    let normalized = model.to_ascii_lowercase();
+    let cap = if normalized.contains("2.5-pro") || normalized.contains("2.5-pro-preview") {
+        32_768
+    } else if normalized.contains("2.5") {
+        24_576
+    } else {
+        budget
+    };
+    let budget = budget.min(cap);
+    if budget != effort.budget_tokens().unwrap_or(0) {
+        warnings.push(Warning::compatibility(
+            warning_feature::THINKING,
+            format!("模型 {model} 的 thinkingBudget 已限制为 {budget}"),
+        ));
+    }
     Some(json!({ "thinkingBudget": budget }))
 }
 
@@ -1080,11 +1117,15 @@ fn map_finish_reason(raw: Option<&str>) -> FinishReasonUnified {
     }
 }
 
-/// usage 四分量折算：`promptTokenCount` 含缓存（减法约定），
-/// `thoughtsTokenCount` 是输出侧子集，不另计。
+/// usage 四分量折算：`promptTokenCount` 含缓存（减法约定）。
+///
+/// Gemini 把思考 token 与可见候选 token 分开报告；两者共同构成上游实际
+/// 生成量，因此必须相加后写入 IR 的 `output_tokens`。`thoughtsTokenCount`
+/// 不是 `candidatesTokenCount` 的子集，省略它会使思考强度越高的请求越少计费。
 fn convert_usage(usage: &Value) -> Usage {
     let prompt = usage_count(usage, "promptTokenCount", "prompt_token_count");
     let candidates = usage_count(usage, "candidatesTokenCount", "candidates_token_count");
+    let thoughts = usage_count(usage, "thoughtsTokenCount", "thoughts_token_count");
     let cached = usage_count(
         usage,
         "cachedContentTokenCount",
@@ -1092,7 +1133,7 @@ fn convert_usage(usage: &Value) -> Usage {
     );
     Usage {
         input_tokens: prompt.saturating_sub(cached),
-        output_tokens: candidates,
+        output_tokens: candidates.saturating_add(thoughts),
         cache_read_tokens: cached,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
@@ -1114,6 +1155,38 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     let usage = value
         .get("usageMetadata")
         .or_else(|| value.get("usage_metadata"))?;
+    let usage_object = usage.as_object()?;
+    let has_metric = [
+        "promptTokenCount",
+        "prompt_token_count",
+        "candidatesTokenCount",
+        "candidates_token_count",
+        "thoughtsTokenCount",
+        "thoughts_token_count",
+        "cachedContentTokenCount",
+        "cached_content_token_count",
+    ]
+    .iter()
+    .any(|key| usage_object.contains_key(*key));
+    if !has_metric {
+        return None;
+    }
+    for key in [
+        "promptTokenCount",
+        "prompt_token_count",
+        "candidatesTokenCount",
+        "candidates_token_count",
+        "thoughtsTokenCount",
+        "thoughts_token_count",
+        "cachedContentTokenCount",
+        "cached_content_token_count",
+    ] {
+        if let Some(value) = usage_object.get(key)
+            && value.as_u64().is_none()
+        {
+            return None;
+        }
+    }
     Some(convert_usage(usage))
 }
 
@@ -1922,7 +1995,10 @@ mod tests {
             "thoughtsTokenCount": 8,
         }));
         assert_eq!(usage.input_tokens, 70);
-        assert_eq!(usage.output_tokens, 20, "思考 token 是输出侧子集，不另计");
+        assert_eq!(
+            usage.output_tokens, 28,
+            "候选与思考 token 都属于输出侧计费量"
+        );
         assert_eq!(usage.cache_read_tokens, 30);
         assert_eq!(usage.cache_write_tokens, 0);
 
@@ -1932,6 +2008,10 @@ mod tests {
         )
         .expect("应能嗅探 usage");
         assert_eq!(sniffed.input_tokens, 70);
+        assert!(
+            sniff_usage(&json!({ "usageMetadata": { "promptTokenCount": "invalid" } })).is_none()
+        );
+        assert!(sniff_usage(&json!({ "usageMetadata": { "unrelated": 1 } })).is_none());
     }
 
     /// finish 双轨：functionCall part 在场时 STOP 归 ToolCalls；

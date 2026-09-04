@@ -2,8 +2,8 @@
 --
 -- 硬删除会连带毁掉对账链——`request_log` 按 `user_id` 归属，删掉用户行后这些消费
 -- 记录就成了孤儿；而 `tokens.user_id` 是 NOT NULL 无级联的外键，硬删还会直接撞
--- FOREIGN KEY 约束返 500。参考 one-api（model/user.go 的 Delete 改状态 + 改名 + 拉黑）
--- 改为软删除：`deleted_at` 非 NULL 即视为已归档，所有读路径过滤掉。
+-- FOREIGN KEY 约束返 500。改为软删除：`deleted_at` 非 NULL 即视为已归档，所有
+-- 读路径过滤掉。
 --
 -- 邮箱同时改写为 `deleted.{id}.{原邮箱}`：`users.email` 是列级 UNIQUE COLLATE NOCASE，
 -- SQLite 无法单独去掉列级 UNIQUE 改成 partial index，而重建 users 要连带重建 4 张

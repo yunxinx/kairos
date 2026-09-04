@@ -138,30 +138,39 @@ async fn get_stats(
                 gross_profit_usd_micros: share.gross_profit_usd_micros,
             })
             .collect(),
-        by_channel: stats
-            .by_channel
-            .into_iter()
-            .map(|share| ChannelShareView {
-                channel: share.name,
-                request_count: share.request_count,
-                cost_usd_micros: share.cost_usd_micros,
-                base_cost_usd_micros: share.base_cost_usd_micros,
-                gross_profit_usd_micros: share.gross_profit_usd_micros,
-            })
-            .collect(),
+        // 渠道名称与分布属于内部路由拓扑；普通用户只看自己的模型聚合，
+        // 管理员及 root 才能按渠道定位运营问题。
+        by_channel: if identity
+            .role()
+            .at_least(crate::store::users::ManagementRole::Admin)
+        {
+            stats
+                .by_channel
+                .into_iter()
+                .map(|share| ChannelShareView {
+                    channel: share.name,
+                    request_count: share.request_count,
+                    cost_usd_micros: share.cost_usd_micros,
+                    base_cost_usd_micros: share.base_cost_usd_micros,
+                    gross_profit_usd_micros: share.gross_profit_usd_micros,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     }))
 }
 
 /// `/stats/lifetime` 响应：全量累计，不受时间窗影响。
 ///
-/// `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 只计 HTTP 2xx
-/// 且已结算的费用。两套口径并列时不要把 token 合计当成已入账费用的用量。
+/// `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 统计所有已结算
+/// 尝试（包括失败尝试）。两套口径并列时不要把 token 合计当成已入账费用的用量。
 #[derive(Debug, Serialize)]
 struct LifetimeStatsView {
     request_count: u64,
-    /// 已结算的成功请求实收合计（micro-USD）。
+    /// 已结算尝试的实收合计（micro-USD）。
     cost_usd_micros: i64,
-    /// 已结算的成功请求渠道原价合计（成本）。
+    /// 已结算尝试的渠道原价合计（成本）。
     base_cost_usd_micros: i64,
     /// 毛利：实收 - 渠道原价。
     gross_profit_usd_micros: i64,
@@ -169,7 +178,7 @@ struct LifetimeStatsView {
     total_tokens: u64,
 }
 
-/// 只读全量累计：请求数 / 成功结算费用 / 四分量 token 合计。
+/// 只读全量累计：请求数 / 已结算费用 / 四分量 token 合计。
 async fn get_lifetime_stats(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,

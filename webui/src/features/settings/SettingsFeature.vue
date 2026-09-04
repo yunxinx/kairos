@@ -31,7 +31,8 @@ const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } 
 
 const fullBody = ref(false);
 const requestRectify = ref(true);
-const allowPrivateNetworks = ref(true);
+const allowPrivateNetworks = ref(false);
+const privateNetworkAllowlist = ref('');
 const maxRequestMb = ref('');
 const maxResponseMb = ref('');
 const logBodyMb = ref('');
@@ -87,6 +88,7 @@ function applySettings(settings: Settings) {
   rateLimitRpm.value = String(settings.rate_limit_rpm);
   requestRectify.value = settings.request_rectify;
   allowPrivateNetworks.value = settings.allow_private_networks;
+  privateNetworkAllowlist.value = settings.private_network_allowlist.join('\n');
 }
 
 const saveMutation = useMutation({
@@ -249,6 +251,10 @@ function handleSave() {
     rate_limit_rpm: Number(rateLimitRpm.value.trim()),
     request_rectify: requestRectify.value,
     allow_private_networks: allowPrivateNetworks.value,
+    private_network_allowlist: privateNetworkAllowlist.value
+      .split(/\r?\n|,/)
+      .map((entry) => entry.trim())
+      .filter(Boolean),
   });
 }
 
@@ -720,6 +726,22 @@ const tabsAria = computed(() => t('settings.sections'));
                     id="settings-allow-private-networks"
                     v-model="allowPrivateNetworks"
                     data-testid="settings-allow-private-networks"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="privateNetworkAllowlist"
+                :label="t('settings.privateNetworkAllowlist')"
+                input-id="settings-private-network-allowlist"
+                :guide="t('settings.privateNetworkAllowlistGuide')"
+              >
+                <template #default>
+                  <textarea
+                    id="settings-private-network-allowlist"
+                    v-model="privateNetworkAllowlist"
+                    rows="3"
+                    class="input-base min-h-20 w-full resize-y font-mono text-xs"
+                    data-testid="settings-private-network-allowlist"
                   />
                 </template>
               </FormField>

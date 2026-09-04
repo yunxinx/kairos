@@ -588,7 +588,12 @@ async fn channel_and_price_immediate_effect() {
 /// 同一可调用名在两条渠道上各自定价；改其一不影响另一条，结算按实际打到的渠道。
 #[tokio::test]
 async fn same_model_prices_are_per_channel() {
-    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let mut gw = TestGateway::start_with_admin(|base| {
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].balance_usd = 50.0;
+        seed
+    })
+    .await;
     let left_id = channel_id_by_name(&gw, "test-channel").await;
 
     let right = channel_body("other-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
@@ -1211,7 +1216,7 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     let mut conflict = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
     conflict["keys"][0]["api_key"] = json!("sk-other");
     conflict["timeout_ms"] = json!(1);
-    conflict["max_retries"] = json!(9);
+    conflict["max_retries"] = json!(4);
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", conflict).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     let after: Value = admin_get(&gw, "/channels")
@@ -1337,7 +1342,12 @@ async fn admin_surface_is_isolated_from_protocol_surface() {
 /// 已准入的在途请求按准入时刻快照走完：流开始后改价格，在途结算仍用旧单价，新请求用新单价。
 #[tokio::test]
 async fn inflight_request_keeps_admission_snapshot() {
-    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let mut gw = TestGateway::start_with_admin(|base| {
+        let mut seed = common::test_seed(base);
+        seed.tokens[0].balance_usd = 50.0;
+        seed
+    })
+    .await;
 
     let text_frame = concat!(
         "data: {\"id\":\"chatcmpl-if\",\"object\":\"chat.completion.chunk\",",
@@ -1467,7 +1477,11 @@ async fn runtime_resources_survive_process_restart() {
     let resp = admin_put(
         &gw,
         "/settings",
-        json!({ "full_body": false, "max_request_bytes": 2048 }),
+        json!({
+            "full_body": false,
+            "max_request_bytes": 2048,
+            "allow_private_networks": true
+        }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -1904,7 +1918,11 @@ async fn settings_toggle_full_body_enables_body_logging() {
     let resp = admin_put(
         &gw,
         "/settings",
-        json!({ "full_body": true, "max_request_bytes": 100_000_000 }),
+        json!({
+            "full_body": true,
+            "max_request_bytes": 100_000_000,
+            "allow_private_networks": true
+        }),
     )
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -2087,7 +2105,7 @@ async fn logs_paginate_and_filter() {
             .all(|e| e["model"] == TEST_MODEL)
     );
 
-    // 按令牌 key 过滤：命中全部 3 条（同一令牌）。
+    // 令牌 key 不是日志查询维度；携带明文 key 的查询应被拒绝。
     let resp = client
         .get(format!("{admin}/logs?token_key={TEST_TOKEN_KEY}"))
         .header(reqwest::header::COOKIE, &gw.session)
@@ -2095,8 +2113,7 @@ async fn logs_paginate_and_filter() {
         .send()
         .await
         .expect("应可过滤日志");
-    let page: Value = resp.json().await.expect("日志应可解析");
-    assert_eq!(page["total"], 3);
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 按令牌名精确过滤：子串不命中。
     let resp = client
@@ -2288,12 +2305,14 @@ async fn logs_redact_long_token_keys() {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cache_write_1h_tokens: 0,
+            usage_reported: false,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: 0,
             base_cost_usd_micros: 0,
             discount_bp: 10_000,
             settled: true,
             request_id: None,
+            billing_attempt_id: None,
             request_body: None,
             response_body: None,
         },
@@ -2346,12 +2365,14 @@ async fn logs_redact_long_token_keys() {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cache_write_1h_tokens: 0,
+            usage_reported: false,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: 0,
             base_cost_usd_micros: 0,
             discount_bp: 10_000,
             settled: true,
             request_id: None,
+            billing_attempt_id: None,
             request_body: None,
             response_body: None,
         },
@@ -2397,12 +2418,14 @@ async fn logs_mask_multibyte_token_keys_without_panic() {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cache_write_1h_tokens: 0,
+            usage_reported: false,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: 0,
             base_cost_usd_micros: 0,
             discount_bp: 10_000,
             settled: true,
             request_id: None,
+            billing_attempt_id: None,
             request_body: None,
             response_body: None,
         },
@@ -2452,12 +2475,14 @@ async fn logs_filter_settled_and_report_unsettled_total() {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
+        usage_reported: false,
         price: kairos::core::billing::PriceSnapshot::default(),
         cost_usd_micros: 9,
         base_cost_usd_micros: 0,
         discount_bp: 10_000,
         settled: false,
         request_id: None,
+        billing_attempt_id: None,
         request_body: None,
         response_body: None,
     };
@@ -2523,12 +2548,14 @@ async fn unsettled_log_can_be_settled_or_waived() {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
+        usage_reported: false,
         price: kairos::core::billing::PriceSnapshot::default(),
         cost_usd_micros: 1_000_000,
         base_cost_usd_micros: 0,
         discount_bp: 10_000,
         settled: false,
         request_id: None,
+        billing_attempt_id: None,
         request_body: None,
         response_body: None,
     };
@@ -2670,12 +2697,14 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
         cache_read_tokens: 0,
         cache_write_tokens: 0,
         cache_write_1h_tokens: 0,
+        usage_reported: false,
         price: kairos::core::billing::PriceSnapshot::default(),
         cost_usd_micros: 1_000_000,
         base_cost_usd_micros: 0,
         discount_bp: 10_000,
         settled: false,
         request_id: None,
+        billing_attempt_id: None,
         request_body: None,
         response_body: None,
     };
@@ -2969,12 +2998,14 @@ async fn seed_log(pool: &sqlx::SqlitePool, log: SeededLog) {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cache_write_1h_tokens: 0,
+            usage_reported: false,
             price: kairos::core::billing::PriceSnapshot::default(),
             cost_usd_micros: log.cost_usd_micros,
             base_cost_usd_micros: log.cost_usd_micros,
             discount_bp: 10_000,
             settled: true,
             request_id: None,
+            billing_attempt_id: None,
             request_body: None,
             response_body: None,
         },
@@ -3027,7 +3058,7 @@ async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
         },
     )
     .await;
-    // 今日一条失败：费用不应计入（仅成功结算）。
+    // 今日一条失败：已完成结算，费用应进入财务统计。
     seed_log(
         pool,
         SeededLog {
@@ -3076,9 +3107,9 @@ async fn seed_stats_logs(pool: &sqlx::SqlitePool, now: i64) -> (i64, i64, i64) {
     (today_start, yesterday, eight_days_ago)
 }
 
-/// `/stats` 汇总与逐日序列与播种数据精确一致；失败行费用不计入。
+/// `/stats` 汇总与逐日序列与播种数据精确一致；已结算失败行费用也计入。
 #[tokio::test]
-async fn stats_aggregates_seeded_logs_with_success_only_cost() {
+async fn stats_aggregates_seeded_logs_with_settled_attempt_cost() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let now = common::unix_millis();
     let (today_start, yesterday, _) = seed_stats_logs(&gw.pool, now).await;
@@ -3098,8 +3129,8 @@ async fn stats_aggregates_seeded_logs_with_success_only_cost() {
     assert_eq!(summary["input_tokens"], 35);
     assert_eq!(summary["output_tokens"], 13);
     assert_eq!(
-        summary["cost_usd_micros"], 3500,
-        "失败行 999999 微元不应计入费用"
+        summary["cost_usd_micros"], 1_003_499,
+        "已结算失败尝试费用应计入财务统计"
     );
     assert_eq!(summary["token_count"], 1, "资源表令牌数");
     assert_eq!(summary["channel_count"], 1, "资源表渠道数");
@@ -3110,7 +3141,7 @@ async fn stats_aggregates_seeded_logs_with_success_only_cost() {
     assert_eq!(today_point["request_count"], 3);
     assert_eq!(today_point["input_tokens"], 30);
     assert_eq!(today_point["output_tokens"], 12);
-    assert_eq!(today_point["cost_usd_micros"], 3000);
+    assert_eq!(today_point["cost_usd_micros"], 1_002_999);
     let yesterday_point = daily
         .iter()
         .find(|p| p["date"] == yesterday_date)
@@ -3128,7 +3159,7 @@ async fn stats_aggregates_seeded_logs_with_success_only_cost() {
         .find(|p| p["model"] == TEST_MODEL)
         .expect("应有 gpt-4o");
     assert_eq!(gpt4o["request_count"], 3);
-    assert_eq!(gpt4o["cost_usd_micros"], 3000);
+    assert_eq!(gpt4o["cost_usd_micros"], 1_002_999);
     let mini = by_model
         .iter()
         .find(|p| p["model"] == "gpt-4o-mini")
@@ -3142,7 +3173,7 @@ async fn stats_aggregates_seeded_logs_with_success_only_cost() {
         .find(|p| p["channel"] == "test-channel")
         .expect("应有 test-channel");
     assert_eq!(test_ch["request_count"], 3);
-    assert_eq!(test_ch["cost_usd_micros"], 3000);
+    assert_eq!(test_ch["cost_usd_micros"], 1_002_999);
     let other = by_channel
         .iter()
         .find(|p| p["channel"] == "other-channel")
@@ -3195,7 +3226,7 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
     );
     assert_eq!(daily[0]["request_count"], 3, "今日 3 条都落在 0 点桶");
     assert_eq!(body["summary"]["request_count"], 3, "1 天窗只有今日 3 条");
-    assert_eq!(body["summary"]["cost_usd_micros"], 3000);
+    assert_eq!(body["summary"]["cost_usd_micros"], 1_002_999);
 
     // 超大值夹取为 90：8 天前那条进入窗口。
     let resp = admin_get(&gw, "/stats?days=99999").await;
@@ -3203,10 +3234,10 @@ async fn stats_clamps_days_and_rejects_invalid_query() {
     let body: Value = resp.json().await.expect("stats 应可解析");
     assert_eq!(body["daily"].as_array().unwrap().len(), 90);
     assert_eq!(body["summary"]["request_count"], 5);
-    assert_eq!(body["summary"]["cost_usd_micros"], 3600);
+    assert_eq!(body["summary"]["cost_usd_micros"], 1_003_599);
 }
 
-/// `/stats/lifetime` 为全量累计，含默认 7 天窗外的条目；失败行费用不计入。
+/// `/stats/lifetime` 为全量累计，含默认 7 天窗外的条目；已结算失败行费用也计入。
 #[tokio::test]
 async fn stats_lifetime_aggregates_all_seeded_logs() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
@@ -3218,8 +3249,8 @@ async fn stats_lifetime_aggregates_all_seeded_logs() {
     let body: Value = resp.json().await.expect("lifetime stats 应可解析");
     assert_eq!(body["request_count"], 5, "全量应含 8 天前那条");
     assert_eq!(
-        body["cost_usd_micros"], 3600,
-        "失败行 999999 微元不应计入费用"
+        body["cost_usd_micros"], 1_003_599,
+        "已结算失败尝试费用应计入财务统计"
     );
     assert_eq!(body["total_tokens"], 50);
 

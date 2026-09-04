@@ -127,6 +127,10 @@ pub struct PlanCapabilities {
     pub toggle_user_tokens: bool,
     pub view_own_plan_groups: bool,
     pub view_other_groups: bool,
+    pub view_channels: bool,
+    pub view_prices: bool,
+    pub view_model_groups: bool,
+    pub view_unified_models: bool,
     pub edit_prices: bool,
     pub edit_model_groups: bool,
     pub edit_unified_models: bool,
@@ -592,6 +596,7 @@ pub async fn update_plan(
         input.discount_bp,
         input.initial_grant_usd_micros,
     )?;
+    validate_capability_dependencies(&input.capabilities)?;
     let capabilities_json = serialize_capabilities_json(&input.capabilities)?;
     // 内部名不随更新改动：它是系统托管的稳定标识，改名需求走显示名。
     let result = sqlx::query(
@@ -657,7 +662,8 @@ fn validate_input(input: &PlanCreateInput) -> Result<(), StoreError> {
         &input.display_name,
         input.discount_bp,
         input.initial_grant_usd_micros,
-    )
+    )?;
+    validate_capability_dependencies(&input.capabilities)
 }
 
 fn validate_fields(
@@ -675,6 +681,24 @@ fn validate_fields(
     }
     if initial_grant_usd_micros < 0 {
         return Err(StoreError::InvalidResource("起步金不能为负数".to_string()));
+    }
+    Ok(())
+}
+
+/// 写能力依赖其对应的读能力。拒绝无法观察目标资源的套餐配置，避免管理员拥有
+/// 修改命令却无法加载编辑器所需资源，形成只有特定调用顺序才工作的权限。
+fn validate_capability_dependencies(capabilities: &PlanCapabilities) -> Result<(), StoreError> {
+    let invalid = (capabilities.edit_prices && !capabilities.view_prices)
+        || (capabilities.edit_model_groups && !capabilities.view_model_groups)
+        || (capabilities.edit_unified_models && !capabilities.view_unified_models)
+        || ((capabilities.edit_prices
+            || capabilities.edit_model_groups
+            || capabilities.edit_unified_models)
+            && !capabilities.view_channels);
+    if invalid {
+        return Err(StoreError::InvalidResource(
+            "套餐的编辑能力必须同时启用对应读能力和渠道名录读能力".to_string(),
+        ));
     }
     Ok(())
 }
@@ -720,6 +744,10 @@ mod tests {
             toggle_user_tokens: true,
             view_own_plan_groups: true,
             view_other_groups: true,
+            view_channels: true,
+            view_prices: true,
+            view_model_groups: true,
+            view_unified_models: true,
             edit_prices: true,
             edit_model_groups: true,
             edit_unified_models: true,

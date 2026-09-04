@@ -108,12 +108,16 @@ struct FinalFailure {
     key_name: String,
 }
 
-/// 认证类失败（401/402/403）：是密钥的问题而非请求的问题。
-fn is_auth_failure(status: u16) -> bool {
-    (401..=403).contains(&status)
+/// 只有 401 能稳定归因到单把凭证失效。402 属于账号计费域，403 还可能表示
+/// 模型权限或组织策略；后二者不能污染跨请求的密钥健康状态。
+fn is_credential_failure(status: u16) -> bool {
+    status == 401
 }
 
 const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// 冷却表是保护性缓存而非事实存储；达到上限时停止接纳新记录，已有记录仍按
+/// TTL 自然清理。这样资源消耗只与配置规模有关，不受错误请求数量控制。
+const MAX_KEY_COOLDOWNS: usize = 4_096;
 
 /// 上游密钥认证失败后的跨请求冷却表。
 #[derive(Clone)]
@@ -148,10 +152,11 @@ impl KeyCooldowns {
 
     fn mark_auth_failure(&self, key_id: i64, now: Instant) {
         let until = now.checked_add(AUTH_FAILURE_COOLDOWN).unwrap_or(now);
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key_id, until);
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, expires_at| *expires_at > now);
+        if entries.contains_key(&key_id) || entries.len() < MAX_KEY_COOLDOWNS {
+            entries.insert(key_id, until);
+        }
     }
 
     fn clear(&self, key_id: i64) {
@@ -167,6 +172,16 @@ pub(super) struct FailoverPolicy<'a> {
     pub(super) inbound_protocol: Protocol,
     pub(super) retry_backoff: RetryBackoff,
     pub(super) key_cooldowns: &'a KeyCooldowns,
+    /// 从入站开始计算的绝对截止时刻；所有渠道与密钥共享，切换不会续期。
+    pub(super) deadline: tokio::time::Instant,
+}
+
+/// 在请求总截止时刻内完成一次退避。返回 false 表示总预算已耗尽，调用方必须
+/// 停止继续发起 provider 请求。
+async fn wait_for_retry(delay: Duration, deadline: tokio::time::Instant) -> bool {
+    tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+        .await
+        .is_ok()
 }
 
 pub(super) async fn run_failover<'a, A, L>(
@@ -184,7 +199,7 @@ where
     let mut last_failure: Option<FinalFailure> = None;
     policy.key_cooldowns.prune_expired(Instant::now());
 
-    for index in &route.channel_indices {
+    'channels: for index in &route.channel_indices {
         let Some(record) = channels.get(*index) else {
             continue;
         };
@@ -208,6 +223,15 @@ where
         let mut retries_used = 0u32;
 
         loop {
+            if tokio::time::Instant::now() >= policy.deadline {
+                last_failure = Some(FinalFailure {
+                    channel: record.channel.name.clone(),
+                    status: Some(504),
+                    message: "请求总时限已耗尽".to_string(),
+                    key_name: rotation.current().name.clone(),
+                });
+                break 'channels;
+            }
             rotation.mark_attempted();
             let key = rotation.current();
             match attempt(record, key).await {
@@ -219,7 +243,7 @@ where
                     channel,
                     status,
                     message,
-                } if is_auth_failure(status) => {
+                } if is_credential_failure(status) => {
                     // 认证失效是该 key 的问题而非请求的问题：请求级标记后换
                     // 下一把立即重试；渠道内全失效才切渠道。不消耗重试预算
                     // （上限是池大小，每把 key 至多失效一次）。
@@ -228,13 +252,28 @@ where
                         .mark_auth_failure(key.id, Instant::now());
                     if matches!(rotation.invalidate_current(), Rotation::Depleted) {
                         last_failure = Some(FinalFailure {
-                            channel,
+                            channel: channel.clone(),
                             status: Some(status),
                             message,
                             key_name: key.name.clone(),
                         });
                         break;
                     }
+                }
+                Outbound::Fatal {
+                    channel,
+                    status,
+                    message,
+                } if status == 402 || status == 403 => {
+                    // 账号余额与模型权限故障以渠道/账号域为单位，保留最后归因并
+                    // 切换下一渠道；不得把当前 key 写入跨请求冷却表。
+                    last_failure = Some(FinalFailure {
+                        channel: channel.clone(),
+                        status: Some(status),
+                        message,
+                        key_name: key.name.clone(),
+                    });
+                    break;
                 }
                 Outbound::Fatal {
                     channel,
@@ -262,33 +301,59 @@ where
                     message,
                     retry_after,
                 } => {
-                    // 429 换下一把未试过的 key 重试可免除当次退避；整池试完
-                    // 才按同渠道重试语义计次退避并轮回。after_rate_limit 的
-                    // Depleted（其余 key 全部认证失效）在此按 Exhausted 处理：
-                    // 当前 key 仍存活，计次重试它即可，边界由 auth 分支兜底。
+                    // 429 可能由密钥、账号、组织或模型配额域产生。即使还有未试
+                    // 密钥也先服从同一退避，避免在共享配额域内无间隔连打；轮换
+                    // 本身仍不额外消耗渠道的同 key 重试预算。
                     let advanced = if status == Some(429) {
                         rotation.after_rate_limit()
                     } else {
                         Rotation::Exhausted
                     };
                     if matches!(advanced, Rotation::Fresh) {
+                        if !wait_for_retry(
+                            retry_delay(retries_used, retry_after, policy.retry_backoff),
+                            policy.deadline,
+                        )
+                        .await
+                        {
+                            last_failure = Some(FinalFailure {
+                                channel,
+                                status: Some(504),
+                                message: "请求总时限已耗尽".to_string(),
+                                key_name: key.name.clone(),
+                            });
+                            break 'channels;
+                        }
                         continue;
                     }
                     last_failure = Some(FinalFailure {
-                        channel,
+                        channel: channel.clone(),
                         status,
                         message,
                         key_name: key.name.clone(),
                     });
-                    if retries_used >= record.channel.max_retries {
+                    if retries_used
+                        >= record
+                            .channel
+                            .max_retries
+                            .min(crate::store::resources::MAX_CHANNEL_RETRIES)
+                    {
                         break;
                     }
-                    tokio::time::sleep(retry_delay(
-                        retries_used,
-                        retry_after,
-                        policy.retry_backoff,
-                    ))
-                    .await;
+                    if !wait_for_retry(
+                        retry_delay(retries_used, retry_after, policy.retry_backoff),
+                        policy.deadline,
+                    )
+                    .await
+                    {
+                        last_failure = Some(FinalFailure {
+                            channel,
+                            status: Some(504),
+                            message: "请求总时限已耗尽".to_string(),
+                            key_name: key.name.clone(),
+                        });
+                        break 'channels;
+                    }
                     retries_used += 1;
                 }
             }
@@ -306,7 +371,7 @@ where
         message: "所有渠道均不可用".to_string(),
         key_name: String::new(),
     });
-    let auth_exhausted = status.is_some_and(is_auth_failure);
+    let auth_exhausted = status.is_some_and(is_credential_failure);
     let status_code = if auth_exhausted {
         502
     } else {
@@ -396,7 +461,7 @@ impl<'k> KeyRotation<'k> {
         }
     }
 
-    /// 认证失效（401/402/403）：标记当前 key 并换下一把可用 key；全部失效
+    /// 认证失效（401）：标记当前 key 并换下一把可用 key；全部失效
     /// 返回 [`Rotation::Depleted`]。
     fn invalidate_current(&mut self) -> Rotation {
         self.dead.insert(self.current().id);
@@ -701,6 +766,7 @@ mod tests {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
                 key_cooldowns: &KeyCooldowns::new(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;
@@ -740,6 +806,7 @@ mod tests {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
                 key_cooldowns: &KeyCooldowns::new(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;
@@ -777,7 +844,7 @@ mod tests {
                     } else {
                         Outbound::Fatal {
                             channel: "ch-1".to_string(),
-                            status: 403,
+                            status: 401,
                             message: "forbidden".to_string(),
                         }
                     }
@@ -788,6 +855,7 @@ mod tests {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
                 key_cooldowns: &KeyCooldowns::new(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;

@@ -1209,12 +1209,18 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
 /// 与 IR 完整路径共用 `convert_usage`，保证直通与 IR 计费口径一致。
 pub fn sniff_chat_usage(value: &Value) -> Option<Usage> {
     let usage = value.get("usage")?.as_object()?;
-    let wire =
-        serde_json::from_value::<WireUsage>(Value::Object(usage.clone())).unwrap_or(WireUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            prompt_tokens_details: None,
-        });
+    let has_metric = usage.contains_key("prompt_tokens")
+        || usage.contains_key("completion_tokens")
+        || usage
+            .get("prompt_tokens_details")
+            .and_then(Value::as_object)
+            .is_some_and(|details| {
+                details.contains_key("cached_tokens") || details.contains_key("cache_write_tokens")
+            });
+    if !has_metric {
+        return None;
+    }
+    let wire = serde_json::from_value::<WireUsage>(Value::Object(usage.clone())).ok()?;
     Some(convert_usage(wire))
 }
 
@@ -2940,6 +2946,8 @@ mod tests {
         // 无 usage 字段的帧返回 None。
         let no_usage = json!({ "choices": [{ "index": 0, "delta": { "content": "hi" } }] });
         assert!(sniff_chat_usage(&no_usage).is_none());
+        assert!(sniff_chat_usage(&json!({ "usage": { "prompt_tokens": "invalid" } })).is_none());
+        assert!(sniff_chat_usage(&json!({ "usage": { "unrelated": 1 } })).is_none());
     }
 
     /// 流内错误编码：chat 无协议内错误通道，以独立 `data:` 帧下发错误 JSON，

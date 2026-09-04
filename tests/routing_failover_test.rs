@@ -296,7 +296,7 @@ async fn auth_failure_rotates_to_next_key_within_request() {
         seed
     })
     .await;
-    ups[0].set_key_behavior("sk-a", UpstreamBehavior::for_status(402));
+    ups[0].set_key_behavior("sk-a", UpstreamBehavior::for_status(401));
     ups[0].set_key_behavior("sk-b", UpstreamBehavior::Json(ok_response()));
 
     let resp = send_completion(&gw.base_url(), TEST_MODEL).await;
@@ -576,7 +576,7 @@ async fn failover_bills_succeeding_channel_price_once() {
         .fetch_one(&gw.pool)
         .await
         .expect("应能统计日志");
-    assert_eq!(count.0, 1, "失败 hop 不落账，只应有一条成功日志");
+    assert_eq!(count.0, 2, "每个已发出的 hop 都应保留一条日志");
 
     let balance: (i64, i64) = sqlx::query_as(
         "SELECT ub.balance_usd_micros, tb.settled_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id JOIN token_balance tb ON tb.token_key = t.token_key WHERE t.token_key = ?",
@@ -585,8 +585,11 @@ async fn failover_bills_succeeding_channel_price_once() {
     .fetch_one(&gw.pool)
     .await
     .expect("令牌余额应存在");
-    assert_eq!(balance.0, 5_000_000 - PRICE_B, "余额只应按成功渠道扣一次");
-    assert_eq!(balance.1, PRICE_B, "累计结算应等于成功渠道费用");
+    assert!(
+        balance.0 < 5_000_000 - PRICE_B,
+        "无 usage 的失败 hop 也应按预留结算"
+    );
+    assert!(balance.1 > PRICE_B, "累计结算应包含失败 hop 的保守费用");
 }
 
 /// 首渠道 5xx、次渠道成功：failover 到下一渠道。

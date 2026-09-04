@@ -22,8 +22,9 @@ use crate::store::resources::{
     self, SETTING_ALLOW_PRIVATE_NETWORKS, SETTING_AUTH_THROTTLE_MAX_FAILURES,
     SETTING_AUTH_THROTTLE_WINDOW_SECS, SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY,
     SETTING_LOG_BODY_MAX_BYTES, SETTING_MAX_REQUEST_BYTES, SETTING_MAX_RESPONSE_BYTES,
-    SETTING_RATE_LIMIT_RPM, SETTING_REQUEST_RECTIFY, SETTING_RETRY_AFTER_CAP_SECS,
-    SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS, SETTING_SSE_REASSEMBLY_MAX_BYTES,
+    SETTING_PRIVATE_NETWORK_ALLOWLIST, SETTING_RATE_LIMIT_RPM, SETTING_REQUEST_RECTIFY,
+    SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS,
+    SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
 use crate::store::users::{self, ManagementRole};
 
@@ -87,6 +88,8 @@ pub struct RuntimeSnapshot {
     pub request_rectify: bool,
     /// 是否允许私网、环回与链路本地上游地址。
     pub allow_private_networks: bool,
+    /// 显式信任的精确私网主机名或 IP；请求路径与管理探测读取同一快照字段。
+    pub private_network_allowlist: Vec<String>,
     /// 实例级密钥，仅用于派生出站缓存亲和标识。
     pub session_cache_secret: [u8; 32],
 }
@@ -196,6 +199,7 @@ impl RuntimeSnapshot {
             rate_limit_rpm: self.rate_limit_rpm,
             request_rectify: self.request_rectify,
             allow_private_networks: self.allow_private_networks,
+            private_network_allowlist: self.private_network_allowlist.clone(),
         }
     }
 }
@@ -342,6 +346,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
             SETTING_ALLOW_PRIVATE_NETWORKS,
             DEFAULT_ALLOW_PRIVATE_NETWORKS,
         ),
+        private_network_allowlist: load_string_list(&settings, SETTING_PRIVATE_NETWORK_ALLOWLIST),
         session_cache_secret,
     })
 }
@@ -386,6 +391,22 @@ fn load_bool(settings: &HashMap<String, Value>, key: &str, default: bool) -> boo
 /// 从开关表解析无符号整数：缺键或非整数时用 `default`。
 fn load_u64(settings: &HashMap<String, Value>, key: &str, default: u64) -> u64 {
     settings.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+/// 从开关表解析字符串数组；非法元素使整项回落为空，避免部分接受配置后形成
+/// 管理面显示与实际网络策略不一致的状态。
+fn load_string_list(settings: &HashMap<String, Value>, key: &str) -> Vec<String> {
+    let Some(values) = settings.get(key).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// 从开关表解析 `full_body`：缺省关闭。
@@ -649,6 +670,10 @@ mod tests {
                 settle_waive: true,
                 toggle_user_tokens: true,
                 view_own_plan_groups: true,
+                view_channels: true,
+                view_prices: true,
+                view_model_groups: true,
+                view_unified_models: true,
                 ..PlanCapabilities::default()
             }
         );

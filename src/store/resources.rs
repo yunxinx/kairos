@@ -428,6 +428,8 @@ pub const SETTING_RATE_LIMIT_RPM: &str = "rate_limit_rpm";
 pub const SETTING_REQUEST_RECTIFY: &str = "request_rectify";
 /// 运行时开关键：是否允许向解析为私网/环回/链路本地地址的上游发起请求。
 pub const SETTING_ALLOW_PRIVATE_NETWORKS: &str = "allow_private_networks";
+/// 运行时开关键：允许解析到私网的精确主机名或 IP 字面量列表。
+pub const SETTING_PRIVATE_NETWORK_ALLOWLIST: &str = "private_network_allowlist";
 /// 进程实例密钥：用于派生出站缓存亲和标识；不属于管理 API 设置契约。
 pub(crate) const SETTING_SESSION_CACHE_SECRET: &str = "session_cache_secret";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
@@ -458,8 +460,13 @@ pub const DEFAULT_RATE_LIMIT_RPM: u64 = 0;
 /// 请求整流重试缺省开启：只作用于原本必败的 400 请求，动作可审计且随
 /// warnings 回传下游，风险低于让请求直接失败。
 pub const DEFAULT_REQUEST_RECTIFY: bool = true;
-/// 默认允许私网目标，便于企业内网部署；可由 root 在设置中关闭。
-pub const DEFAULT_ALLOW_PRIVATE_NETWORKS: bool = true;
+/// 默认拒绝私网目标；需要内网渠道时由 root 在设置中显式放行。
+pub const DEFAULT_ALLOW_PRIVATE_NETWORKS: bool = false;
+/// 单次渠道调用的服务端超时硬上限。管理面拒绝更大值，请求路径仍再次钳制，
+/// 使直接写库或旧快照也不能突破请求资源预算。
+pub const MAX_CHANNEL_TIMEOUT_MS: u64 = 120_000;
+/// 每渠道同 key 重试硬上限；密钥轮换另受启用密钥数量的有限集合约束。
+pub const MAX_CHANNEL_RETRIES: u32 = 4;
 
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_auth_throttle_max_failures() -> u64 {
@@ -550,6 +557,9 @@ pub struct Settings {
     /// 是否允许私网、环回与链路本地上游地址。
     #[serde(default = "default_allow_private_networks")]
     pub allow_private_networks: bool,
+    /// 无需全局放开私网即可访问的精确主机名或 IP；不接受通配符和 URL。
+    #[serde(default)]
+    pub private_network_allowlist: Vec<String>,
 }
 
 impl Default for Settings {
@@ -569,6 +579,7 @@ impl Default for Settings {
             rate_limit_rpm: DEFAULT_RATE_LIMIT_RPM,
             request_rectify: DEFAULT_REQUEST_RECTIFY,
             allow_private_networks: DEFAULT_ALLOW_PRIVATE_NETWORKS,
+            private_network_allowlist: Vec::new(),
         }
     }
 }
@@ -1732,6 +1743,19 @@ pub async fn upsert_settings(
         conn,
         SETTING_ALLOW_PRIVATE_NETWORKS,
         &Value::Bool(settings.allow_private_networks),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_PRIVATE_NETWORK_ALLOWLIST,
+        &Value::Array(
+            settings
+                .private_network_allowlist
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
     )
     .await?;
     Ok(())

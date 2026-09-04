@@ -20,8 +20,8 @@ use crate::store::plans;
 use crate::store::users::{self, ManagementRole, NewUser, UserRecord};
 
 use super::auth::{
-    ManagementCapability, ManagementIdentity, SESSION_COOKIE, request_is_secure,
-    session_from_headers, session_from_request,
+    ManagementCapability, ManagementIdentity, SESSION_COOKIE, session_from_headers,
+    session_from_request,
 };
 use super::tokens;
 use super::{
@@ -109,7 +109,7 @@ struct LoginView {
 async fn login(
     State(deps): State<AdminDeps>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Result<Json<LoginBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
     let snapshot = deps.snapshot.read().await;
@@ -117,18 +117,27 @@ async fn login(
     let window = snapshot.auth_throttle_window();
     drop(snapshot);
     let ip = addr.ip();
-    if deps.throttle.is_blocked(ip, max_failures, window) {
-        return Err(AdminError::RateLimited);
-    }
     let body = body.map_err(AdminError::bad_body)?.0;
     // 形状封顶先于限流记账、Argon2 与审计写入：超长字段只会白白消耗 CPU，
     // email 还会原样进审计行（放大 system_log）；控制字符可伪造多行日志。
     validate_login_shape(&body.email, &body.password)?;
+    if deps
+        .throttle
+        .is_blocked(ip, Some(&body.email), max_failures, window)
+    {
+        return Err(AdminError::RateLimited);
+    }
+    let _verification_permit = deps
+        .password_verifiers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AdminError::RateLimited)?;
     let Some(user) = users::authenticate_password(&deps.pool, &body.email, &body.password)
         .await
         .map_err(AdminError::Store)?
     else {
-        deps.throttle.record_failure(ip, max_failures, window);
+        deps.throttle
+            .record_failure(ip, Some(&body.email), max_failures, window);
         // 失败登录记 warn 且不带 actor：此刻还没认出是谁，邮箱只是对方声称的。
         store::record_audit_detached(
             &deps.pool,
@@ -165,11 +174,7 @@ async fn login(
         ),
     )
     .await;
-    let secure = if request_is_secure(&headers) {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure = "; Secure";
     let cookie = format!(
         "{SESSION_COOKIE}={token}; Path=/api; HttpOnly; SameSite=Strict{secure}; Max-Age={}",
         (expires_at - now).max(0) / 1000
@@ -207,11 +212,7 @@ async fn logout(
     users::revoke_session(&deps.pool, provided)
         .await
         .map_err(AdminError::Store)?;
-    let secure = if request_is_secure(request.headers()) {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure = "; Secure";
     let clear = HeaderValue::from_str(&format!(
         "{SESSION_COOKIE}=; Path=/api; HttpOnly; SameSite=Strict{secure}; Max-Age=0"
     ))

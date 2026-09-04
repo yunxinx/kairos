@@ -31,7 +31,7 @@ use sqlx::{
 };
 use thiserror::Error;
 
-use crate::core::billing::PriceSnapshot;
+use crate::core::billing::{self, PriceSnapshot};
 
 /// 存储层错误，向上抛给应用边界。
 #[derive(Debug, Error)]
@@ -42,6 +42,8 @@ pub enum StoreError {
     Migrate(sqlx::migrate::MigrateError),
     #[error("数据库操作失败: {0}")]
     Query(sqlx::Error),
+    #[error("请求日志持久化超过请求截止时间")]
+    PersistenceTimeout,
     #[error("读取数据库文件元数据 {path} 失败: {source}")]
     FileMetadata {
         path: PathBuf,
@@ -58,6 +60,8 @@ pub enum StoreError {
     MissingToken(String),
     #[error("资源数据非法: {0}")]
     InvalidResource(String),
+    #[error("管理主体无权操作该记录")]
+    PermissionDenied,
     #[error("不能删除或降级最后一个 root")]
     LastRootProtected,
     #[error("用户 {0} 不存在")]
@@ -72,6 +76,12 @@ pub enum StoreError {
     EntityIdClockBeforeEpoch,
     #[error("资源 id 空间已耗尽")]
     EntityIdExhausted,
+    #[error("用户余额不足以预留本次请求费用")]
+    InsufficientFunds,
+    #[error("令牌累计结算上限不足以预留本次请求费用")]
+    TokenLimitExceeded,
+    #[error("请求费用预留与已有请求身份不一致")]
+    ReservationConflict,
 }
 
 /// 写锁等待上限：与 sqlx-sqlite 缺省一致，此处显式声明意图——SQLite 单写者下
@@ -125,7 +135,7 @@ pub async fn insert_smoke(pool: &SqlitePool, note: &str) -> Result<i64, StoreErr
 }
 
 /// 一条请求日志的可持久化字段。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestLog {
     /// 时间有序主键：新增时由存储层分配，插入构造时填 0。
     pub id: i64,
@@ -156,6 +166,9 @@ pub struct RequestLog {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cache_write_1h_tokens: u64,
+    /// 上游结果是否明确携带 usage 字段；显式的全零 usage 仍为已报告。
+    #[serde(default)]
+    pub usage_reported: bool,
     /// 计费时的价格快照（micro-USD / 1M tokens）。
     pub price: PriceSnapshot,
     /// 渠道原价（micro-USD），不套用折扣。
@@ -170,6 +183,11 @@ pub struct RequestLog {
     pub settled: bool,
     /// 一次下游入站请求的身份；同一请求的多次出站尝试共用。存量行可能为 `None`。
     pub request_id: Option<String>,
+    /// 一次实际出站尝试的计费身份。
+    ///
+    /// 同一个 `request_id` 可以产生多条不同的 attempt；该字段把最终日志与唯一的
+    /// 预留、上游结果和钱包扣款对应起来。未进入出站阶段的请求日志为 `None`。
+    pub billing_attempt_id: Option<String>,
     /// 可选的入站请求原始字节（仅 `logging.full_body` 开启时保存）。
     pub request_body: Option<Vec<u8>>,
     /// 可选的入站响应原始字节（仅 `logging.full_body` 开启时保存）。
@@ -179,7 +197,7 @@ pub struct RequestLog {
 }
 
 /// 已持久化、等待后台完成结算与写入最终日志的请求。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingRequestLog {
     pub(crate) log: RequestLog,
     /// 费用计算阶段已失败时保留原因；此类记录不得执行扣费。
@@ -203,6 +221,9 @@ pub async fn insert_request_log_on(
 }
 
 /// 使用预先分配的 id 插入请求日志，供持久化队列原子完成“入日志并出队”。
+///
+/// 仅对预先分配的主键做幂等处理；若同一计费尝试已由其它 id 写入，唯一约束
+/// 错误必须显式暴露，不能把不同结果静默折叠成一条日志。
 pub(crate) async fn insert_request_log_with_id_on(
     conn: &mut SqliteConnection,
     log: &RequestLog,
@@ -221,8 +242,9 @@ pub(crate) async fn insert_request_log_with_id_on(
           cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
           cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
           base_cost_usd_micros, discount_bp, cost_usd_micros, \
-          settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          settled, usage_reported, request_id, billing_attempt_id, request_body, response_body) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT(id) DO NOTHING",
     )
     .bind(id)
     .bind(log.created_at)
@@ -250,7 +272,9 @@ pub(crate) async fn insert_request_log_with_id_on(
     .bind(log.discount_bp)
     .bind(log.cost_usd_micros)
     .bind(log.settled as i64)
+    .bind(log.usage_reported as i64)
     .bind(&log.request_id)
+    .bind(&log.billing_attempt_id)
     .bind(&log.request_body)
     .bind(&log.response_body)
     .execute(&mut *conn)
@@ -287,22 +311,136 @@ pub(crate) async fn enqueue_pending_request_log(
     let response_body = pending.log.response_body.take();
     let metadata = serde_json::to_vec(&pending)
         .map_err(|err| StoreError::InvalidResource(format!("待结算请求无法编码: {err}")))?;
-    sqlx::query(
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+    let inserted = sqlx::query(
         "INSERT INTO request_log_outbox \
-         (id, token_key, user_id, cost_usd_micros, metadata, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         (id, token_key, user_id, cost_usd_micros, metadata, request_body, response_body, \
+          request_id, billing_attempt_id) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(&pending.log.token_key)
     .bind(pending.log.user_id)
     .bind(pending.log.cost_usd_micros)
-    .bind(metadata)
-    .bind(request_body)
-    .bind(response_body)
-    .execute(pool)
+    .bind(&metadata)
+    .bind(&request_body)
+    .bind(&response_body)
+    .bind(&pending.log.request_id)
+    .bind(&pending.log.billing_attempt_id)
+    .execute(&mut *tx)
     .await
     .map_err(StoreError::Query)?;
-    Ok(id)
+    let persisted_id = if inserted.rows_affected() == 0 {
+        let attempt_id = pending.log.billing_attempt_id.as_deref().ok_or_else(|| {
+            StoreError::InvalidResource("无计费尝试标识的日志发生唯一键冲突".to_string())
+        })?;
+        let existing = sqlx::query_as::<_, (i64, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)>(
+            "SELECT id, metadata, request_body, response_body \
+             FROM request_log_outbox WHERE billing_attempt_id = ?",
+        )
+        .bind(attempt_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+        if existing.1 != metadata || existing.2 != request_body || existing.3 != response_body {
+            return Err(StoreError::ReservationConflict);
+        }
+        existing.0
+    } else {
+        id
+    };
+    if let Some(attempt_id) = pending.log.billing_attempt_id.as_deref() {
+        mark_billing_attempt_result_persisted(&mut tx, attempt_id).await?;
+    }
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(persisted_id)
+}
+
+/// 标记结果已进入 outbox，并清理预留行中的完整结果副本。
+///
+/// 预留元数据只需在 outbox 尚未形成时支持崩溃恢复；结果进入 outbox 后，继续保留
+/// 请求体、响应体和 usage 会使同一份敏感数据在账务表中长期重复存储。元数据损坏时
+/// 不覆盖原始 BLOB，只更新状态位并交由隔离记录保留原文。
+async fn mark_billing_attempt_result_persisted(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+) -> Result<(), StoreError> {
+    let metadata = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT recovery_metadata FROM billing_reservations \
+         WHERE attempt_id = ? AND status = 'reserved'",
+    )
+    .bind(attempt_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?
+    .ok_or_else(|| StoreError::InvalidResource(format!("费用预留 {attempt_id} 不存在或已终止")))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    clear_billing_attempt_recovery_payload(conn, attempt_id, &metadata).await?;
+    let updated = sqlx::query(
+        "UPDATE billing_reservations SET result_persisted = 1, updated_at = ? \
+         WHERE attempt_id = ? AND status = 'reserved'",
+    )
+    .bind(now)
+    .bind(attempt_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::InvalidResource(format!(
+            "费用预留 {attempt_id} 不存在或已终止"
+        )));
+    }
+    Ok(())
+}
+
+/// 清理预留元数据中的大对象结果；无法解析时保留原始字节供隔离记录复核。
+async fn clear_billing_attempt_recovery_payload(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+    metadata: &[u8],
+) -> Result<(), StoreError> {
+    let Ok(mut recovery) = serde_json::from_slice::<BillingAttemptRecovery>(metadata) else {
+        return Ok(());
+    };
+    recovery.request_body = None;
+    recovery.result = None;
+    recovery.result_settlement_error = None;
+    let cleaned = serde_json::to_vec(&recovery)
+        .map_err(|err| StoreError::InvalidResource(format!("费用元数据无法编码: {err}")))?;
+    sqlx::query(
+        "UPDATE billing_reservations SET recovery_metadata = ? \
+         WHERE attempt_id = ?",
+    )
+    .bind(cleaned)
+    .bind(attempt_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+async fn clear_billing_attempt_recovery_payload_by_id(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+) -> Result<(), StoreError> {
+    let metadata = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT recovery_metadata FROM billing_reservations WHERE attempt_id = ?",
+    )
+    .bind(attempt_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    if let Some(metadata) = metadata {
+        clear_billing_attempt_recovery_payload(conn, attempt_id, &metadata).await?;
+    }
+    Ok(())
 }
 
 /// 按 id 读取一批待结算请求；后台按该顺序处理，避免旧记录长期滞留。
@@ -310,10 +448,17 @@ pub(crate) async fn load_pending_request_logs(
     pool: &SqlitePool,
     limit: i64,
 ) -> Result<Vec<PendingRequestLog>, StoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
     let rows = sqlx::query(
         "SELECT id, metadata, request_body, response_body \
-         FROM request_log_outbox ORDER BY id LIMIT ?",
+         FROM request_log_outbox \
+         WHERE (state = 'queued' OR (state = 'isolated' AND next_retry_at IS NOT NULL AND next_retry_at <= ?)) \
+         ORDER BY id LIMIT ?",
     )
+    .bind(now)
     .bind(limit.max(1))
     .fetch_all(pool)
     .await
@@ -322,15 +467,460 @@ pub(crate) async fn load_pending_request_logs(
     for row in rows {
         let id: i64 = row.try_get("id").map_err(StoreError::Query)?;
         let metadata: Vec<u8> = row.try_get("metadata").map_err(StoreError::Query)?;
-        let mut item: PendingRequestLog = serde_json::from_slice(&metadata).map_err(|err| {
-            StoreError::InvalidResource(format!("待结算请求 {id} 无法解码: {err}"))
-        })?;
+        let mut item: PendingRequestLog = match serde_json::from_slice(&metadata) {
+            Ok(item) => item,
+            Err(err) => {
+                // 元数据损坏只影响当前记录。把原始 BLOB 留在同一行并标记为
+                // isolated，主队列仍可继续处理后续记录；数据库写入失败时才
+                // 向上返回，让下一轮重试这次隔离动作。
+                let reason = format!("待结算请求无法解码: {err}");
+                isolate_pending_request_log(pool, id, &reason, None).await?;
+                record_system_error(
+                    pool,
+                    "billing",
+                    &SystemLogEvent::new(
+                        "request_log.metadata_corrupt",
+                        serde_json::json!({ "outbox_id": id }),
+                        reason,
+                    ),
+                )
+                .await;
+                continue;
+            }
+        };
         item.log.id = id;
-        item.log.request_body = row.try_get("request_body").map_err(StoreError::Query)?;
-        item.log.response_body = row.try_get("response_body").map_err(StoreError::Query)?;
+        // 新记录把正文放在独立 BLOB 列，恢复记录还可能把正文保存在 metadata
+        // 内。仅在 BLOB 列确实有值时覆盖，避免旧版本崩溃恢复把已保存正文
+        // 用 NULL 覆盖掉。
+        let request_body: Option<Vec<u8>> =
+            row.try_get("request_body").map_err(StoreError::Query)?;
+        if request_body.is_some() {
+            item.log.request_body = request_body;
+        }
+        let response_body: Option<Vec<u8>> =
+            row.try_get("response_body").map_err(StoreError::Query)?;
+        if response_body.is_some() {
+            item.log.response_body = response_body;
+        }
         pending.push(item);
     }
     Ok(pending)
+}
+
+/// 将结算失败永久保留在 outbox 中，并记录下次重放时间。
+///
+/// `isolated` 只表示该条记录不再阻塞主队列；原始 metadata、请求/响应 body
+/// 仍在同一行，后台可按 request id 精确重放，运维也能据此定位失败原因。
+pub(crate) async fn isolate_pending_request_log(
+    pool: &SqlitePool,
+    id: i64,
+    reason: &str,
+    retry_after: Option<Duration>,
+) -> Result<(), StoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+    let (attempt_count, billing_attempt_id): (i64, Option<String>) = sqlx::query_as(
+        "SELECT attempt_count, billing_attempt_id FROM request_log_outbox WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?
+    .unwrap_or((0, None));
+    let next_retry_at = retry_after.and_then(|delay| {
+        let exponent = u32::try_from(attempt_count.min(16)).unwrap_or(0);
+        let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
+        let millis = i64::try_from(delay.as_millis())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(multiplier)
+            .min(10 * 60 * 1000);
+        now.checked_add(millis)
+    });
+    sqlx::query(
+        "UPDATE request_log_outbox \
+         SET state = 'isolated', attempt_count = attempt_count + 1, \
+             next_retry_at = ?, last_error = ? WHERE id = ?",
+    )
+    .bind(next_retry_at)
+    .bind(reason)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?;
+    if retry_after.is_none() {
+        // 未派发尝试没有上游费用，可释放预留让后续请求继续使用余额；已派发
+        // 尝试必须保留预留并占用准入额度，直到人工修正后以同一 attempt_id
+        // 重放结算。
+        if let Some(attempt_id) = billing_attempt_id {
+            sqlx::query(
+                "UPDATE billing_reservations SET status = 'released', updated_at = ? \
+                 WHERE attempt_id = ? AND status = 'reserved' AND dispatched = 0",
+            )
+            .bind(now)
+            .bind(attempt_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+        }
+    }
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 永久隔离或等待重试的 outbox 记录，供管理面定位和发起重放。
+///
+/// `request_body` 和 `response_body` 均保留原始字节。元数据损坏时 `log` 为
+/// `None`，但数据库中的原文不会被占位对象覆盖；调用方可以据此决定人工修复
+/// 后再重放，确保“无法解析”不会退化成静默丢弃。
+#[derive(Debug, Clone)]
+pub(crate) struct IsolatedRequestLog {
+    pub(crate) id: i64,
+    pub(crate) request_id: Option<String>,
+    pub(crate) billing_attempt_id: Option<String>,
+    pub(crate) token_key: String,
+    pub(crate) user_id: i64,
+    pub(crate) attempt_count: i64,
+    pub(crate) next_retry_at: Option<i64>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) request_body: Option<Vec<u8>>,
+    pub(crate) response_body: Option<Vec<u8>>,
+    pub(crate) log: Option<RequestLog>,
+}
+
+/// 查询隔离 outbox 记录。
+///
+/// 结果按 outbox id 升序返回；无论元数据是否损坏，原始字段都会返回，因而
+/// 管理面可以展示失败原因并按精确 attempt id 发起重放。`limit` 至少取 1。
+/// 按管理主体范围读取隔离记录；非 root 仅能看到普通用户归属的记录。
+pub(crate) async fn query_isolated_request_logs_scoped(
+    pool: &SqlitePool,
+    limit: i64,
+    include_management_records: bool,
+) -> Result<Vec<IsolatedRequestLog>, StoreError> {
+    let sql = if include_management_records {
+        "SELECT outbox.id, outbox.request_id, outbox.billing_attempt_id, outbox.token_key, outbox.user_id, outbox.attempt_count, \
+                outbox.next_retry_at, outbox.last_error, outbox.metadata, outbox.request_body, outbox.response_body \
+         FROM request_log_outbox outbox WHERE outbox.state = 'isolated' ORDER BY outbox.id LIMIT ?"
+    } else {
+        "SELECT outbox.id, outbox.request_id, outbox.billing_attempt_id, outbox.token_key, outbox.user_id, outbox.attempt_count, \
+                outbox.next_retry_at, outbox.last_error, outbox.metadata, outbox.request_body, outbox.response_body \
+         FROM request_log_outbox outbox \
+         INNER JOIN users owner ON owner.id = outbox.user_id AND owner.role = 'user' \
+         WHERE outbox.state = 'isolated' ORDER BY outbox.id LIMIT ?"
+    };
+    let rows = sqlx::query(sql)
+        .bind(limit.max(1))
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+
+    rows.into_iter()
+        .map(|row| {
+            let metadata: Vec<u8> = row.try_get("metadata").map_err(StoreError::Query)?;
+            let request_body: Option<Vec<u8>> =
+                row.try_get("request_body").map_err(StoreError::Query)?;
+            let response_body: Option<Vec<u8>> =
+                row.try_get("response_body").map_err(StoreError::Query)?;
+            let log = match serde_json::from_slice::<PendingRequestLog>(&metadata) {
+                Ok(mut pending) => {
+                    if request_body.is_some() {
+                        pending.log.request_body.clone_from(&request_body);
+                    }
+                    if response_body.is_some() {
+                        pending.log.response_body.clone_from(&response_body);
+                    }
+                    Some(pending.log)
+                }
+                Err(_) => None,
+            };
+            Ok(IsolatedRequestLog {
+                id: row.try_get("id").map_err(StoreError::Query)?,
+                request_id: row.try_get("request_id").map_err(StoreError::Query)?,
+                billing_attempt_id: row
+                    .try_get("billing_attempt_id")
+                    .map_err(StoreError::Query)?,
+                token_key: row.try_get("token_key").map_err(StoreError::Query)?,
+                user_id: row.try_get("user_id").map_err(StoreError::Query)?,
+                attempt_count: row.try_get("attempt_count").map_err(StoreError::Query)?,
+                next_retry_at: row.try_get("next_retry_at").map_err(StoreError::Query)?,
+                last_error: row.try_get("last_error").map_err(StoreError::Query)?,
+                request_body,
+                response_body,
+                log,
+            })
+        })
+        .collect()
+}
+
+/// 隔离记录的重放结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IsolatedReplayAction {
+    /// 已从隔离状态重新放入主队列。
+    Requeued,
+    /// 记录本来就在主队列中，重复操作不产生副作用。
+    AlreadyQueued,
+    /// 该尝试已经写入最终日志，重复操作不产生副作用。
+    AlreadySettled,
+    /// 没有找到指定的 attempt。
+    NotFound,
+}
+
+/// 按计费尝试身份重放隔离记录。
+///
+/// 只清除调度字段，不改原始 metadata、正文、失败次数或计费尝试身份。
+/// 后台再次消费时仍以 `billing_attempt_id` 唯一键结算，因而重复点击不会重复
+/// 扣款。调用方应在管理层记录操作者审计信息。
+pub(crate) async fn requeue_isolated_request_log(
+    pool: &SqlitePool,
+    billing_attempt_id: &str,
+    include_management_records: bool,
+) -> Result<IsolatedReplayAction, StoreError> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    if !include_management_records {
+        let owner_role = sqlx::query_scalar::<_, String>(
+            "SELECT owner.role FROM request_log_outbox outbox \
+             LEFT JOIN users owner ON owner.id = outbox.user_id \
+             WHERE outbox.billing_attempt_id = ? AND outbox.state = 'isolated'",
+        )
+        .bind(billing_attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+        if owner_role.as_deref() != Some("user") {
+            tx.rollback().await.map_err(StoreError::Query)?;
+            return Err(StoreError::PermissionDenied);
+        }
+    }
+    let updated = sqlx::query(
+        "UPDATE request_log_outbox SET state = 'queued', next_retry_at = NULL, last_error = NULL \
+         WHERE billing_attempt_id = ? AND state = 'isolated'",
+    )
+    .bind(billing_attempt_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?;
+    let action = if updated.rows_affected() == 1 {
+        if let Err(err) =
+            restore_released_billing_reservation(&mut tx, billing_attempt_id, now).await
+        {
+            tx.rollback().await.map_err(StoreError::Query)?;
+            return Err(err);
+        }
+        IsolatedReplayAction::Requeued
+    } else if sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM request_log_outbox WHERE billing_attempt_id = ? AND state = 'queued'",
+    )
+    .bind(billing_attempt_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?
+        > 0
+    {
+        IsolatedReplayAction::AlreadyQueued
+    } else if sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM request_log WHERE billing_attempt_id = ?",
+    )
+    .bind(billing_attempt_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?
+        > 0
+    {
+        IsolatedReplayAction::AlreadySettled
+    } else {
+        IsolatedReplayAction::NotFound
+    };
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(action)
+}
+
+/// 按 outbox 行身份重放隔离记录。
+///
+/// 没有计费尝试身份的历史日志只能通过 outbox 主键定位；这类记录不涉及
+/// 钱包预留，重放仅恢复队列状态。若该行同时带有计费尝试，则复用同一预留
+/// 恢复校验，保持与按尝试身份重放一致的结算语义。
+pub(crate) async fn requeue_isolated_request_log_by_id(
+    pool: &SqlitePool,
+    id: i64,
+    include_management_records: bool,
+) -> Result<IsolatedReplayAction, StoreError> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT outbox.state, owner.role FROM request_log_outbox outbox \
+         LEFT JOIN users owner ON owner.id = outbox.user_id \
+         WHERE outbox.id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?;
+    let Some((state, owner_role)) = row else {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Ok(IsolatedReplayAction::NotFound);
+    };
+    if state == "queued" {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Ok(IsolatedReplayAction::AlreadyQueued);
+    }
+    if state != "isolated" {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Ok(IsolatedReplayAction::NotFound);
+    }
+    if !include_management_records && owner_role.as_deref() != Some("user") {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Err(StoreError::PermissionDenied);
+    }
+    let attempt_id = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT billing_attempt_id FROM request_log_outbox \
+         WHERE id = ? AND state = 'isolated'",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?
+    .flatten();
+    let updated = sqlx::query(
+        "UPDATE request_log_outbox SET state = 'queued', next_retry_at = NULL, last_error = NULL \
+         WHERE id = ? AND state = 'isolated'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?;
+    let action = if updated.rows_affected() == 1 {
+        if let Some(attempt_id) = attempt_id.as_deref() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+            if let Err(err) = restore_released_billing_reservation(&mut tx, attempt_id, now).await {
+                tx.rollback().await.map_err(StoreError::Query)?;
+                return Err(err);
+            }
+        }
+        IsolatedReplayAction::Requeued
+    } else {
+        IsolatedReplayAction::NotFound
+    };
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(action)
+}
+
+/// 恢复确定性隔离记录释放的预留，并再次执行原子准入检查。
+///
+/// 隔离时释放了未扣除的冻结金额；重放不能无条件把状态改回 reserved，
+/// 否则余额或令牌累计上限在此期间下降时会绕过准入。检查通过后保留原
+/// `attempt_id` 和原始金额，后台结算仍保持 exactly-once。
+async fn restore_released_billing_reservation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt_id: &str,
+    now: i64,
+) -> Result<(), StoreError> {
+    let row = sqlx::query_as::<_, (String, i64, i64, Option<i64>, String)>(
+        "SELECT token_key, user_id, reserved_cost_usd_micros, token_limit_usd_micros, status \
+         FROM billing_reservations WHERE attempt_id = ?",
+    )
+    .bind(attempt_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(StoreError::Query)?;
+    let Some((token_key, user_id, reserved_cost, _token_limit, status)) = row else {
+        return Err(StoreError::InvalidResource(format!(
+            "费用预留 {attempt_id} 不存在"
+        )));
+    };
+    if status != "reserved" && status != "released" {
+        return Err(StoreError::ReservationConflict);
+    }
+    let current_limit: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT limit_usd_micros FROM tokens WHERE token_key = ?")
+            .bind(&token_key)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(StoreError::Query)?;
+    let Some(current_limit) = current_limit else {
+        return Err(StoreError::InvalidResource(format!(
+            "令牌 {token_key} 不存在，无法重放费用预留"
+        )));
+    };
+    if reserved_cost > 0 {
+        let pending_user: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(reserved_cost_usd_micros), 0) \
+             FROM billing_reservations reserved \
+             WHERE reserved.user_id = ? AND reserved.status = 'reserved' \
+               AND reserved.attempt_id <> ?",
+        )
+        .bind(user_id)
+        .bind(attempt_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(StoreError::Query)?;
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(StoreError::Query)?;
+        if balance.saturating_sub(pending_user) < reserved_cost {
+            return Err(StoreError::InsufficientFunds);
+        }
+        if let Some(limit) = current_limit {
+            let settled: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(settled_usd_micros, 0) FROM token_balance WHERE token_key = ?",
+            )
+            .bind(&token_key)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(StoreError::Query)?
+            .unwrap_or(0);
+            let pending_token: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(reserved_cost_usd_micros), 0) \
+                 FROM billing_reservations reserved \
+                 WHERE reserved.token_key = ? AND reserved.status = 'reserved' \
+                   AND reserved.attempt_id <> ?",
+            )
+            .bind(&token_key)
+            .bind(attempt_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(StoreError::Query)?;
+            if settled
+                .saturating_add(pending_token)
+                .saturating_add(reserved_cost)
+                > limit
+            {
+                return Err(StoreError::TokenLimitExceeded);
+            }
+        }
+    }
+    if status == "released" {
+        sqlx::query(
+            "UPDATE billing_reservations SET status = 'reserved', updated_at = ? \
+             WHERE attempt_id = ? AND status = 'released'",
+        )
+        .bind(now)
+        .bind(attempt_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(StoreError::Query)?;
+    }
+    Ok(())
 }
 
 /// 在结算事务内删除已写入最终日志的队列项。
@@ -367,6 +957,642 @@ pub struct TokenSettlement {
 pub struct AdmissionSnapshot {
     pub wallet: UserWallet,
     pub token: TokenSettlement,
+}
+
+/// 一次实际出站尝试在准入事务中冻结的账务信息。
+pub struct BillingAttemptReservation<'a> {
+    /// 每次实际出站尝试唯一；同一入站请求的重试不得复用。
+    pub attempt_id: &'a str,
+    /// 聚合同一次入站请求产生的所有出站尝试。
+    pub request_id: &'a str,
+    pub token_key: &'a str,
+    pub user_id: i64,
+    pub cost_usd_micros: i64,
+    /// 令牌是累计用量边界而非钱包；`None` 表示不限制累计金额。
+    pub token_limit_usd_micros: Option<i64>,
+    /// 供进程崩溃恢复构造持久化结果的最小请求元数据。
+    pub recovery_metadata: &'a [u8],
+}
+
+/// 已发出但尚未把结果写入 outbox 时，恢复任务用于重建日志的元数据。
+///
+/// 出站前先保存结算与审计所需的标识和价格快照；结果生成后再原位补入完整日志，
+/// 因而恢复任务既能处理未知结果，也能在 outbox 写入失败时保留已生成的正文与 usage。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BillingAttemptRecovery {
+    pub token_name: String,
+    pub model: String,
+    pub outbound_model: Option<String>,
+    pub channel: String,
+    pub channel_key: Option<String>,
+    pub inbound_protocol: String,
+    pub started: i64,
+    pub price: PriceSnapshot,
+    pub discount_bp: i64,
+    /// 请求体快照仅在启用完整日志且结果尚未进入 outbox 时保留。
+    #[serde(default)]
+    pub request_body: Option<Vec<u8>>,
+    /// 已生成但尚未进入 outbox 的完整结果；崩溃恢复优先使用它重建原始记录。
+    #[serde(default)]
+    pub result: Option<Box<RequestLog>>,
+    /// 费用计算错误的稳定文本；存在时恢复记录必须保持未结算。
+    #[serde(default)]
+    pub result_settlement_error: Option<String>,
+}
+
+/// 在计费预留行中保存已生成的结果，供 outbox 写入失败或进程崩溃后的恢复任务
+/// 使用。该更新不改变预留状态，重复写入同一结果保持幂等。
+pub(crate) async fn persist_billing_attempt_result(
+    pool: &SqlitePool,
+    attempt_id: &str,
+    pending: &PendingRequestLog,
+) -> Result<(), StoreError> {
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+    let metadata = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT recovery_metadata FROM billing_reservations \
+         WHERE attempt_id = ? AND status = 'reserved'",
+    )
+    .bind(attempt_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?
+    .ok_or_else(|| StoreError::InvalidResource(format!("费用预留 {attempt_id} 不存在或已终止")))?;
+    let mut recovery: BillingAttemptRecovery = serde_json::from_slice(&metadata)
+        .map_err(|err| StoreError::InvalidResource(format!("费用恢复元数据无法解码: {err}")))?;
+    if let Some(existing) = recovery.result.as_deref() {
+        if existing == &pending.log && recovery.result_settlement_error == pending.settlement_error
+        {
+            tx.commit().await.map_err(StoreError::Query)?;
+            return Ok(());
+        }
+        return Err(StoreError::ReservationConflict);
+    }
+    recovery.result = Some(Box::new(pending.log.clone()));
+    recovery.result_settlement_error = pending.settlement_error.clone();
+    let encoded = serde_json::to_vec(&recovery)
+        .map_err(|err| StoreError::InvalidResource(format!("费用结果无法编码: {err}")))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let updated = sqlx::query(
+        "UPDATE billing_reservations SET recovery_metadata = ?, updated_at = ? \
+         WHERE attempt_id = ? AND status = 'reserved'",
+    )
+    .bind(encoded)
+    .bind(now)
+    .bind(attempt_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::InvalidResource(format!(
+            "费用预留 {attempt_id} 不存在或已终止"
+        )));
+    }
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 在实际出站调用前为一次物理尝试原子预留费用。
+///
+/// 用户钱包是唯一资金来源；令牌金额仅限制该令牌的累计结算。钱包余额、令牌
+/// 累计上限和预留行在同一个 `BEGIN IMMEDIATE` 事务中检查并写入，因而并发尝试
+/// 不能共同消费同一份可用额度。幂等性只作用于 `attempt_id`；`request_id` 相同的
+/// 重试、渠道切换和统一模型跳转仍是互相独立的账务动作。
+pub async fn reserve_billing_attempt(
+    pool: &SqlitePool,
+    reservation: BillingAttemptReservation<'_>,
+) -> Result<bool, StoreError> {
+    if reservation.cost_usd_micros < 0 {
+        return Err(StoreError::InvalidResource(
+            "预留费用不能为负数".to_string(),
+        ));
+    }
+    if reservation.recovery_metadata.is_empty() {
+        return Err(StoreError::InvalidResource(
+            "计费预留缺少恢复元数据".to_string(),
+        ));
+    }
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+    if let Some((existing_token, existing_user, existing_cost, status)) =
+        sqlx::query_as::<_, (String, i64, i64, String)>(
+            "SELECT token_key, user_id, reserved_cost_usd_micros, status \
+             FROM billing_reservations WHERE attempt_id = ?",
+        )
+        .bind(reservation.attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?
+    {
+        if existing_token != reservation.token_key
+            || existing_user != reservation.user_id
+            || existing_cost != reservation.cost_usd_micros
+        {
+            return Err(StoreError::ReservationConflict);
+        }
+        tx.commit().await.map_err(StoreError::Query)?;
+        return Ok(status == "reserved" || status == "settled");
+    }
+
+    let pending_user: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(reserved_cost_usd_micros), 0) \
+         FROM billing_reservations reserved \
+         WHERE reserved.user_id = ? AND reserved.status = 'reserved'",
+    )
+    .bind(reservation.user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?;
+    if reservation.cost_usd_micros > 0 {
+        let balance: Option<i64> =
+            sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")
+                .bind(reservation.user_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(StoreError::Query)?;
+        let balance = balance.ok_or(StoreError::MissingWallet(reservation.user_id))?;
+        if balance.saturating_sub(pending_user) < reservation.cost_usd_micros {
+            tx.rollback().await.map_err(StoreError::Query)?;
+            return Ok(false);
+        }
+    }
+
+    if let Some(limit) = reservation.token_limit_usd_micros {
+        let settled: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(settled_usd_micros, 0) FROM token_balance WHERE token_key = ?",
+        )
+        .bind(reservation.token_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?
+        .unwrap_or(0);
+        let pending_token: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(reserved_cost_usd_micros), 0) \
+             FROM billing_reservations reserved \
+             WHERE reserved.token_key = ? AND reserved.status = 'reserved'",
+        )
+        .bind(reservation.token_key)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+        if settled
+            .saturating_add(pending_token)
+            .saturating_add(reservation.cost_usd_micros)
+            > limit
+        {
+            tx.rollback().await.map_err(StoreError::Query)?;
+            return Ok(false);
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    sqlx::query(
+        "INSERT INTO billing_reservations \
+         (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, token_limit_usd_micros, \
+          recovery_metadata, status, dispatched, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', 0, ?, ?)",
+    )
+    .bind(reservation.attempt_id)
+    .bind(reservation.request_id)
+    .bind(reservation.token_key)
+    .bind(reservation.user_id)
+    .bind(reservation.cost_usd_micros)
+    .bind(reservation.token_limit_usd_micros)
+    .bind(reservation.recovery_metadata)
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(StoreError::Query)?;
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(true)
+}
+
+/// 标记预留已经进入实际出站调用阶段；恢复任务据此区分可释放和未知费用。
+pub async fn mark_billing_attempt_dispatched(
+    pool: &SqlitePool,
+    attempt_id: &str,
+) -> Result<(), StoreError> {
+    let updated = sqlx::query(
+        "UPDATE billing_reservations SET dispatched = 1, updated_at = ? \
+         WHERE attempt_id = ? AND status = 'reserved' AND dispatched = 0",
+    )
+    .bind(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0),
+    )
+    .bind(attempt_id)
+    .execute(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::InvalidResource(format!(
+            "费用预留 {attempt_id} 不存在、已发出或已终止"
+        )));
+    }
+    Ok(())
+}
+
+/// 结算一个预留。实际费用不足预留时退回差额；超过预留时只允许在同一事务中
+/// 通过用户余额和令牌累计上限的再次检查后补差，绝不静默形成未记录欠款。
+pub async fn settle_billing_attempt(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+    actual_cost_usd_micros: i64,
+) -> Result<(), StoreError> {
+    if actual_cost_usd_micros < 0 {
+        return Err(StoreError::InvalidResource(
+            "实际费用不能为负数".to_string(),
+        ));
+    }
+    let row = sqlx::query_as::<_, (String, i64, i64, Option<i64>, Option<i64>, String)>(
+        "SELECT token_key, user_id, reserved_cost_usd_micros, token_limit_usd_micros, \
+                actual_cost_usd_micros, status \
+         FROM billing_reservations WHERE attempt_id = ?",
+    )
+    .bind(attempt_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    let Some(row) = row else {
+        if actual_cost_usd_micros == 0 {
+            return Ok(());
+        }
+        return Err(StoreError::InvalidResource(format!(
+            "找不到费用预留 {attempt_id}"
+        )));
+    };
+    let (token_key, user_id, reserved, token_limit, recorded_actual, status) = row;
+    if status == "settled" {
+        if recorded_actual == Some(actual_cost_usd_micros) {
+            return Ok(());
+        }
+        return Err(StoreError::ReservationConflict);
+    }
+    if status != "reserved" {
+        return Err(StoreError::InvalidResource(format!(
+            "费用预留 {attempt_id} 已终止"
+        )));
+    }
+    if actual_cost_usd_micros > reserved {
+        let pending_user: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(reserved_cost_usd_micros), 0) \
+             FROM billing_reservations reserved \
+             WHERE reserved.user_id = ? AND reserved.status = 'reserved' \
+               AND reserved.attempt_id <> ?",
+        )
+        .bind(user_id)
+        .bind(attempt_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(StoreError::Query)?;
+        if balance
+            .saturating_sub(pending_user)
+            .saturating_sub(actual_cost_usd_micros)
+            < 0
+        {
+            return Err(StoreError::InsufficientFunds);
+        }
+        if let Some(limit) = token_limit {
+            let settled: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(settled_usd_micros, 0) FROM token_balance WHERE token_key = ?",
+            )
+            .bind(&token_key)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?
+            .unwrap_or(0);
+            let pending_token: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(reserved_cost_usd_micros), 0) \
+                 FROM billing_reservations reserved \
+                 WHERE reserved.token_key = ? AND reserved.status = 'reserved' \
+                   AND reserved.attempt_id <> ?",
+            )
+            .bind(&token_key)
+            .bind(attempt_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+            if settled
+                .saturating_add(pending_token)
+                .saturating_add(actual_cost_usd_micros)
+                > limit
+            {
+                return Err(StoreError::TokenLimitExceeded);
+            }
+        }
+    }
+    // 预留冻结了费用归属。令牌在请求完成前被删除时，结算仍扣所属用户钱包；
+    // 令牌累计行是附属投影，不得反过来决定已发生费用能否入账。
+    apply_charge(conn, user_id, &token_key, actual_cost_usd_micros, false).await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    sqlx::query(
+        "UPDATE billing_reservations SET actual_cost_usd_micros = ?, status = 'settled', updated_at = ? \
+         WHERE attempt_id = ?",
+    )
+    .bind(actual_cost_usd_micros)
+    .bind(now)
+    .bind(attempt_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    clear_billing_attempt_recovery_payload_by_id(conn, attempt_id).await?;
+    Ok(())
+}
+
+/// provider 尚未调用时释放预留；已 dispatch 的 attempt 不允许走退款路径。
+pub async fn release_billing_attempt(
+    pool: &SqlitePool,
+    attempt_id: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE billing_reservations SET status = 'released', updated_at = ? \
+         WHERE attempt_id = ? AND status = 'reserved' AND dispatched = 0",
+    )
+    .bind(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0),
+    )
+    .bind(attempt_id)
+    .execute(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 扫描进程崩溃留下的预留：尚未进入 provider 阶段的释放，已进入阶段的生成
+/// 保守结算记录。所有动作都在各自的短写事务中完成，和正常入队共享同一唯一键。
+pub(crate) async fn recover_orphan_billing_attempts(
+    pool: &SqlitePool,
+    max_age: Duration,
+    limit: i64,
+) -> Result<usize, StoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let age_millis = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+    let cutoff = now.saturating_sub(age_millis);
+    let candidates = sqlx::query(
+        "SELECT attempt_id FROM billing_reservations \
+         WHERE status = 'reserved' AND result_persisted = 0 \
+           AND updated_at <= ? ORDER BY updated_at, attempt_id LIMIT ?",
+    )
+    .bind(cutoff)
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await
+    .map_err(StoreError::Query)?;
+
+    let mut recovered = 0usize;
+    for candidate in candidates {
+        let attempt_id: String = candidate.try_get("attempt_id").map_err(StoreError::Query)?;
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(StoreError::Query)?;
+        let row = sqlx::query(
+            "SELECT request_id, token_key, user_id, reserved_cost_usd_micros, dispatched, \
+                    recovery_metadata \
+             FROM billing_reservations \
+             WHERE attempt_id = ? AND status = 'reserved' AND result_persisted = 0 \
+               AND updated_at <= ?",
+        )
+        .bind(&attempt_id)
+        .bind(cutoff)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+        let Some(row) = row else {
+            tx.rollback().await.map_err(StoreError::Query)?;
+            continue;
+        };
+        let dispatched: i64 = row.try_get("dispatched").map_err(StoreError::Query)?;
+        if dispatched == 0 {
+            sqlx::query(
+                "UPDATE billing_reservations SET status = 'released', updated_at = ? \
+                 WHERE attempt_id = ? AND status = 'reserved' AND result_persisted = 0",
+            )
+            .bind(now)
+            .bind(&attempt_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+            tx.commit().await.map_err(StoreError::Query)?;
+            recovered = recovered.saturating_add(1);
+            continue;
+        }
+
+        let request_id: String = row.try_get("request_id").map_err(StoreError::Query)?;
+        let token_key: String = row.try_get("token_key").map_err(StoreError::Query)?;
+        let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
+        let reserved_cost: i64 = row
+            .try_get("reserved_cost_usd_micros")
+            .map_err(StoreError::Query)?;
+        let metadata: Vec<u8> = row
+            .try_get("recovery_metadata")
+            .map_err(StoreError::Query)?;
+        let (recovery, metadata_error) =
+            match serde_json::from_slice::<BillingAttemptRecovery>(&metadata) {
+                Ok(recovery) => (recovery, None),
+                Err(err) => {
+                    // 保留损坏的原始 BLOB，同时生成一条不可自动结算的隔离记录。
+                    // 不能用占位元数据静默替换原始事实，否则后续人工复核无法判断
+                    // 这条请求实际使用的模型、价格和响应是否可信。
+                    let reason = format!("费用恢复元数据损坏: {err}");
+                    (
+                        BillingAttemptRecovery {
+                            token_name: token_key.clone(),
+                            model: "<recovered-attempt>".to_string(),
+                            outbound_model: None,
+                            channel: "<unknown-channel>".to_string(),
+                            channel_key: None,
+                            inbound_protocol: "unknown".to_string(),
+                            started: now,
+                            price: PriceSnapshot::default(),
+                            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+                            request_body: None,
+                            result: None,
+                            result_settlement_error: Some(reason.clone()),
+                        },
+                        Some(reason),
+                    )
+                }
+            };
+        let BillingAttemptRecovery {
+            token_name,
+            model,
+            outbound_model,
+            channel,
+            channel_key,
+            inbound_protocol,
+            started,
+            price,
+            discount_bp,
+            request_body,
+            result,
+            result_settlement_error,
+        } = recovery;
+        let (mut log, settlement_error) = if let Some(result) = result {
+            (*result, result_settlement_error.or(metadata_error.clone()))
+        } else {
+            let log = RequestLog {
+                id: 0,
+                created_at: now,
+                token_name,
+                token_key,
+                user_id,
+                inbound_protocol,
+                model,
+                outbound_model,
+                channel,
+                channel_key,
+                status_code: 502,
+                latency_ms: now.saturating_sub(started),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
+                usage_reported: false,
+                price,
+                base_cost_usd_micros: conservative_base_from_charge(reserved_cost, discount_bp),
+                discount_bp,
+                cost_usd_micros: reserved_cost,
+                settled: false,
+                request_id: Some(request_id),
+                billing_attempt_id: Some(attempt_id.clone()),
+                request_body,
+                response_body: None,
+            };
+            (log, result_settlement_error)
+        };
+        if !log.usage_reported && settlement_error.is_none() {
+            // 结果可能来自旧版本：当时缺失 usage 的日志尚未把预留金额写进
+            // result。恢复时按当前预留补齐费用与基础成本，避免崩溃窗口把
+            // 请求错误地当成零费用。
+            log.cost_usd_micros = reserved_cost;
+            if log.base_cost_usd_micros == 0 {
+                log.base_cost_usd_micros =
+                    conservative_base_from_charge(reserved_cost, discount_bp);
+            }
+        }
+        let mut pending = PendingRequestLog {
+            log,
+            settlement_error,
+        };
+        let outbox_id = ids::next_id()?;
+        let request_body = pending.log.request_body.take();
+        let response_body = pending.log.response_body.take();
+        let encoded = serde_json::to_vec(&pending)
+            .map_err(|err| StoreError::InvalidResource(format!("恢复记录无法编码: {err}")))?;
+        let inserted = sqlx::query(
+            "INSERT INTO request_log_outbox \
+             (id, token_key, user_id, cost_usd_micros, metadata, request_body, response_body, \
+              request_id, billing_attempt_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(outbox_id)
+        .bind(&pending.log.token_key)
+        .bind(pending.log.user_id)
+        .bind(pending.log.cost_usd_micros)
+        .bind(&encoded)
+        .bind(&request_body)
+        .bind(&response_body)
+        .bind(&pending.log.request_id)
+        .bind(&pending.log.billing_attempt_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+        if inserted.rows_affected() == 0 {
+            let existing = sqlx::query_as::<
+                _,
+                (
+                    String,
+                    i64,
+                    i64,
+                    Vec<u8>,
+                    Option<Vec<u8>>,
+                    Option<Vec<u8>>,
+                    Option<String>,
+                    Option<String>,
+                ),
+            >(
+                "SELECT token_key, user_id, cost_usd_micros, metadata, request_body, \
+                        response_body, request_id, billing_attempt_id \
+                 FROM request_log_outbox WHERE billing_attempt_id = ?",
+            )
+            .bind(&attempt_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+            if existing.0 != pending.log.token_key
+                || existing.1 != pending.log.user_id
+                || existing.2 != pending.log.cost_usd_micros
+                || existing.3 != encoded
+                || existing.4 != request_body
+                || existing.5 != response_body
+                || existing.6 != pending.log.request_id
+                || existing.7 != pending.log.billing_attempt_id
+            {
+                return Err(StoreError::ReservationConflict);
+            }
+        }
+        mark_billing_attempt_result_persisted(&mut tx, &attempt_id).await?;
+        tx.commit().await.map_err(StoreError::Query)?;
+        if let Some(reason) = metadata_error {
+            record_system_error(
+                pool,
+                "billing",
+                &SystemLogEvent::new(
+                    "billing.recovery_metadata_corrupt",
+                    serde_json::json!({ "attempt_id": attempt_id }),
+                    reason,
+                ),
+            )
+            .await;
+        }
+        recovered = recovered.saturating_add(1);
+    }
+    Ok(recovered)
+}
+
+/// 由折后金额反推在整数截断下可能对应的原价上界。
+///
+/// 结算预留只保存折后金额，恢复任务无法重新获得原始 usage 时使用此上界
+/// 记录基础成本，避免把整笔预留错误显示为毛利。免费折扣不可逆，返回 0。
+fn conservative_base_from_charge(charge: i64, discount_bp: i64) -> i64 {
+    if charge <= 0 || discount_bp <= 0 {
+        return 0;
+    }
+    let numerator = (charge as i128 + 1)
+        .saturating_mul(billing::DEFAULT_DISCOUNT_BP as i128)
+        .saturating_sub(1);
+    let estimate = numerator / discount_bp as i128;
+    i64::try_from(estimate).unwrap_or(i64::MAX)
 }
 
 /// 令牌首次出现时建立累计结算行，并把初始余额记入所属用户钱包；已存在则原样返回。
@@ -440,14 +1666,22 @@ pub async fn get_admission_snapshot(
                     ub.settled_usd_micros AS user_settled_usd_micros, \
                     COALESCE(tb.settled_usd_micros, 0) AS token_settled_usd_micros, \
                     COALESCE(( \
+                        SELECT SUM(reserved.reserved_cost_usd_micros) \
+                        FROM billing_reservations reserved \
+                        WHERE reserved.user_id = t.user_id AND reserved.status = 'reserved' \
+                    ), 0) + COALESCE(( \
                         SELECT SUM(pending.cost_usd_micros) \
                         FROM request_log_outbox pending \
-                        WHERE pending.user_id = t.user_id \
+                        WHERE pending.user_id = t.user_id AND pending.request_id IS NULL \
                     ), 0) AS pending_user_cost, \
                     COALESCE(( \
+                        SELECT SUM(reserved.reserved_cost_usd_micros) \
+                        FROM billing_reservations reserved \
+                        WHERE reserved.token_key = t.token_key AND reserved.status = 'reserved' \
+                    ), 0) + COALESCE(( \
                         SELECT SUM(pending.cost_usd_micros) \
                         FROM request_log_outbox pending \
-                        WHERE pending.token_key = t.token_key \
+                        WHERE pending.token_key = t.token_key AND pending.request_id IS NULL \
                     ), 0) AS pending_token_cost \
              FROM tokens t \
              INNER JOIN user_balance ub ON ub.user_id = t.user_id \
@@ -786,7 +2020,7 @@ async fn query_request_logs_on(
          cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
-         settled FROM request_log",
+         settled, usage_reported, request_id, billing_attempt_id FROM request_log",
     );
     push_request_log_filters(&mut qb, filter);
     push_request_log_order(&mut qb, filter);
@@ -822,7 +2056,8 @@ pub async fn get_request_log_on_conn(
          cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
-         settled, request_body, response_body FROM request_log WHERE id = ?",
+         settled, usage_reported, request_id, billing_attempt_id, request_body, response_body \
+         FROM request_log WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -872,7 +2107,11 @@ pub async fn settle_unsettled_log(
     Ok(UnsettledLogAction::Closed)
 }
 
-/// 豁免未结算日志：只翻 `settled`，不动余额。
+/// 豁免未结算日志：清除待收费用并翻 `settled`，不动余额。
+///
+/// `settled` 同时表示财务聚合可纳入的已完成状态，因此豁免行必须把费用列
+/// 归零，否则会在不扣钱包的情况下被统计为收入。原始请求/响应正文和审计
+/// 事件仍保留，便于追溯豁免前的记录。
 pub async fn waive_unsettled_log(
     conn: &mut SqliteConnection,
     id: i64,
@@ -883,7 +2122,14 @@ pub async fn waive_unsettled_log(
     if settled {
         return Ok(UnsettledLogAction::AlreadySettled);
     }
-    mark_request_log_settled(conn, id).await?;
+    sqlx::query(
+        "UPDATE request_log SET settled = 1, cost_usd_micros = 0, base_cost_usd_micros = 0 \
+         WHERE id = ?",
+    )
+    .bind(id)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
     Ok(UnsettledLogAction::Closed)
 }
 
@@ -1157,7 +2403,7 @@ pub struct CostShare {
 ///
 /// 口径：`request_count` 按 `request_id` 去重（存量无 id 的行回退到主键），
 /// 表示下游入站次数；`total_tokens` 含全部请求日志行（含未结算），
-/// `cost_usd_micros` 只计 HTTP 2xx 且已结算的费用。并列展示时
+/// `cost_usd_micros` 统计所有已结算出站尝试（包括失败尝试）。并列展示时
 /// 不要把 token 合计当成已入账费用的用量。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifetimeStats {
@@ -1168,7 +2414,8 @@ pub struct LifetimeStats {
     pub total_tokens: u64,
 }
 
-/// 聚合 `days` 天（已夹取）内的 stats。费用只计 HTTP 2xx（与计费「仅成功结算」一致）。
+/// 聚合 `days` 天（已夹取）内的 stats。费用统计所有已结算尝试，成功数仍只
+/// 统计 HTTP 2xx，避免失败尝试扣费后在财务报表中消失。
 ///
 /// `user_id` 为 `Some` 时只统计该用户名下的流量（普通用户视图），并省略渠道数。
 pub async fn query_stats(
@@ -1190,11 +2437,11 @@ pub async fn query_stats(
          COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS success_count, \
          COALESCE(SUM(input_tokens), 0) AS input_tokens, \
          COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
            AS base_cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+         COALESCE(SUM(CASE WHEN settled = 1 \
              THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
            AS gross_profit_usd_micros \
          FROM request_log WHERE created_at >= ?{}",
@@ -1277,7 +2524,7 @@ pub async fn query_stats(
     })
 }
 
-/// 全量累计：请求数、成功结算费用、四分量 token 合计。
+/// 全量累计：请求数、已结算费用和四分量 token 合计。
 ///
 /// `user_id` 为 `Some` 时只累计该用户名下的流量。
 pub async fn query_lifetime_stats(
@@ -1286,11 +2533,11 @@ pub async fn query_lifetime_stats(
 ) -> Result<LifetimeStats, StoreError> {
     let sql = format!(
         "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
            AS base_cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+         COALESCE(SUM(CASE WHEN settled = 1 \
              THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
            AS gross_profit_usd_micros, \
          COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
@@ -1359,11 +2606,11 @@ async fn query_hourly_buckets(
                    COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                   COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                   COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                   COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
             FROM request_log WHERE created_at >= ?{} \
             GROUP BY hour \
@@ -1409,11 +2656,11 @@ async fn query_daily_buckets(
                    COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                   COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                   COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+                   COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
             FROM request_log WHERE created_at >= ?{} \
             GROUP BY day \
@@ -1439,7 +2686,7 @@ enum CostDimension {
     Channel,
 }
 
-/// 按模型或按渠道聚合费用/请求；费用仅计 2xx。
+/// 按模型或按渠道聚合费用/请求；费用统计所有已结算尝试。
 async fn query_cost_share(
     pool: &SqlitePool,
     from_created_at: i64,
@@ -1452,11 +2699,11 @@ async fn query_cost_share(
     };
     let sql = format!(
         "SELECT {column} AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
            AS cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
+         COALESCE(SUM(CASE WHEN settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
            AS base_cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
+         COALESCE(SUM(CASE WHEN settled = 1 \
              THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
            AS gross_profit_usd_micros \
          FROM request_log WHERE created_at >= ?{} \
@@ -1746,7 +2993,14 @@ fn map_request_log_row(
             .try_get::<i64, _>("settled")
             .map_err(StoreError::Query)?
             != 0,
-        request_id: None,
+        usage_reported: row
+            .try_get::<i64, _>("usage_reported")
+            .map_err(StoreError::Query)?
+            != 0,
+        request_id: row.try_get("request_id").map_err(StoreError::Query)?,
+        billing_attempt_id: row
+            .try_get("billing_attempt_id")
+            .map_err(StoreError::Query)?,
         request_body: if include_body {
             row.try_get("request_body").map_err(StoreError::Query)?
         } else {
@@ -1827,6 +3081,256 @@ mod tests {
             pending[0].log.response_body.as_deref(),
             Some(&b"response"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn orphan_dispatched_attempt_is_rebuilt_into_outbox() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-recovery").await;
+        initialize_token_settlement(&mut conn, "sk-recovery", 10_000, 1)
+            .await
+            .expect("应能初始化余额");
+        let mut result = sample_log(1, false);
+        result.token_name = "recovery".to_string();
+        result.token_key = "sk-recovery".to_string();
+        result.channel = "channel".to_string();
+        result.channel_key = Some("key-1".to_string());
+        result.status_code = 200;
+        result.cost_usd_micros = 123;
+        result.usage_reported = true;
+        result.request_id = Some("request-recovery".to_string());
+        result.billing_attempt_id = Some("attempt-recovery".to_string());
+        result.request_body = Some(b"original request".to_vec());
+        result.response_body = Some(b"original response".to_vec());
+        let metadata = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "recovery".to_string(),
+            model: "model".to_string(),
+            outbound_model: Some("provider-model".to_string()),
+            channel: "channel".to_string(),
+            channel_key: Some("key-1".to_string()),
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price: PriceSnapshot::default(),
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            request_body: None,
+            result: Some(Box::new(result)),
+            result_settlement_error: None,
+        })
+        .expect("恢复元数据应可编码");
+        sqlx::query(
+            "INSERT INTO billing_reservations \
+             (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+              token_limit_usd_micros, recovery_metadata, status, dispatched, result_persisted, \
+              created_at, updated_at) \
+             VALUES ('attempt-recovery', 'request-recovery', 'sk-recovery', 1, 123, NULL, ?, \
+                     'reserved', 1, 0, 0, 0)",
+        )
+        .bind(metadata)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写入模拟遗留预留");
+        drop(conn);
+
+        assert_eq!(
+            recover_orphan_billing_attempts(&pool, Duration::ZERO, 16)
+                .await
+                .expect("恢复任务应成功"),
+            1
+        );
+        let pending = load_pending_request_logs(&pool, 16)
+            .await
+            .expect("应能读取恢复记录");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].log.billing_attempt_id.as_deref(),
+            Some("attempt-recovery")
+        );
+        assert_eq!(pending[0].log.cost_usd_micros, 123);
+        assert_eq!(pending[0].log.status_code, 200);
+        assert_eq!(
+            pending[0].log.request_body.as_deref(),
+            Some(&b"original request"[..])
+        );
+        assert_eq!(
+            pending[0].log.response_body.as_deref(),
+            Some(&b"original response"[..])
+        );
+        assert!(pending[0].log.usage_reported);
+        let recovery_metadata: Vec<u8> = sqlx::query_scalar(
+            "SELECT recovery_metadata FROM billing_reservations WHERE attempt_id = 'attempt-recovery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取恢复元数据");
+        let recovery: BillingAttemptRecovery =
+            serde_json::from_slice(&recovery_metadata).expect("恢复元数据应保持可解析");
+        assert!(recovery.result.is_none(), "结果进入 outbox 后不应重复保留");
+        assert!(
+            recovery.request_body.is_none(),
+            "请求体进入 outbox 后不应重复保留"
+        );
+        isolate_pending_request_log(&pool, pending[0].log.id, "需要人工复核", None)
+            .await
+            .expect("应能隔离记录");
+        let isolated = query_isolated_request_logs_scoped(&pool, 16, true)
+            .await
+            .expect("应能查询隔离记录");
+        assert_eq!(isolated.len(), 1);
+        assert_eq!(
+            isolated[0].billing_attempt_id.as_deref(),
+            Some("attempt-recovery")
+        );
+        assert_eq!(
+            isolated[0].request_body.as_deref(),
+            Some(&b"original request"[..])
+        );
+        assert_eq!(
+            isolated[0].response_body.as_deref(),
+            Some(&b"original response"[..])
+        );
+        sqlx::query("UPDATE user_balance SET balance_usd_micros = 0 WHERE user_id = 1")
+            .execute(&pool)
+            .await
+            .expect("应能暂时收紧用户余额");
+        assert!(matches!(
+            requeue_isolated_request_log(&pool, "attempt-recovery", true).await,
+            Err(StoreError::InsufficientFunds)
+        ));
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM request_log_outbox WHERE billing_attempt_id = 'attempt-recovery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取回滚后的队列状态");
+        assert_eq!(state, "isolated");
+        sqlx::query("UPDATE user_balance SET balance_usd_micros = 5_000_000 WHERE user_id = 1")
+            .execute(&pool)
+            .await
+            .expect("应能恢复用户余额");
+        sqlx::query("UPDATE tokens SET limit_usd_micros = 100 WHERE token_key = 'sk-recovery'")
+            .execute(&pool)
+            .await
+            .expect("应能收紧令牌累计上限");
+        assert!(matches!(
+            requeue_isolated_request_log(&pool, "attempt-recovery", true).await,
+            Err(StoreError::TokenLimitExceeded)
+        ));
+        sqlx::query("UPDATE tokens SET limit_usd_micros = 1_000 WHERE token_key = 'sk-recovery'")
+            .execute(&pool)
+            .await
+            .expect("应能放宽令牌累计上限");
+        assert!(matches!(
+            requeue_isolated_request_log(&pool, "attempt-recovery", true).await,
+            Ok(IsolatedReplayAction::Requeued)
+        ));
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM request_log_outbox WHERE billing_attempt_id = 'attempt-recovery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取重放状态");
+        assert_eq!(state, "queued");
+        let reservation_status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_reservations WHERE attempt_id = 'attempt-recovery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取重放预留状态");
+        assert_eq!(reservation_status, "reserved");
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT result_persisted FROM billing_reservations WHERE attempt_id = 'attempt-recovery'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取恢复状态");
+        assert_eq!(persisted, 1);
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("应能开启结算事务");
+        settle_billing_attempt(&mut tx, "attempt-recovery", 123)
+            .await
+            .expect("首次重放应能结算");
+        tx.commit().await.expect("应能提交首次结算");
+        let balance_after_first: i64 =
+            sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("应能读取首次结算余额");
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("应能开启幂等结算事务");
+        settle_billing_attempt(&mut tx, "attempt-recovery", 123)
+            .await
+            .expect("重复重放应保持幂等");
+        tx.commit().await.expect("应能提交幂等结算");
+        let balance_after_second: i64 =
+            sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("应能读取重复结算余额");
+        assert_eq!(
+            balance_after_second, balance_after_first,
+            "同一计费尝试重复结算不得重复扣款"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_undispatched_attempt_is_released() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-release").await;
+        initialize_token_settlement(&mut conn, "sk-release", 10_000, 1)
+            .await
+            .expect("应能初始化余额");
+        let metadata = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "release".to_string(),
+            model: "model".to_string(),
+            outbound_model: None,
+            channel: "channel".to_string(),
+            channel_key: None,
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price: PriceSnapshot::default(),
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            request_body: None,
+            result: None,
+            result_settlement_error: None,
+        })
+        .expect("恢复元数据应可编码");
+        sqlx::query(
+            "INSERT INTO billing_reservations \
+             (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+              token_limit_usd_micros, recovery_metadata, status, dispatched, result_persisted, \
+              created_at, updated_at) \
+             VALUES ('attempt-release', 'request-release', 'sk-release', 1, 123, NULL, ?, \
+                     'reserved', 0, 0, 0, 0)",
+        )
+        .bind(metadata)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写入模拟遗留预留");
+        drop(conn);
+
+        assert_eq!(
+            recover_orphan_billing_attempts(&pool, Duration::ZERO, 16)
+                .await
+                .expect("恢复任务应成功"),
+            1
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_reservations WHERE attempt_id = 'attempt-release'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取释放状态");
+        assert_eq!(status, "released");
+        let pending = load_pending_request_logs(&pool, 16)
+            .await
+            .expect("应能读取待结算请求");
+        assert!(pending.is_empty());
     }
 
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
@@ -2424,12 +3928,14 @@ mod tests {
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                     cache_write_1h_tokens: 0,
+                    usage_reported: false,
                     price,
                     cost_usd_micros: i as i64,
                     base_cost_usd_micros: 0,
                     discount_bp: 10_000,
                     settled: true,
                     request_id: None,
+                    billing_attempt_id: None,
                     request_body: None,
                     response_body: None,
                 },
@@ -2545,12 +4051,14 @@ mod tests {
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                     cache_write_1h_tokens: 0,
+                    usage_reported: false,
                     price,
                     cost_usd_micros: 0,
                     base_cost_usd_micros: 0,
                     discount_bp: 10_000,
                     settled: true,
                     request_id: None,
+                    billing_attempt_id: None,
                     request_body: None,
                     response_body: None,
                 },
@@ -2633,12 +4141,14 @@ mod tests {
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
                     cache_write_1h_tokens: 0,
+                    usage_reported: false,
                     price,
                     cost_usd_micros: 0,
                     base_cost_usd_micros: 0,
                     discount_bp: 10_000,
                     settled: true,
                     request_id: None,
+                    billing_attempt_id: None,
                     request_body: None,
                     response_body: None,
                 },
@@ -2695,12 +4205,14 @@ mod tests {
                 cache_read_tokens: 1_000,
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
+                usage_reported: false,
                 price,
                 cost_usd_micros: 0,
                 base_cost_usd_micros: 0,
                 discount_bp: 10_000,
                 settled: true,
                 request_id: None,
+                billing_attempt_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -2727,12 +4239,14 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
+                usage_reported: false,
                 price,
                 cost_usd_micros: 0,
                 base_cost_usd_micros: 0,
                 discount_bp: 10_000,
                 settled: true,
                 request_id: None,
+                billing_attempt_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -2786,12 +4300,14 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
+                usage_reported: false,
                 price,
                 cost_usd_micros: 12,
                 base_cost_usd_micros: 0,
                 discount_bp: 10_000,
                 settled: true,
                 request_id: None,
+                billing_attempt_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -2853,12 +4369,14 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
+                usage_reported: false,
                 price: PriceSnapshot::default(),
                 cost_usd_micros: 0,
                 base_cost_usd_micros: 0,
                 discount_bp: 10_000,
                 settled: true,
                 request_id: None,
+                billing_attempt_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -2874,7 +4392,7 @@ mod tests {
         assert!(rows[1].settled, "缺 settled 列的存量行默认已结算");
     }
 
-    /// 请求日志过滤列有索引；未结算费用不进入 stats 聚合。
+    /// 请求日志过滤列有索引；未结算费用不进入聚合，已结算失败费用仍计入。
     #[tokio::test]
     async fn request_log_indexes_exist_and_unsettled_cost_is_excluded() {
         let (_dir, pool) = test_pool().await;
@@ -2917,12 +4435,14 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
+                usage_reported: false,
                 price,
                 cost_usd_micros: 9_999,
                 base_cost_usd_micros: 0,
                 discount_bp: 10_000,
                 settled: false,
                 request_id: None,
+                billing_attempt_id: None,
                 request_body: None,
                 response_body: None,
             },
@@ -2949,21 +4469,29 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 cache_write_1h_tokens: 0,
+                usage_reported: false,
                 price,
                 cost_usd_micros: 100,
                 base_cost_usd_micros: 0,
                 discount_bp: 10_000,
                 settled: true,
                 request_id: None,
+                billing_attempt_id: None,
                 request_body: None,
                 response_body: None,
             },
         )
         .await
         .expect("应能写已结算日志");
+        let mut failed = sample_log(3, true);
+        failed.status_code = 503;
+        failed.cost_usd_micros = 50;
+        insert_request_log(&pool, &failed)
+            .await
+            .expect("应能写已结算失败日志");
 
         let lifetime = query_lifetime_stats(&pool, None).await.expect("应能聚合");
-        assert_eq!(lifetime.cost_usd_micros, 100, "未结算费用不应计入");
+        assert_eq!(lifetime.cost_usd_micros, 150, "已结算失败费用也应计入");
     }
 
     fn sample_log(created_at: i64, settled: bool) -> RequestLog {
@@ -2985,12 +4513,14 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cache_write_1h_tokens: 0,
+            usage_reported: false,
             price: PriceSnapshot::default(),
             cost_usd_micros: 1,
             base_cost_usd_micros: 0,
             discount_bp: 10_000,
             settled,
             request_id: None,
+            billing_attempt_id: None,
             request_body: None,
             response_body: None,
         }

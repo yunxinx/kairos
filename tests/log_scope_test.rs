@@ -185,13 +185,9 @@ async fn request_logs_and_stats_are_scoped_to_owner() {
     let root_reads_bob = admin_get(&gw, &gw.session, &format!("/logs/{}", bob_ids[0])).await;
     assert_eq!(root_reads_bob.status(), StatusCode::OK);
 
-    // 查询参数不能拿来越权：显式指定他人令牌仍只在自己的范围内过滤。
-    let forged: Value = admin_get(&gw, &alice, "/logs?token_key=bob-key")
-        .await
-        .json()
-        .await
-        .expect("日志页应可解析");
-    assert_eq!(forged["total"], 0);
+    // 凭证不是日志查询维度；旧式精确 key 参数会被拒绝，而不是进入查询层。
+    let forged = admin_get(&gw, &alice, "/logs?token_key=bob-key").await;
+    assert_eq!(forged.status(), StatusCode::BAD_REQUEST);
 
     let alice_stats: Value = admin_get(&gw, &alice, "/stats")
         .await

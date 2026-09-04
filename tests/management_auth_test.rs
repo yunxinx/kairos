@@ -174,7 +174,7 @@ async fn session_cookie_is_http_only_and_secure_for_https() {
     assert!(http_cookie.contains("Path=/api"));
     assert!(http_cookie.contains("HttpOnly"));
     assert!(http_cookie.contains("SameSite=Strict"));
-    assert!(!http_cookie.contains("; Secure"));
+    assert!(http_cookie.contains("; Secure"));
     let body: Value = http.json().await.expect("登录响应应可解析");
     assert!(body.get("token").is_none());
 
@@ -720,6 +720,8 @@ async fn user_rate_limit_and_stats_roundtrip() {
         .expect("call 3");
     assert_eq!(call3.status(), StatusCode::TOO_MANY_REQUESTS);
 
+    common::wait_for_request_persistence(&gw.pool).await;
+
     // Root 查询 /users 列表，验证统计数据已聚合
     let users_list: Vec<Value> = admin_get(&gw, &gw.session, "/users")
         .await
@@ -1096,8 +1098,8 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
     ] {
         assert_eq!(
             admin_get(&gw, &admin_token, path).await.status(),
-            StatusCode::OK,
-            "零能力管理员仍应可读模型运营资源: {path}"
+            StatusCode::FORBIDDEN,
+            "关闭对应读能力后资源应不可见: {path}"
         );
     }
     assert_eq!(
@@ -1149,9 +1151,9 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         StatusCode::FORBIDDEN
     );
 
-    // 只打开改价时，admin 能写价格，但完整模型资源仍按管理员角色只读可见。
+    // 打开改价时必须同时打开价格与渠道名录读取能力，其他资源仍不可见。
     sqlx::query("UPDATE plans SET capabilities_json = ? WHERE id = 2")
-        .bind("{\"edit_prices\":true}")
+        .bind("{\"view_channels\":true,\"view_prices\":true,\"edit_prices\":true}")
         .execute(&gw.pool)
         .await
         .expect("应能打开改价");
@@ -1163,7 +1165,7 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
     );
     assert_eq!(
         admin_get(&gw, &admin_token, "/model-groups").await.status(),
-        StatusCode::OK
+        StatusCode::FORBIDDEN
     );
 
     let prices_body: Value = prices.json().await.expect("价格列表应可解析");
@@ -1192,8 +1194,9 @@ async fn plan_capabilities_intersect_role_and_take_effect_without_relogin() {
         .bind(
             "{\"manage_users\":true,\"assign_plan\":true,\"view_logs_stats\":true,\
              \"settle_waive\":true,\"toggle_user_tokens\":true,\"view_own_plan_groups\":true,\
-             \"view_other_groups\":true,\"edit_prices\":true,\"edit_model_groups\":true,\
-             \"edit_unified_models\":true,\"edit_price_catalog\":true}",
+             \"view_other_groups\":true,\"view_channels\":true,\"view_prices\":true,\
+             \"view_model_groups\":true,\"view_unified_models\":true,\"edit_prices\":true,\
+             \"edit_model_groups\":true,\"edit_unified_models\":true,\"edit_price_catalog\":true}",
         )
         .execute(&gw.pool)
         .await

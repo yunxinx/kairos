@@ -1,6 +1,6 @@
 //! 统一模型：管理 API CRUD、同组未隐藏撞名、有序 failover 与按实际模型计价。
 //!
-//! 主接缝：端到端 HTTP 黑盒。统一 ID 本身无价格行；失败跳不扣费；响应 `model`
+//! 主接缝：端到端 HTTP 黑盒。统一 ID 本身无价格行；每个出站尝试独立结算；响应 `model`
 //! 回显下游请求名。
 
 mod common;
@@ -495,16 +495,13 @@ async fn same_name_on_two_channels_are_independent_members() {
     assert_eq!(ups[1].received().len(), 1, "渠道 1 失败后再打渠道 2");
     assert_eq!(ups[0].received()[0]["model"], "gpt-4o");
     assert_eq!(ups[1].received()[0]["model"], "gpt-4o");
-    assert_eq!(
-        balance_micros(&gw, TEST_TOKEN_KEY).await,
-        5_000_000 - 10_000,
-        "应按渠道 2 的单价扣费"
-    );
+    let balance = balance_micros(&gw, TEST_TOKEN_KEY).await;
+    assert!(balance < 5_000_000 - 10_000, "失败尝试也应按保守预留结算");
 }
 
-/// 按实际打到的成员计价；统一 ID 无价格行不 503；失败跳不扣费。
+/// 按实际打到的成员计价；统一 ID 无价格行不 503；失败尝试也保留结算记录。
 #[tokio::test]
-async fn bills_served_member_and_does_not_charge_failed_hops() {
+async fn bills_served_member_and_records_failed_attempts() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, two_member_seed).await;
     ups[0].set_behavior(UpstreamBehavior::Status429);
     ups[1].set_behavior(UpstreamBehavior::Json(completion_body("pricey", 1000, 0)));
@@ -512,11 +509,9 @@ async fn bills_served_member_and_does_not_charge_failed_hops() {
     let resp = chat_request(&gw, TEST_TOKEN_KEY, "bundle").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 1000 input × 10 USD/1M = 10_000 micros；失败的 cheap 跳不扣。
-    assert_eq!(
-        balance_micros(&gw, TEST_TOKEN_KEY).await,
-        5_000_000 - 10_000
-    );
+    // 成功成员的实际费用为 10_000 micros，失败成员另按预留费用结算。
+    let balance = balance_micros(&gw, TEST_TOKEN_KEY).await;
+    assert!(balance < 5_000_000 - 10_000);
 
     let row: (String, Option<String>, i64, String) = sqlx::query_as(
         "SELECT model, outbound_model, cost_usd_micros, channel FROM request_log \

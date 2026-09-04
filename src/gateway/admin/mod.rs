@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
     runtime,
@@ -48,6 +48,7 @@ use crate::{
 };
 
 use self::auth::{AdminAuth, ManagementIdentity};
+use super::logging::RequestLogWriter;
 use super::network::OutboundClients;
 use super::throttle::AuthThrottle;
 
@@ -124,11 +125,16 @@ pub(super) struct AdminDeps {
     pub(super) client: reqwest::Client,
     pub(super) outbound_clients: OutboundClients,
     pub(super) throttle: AuthThrottle,
+    /// Argon2id 是刻意昂贵的阻塞工作；独立预算限制同时运行的校验数量，避免登录
+    /// 洪峰把 tokio blocking 池和内存同时占满。permit 只覆盖一次口令校验。
+    pub(super) password_verifiers: Arc<Semaphore>,
     /// 数据库文件路径：日志维护的磁盘占用统计需要读主库与 WAL 边车的实际大小，
     /// SQL 层拿不到 WAL 文件尺寸，只能走文件系统。
     pub(super) db_path: std::path::PathBuf,
     /// 串行化「库提交后重载快照」，避免慢重载用旧库状态回退覆盖新快照。
     pub(super) reload_lock: Arc<Mutex<()>>,
+    /// 结算队列写入器；管理面重放成功后通过同一通知通道立即唤醒后台消费。
+    pub(super) request_log_writer: RequestLogWriter,
 }
 
 /// 开启 SQLite 写事务并立即取得写保留锁。
@@ -154,6 +160,21 @@ pub fn router(
     snapshot: crate::runtime::SnapshotHandle,
     db_path: std::path::PathBuf,
 ) -> Router {
+    router_with_writer(
+        pool.clone(),
+        snapshot,
+        db_path,
+        RequestLogWriter::start(pool),
+    )
+}
+
+/// 组装管理面路由并注入共享的请求日志写入器。
+pub fn router_with_writer(
+    pool: SqlitePool,
+    snapshot: crate::runtime::SnapshotHandle,
+    db_path: std::path::PathBuf,
+    request_log_writer: RequestLogWriter,
+) -> Router {
     // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
     // builder 事先记下错误时失败；本路径未设置会失败的选项。
     let client = reqwest::Client::builder()
@@ -167,8 +188,10 @@ pub fn router(
         client,
         outbound_clients: OutboundClients::new(),
         throttle: throttle.clone(),
+        password_verifiers: Arc::new(Semaphore::new(4)),
         db_path,
         reload_lock: Arc::new(Mutex::new(())),
+        request_log_writer,
     };
     let root_only = Router::new()
         .merge(channels::routes())

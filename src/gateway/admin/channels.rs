@@ -14,7 +14,7 @@ use crate::gateway::{logging, routing};
 use crate::store;
 use crate::store::resources::{Channel, ChannelRecord};
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::models::reject_unhidden_unified_collision;
 use super::{
     AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, begin_write, db_err, reload_and_swap,
@@ -68,7 +68,9 @@ struct ChannelSummaryView {
 /// 列出全部渠道名录。路由层已限制为 admin+；响应只含模型视图所需的安全字段。
 async fn list_channel_summaries(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<ChannelSummaryView>>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewChannels)?;
     let snapshot = deps.snapshot.read().await;
     Ok(Json(
         snapshot
@@ -487,6 +489,20 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
     }
     reject_non_http_url(&channel.base_url)?;
+    if channel.timeout_ms == 0
+        || channel.timeout_ms > crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+    {
+        return Err(AdminError::InvalidBody(format!(
+            "timeout_ms 必须在 1..={} 之间",
+            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+        )));
+    }
+    if channel.max_retries > crate::store::resources::MAX_CHANNEL_RETRIES {
+        return Err(AdminError::InvalidBody(format!(
+            "max_retries 不能超过 {}",
+            crate::store::resources::MAX_CHANNEL_RETRIES
+        )));
+    }
     if channel.keys.is_empty() {
         return Err(AdminError::InvalidBody("keys 不能为空".to_string()));
     }

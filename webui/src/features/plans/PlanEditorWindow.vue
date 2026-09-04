@@ -277,6 +277,29 @@ function handleSave() {
 function capabilityLabel(key: keyof PlanCapabilities): string {
   return t(`plans.capabilities.${key}`);
 }
+
+/**
+ * 编辑能力依赖对应资源读视图，所有模型配置还依赖渠道名录。表单在开关变化时
+ * 立即维护该不变量：开启写能力补齐依赖；关闭读能力同步撤销无法工作的写能力。
+ */
+function updateCapability(key: keyof PlanCapabilities, checked: boolean): void {
+  capabilities.value[key] = checked;
+  const dependencies: Partial<Record<keyof PlanCapabilities, (keyof PlanCapabilities)[]>> = {
+    edit_prices: ['view_prices', 'view_channels'],
+    edit_model_groups: ['view_model_groups', 'view_channels'],
+    edit_unified_models: ['view_unified_models', 'view_channels'],
+  };
+  if (checked) {
+    for (const dependency of dependencies[key] ?? []) capabilities.value[dependency] = true;
+    return;
+  }
+  for (const [writer, required] of Object.entries(dependencies) as [
+    keyof PlanCapabilities,
+    (keyof PlanCapabilities)[],
+  ][]) {
+    if (required.includes(key)) capabilities.value[writer] = false;
+  }
+}
 </script>
 
 <template>
@@ -547,7 +570,7 @@ function capabilityLabel(key: keyof PlanCapabilities): string {
                 :id="`plan-capability-${key}`"
                 :model-value="capabilities[key]"
                 :data-testid="`plan-capability-${key}`"
-                @update:model-value="(checked: boolean) => (capabilities[key] = checked)"
+                @update:model-value="(checked: boolean) => updateCapability(key, checked)"
               />
               <span>{{ capabilityLabel(key) }}</span>
             </label>

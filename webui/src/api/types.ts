@@ -237,6 +237,7 @@ export interface Settings {
   rate_limit_rpm: number;
   request_rectify: boolean;
   allow_private_networks: boolean;
+  private_network_allowlist: string[];
 }
 
 /** 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。 */
@@ -306,6 +307,10 @@ export interface PlanCapabilities {
   toggle_user_tokens: boolean;
   view_own_plan_groups: boolean;
   view_other_groups: boolean;
+  view_channels: boolean;
+  view_prices: boolean;
+  view_model_groups: boolean;
+  view_unified_models: boolean;
   edit_prices: boolean;
   edit_model_groups: boolean;
   edit_unified_models: boolean;
@@ -520,6 +525,8 @@ export interface LogEntry {
   cost_usd_micros: number;
   /** 费用是否已完成所属用户钱包结算。 */
   settled: boolean;
+  /** 上游响应是否明确携带 usage；显式零用量也属于已报告。 */
+  usage_reported: boolean;
   /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
   request_body: string | null;
   /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
@@ -550,7 +557,6 @@ export type SystemLogSortBy = 'created';
 
 /** 日志列表查询。 */
 export interface LogQuery {
-  token_key?: string;
   /** 按令牌展示名精确过滤；列表里的 `token_key` 已脱敏，行内筛选用这个。 */
   token_name?: string;
   model?: string;
@@ -668,7 +674,7 @@ export interface StatsView {
 
 /** `/stats/lifetime` 全量累计，不受时间窗影响。
  *
- * `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 只计已结算的成功费用。
+ * `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 统计所有已结算尝试。
  */
 export interface LifetimeStats {
   request_count: number;

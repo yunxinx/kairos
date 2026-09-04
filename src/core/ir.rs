@@ -346,7 +346,7 @@ pub enum ToolChoice {
 /// reasoning 请求旋钮的档位。
 ///
 /// OpenAI 官方档位为 none 到 max（realtime 封顶 xhigh，支持度随模型）；
-/// `ultra` 是 Codex 客户端的扩展档位（官方 API 参考未列出），IR 收入以
+/// `ultra` 是客户端扩展档位，IR 收入以
 /// 保真，跨族映射时钳到 [`ReasoningEffort::Max`]。Anthropic 侧
 /// 原生档位为 `output_config.effort` 的 low/medium/high/xhigh/max（无
 /// none/minimal），legacy 模型走 budget_tokens 阶梯

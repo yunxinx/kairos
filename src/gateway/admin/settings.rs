@@ -87,6 +87,13 @@ fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
     diff!(rate_limit_rpm);
     diff!(request_rectify);
     diff!(allow_private_networks);
+    if before.private_network_allowlist != after.private_network_allowlist {
+        changes.push(format!(
+            "private_network_allowlist {} 项 → {} 项",
+            before.private_network_allowlist.len(),
+            after.private_network_allowlist.len()
+        ));
+    }
     changes
 }
 
@@ -136,6 +143,26 @@ fn validate_settings(settings: &Settings) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody(
             "log_body_max_bytes 必须大于 0".to_string(),
         ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in &settings.private_network_allowlist {
+        let host = entry.trim();
+        if host.is_empty()
+            || host.contains('/')
+            || host.contains("//")
+            || host.contains('*')
+            || host.chars().any(char::is_whitespace)
+        {
+            return Err(AdminError::InvalidBody(
+                "private_network_allowlist 只接受精确主机名或 IP，不接受 URL、路径和通配符"
+                    .to_string(),
+            ));
+        }
+        if !seen.insert(host.to_ascii_lowercase()) {
+            return Err(AdminError::InvalidBody(format!(
+                "private_network_allowlist 包含重复项 {host}"
+            )));
+        }
     }
     Ok(())
 }

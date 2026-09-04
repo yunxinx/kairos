@@ -67,9 +67,9 @@ async fn oversized_upstream_body_returns_502() {
     );
 }
 
-/// 超限是可重试错误：首渠道大体失败后打到次渠道成功。
+/// 超限是确定性策略结果：不得在其它渠道重新下载另一份可能同样超限的响应。
 #[tokio::test]
-async fn oversized_upstream_body_fails_over_to_next_channel() {
+async fn oversized_upstream_body_does_not_retry_another_channel() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
         let mut seed = common::test_seed(&bases[0]);
         // 成功响应 JSON 本身超过 200 字节，这里用 500 才能区分「大体超限」和「小体成功」。
@@ -137,9 +137,9 @@ async fn oversized_upstream_body_fails_over_to_next_channel() {
         .send()
         .await
         .expect("应能请求网关");
-    assert_eq!(resp.status(), reqwest::StatusCode::OK, "次渠道小体应成功");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
     assert_eq!(ups[0].received().len(), 1, "首渠道应收一次");
-    assert_eq!(ups[1].received().len(), 1, "应 failover 到次渠道");
+    assert_eq!(ups[1].received().len(), 0, "响应超限不得切换渠道重试");
 }
 
 /// 跨协议 IR 路径同样封顶：超限不把大体解码成 200。

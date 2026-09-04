@@ -50,6 +50,14 @@ async fn oversized_request_returns_413() {
 #[tokio::test]
 async fn large_body_over_axum_default_is_allowed() {
     let mut gw = TestGateway::start().await;
+    sqlx::query(
+        "UPDATE user_balance SET balance_usd_micros = 10_000_000_000 \
+         WHERE user_id = (SELECT user_id FROM tokens WHERE token_key = ?)",
+    )
+    .bind(TEST_TOKEN_KEY)
+    .execute(&gw.pool)
+    .await
+    .expect("应能为大请求准备充足余额");
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "chatcmpl-2m", "object": "chat.completion", "model": "gpt-4o",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},

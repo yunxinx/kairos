@@ -65,6 +65,27 @@ async fn send_completion(base: &str, model: &str, key: &str) -> reqwest::Respons
         .expect("应能请求网关")
 }
 
+/// 发起带显式输出上限的 Chat Completions 请求。
+async fn send_completion_with_max_tokens(
+    base: &str,
+    model: &str,
+    key: &str,
+    max_tokens: u32,
+) -> reqwest::Response {
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(key)
+        .json(&json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关")
+}
+
 /// 计费按实际 usage 四分量 × 各自价格精确扣减（整数 micro-USD）。
 #[tokio::test]
 async fn exact_usage_billed_and_deducted() {
@@ -116,7 +137,7 @@ async fn zero_usage_is_not_charged() {
     assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
 }
 
-/// 成功 2xx 但上游不回报 usage：零计费，并落一条可观测的系统日志。
+/// 成功 2xx 但上游不回报 usage：按出站预留结算，并落一条可观测的系统日志。
 ///
 /// 告警携带对账三要素之外的完整定位信息：请求 id（关联请求日志）、渠道、
 /// 入站协议模式。
@@ -137,7 +158,16 @@ async fn missing_usage_on_success_writes_system_warning() {
 
     let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
+    wait_for_request_persistence(&gw.pool).await;
+    let charged: i64 = sqlx::query_scalar("SELECT cost_usd_micros FROM request_log")
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应落未知 usage 的结算记录");
+    assert!(charged > 0, "已发出的未知 usage 尝试必须按预留结算");
+    assert_eq!(
+        balance_micros(&gw, TEST_TOKEN_KEY).await,
+        5_000_000 - charged
+    );
 
     let (level, target, message, event_code, raw_params): (
         String,
@@ -156,7 +186,7 @@ async fn missing_usage_on_success_writes_system_warning() {
     assert_eq!(target, "billing");
     assert!(
         message.contains("上游未回报 usage"),
-        "系统日志应说明零计费原因，实际: {message}"
+        "系统日志应说明保守结算原因，实际: {message}"
     );
     assert_eq!(event_code.as_deref(), Some("billing.usage_missing"));
 
@@ -191,15 +221,25 @@ async fn missing_usage_on_success_writes_system_warning() {
     assert_eq!(warning_count, 1, "重复缺报不应淹没系统日志");
 }
 #[tokio::test]
-async fn failed_request_is_not_charged() {
+async fn failed_request_is_settled_from_reservation() {
     let mut gw = TestGateway::start().await;
     gw.upstream.set_behavior(UpstreamBehavior::Status429);
 
     let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 
-    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
-    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
+    wait_for_request_persistence(&gw.pool).await;
+    let charged: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(cost_usd_micros), 0) FROM request_log")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("失败尝试也应落日志");
+    assert!(charged > 0, "已发出的失败尝试没有 usage 时应按预留结算");
+    assert_eq!(
+        balance_micros(&gw, TEST_TOKEN_KEY).await,
+        5_000_000 - charged
+    );
+    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, charged);
 }
 
 /// 缓存档缺省时该档不计费（用仅配置 input/output 的价格）。
@@ -264,71 +304,106 @@ async fn zero_balance_request_is_402() {
     assert!(gw.upstream.received().is_empty(), "准入拒绝不应出站");
 }
 
-/// 在途透支：正余额准入后实际费用超出剩余余额，照常结算（余额可为负），
-/// 下一次请求在准入时被拒绝。
+/// 实际费用超过预留但钱包无法补差时，仅隔离当前账务记录，不形成隐式负债。
 #[tokio::test]
-async fn overdraft_settles_and_blocks_next_request() {
-    // 初始余额 0.000001 USD = 1 micro-USD，费用会透支。
+async fn actual_cost_overrun_isolated_without_debt() {
+    // 预留使用显式 max_tokens，确保请求能够通过准入；真实 usage 刻意超过预留。
     let mut gw = TestGateway::start_with(|base| {
         let mut seed = common::test_seed(base);
-        seed.tokens[0].balance_usd = 0.000001;
+        seed.tokens[0].balance_usd = 1.0;
         seed
     })
     .await;
-    // prompt=1250, cached=200, cache_write=50, completion=100 → input=1000, cache_read=200,
-    // cache_write=50 → cost = 2500+1000+250+500 = 4250。
+    // provider usage 的输出费用远高于 max_tokens=1 对应的预留。
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(ok_response(json!({
-            "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
+            "prompt_tokens": 1250, "completion_tokens": 200_000, "total_tokens": 201_250,
             "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
         }))));
 
-    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
     assert_eq!(resp.status(), reqwest::StatusCode::OK, "准入时余额为正");
-    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 1 - 4250);
-
-    // 下一次请求：余额 ≤ 0，准入拒绝（无需再设 mock 行为）。
-    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+    for _ in 0..200 {
+        let isolated_now: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_log_outbox WHERE state = 'isolated'")
+                .fetch_one(&gw.pool)
+                .await
+                .expect("应能查询隔离队列");
+        if isolated_now > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let isolated: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_log_outbox WHERE state = 'isolated'")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能查询隔离队列");
+    assert_eq!(isolated, 1);
+    let balance: i64 = sqlx::query_scalar(
+        "SELECT ub.balance_usd_micros FROM tokens t \
+         JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?",
+    )
+    .bind(TEST_TOKEN_KEY)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("用户余额应存在");
+    assert_eq!(balance, 1_000_000);
 }
 
 /// 累计结算超 limit_usd（与余额相互独立）时准入拒绝。
 #[tokio::test]
 async fn settled_limit_exceeded_is_402() {
-    // 初始余额充足，但 limit_usd 极小（0.01 USD = 10000 micro-USD）。
+    // limit_usd 同时约束累计结算与在途预留；显式 max_tokens 让三次预留均可通过。
     let mut gw = TestGateway::start_with(|base| {
         let mut seed = common::test_seed(base);
         seed.tokens[0].balance_usd = 5.0;
-        seed.tokens[0].limit_usd = Some(0.01);
+        seed.tokens[0].limit_usd = Some(0.02);
         seed
     })
     .await;
-    // 每次结算 4250，settled 依次 4250/8500/12750。
+    // 每次结算 4250，settled 依次 4250/8500/12750；第四次会被预留上限挡住。
     let usage = json!({
         "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
         "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
     });
 
-    // 第一次：结算 4250，settled=4250 < 10000，准入通过。
+    // 前三次均在累计上限内，且各自预留可由钱包覆盖。
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(ok_response(usage.clone())));
-    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    let resp =
+        send_completion_with_max_tokens(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY, 1000).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let _ = settled_micros(&gw, TEST_TOKEN_KEY).await;
 
-    // 第二次：settled=4250 < 10000，准入通过，结算后 settled=8500。
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(ok_response(usage.clone())));
-    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    let resp =
+        send_completion_with_max_tokens(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY, 1000).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let _ = settled_micros(&gw, TEST_TOKEN_KEY).await;
 
-    // 第三次：settled=8500 < 10000，准入通过，结算后 settled=12750。
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(ok_response(usage.clone())));
-    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    let resp =
+        send_completion_with_max_tokens(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY, 1000).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let _ = settled_micros(&gw, TEST_TOKEN_KEY).await;
 
-    // 第四次：settled=12750 ≥ 10000，准入拒绝（无需 mock 行为）。
-    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    // 第四次：累计费用仍未达到 20,000，但预留本身会使累计上限不足，准入拒绝。
+    let resp =
+        send_completion_with_max_tokens(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY, 1000).await;
     assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
     assert!(
         gw.upstream.received().len() == 3,
@@ -491,11 +566,11 @@ async fn sibling_tokens_share_user_wallet() {
     assert_eq!(settled_micros(&gw, SIBLING_KEY).await, 4250);
 }
 
-/// 一把令牌在途透支后，同用户另一把令牌的新请求也被挡住。
+/// 同一用户的令牌共用钱包；钱包不足时任一令牌都不能建立出站预留。
 #[tokio::test]
-async fn overdraft_on_one_token_blocks_sibling() {
+async fn insufficient_wallet_blocks_sibling_tokens() {
     const SIBLING_KEY: &str = "sk-test-token-b";
-    let mut gw = TestGateway::start_with(|base| {
+    let gw = TestGateway::start_with(|base| {
         let mut seed = common::test_seed(base);
         seed.tokens[0].balance_usd = 0.000001;
         seed.tokens.push(common::SeedToken {
@@ -508,31 +583,25 @@ async fn overdraft_on_one_token_blocks_sibling() {
         seed
     })
     .await;
-    gw.upstream
-        .set_behavior(UpstreamBehavior::Json(ok_response(json!({
-            "prompt_tokens": 1250, "completion_tokens": 100, "total_tokens": 1350,
-            "prompt_tokens_details": { "cached_tokens": 200, "cache_write_tokens": 50 }
-        }))));
     let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(balance_micros(&gw, SIBLING_KEY).await, 1 - 4250);
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
 
     let resp = send_completion(&gw.base_url(), TEST_MODEL, SIBLING_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
     assert_eq!(
         gw.upstream.received().len(),
-        1,
-        "第二把令牌被挡住时不应再出站"
+        0,
+        "钱包不足时不应有任何令牌出站"
     );
 }
 
-/// 令牌 `limit_usd_micros` 按该令牌 settled，不与同用户另一把令牌共享。
+/// 令牌累计上限按该令牌的 settled 与在途预留计算，不与同用户另一把令牌共享。
 #[tokio::test]
 async fn token_limit_is_per_token_not_shared_wallet() {
     const SIBLING_KEY: &str = "sk-test-token-b";
     let mut gw = TestGateway::start_with(|base| {
         let mut seed = common::test_seed(base);
-        seed.tokens[0].limit_usd = Some(0.01);
+        seed.tokens[0].limit_usd = Some(0.02);
         seed.tokens.push(common::SeedToken {
             token_key: SIBLING_KEY.to_string(),
             name: "dev-b".to_string(),
@@ -550,15 +619,20 @@ async fn token_limit_is_per_token_not_shared_wallet() {
     for _ in 0..3 {
         gw.upstream
             .set_behavior(UpstreamBehavior::Json(ok_response(usage.clone())));
-        let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+        let resp =
+            send_completion_with_max_tokens(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY, 1000).await;
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        // 等后台结算完成，下一次准入只需考虑已结算累计额。
+        let _ = settled_micros(&gw, TEST_TOKEN_KEY).await;
     }
-    let blocked = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    let blocked =
+        send_completion_with_max_tokens(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY, 1000).await;
     assert_eq!(blocked.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
 
     gw.upstream
         .set_behavior(UpstreamBehavior::Json(ok_response(usage)));
-    let sibling = send_completion(&gw.base_url(), TEST_MODEL, SIBLING_KEY).await;
+    let sibling =
+        send_completion_with_max_tokens(&gw.base_url(), TEST_MODEL, SIBLING_KEY, 1000).await;
     assert_eq!(sibling.status(), reqwest::StatusCode::OK);
     assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 12_750);
     assert_eq!(settled_micros(&gw, SIBLING_KEY).await, 4250);
@@ -568,7 +642,7 @@ async fn token_limit_is_per_token_not_shared_wallet() {
     );
 }
 
-/// 未带 `max_tokens` 时不做输出粗估，沿用余额门槛。
+/// 未带 `max_tokens` 时使用固定的保守输出上限，仍可在正常余额下完成请求。
 #[tokio::test]
 async fn omitted_max_tokens_does_not_use_estimate_gate() {
     let mut gw = TestGateway::start().await;
