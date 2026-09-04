@@ -32,7 +32,7 @@ async fn config_driven_listen_and_fallback() {
     // 空库加载出快照（无资源），网关可正常启动；本测试只验证监听与未实现路径。
     let snapshot = runtime::load_snapshot(&pool).await.expect("应能加载快照");
     let snapshot = runtime::snapshot_handle(snapshot);
-    let app = gateway::router(pool, snapshot).await;
+    let app = gateway::router(pool, snapshot, gateway::ChannelCooldowns::new()).await;
 
     let listen = format!("{}:{}", cfg.listen.host, cfg.listen.port);
     let listener = tokio::net::TcpListener::bind(&listen)

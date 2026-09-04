@@ -4,6 +4,12 @@
 //! 避免协议面与管理面被无意义的 401 打满。成功请求不计入。次数与窗口来自运行时
 //! 快照，设置写入后对新请求即时生效。
 //!
+//! 窗口用滑动语义：任意滚动跨度内的失败次数都不超过同一上限。固定窗口在边界
+//! 处可容纳两轮满额突发（旧窗口尾部一轮、新窗口头部再一轮），对猜凭证的防护
+//! 是缺口。两平面的限速同用滑动窗口但理由不同：本平面只在认证被拒时记账，
+//! 事件稀疏，为每次失败保存时刻的代价可忽略；协议面请求限速面对高频请求，
+//! 靠分片与按批清理把单次请求的记账成本摊销为常数。
+//!
 //! 对端 IP 取自 `ConnectInfo`。部署在反代之后时所有下游会共享代理 IP，一个
 //! 攻击者的失败可能误伤全体；本实现不读取 `X-Forwarded-For`（没有可信代理模型）。
 //! 应直接暴露协议监听，或由反代自己做认证失败限流。
@@ -28,20 +34,23 @@ enum FailureKey {
     Identity([u8; 32]),
 }
 
-struct FailureWindow {
-    count: u32,
-    start: Instant,
+/// 单个键的失败历史。
+struct FailureHistory {
+    /// 该键本次进入计数表的时间，用作驱逐队列中甄别同一键新旧占位的标记。
+    created: Instant,
+    /// 窗口内的失败时刻，按时间升序，队首最老；滑出窗口的时刻按需丢弃。
+    attempts: VecDeque<Instant>,
 }
 
 struct FailureTable {
-    entries: HashMap<FailureKey, FailureWindow>,
-    /// 按窗口开始时间保存候选驱逐顺序。元素带时间戳，以便忽略同一键旧窗口
-    /// 留下的过期队列项；这样容量满时的驱逐成本按失败次数摊销为常数。
+    entries: HashMap<FailureKey, FailureHistory>,
+    /// 按键建立时间保存候选驱逐顺序。元素带建立时间，以便忽略同一键被驱逐后
+    /// 重新占位留下的过期队列项；这样容量满时的驱逐成本按失败次数摊销为常数。
     order: VecDeque<(FailureKey, Instant)>,
-    /// 当固定容量已满时，无法为新键建立独立窗口；该桶把这些失败合并计数，
-    /// 使攻击者不能只靠轮换来源绕过限流。达到同一窗口上限后，新的失败尝试会
-    /// 暂时整体阻断，避免容量压力下通过轮换来源耗尽认证资源。
-    overflow: FailureWindow,
+    /// 当固定容量已满时，无法为新键建立独立窗口；该桶把这些失败的失败时刻
+    /// 合并记录，使攻击者不能只靠轮换来源绕过限流。滑动窗口内达到同一上限后，
+    /// 新的失败尝试会暂时整体阻断，避免容量压力下通过轮换来源耗尽认证资源。
+    overflow: VecDeque<Instant>,
     /// 清理窗口的最小间隔，避免每次失败都遍历全部条目。
     last_prune: Instant,
 }
@@ -52,10 +61,7 @@ impl AuthThrottle {
             inner: Arc::new(Mutex::new(FailureTable {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
-                overflow: FailureWindow {
-                    count: 0,
-                    start: Instant::now(),
-                },
+                overflow: VecDeque::new(),
                 last_prune: Instant::now(),
             })),
         }
@@ -76,18 +82,21 @@ impl AuthThrottle {
         };
         let mut table = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         Self::maybe_prune(&mut table, window);
+        let now = Instant::now();
         let identity = identity.map(identity_key);
-        if table.entries.len() >= MAX_FAILURE_KEYS && table.overflow.count >= max {
+        if table.entries.len() >= MAX_FAILURE_KEYS
+            && live_count(&mut table.overflow, now, window) >= max
+        {
             return true;
         }
+        let entries = &mut table.entries;
         [Some(FailureKey::Ip(ip)), identity.map(FailureKey::Identity)]
             .into_iter()
             .flatten()
             .any(|key| {
-                table
-                    .entries
-                    .get(&key)
-                    .is_some_and(|entry| entry.count >= max)
+                entries
+                    .get_mut(&key)
+                    .is_some_and(|entry| live_count(&mut entry.attempts, now, window) >= max)
             })
     }
 
@@ -112,36 +121,26 @@ impl AuthThrottle {
         for key in keys.into_iter().flatten() {
             let capacity_available = table.entries.len() < MAX_FAILURE_KEYS;
             match table.entries.get_mut(&key) {
-                Some(entry) if entry.start.elapsed() < window => {
-                    entry.count = entry.count.saturating_add(1);
-                }
                 Some(entry) => {
-                    entry.count = 1;
-                    entry.start = now;
-                    table.order.push_back((key, now));
+                    live_count(&mut entry.attempts, now, window);
+                    entry.attempts.push_back(now);
                 }
                 None if capacity_available => {
-                    table.entries.insert(
-                        key,
-                        FailureWindow {
-                            count: 1,
-                            start: now,
-                        },
-                    );
+                    table.entries.insert(key, FailureHistory::single(now));
                     table.order.push_back((key, now));
                 }
                 None => {
-                    // 容量耗尽时仍保留一次失败信号，并驱逐最早建立的窗口，
+                    // 容量耗尽时仍保留一次失败信号，并驱逐最早建立的键，
                     // 让表可以继续服务新来源；溢出桶保证轮换来源不会无限绕过限制。
-                    table.overflow.count = table.overflow.count.saturating_add(1);
+                    table.overflow.push_back(now);
                     while table.entries.len() >= MAX_FAILURE_KEYS {
-                        let Some((oldest, started)) = table.order.pop_front() else {
+                        let Some((oldest, created)) = table.order.pop_front() else {
                             break;
                         };
                         if table
                             .entries
                             .get(&oldest)
-                            .is_some_and(|entry| entry.start == started)
+                            .is_some_and(|entry| entry.created == created)
                         {
                             table.entries.remove(&oldest);
                             break;
@@ -153,13 +152,7 @@ impl AuthThrottle {
                             table.entries.remove(&oldest);
                         }
                     }
-                    table.entries.insert(
-                        key,
-                        FailureWindow {
-                            count: 1,
-                            start: now,
-                        },
-                    );
+                    table.entries.insert(key, FailureHistory::single(now));
                     table.order.push_back((key, now));
                 }
             }
@@ -172,30 +165,47 @@ impl AuthThrottle {
         if now.duration_since(table.last_prune) >= PRUNE_INTERVAL {
             table
                 .entries
-                .retain(|_, entry| now.duration_since(entry.start) < window);
-            table.order.retain(|(key, started)| {
+                .retain(|_, entry| live_count(&mut entry.attempts, now, window) > 0);
+            table.order.retain(|(key, created)| {
                 table
                     .entries
                     .get(key)
-                    .is_some_and(|entry| entry.start == *started)
+                    .is_some_and(|entry| entry.created == *created)
             });
-            if now.duration_since(table.overflow.start) >= window {
-                table.overflow = FailureWindow {
-                    count: 0,
-                    start: now,
-                };
-            }
+            live_count(&mut table.overflow, now, window);
             table.last_prune = now;
         }
     }
 }
 
-/// `0` 表示关闭；其余截到 `u32::MAX` 以便与窗口计数比较。
-fn failure_cap(max_failures: u64) -> Option<u32> {
+impl FailureHistory {
+    /// 以一次失败建立新键的失败历史。
+    fn single(at: Instant) -> Self {
+        Self {
+            created: at,
+            attempts: VecDeque::from([at]),
+        }
+    }
+}
+
+/// 丢弃滑出窗口的失败时刻，返回窗口内的计数。时刻按时间升序，因此只需
+/// 从队首连续弹出。
+fn live_count(attempts: &mut VecDeque<Instant>, now: Instant, window: Duration) -> usize {
+    while attempts
+        .front()
+        .is_some_and(|at| now.saturating_duration_since(*at) >= window)
+    {
+        attempts.pop_front();
+    }
+    attempts.len()
+}
+
+/// `0` 表示关闭；其余截到 `usize::MAX` 以便与窗口计数比较。
+fn failure_cap(max_failures: u64) -> Option<usize> {
     if max_failures == 0 {
         return None;
     }
-    Some(u32::try_from(max_failures).unwrap_or(u32::MAX))
+    Some(usize::try_from(max_failures).unwrap_or(usize::MAX))
 }
 
 const MAX_FAILURE_KEYS: usize = 8_192;
@@ -282,5 +292,26 @@ mod tests {
 
         let table = throttle.inner.lock().unwrap();
         assert_eq!(table.entries.len(), MAX_FAILURE_KEYS);
+    }
+
+    /// 固定窗口在边界处可容纳两轮满额失败：旧窗口尾部一轮、新窗口头部再一轮。
+    /// 滑动窗口下，边界前的失败仍在窗口内，只能补足到上限，不得再放行一整轮。
+    #[test]
+    fn window_boundary_does_not_admit_double_burst() {
+        let throttle = AuthThrottle::new();
+        let ip: IpAddr = "127.0.0.1".parse().expect("应能解析 IP");
+        let window = Duration::from_secs(1);
+        throttle.record_failure(ip, None, 3, window);
+        std::thread::sleep(Duration::from_millis(500));
+        throttle.record_failure(ip, None, 3, window);
+        throttle.record_failure(ip, None, 3, window);
+        // 窗口内三次失败已满：跨过首次失败起算的固定窗口边界之前，持续阻断。
+        assert!(throttle.is_blocked(ip, None, 3, window));
+        // 越过固定窗口边界后，边界前的两次失败仍在滑动窗口内：
+        // 只允许再补一次到上限，而不是再放行一整轮。
+        std::thread::sleep(Duration::from_millis(550));
+        assert!(!throttle.is_blocked(ip, None, 3, window));
+        throttle.record_failure(ip, None, 3, window);
+        assert!(throttle.is_blocked(ip, None, 3, window));
     }
 }

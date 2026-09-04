@@ -401,6 +401,53 @@ pub fn chat_response_to_stream_events(response: &ChatResponse) -> Vec<StreamEven
     events
 }
 
+/// 流式失败帧的错误 message 提取口径：错误帧形状随协议而异。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorMessageShape {
+    /// 仅认嵌套 `error.message`：错误帧 message 一律嵌套的协议
+    /// （Chat Completions / Gemini / Anthropic）。
+    NestedOnly,
+    /// 兼认顶层 `message`，但仅当事件声明 `type == "error"`（Responses 官方
+    /// 错误事件的 message 在顶层；type 门控避免把带 `message` 字段的普通
+    /// 事件误判为错误）。
+    TopLevelOnErrorType,
+}
+
+/// 反序列化失败的流式帧：留痕后尽量提取错误语义，四个协议解码器共用。
+///
+/// 流式面对的是已建立连接的上游，单个坏帧不值得整条流报废：先
+/// `tracing::warn` 留痕；能安全提取字符串错误 message 时映射为单个
+/// [`StreamEvent::Error`] 交由网关终止流，其余失败帧跳过，帧内未知字段的
+/// 容忍策略不变。返回事件序列而非各适配器的 delivery 包装——
+/// `DecodeStreamChunk` 是适配器私有类型，由调用方自行包一层。
+pub(crate) fn decode_failed_frame(
+    err: &serde_json::Error,
+    frame: &Value,
+    message_shape: ErrorMessageShape,
+) -> Vec<StreamEvent> {
+    tracing::warn!(error = %err, payload = %frame, "上游流式帧无法解码");
+    let nested = frame
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str);
+    let message = match (nested, message_shape) {
+        (Some(message), _) => Some(message),
+        (None, ErrorMessageShape::TopLevelOnErrorType)
+            if frame.get("type").and_then(Value::as_str) == Some("error") =>
+        {
+            frame.get("message").and_then(Value::as_str)
+        }
+        (None, _) => None,
+    };
+    message
+        .map(|message| {
+            vec![StreamEvent::Error {
+                message: message.to_string(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

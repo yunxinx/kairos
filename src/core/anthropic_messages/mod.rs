@@ -26,7 +26,7 @@ use crate::core::ir::{
     apply_provider_extra, capture_unknown_fields, warning_feature,
 };
 use crate::core::schema::normalize_object_root;
-use crate::core::stream::SseFrame;
+use crate::core::stream::{ErrorMessageShape, SseFrame, decode_failed_frame};
 
 // ---- 错误 ----
 
@@ -2315,7 +2315,8 @@ fn encode_usage(usage: &Usage) -> Value {
 /// 产出增量（`signature_delta` 以零长增量携带 signature），`content_block_stop`
 /// 收尾（tool_use 在此解析出完整 input），`message_delta` 产出 Finish（最终
 /// usage + stop_reason），`error` 产出 IR Error 事件（overloaded_error 等
-/// 流内错误，不再静默吞掉）。
+/// 流内错误，不再静默吞掉）；反序列化失败的事件留痕后跳过，错误语义可
+/// 安全提取时映射 IR Error。
 #[derive(Debug, Default)]
 pub struct StreamDecoder {
     /// 按块 index 维护进行中的块状态。
@@ -2344,7 +2345,13 @@ impl StreamDecoder {
     pub fn process(&mut self, value: &Value) -> DecodeStreamChunk {
         let wire = match serde_json::from_value::<WireStreamEvent>(value.clone()) {
             Ok(wire) => wire,
-            Err(_) => return DecodeStreamChunk::delivery(Vec::new()),
+            Err(err) => {
+                return DecodeStreamChunk::delivery(decode_failed_frame(
+                    &err,
+                    value,
+                    ErrorMessageShape::NestedOnly,
+                ));
+            }
         };
 
         let mut events = Vec::new();
@@ -3929,6 +3936,41 @@ mod tests {
             [StreamEvent::Error { message }] if message == "Overloaded"
         ));
         assert!(!chunk.is_output);
+    }
+
+    /// 形状畸形的错误帧仍提取错误语义：缺 `type` 判别键（部分代理以裸
+    /// `{"error": {...}}` 报错）导致整帧解析失败时，留痕后以顶层 error.message
+    /// 映射 IR Error，不静默为空。
+    #[test]
+    fn malformed_error_event_still_surfaces_error_semantics() {
+        let event = json!({
+            "error": { "type": "overloaded_error", "message": "Overloaded" },
+        });
+        let decoded = StreamDecoder::default().process(&event);
+        assert!(matches!(
+            decoded.events.as_slice(),
+            [StreamEvent::Error { message }] if message == "Overloaded"
+        ));
+    }
+
+    /// 解析失败且无错误语义的事件：留痕后跳过（空事件），不中断流。
+    #[test]
+    fn malformed_event_without_error_semantics_is_skipped() {
+        let event = json!({
+            "type": "content_block_delta",
+            "index": "not-a-number",
+            "delta": { "type": "text_delta", "text": "hi" },
+        });
+        let decoded = StreamDecoder::default().process(&event);
+        assert_eq!(decoded.events, Vec::new());
+
+        // error 对象在场但 message 类型不符：无字符串可提取，同样跳过。
+        let event = json!({
+            "type": "error",
+            "error": { "type": "overloaded_error", "message": 42 },
+        });
+        let decoded = StreamDecoder::default().process(&event);
+        assert_eq!(decoded.events, Vec::new());
     }
 
     /// 流内错误编码：以 `event: error` 帧下发，与网关兜底错误帧

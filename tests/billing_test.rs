@@ -137,12 +137,12 @@ async fn zero_usage_is_not_charged() {
     assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
 }
 
-/// 成功 2xx 但上游不回报 usage：按出站预留结算，并落一条可观测的系统日志。
+/// 成功 2xx 但上游不回报 usage：不产生费用，预留释放，并落一条系统告警。
 ///
-/// 告警携带对账三要素之外的完整定位信息：请求 id（关联请求日志）、渠道、
-/// 入站协议模式。
+/// 告警携带对账定位信息：请求 id（关联请求日志）、渠道、入站协议模式；
+/// 同一令牌/模型/渠道组合在冷却窗口内只保留一条。
 #[tokio::test]
-async fn missing_usage_on_success_writes_system_warning() {
+async fn missing_usage_on_success_releases_reservation_and_warns() {
     let mut gw = TestGateway::start().await;
     gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
         "id": "chatcmpl-bill",
@@ -159,15 +159,21 @@ async fn missing_usage_on_success_writes_system_warning() {
     let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     wait_for_request_persistence(&gw.pool).await;
-    let charged: i64 = sqlx::query_scalar("SELECT cost_usd_micros FROM request_log")
-        .fetch_one(&gw.pool)
-        .await
-        .expect("应落未知 usage 的结算记录");
-    assert!(charged > 0, "已发出的未知 usage 尝试必须按预留结算");
-    assert_eq!(
-        balance_micros(&gw, TEST_TOKEN_KEY).await,
-        5_000_000 - charged
-    );
+    let (charged, settled): (i64, i64) =
+        sqlx::query_as("SELECT cost_usd_micros, settled FROM request_log")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应落缺失 usage 的对账日志");
+    assert_eq!(charged, 0, "缺失 usage 的尝试不产生费用");
+    assert_eq!(settled, 1, "释放即终态，无需人工补账");
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
+    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
+    let reserved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM billing_reservations WHERE status = 'reserved'")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能查询预留状态");
+    assert_eq!(reserved, 0, "预留应已释放，不再占用准入额度");
 
     let (level, target, message, event_code, raw_params): (
         String,
@@ -185,8 +191,8 @@ async fn missing_usage_on_success_writes_system_warning() {
     assert_eq!(level, "warn");
     assert_eq!(target, "billing");
     assert!(
-        message.contains("上游未回报 usage"),
-        "系统日志应说明保守结算原因，实际: {message}"
+        message.contains("可能已产生费用"),
+        "已受理但缺失 usage 的告警应提示人工对账，实际: {message}"
     );
     assert_eq!(event_code.as_deref(), Some("billing.usage_missing"));
 
@@ -220,8 +226,10 @@ async fn missing_usage_on_success_writes_system_warning() {
     .expect("应能统计 usage 缺失告警");
     assert_eq!(warning_count, 1, "重复缺报不应淹没系统日志");
 }
+
+/// 已派发的失败尝试（5xx 且无 usage）同样不产生费用：预留释放、日志照落。
 #[tokio::test]
-async fn failed_request_is_settled_from_reservation() {
+async fn failed_request_without_usage_releases_reservation() {
     let mut gw = TestGateway::start().await;
     gw.upstream.set_behavior(UpstreamBehavior::Status429);
 
@@ -229,17 +237,76 @@ async fn failed_request_is_settled_from_reservation() {
     assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
 
     wait_for_request_persistence(&gw.pool).await;
-    let charged: i64 =
-        sqlx::query_scalar("SELECT COALESCE(SUM(cost_usd_micros), 0) FROM request_log")
+    let (charged, settled): (i64, i64) =
+        sqlx::query_as("SELECT cost_usd_micros, settled FROM request_log")
             .fetch_one(&gw.pool)
             .await
-            .expect("失败尝试也应落日志");
-    assert!(charged > 0, "已发出的失败尝试没有 usage 时应按预留结算");
-    assert_eq!(
-        balance_micros(&gw, TEST_TOKEN_KEY).await,
-        5_000_000 - charged
+            .expect("失败尝试也应落对账日志");
+    assert_eq!(charged, 0, "缺失 usage 的失败尝试不产生费用");
+    assert_eq!(settled, 1);
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
+    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, 0);
+    let reserved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM billing_reservations WHERE status = 'reserved'")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能查询预留状态");
+    assert_eq!(reserved, 0, "失败尝试的预留应已释放");
+}
+
+/// 上游连接未建立（连接拒绝）：预留释放、费用为零，告警事件码区分于
+/// 已受理但缺失 usage 的情形。
+#[tokio::test]
+async fn connection_refused_releases_reservation_with_unreached_warning() {
+    // 占住一个端口后立即释放，得到一个几乎必然连接拒绝的本地地址。
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("应能占用端口");
+    let port = listener.local_addr().expect("应能读取端口").port();
+    drop(listener);
+    let refused = format!("http://127.0.0.1:{port}");
+
+    let gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].base_url = refused.clone();
+        seed
+    })
+    .await;
+
+    let resp = send_completion(&gw.base_url(), TEST_MODEL, TEST_TOKEN_KEY).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    wait_for_request_persistence(&gw.pool).await;
+    let (charged, settled): (i64, i64) =
+        sqlx::query_as("SELECT cost_usd_micros, settled FROM request_log")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("未达尝试也应落对账日志");
+    assert_eq!(charged, 0, "连接未建立的尝试不产生费用");
+    assert_eq!(settled, 1);
+    assert_eq!(balance_micros(&gw, TEST_TOKEN_KEY).await, 5_000_000);
+    let reserved: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM billing_reservations WHERE status = 'reserved'")
+            .fetch_one(&gw.pool)
+            .await
+            .expect("应能查询预留状态");
+    assert_eq!(reserved, 0, "未达尝试的预留应已释放");
+
+    let (message, event_code, raw_params): (String, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT message, event_code, event_params \
+             FROM system_log WHERE target = 'billing' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&gw.pool)
+        .await
+        .expect("应落上游未达的系统日志");
+    assert_eq!(event_code.as_deref(), Some("billing.upstream_unreached"));
+    assert!(
+        message.contains("连接未建立"),
+        "未达告警应说明确定无费用，实际: {message}"
     );
-    assert_eq!(settled_micros(&gw, TEST_TOKEN_KEY).await, charged);
+    let params: Value = serde_json::from_str(&raw_params.expect("告警应携带结构化参数"))
+        .expect("结构化参数应为合法 JSON");
+    assert_eq!(params["upstream_reached"], Value::Bool(false));
+    assert_eq!(params["reservation_released"], Value::Bool(true));
 }
 
 /// 缓存档缺省时该档不计费（用仅配置 input/output 的价格）。

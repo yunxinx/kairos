@@ -19,8 +19,9 @@ expression: frames
     "event": "response.output_item.added",
     "data": {
       "item": {
+        "content": [],
         "id": "0",
-        "phase": "final_answer",
+        "role": "assistant",
         "type": "message"
       },
       "output_index": 0,

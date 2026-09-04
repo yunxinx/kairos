@@ -370,6 +370,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
             injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         },
         Channel {
             name: "ch-pricey".to_string(),
@@ -392,6 +393,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
             injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         },
     ];
     seed.prices = vec![
@@ -496,10 +498,10 @@ async fn same_name_on_two_channels_are_independent_members() {
     assert_eq!(ups[0].received()[0]["model"], "gpt-4o");
     assert_eq!(ups[1].received()[0]["model"], "gpt-4o");
     let balance = balance_micros(&gw, TEST_TOKEN_KEY).await;
-    assert!(balance < 5_000_000 - 10_000, "失败尝试也应按保守预留结算");
+    assert_eq!(balance, 5_000_000 - 10_000, "失败尝试缺失 usage 不产生费用");
 }
 
-/// 按实际打到的成员计价；统一 ID 无价格行不 503；失败尝试也保留结算记录。
+/// 按实际打到的成员计价；统一 ID 无价格行不 503；失败尝试保留对账日志。
 #[tokio::test]
 async fn bills_served_member_and_records_failed_attempts() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, two_member_seed).await;
@@ -509,9 +511,9 @@ async fn bills_served_member_and_records_failed_attempts() {
     let resp = chat_request(&gw, TEST_TOKEN_KEY, "bundle").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 成功成员的实际费用为 10_000 micros，失败成员另按预留费用结算。
+    // 成功成员按实际 usage 扣 10_000 micros，失败成员缺失 usage 不产生费用。
     let balance = balance_micros(&gw, TEST_TOKEN_KEY).await;
-    assert!(balance < 5_000_000 - 10_000);
+    assert_eq!(balance, 5_000_000 - 10_000);
 
     let row: (String, Option<String>, i64, String) = sqlx::query_as(
         "SELECT model, outbound_model, cost_usd_micros, channel FROM request_log \

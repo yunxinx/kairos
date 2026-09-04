@@ -97,6 +97,7 @@ async fn oversized_upstream_body_does_not_retry_another_channel() {
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
                 injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
             Channel {
                 name: "ch-1".to_string(),
@@ -119,6 +120,7 @@ async fn oversized_upstream_body_does_not_retry_another_channel() {
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
                 injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         ];
         seed

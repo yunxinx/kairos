@@ -38,7 +38,7 @@ test.describe('settings page', () => {
     );
   });
 
-  test('saves the full_body switch and keeps it after refresh', async ({ page, request }) => {
+  test('saves the full_body switch and keeps it after refresh', async ({ page }) => {
     await page.goto('/settings');
     const checkbox = page.getByTestId('settings-full-body');
     await expect(checkbox).toBeVisible();
@@ -51,8 +51,8 @@ test.describe('settings page', () => {
     await page.getByTestId('settings-save').click();
     await expect(page.getByTestId('toast')).toContainText(/saved|已保存/);
 
-    const resp = await request.get('/api/settings', {
-      headers: await e2eRootHeaders(page.request),
+    const resp = await page.request.get('/api/settings', {
+      headers: await e2eRootHeaders(page),
     });
     expect(resp.ok()).toBeTruthy();
     expect((await resp.json()).full_body).toBe(true);

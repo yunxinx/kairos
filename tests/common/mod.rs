@@ -62,6 +62,14 @@ pub enum UpstreamBehavior {
     RawSse(Vec<Vec<u8>>),
     /// 返回有固定块间隔的原始 SSE 字节块，用于构造下游中途断开。
     DelayedRawSse { chunks: Vec<Vec<u8>>, delay_ms: u64 },
+    /// 返回原始 SSE 字节块：前缀块立即逐块下发，其余块每块之前沉默
+    /// `gap_ms`。用于构造「流已建立后上游长时间沉默」的场景，区分渠道
+    /// 空闲超时与请求总时限的截断语义。
+    GappedRawSse {
+        prefix: Vec<Vec<u8>>,
+        gap_ms: u64,
+        tail: Vec<Vec<u8>>,
+    },
     /// 返回普通 JSON 响应。
     Json(Value),
     /// 返回 429（可重试）。
@@ -413,6 +421,22 @@ impl IntoResponse for UpstreamBehavior {
                 };
                 raw_sse_response(Body::from_stream(stream))
             }
+            UpstreamBehavior::GappedRawSse {
+                prefix,
+                gap_ms,
+                tail,
+            } => {
+                let stream = async_stream::stream! {
+                    for chunk in prefix {
+                        yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk));
+                    }
+                    for chunk in tail {
+                        tokio::time::sleep(std::time::Duration::from_millis(gap_ms)).await;
+                        yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk));
+                    }
+                };
+                raw_sse_response(Body::from_stream(stream))
+            }
             UpstreamBehavior::Json(value) => Json(value).into_response(),
             UpstreamBehavior::Status429 => {
                 (axum::http::StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
@@ -520,6 +544,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
             injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         }],
         tokens: vec![SeedToken {
             token_key: TEST_TOKEN_KEY.to_string(),
@@ -718,7 +743,9 @@ impl TestGateway {
         let snapshot = runtime::snapshot_handle(snapshot);
 
         // 管理面与协议面共用同一快照句柄：管理写库后换快照，协议请求路径读到
-        // 新资源，端到端断言「写后即时生效」。
+        // 新资源，端到端断言「写后即时生效」。渠道冷却表同样两面共享：协议面
+        // 记账、管理面健康端点展示。
+        let channel_cooldowns = gateway::ChannelCooldowns::new();
         let (admin_addr, session) = if with_admin {
             // 测试不走 config.json：直接调用与进程启动相同的播种入口，再 `/login` 换会话。
             // `TEST_ROOT_PASSWORD` 只用于登录，管理 API 由会话 Cookie 认证。
@@ -729,7 +756,12 @@ impl TestGateway {
             )
             .await
             .expect("测试 root 应能播种登录凭证");
-            let admin_app = gateway::admin_router(pool.clone(), snapshot.clone(), db_path.clone());
+            let admin_app = gateway::admin_router(
+                pool.clone(),
+                snapshot.clone(),
+                db_path.clone(),
+                channel_cooldowns.clone(),
+            );
             let admin_listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("管理监听应能绑定随机端口");
@@ -750,7 +782,7 @@ impl TestGateway {
             (None, String::new())
         };
 
-        let app = gateway::router(pool.clone(), snapshot).await;
+        let app = gateway::router(pool.clone(), snapshot, channel_cooldowns).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -802,7 +834,7 @@ impl TestGateway {
             .await
             .expect("应能加载运行时快照");
         let snapshot = runtime::snapshot_handle(snapshot);
-        let app = gateway::router(pool.clone(), snapshot).await;
+        let app = gateway::router(pool.clone(), snapshot, gateway::ChannelCooldowns::new()).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -864,7 +896,8 @@ impl TestGateway {
             .await
             .expect("重启应从库加载快照");
         let snapshot = runtime::snapshot_handle(snapshot);
-        let app = gateway::router(pool, snapshot).await;
+        // 重启模拟：冷却表是进程内存态，新实例从空表开始（自愈语义）。
+        let app = gateway::router(pool, snapshot, gateway::ChannelCooldowns::new()).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");

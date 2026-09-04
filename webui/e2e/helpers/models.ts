@@ -15,7 +15,7 @@ export async function seedChannel(
   page: Page,
   body: Partial<Channel> & Pick<Channel, 'name' | 'models'> & { api_key?: string },
 ): Promise<{ id: number }> {
-  const headers = await e2eRootHeaders(page.request);
+  const headers = await e2eRootHeaders(page);
   const { api_key, ...rest } = body;
   const keys: ChannelKey[] =
     body.keys ??
@@ -52,7 +52,7 @@ export async function seedChannel(
 /** 经管理 API 写入一条价格。 */
 export async function seedPrice(page: Page, body: Price): Promise<void> {
   const resp = await page.request.post('/api/prices', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: body,
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -61,7 +61,7 @@ export async function seedPrice(page: Page, body: Price): Promise<void> {
 /** 经管理 API 写入一个统一模型。 */
 export async function seedUnifiedModel(page: Page, body: UnifiedModel): Promise<void> {
   const resp = await page.request.post('/api/unified-models', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: body,
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -74,7 +74,7 @@ export async function seedChannelModelOrder(
   channelIds: number[],
 ): Promise<void> {
   const resp = await page.request.put(`/api/channel-model-orders/${encodeURIComponent(model)}`, {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: { model, channel_ids: channelIds },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -83,7 +83,7 @@ export async function seedChannelModelOrder(
 /** 经管理 API 写入一个模型组。 */
 export async function seedModelGroup(page: Page, body: ModelGroup): Promise<void> {
   const resp = await page.request.post('/api/model-groups', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: body,
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -95,7 +95,7 @@ export async function seedToken(
   body: Partial<{ name: string; model_group: string }> & { name: string },
 ): Promise<{ token_key: string }> {
   const resp = await page.request.post('/api/tokens', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: {
       balance_usd_micros: null,
       enabled: true,
@@ -121,7 +121,7 @@ export async function seedCatalog(
   }>,
 ): Promise<void> {
   const resp = await page.request.put('/api/catalog', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: { models },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -133,7 +133,7 @@ export async function updateChannel(
   id: number,
   patch: Partial<Channel>,
 ): Promise<void> {
-  const headers = await e2eRootHeaders(page.request);
+  const headers = await e2eRootHeaders(page);
   const listed = await page.request.get('/api/channels', { headers });
   expect(listed.ok(), await listed.text()).toBeTruthy();
   const channels = (await listed.json()) as ChannelView[];
@@ -151,7 +151,7 @@ export async function updateChannel(
 /** 删除渠道。 */
 export async function deleteChannel(page: Page, id: number): Promise<void> {
   const resp = await page.request.delete(`/api/channels/${id}`, {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
 }

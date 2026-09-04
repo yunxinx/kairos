@@ -1263,6 +1263,187 @@ async fn unknown_field_is_rejected() {
     assert_eq!(body["error"]["code"], "invalid_body");
 }
 
+/// 读取面密钥掩码：渠道列表与创建/更新/删除响应一律不回显明文密钥。
+#[tokio::test]
+async fn channel_key_read_responses_are_masked() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    let list: Value = admin_get(&gw, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let seeded = &list[0]["keys"][0];
+    assert_eq!(seeded["api_key"], json!("******"), "短密钥读取面应完全掩码");
+    let body_text = serde_json::to_string(&list).expect("响应应可序列化");
+    assert!(
+        !body_text.contains("sk-upstream"),
+        "渠道读取面响应不得包含明文密钥: {body_text}"
+    );
+
+    // 创建响应同样掩码：长密钥保留前后 8 字符，中段不出现。
+    let mut created_body = channel_body("masked-read", gw.upstream.base_url(), json!([TEST_MODEL]));
+    created_body["keys"][0]["api_key"] = json!("sk-ant-api03-1234567890abcdef-secret-tail");
+    let created = admin_json(&gw, reqwest::Method::POST, "/channels", created_body).await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let view: Value = created.json().await.expect("创建响应应可解析");
+    assert_eq!(
+        view["keys"][0]["api_key"],
+        json!("sk-ant-a******ret-tail"),
+        "长密钥应保留前后 8 字符并以 * 作掩码"
+    );
+
+    // 更新与删除响应同样掩码。
+    let id = channel_id_by_name(&gw, "masked-read").await;
+    let mut update = channel_body("masked-read", gw.upstream.base_url(), json!([TEST_MODEL]));
+    update["keys"][0]["api_key"] = json!("sk-replaced-plaintext-key-xyz");
+    let updated = admin_put(&gw, &format!("/channels/{id}"), update).await;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let view: Value = updated.json().await.expect("更新响应应可解析");
+    assert!(
+        !serde_json::to_string(&view)
+            .expect("响应应可序列化")
+            .contains("sk-replaced-plaintext-key-xyz"),
+        "更新响应不得回显刚写入的明文"
+    );
+}
+
+/// 更新渠道时空串或掩码串按 name 保留库中原值；新明文照常替换。
+#[tokio::test]
+async fn channel_update_preserves_key_when_masked_or_empty() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let id = channel_id_by_name(&gw, "test-channel").await;
+
+    async fn stored_api_key(pool: &sqlx::SqlitePool, channel_id: i64, name: &str) -> String {
+        sqlx::query_scalar("SELECT api_key FROM channel_keys WHERE channel_id = ? AND name = ?")
+            .bind(channel_id)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .expect("应能查询渠道密钥")
+    }
+
+    // 掩码串 + 同名条目：保留原值。
+    let mut masked = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    masked["keys"][0]["api_key"] = json!("******");
+    let resp = admin_put(&gw, &format!("/channels/{id}"), masked).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        stored_api_key(&gw.pool, id, "default").await,
+        "sk-upstream",
+        "掩码串应保留库中原值"
+    );
+
+    // 空串 + 同名条目：保留原值。
+    let mut empty = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    empty["keys"][0]["api_key"] = json!("");
+    let resp = admin_put(&gw, &format!("/channels/{id}"), empty).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        stored_api_key(&gw.pool, id, "default").await,
+        "sk-upstream",
+        "空串应保留库中原值"
+    );
+
+    // 新明文：照常替换。
+    let mut replaced = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    replaced["keys"][0]["api_key"] = json!("sk-brand-new");
+    let resp = admin_put(&gw, &format!("/channels/{id}"), replaced).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        stored_api_key(&gw.pool, id, "default").await,
+        "sk-brand-new",
+        "新明文应替换原值"
+    );
+
+    // 同名多条目各自匹配：一条掩码保留、一条空串保留、一条明文替换。
+    let mut multi = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    multi["keys"] = json!([
+        { "name": "default", "api_key": "******", "weight": 1, "enabled": true },
+        { "name": "second", "api_key": "", "weight": 1, "enabled": true },
+        { "name": "third", "api_key": "sk-third-plain", "weight": 1, "enabled": true }
+    ]);
+    let resp = admin_put(&gw, &format!("/channels/{id}"), multi).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "second 无原值可保留，应校验失败"
+    );
+
+    // 先补上 second 的明文，再验证同名多条目各自匹配。
+    let mut multi = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    multi["keys"] = json!([
+        { "name": "default", "api_key": "sk-brand-new", "weight": 1, "enabled": true },
+        { "name": "second", "api_key": "sk-second-plain", "weight": 1, "enabled": true }
+    ]);
+    let resp = admin_put(&gw, &format!("/channels/{id}"), multi).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let mut masked = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    masked["keys"] = json!([
+        { "name": "default", "api_key": "******", "weight": 1, "enabled": true },
+        { "name": "second", "api_key": "", "weight": 1, "enabled": true }
+    ]);
+    let resp = admin_put(&gw, &format!("/channels/{id}"), masked).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        stored_api_key(&gw.pool, id, "default").await,
+        "sk-brand-new"
+    );
+    assert_eq!(
+        stored_api_key(&gw.pool, id, "second").await,
+        "sk-second-plain"
+    );
+
+    // 保留原值后出站认证仍使用库中原值：mock 上游收到替换后的明文。
+    // second 停用，出站密钥选择确定落在 default 上。
+    let mut masked = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    masked["keys"] = json!([
+        { "name": "default", "api_key": "******", "weight": 1, "enabled": true },
+        { "name": "second", "api_key": "", "weight": 1, "enabled": false }
+    ]);
+    let resp = admin_put(&gw, &format!("/channels/{id}"), masked).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        gw.upstream.received_api_keys().last().cloned().flatten(),
+        Some("Bearer sk-brand-new".to_string()),
+        "出站认证应使用库中保留的原值"
+    );
+}
+
+/// 更新时空串/掩码串的 name 无匹配（无原值可保留）→ 校验错误；
+/// 创建渠道仍要求明文，掩码形态一律拒绝。
+#[tokio::test]
+async fn channel_placeholder_keys_without_match_are_rejected() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let id = channel_id_by_name(&gw, "test-channel").await;
+
+    // 更新：掩码串的 name 在当前渠道上不存在 → 400「密钥 api_key 不能为空」。
+    let mut unmatched = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
+    unmatched["keys"][0]["name"] = json!("ghost");
+    unmatched["keys"][0]["api_key"] = json!("******");
+    let resp = admin_put(&gw, &format!("/channels/{id}"), unmatched).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["message"], json!("密钥 api_key 不能为空"));
+
+    // 创建：掩码形态没有「原值」语义，一律要求明文。
+    let mut masked_create =
+        channel_body("masked-create", gw.upstream.base_url(), json!([TEST_MODEL]));
+    masked_create["keys"][0]["api_key"] = json!("******");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", masked_create).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let mut empty_create =
+        channel_body("masked-create", gw.upstream.base_url(), json!([TEST_MODEL]));
+    empty_create["keys"][0]["api_key"] = json!("");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", empty_create).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
 /// 已配置管理面时协议监听仍不注册管理路由或 UI；管理监听不提供协议端点。
 ///
 /// admin key 与下游令牌体系隔离：下游令牌调管理面 401，admin key 当下游令牌 401。
@@ -4003,4 +4184,109 @@ async fn channel_rejects_intra_channel_alias_occupancy() {
         json!({ occupied: owner }),
         "占用更新不应改别名"
     );
+}
+
+// --- 渠道健康冷却与管理面展示 ---
+
+/// 以 root 会话新建一个 admin 角色账号并登录，返回其会话 Cookie。
+async fn create_admin_session(gw: &TestGateway) -> String {
+    let resp = admin_json(
+        gw,
+        reqwest::Method::POST,
+        "/users",
+        json!({
+            "email": "health-admin@example.com",
+            "display_name": "health-admin",
+            "password": "password1",
+            "role": "admin"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let resp = reqwest::Client::new()
+        .post(format!("{}/login", gw.admin_base_url()))
+        .json(&json!({
+            "email": "health-admin@example.com",
+            "password": "password1"
+        }))
+        .send()
+        .await
+        .expect("admin 应能登录");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    common::session_cookie(&resp)
+}
+
+/// 渠道连续三次可重试失败后进入冷却：root 健康端点可见冷却行；
+/// 冷却中的渠道被路由跳过——上游恢复健康也不出站；admin 角色 403。
+#[tokio::test]
+async fn channel_health_reports_cooldown_and_routing_skips_cooled_channel() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+
+    // seed 渠道 max_retries = 0：每次请求记一次可重试失败，跨请求累计。
+    for _ in 0..3 {
+        gw.upstream.set_behavior(UpstreamBehavior::Status5xx(500));
+        let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "冷却前失败应原样返回上游 5xx"
+        );
+    }
+
+    // root：健康端点列出冷却中渠道，含渠道 id/名、到期时刻与连续失败计数。
+    let health: Value = admin_get(&gw, "/channels/health")
+        .await
+        .json()
+        .await
+        .expect("健康端点应可解析");
+    let entries = health["channels"].as_array().expect("channels 应为数组");
+    assert_eq!(entries.len(), 1, "唯一渠道应处于冷却中");
+    assert_eq!(entries[0]["channel"], "test-channel");
+    assert!(
+        entries[0]["channel_id"].as_i64().is_some_and(|id| id > 0),
+        "应回传库生成的渠道 id"
+    );
+    assert!(
+        entries[0]["cooldown_until"]
+            .as_i64()
+            .is_some_and(|ms| ms > common::unix_millis()),
+        "冷却到期时刻应在未来"
+    );
+    assert_eq!(
+        entries[0]["consecutive_failures"], 3,
+        "三次连续失败应被累计"
+    );
+
+    // 冷却中的渠道被跳过：上游恢复健康也不再出站，请求以无候选的 502 结束。
+    let received_before = gw.upstream.received().len();
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(completion_body()));
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "唯一渠道冷却后应无候选可用"
+    );
+    assert_eq!(
+        gw.upstream.received().len(),
+        received_before,
+        "冷却中的渠道不应产生出站请求"
+    );
+
+    // admin 角色会话：root 层端点返回 403 结构化错误。
+    let admin_session = create_admin_session(&gw).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/channels/health", gw.admin_base_url()))
+        .header(reqwest::header::COOKIE, admin_session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
+        .send()
+        .await
+        .expect("管理请求应可达");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "非 root 角色读取健康端点应被拒绝"
+    );
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert_eq!(body["error"]["code"], "forbidden");
 }

@@ -303,9 +303,13 @@
     "disable": "禁用",
     "enabled": "启用",
     "enabledGuide": "禁用后，该渠道不再参与路由与失败切换。",
+    "health": "健康",
+    "cooling": "冷却中",
+    "cooldownRemaining": "剩余 {time}",
     "goneOnSave": "该渠道已被删除，无法保存。",
     "baseUrl": "Base URL",
     "apiKey": "上游 API key",
+    "apiKeyKeepPlaceholder": "留空保留原密钥",
     "modelGroup": "默认模型组",
     "modelGroupGuide": "保存时把新加入的可调用名并入该组。未分组表示不自动入组。",
     "reasoningOutput": {
@@ -325,6 +329,10 @@
     "injectsCacheBreakpoints": {
       "label": "自动缓存断点注入",
       "guide": "开启后按 tools 尾 → system 尾 → 末条消息尾块的顺序为出站请求自动补缓存断点（上限 4 个，已有断点计入预算）。仅对 Anthropic Messages 渠道生效。"
+    },
+    "abortOnDisconnect": {
+      "label": "断连即取消上游",
+      "guide": "开启时，下游断开连接立即停止读取上游，按已获得的用量结算并释放未计量费用；关闭时，继续消费上游至自然收尾，按实际用量结算。"
     },
     "models": "模型清单",
     "modelsTitle": "模型清单",

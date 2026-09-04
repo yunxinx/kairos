@@ -59,6 +59,10 @@ pub(super) enum Outbound {
         status: u16,
         message: String,
     },
+    /// 网关本地计费准入拒绝（下游钱包或令牌累计额度不足）：请求未出站，
+    /// 故障在下游域而非渠道域。与上游返回的 402 严格区分——只有后者
+    /// 才参与渠道冷却记账。
+    BillingDenied { channel: String, message: String },
 }
 
 /// 指数退避的随机抖动幅度：最终等待为计算值的 80%–120%。
@@ -167,11 +171,149 @@ impl KeyCooldowns {
     }
 }
 
-/// 一次失败切换使用的协议编码、退避参数与跨请求密钥冷却。
+/// 上游渠道故障后的冷却时长：期间路由跳过该渠道，到期自然恢复。
+const CHANNEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// 连续可重试失败达到该次数即进入冷却；成功出站清零。
+const CHANNEL_RETRY_FAILURE_THRESHOLD: u32 = 3;
+/// 渠道冷却表是保护性缓存而非事实存储；达到上限时停止接纳新记录，已有记录
+/// 仍按 TTL 自然清理。这样资源消耗只与配置规模有关，不受错误请求数量控制。
+const MAX_CHANNEL_COOLDOWNS: usize = 4_096;
+
+/// 单个渠道的健康账目：连续失败计数与冷却到期时刻同表承载。
+#[derive(Debug, Clone, Copy)]
+struct ChannelHealth {
+    /// 自上次成功出站以来的连续可重试失败次数；成功清零，随冷却到期记录一并清除。
+    consecutive_failures: u32,
+    /// 冷却到期时刻；未冷却时为 `None`（仅计数）。
+    cooldown_until: Option<Instant>,
+}
+
+impl ChannelHealth {
+    fn is_cooling(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|until| until > now)
+    }
+
+    /// 冷却已到期；仅计数的记录（无到期时刻）不算到期，交由成功清零回收。
+    fn is_expired(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|until| until <= now)
+    }
+}
+
+/// 计算冷却到期时刻；时钟不支持前推时退化为当前时刻（立即到期）。
+fn cooldown_expiry(now: Instant) -> Instant {
+    now.checked_add(CHANNEL_FAILURE_COOLDOWN).unwrap_or(now)
+}
+
+/// 上游渠道故障后的跨请求冷却表：上游返回的 402/403 立即冷却，可重试失败
+/// （网络错误/429/5xx）按渠道跨请求连续计次、达阈值冷却；成功出站清零。
+///
+/// 网关本地计费准入拒绝不属于渠道故障，记账调用方必须以
+/// [`Outbound::BillingDenied`] 区分来源，不得把本地 402 记入本表。
+#[derive(Clone)]
+pub struct ChannelCooldowns {
+    inner: Arc<Mutex<HashMap<i64, ChannelHealth>>>,
+}
+
+impl Default for ChannelCooldowns {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChannelCooldowns {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// 渠道当前是否可出站：无记录、仅计数或冷却已到期均可用。
+    ///
+    /// 到期即恢复到无失败状态——首个请求即试探，成功清零、失败重新累计；
+    /// 到期记录由 [`Self::prune_expired`] 统一回收，此处只读不改。
+    fn is_available(&self, channel_id: i64, now: Instant) -> bool {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        match entries.get(&channel_id) {
+            Some(health) => !health.is_cooling(now),
+            None => true,
+        }
+    }
+
+    /// 清理已结束的冷却记录，避免长期不再命中的渠道让表持续增长；
+    /// 仅计数未冷却的记录不在此回收，由成功清零或后续冷却接手。
+    fn prune_expired(&self, now: Instant) {
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, health| !health.is_expired(now));
+    }
+
+    /// 记一次上游返回的账号/权限域故障（402/403）：该渠道立即进入冷却。
+    fn mark_policy_failure(&self, channel_id: i64, now: Instant) {
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, health| !health.is_expired(now));
+        if let Some(health) = entries.get_mut(&channel_id) {
+            health.cooldown_until = Some(cooldown_expiry(now));
+        } else if entries.len() < MAX_CHANNEL_COOLDOWNS {
+            entries.insert(
+                channel_id,
+                ChannelHealth {
+                    consecutive_failures: 0,
+                    cooldown_until: Some(cooldown_expiry(now)),
+                },
+            );
+        }
+    }
+
+    /// 记一次可重试失败（网络错误/429/5xx）：连续计次，达到阈值即冷却。
+    ///
+    /// 冷却期间不会再有出站尝试，计数冻结在触发值；到期记录先行回收，
+    /// 使恢复后的渠道从零重新累计。
+    fn mark_retryable_failure(&self, channel_id: i64, now: Instant) {
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, health| !health.is_expired(now));
+        if !entries.contains_key(&channel_id) && entries.len() >= MAX_CHANNEL_COOLDOWNS {
+            return;
+        }
+        let health = entries.entry(channel_id).or_insert(ChannelHealth {
+            consecutive_failures: 0,
+            cooldown_until: None,
+        });
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        if health.consecutive_failures >= CHANNEL_RETRY_FAILURE_THRESHOLD {
+            health.cooldown_until = Some(cooldown_expiry(now));
+        }
+    }
+
+    /// 成功出站后清零该渠道的连续失败计数：失败序列只有成功能打断。
+    fn clear(&self, channel_id: i64) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&channel_id);
+    }
+
+    /// 当前处于冷却中的渠道：`(渠道 id, 冷却到期时刻, 连续失败计数)`。
+    /// 供管理面健康视图只读展示，顺序按渠道 id。
+    pub(super) fn cooling_channels(&self, now: Instant) -> Vec<(i64, Instant, u32)> {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut rows: Vec<(i64, Instant, u32)> = entries
+            .iter()
+            .filter_map(|(id, health)| {
+                let until = health.cooldown_until.filter(|until| *until > now)?;
+                Some((*id, until, health.consecutive_failures))
+            })
+            .collect();
+        rows.sort_by_key(|(id, _, _)| *id);
+        rows
+    }
+}
+
+/// 一次失败切换使用的协议编码、退避参数与跨请求密钥/渠道冷却。
 pub(super) struct FailoverPolicy<'a> {
     pub(super) inbound_protocol: Protocol,
     pub(super) retry_backoff: RetryBackoff,
     pub(super) key_cooldowns: &'a KeyCooldowns,
+    /// 渠道域跨请求冷却：循环入口跳过冷却中的渠道，失败记账、成功清零。
+    pub(super) channel_cooldowns: &'a ChannelCooldowns,
     /// 从入站开始计算的绝对截止时刻；所有渠道与密钥共享，切换不会续期。
     pub(super) deadline: tokio::time::Instant,
 }
@@ -197,12 +339,21 @@ where
     L: Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()>,
 {
     let mut last_failure: Option<FinalFailure> = None;
-    policy.key_cooldowns.prune_expired(Instant::now());
+    let now = Instant::now();
+    policy.key_cooldowns.prune_expired(now);
+    policy.channel_cooldowns.prune_expired(now);
 
     'channels: for index in &route.channel_indices {
         let Some(record) = channels.get(*index) else {
             continue;
         };
+        // 冷却中的渠道整体跳过：不出站、不记账，剩余候选照常评估。
+        if !policy
+            .channel_cooldowns
+            .is_available(record.id, Instant::now())
+        {
+            continue;
+        }
         let Some(first_key_id) = route.selected_key_id(record.id) else {
             continue;
         };
@@ -237,6 +388,7 @@ where
             match attempt(record, key).await {
                 Outbound::Success(response) => {
                     policy.key_cooldowns.clear(key.id);
+                    policy.channel_cooldowns.clear(record.id);
                     return response;
                 }
                 Outbound::Fatal {
@@ -260,13 +412,27 @@ where
                         break;
                     }
                 }
+                Outbound::BillingDenied { channel, message } => {
+                    // 计费准入拒绝源于下游钱包/令牌额度域，不是渠道故障：
+                    // 只保留归因并切换下一渠道，不给渠道记冷却。
+                    last_failure = Some(FinalFailure {
+                        channel,
+                        status: Some(402),
+                        message,
+                        key_name: key.name.clone(),
+                    });
+                    break;
+                }
                 Outbound::Fatal {
                     channel,
                     status,
                     message,
                 } if status == 402 || status == 403 => {
-                    // 账号余额与模型权限故障以渠道/账号域为单位，保留最后归因并
-                    // 切换下一渠道；不得把当前 key 写入跨请求冷却表。
+                    // 账号余额与模型权限故障以渠道/账号域为单位：立即冷却该
+                    // 渠道，让后续请求不再撞同一堵墙；本请求继续换下一渠道。
+                    policy
+                        .channel_cooldowns
+                        .mark_policy_failure(record.id, Instant::now());
                     last_failure = Some(FinalFailure {
                         channel: channel.clone(),
                         status: Some(status),
@@ -301,6 +467,11 @@ where
                     message,
                     retry_after,
                 } => {
+                    // 可重试失败（网络错误/429/5xx）按渠道跨请求连续计次：
+                    // 达到阈值后让后续请求先跳过该渠道，给上游自愈窗口。
+                    policy
+                        .channel_cooldowns
+                        .mark_retryable_failure(record.id, Instant::now());
                     // 429 可能由密钥、账号、组织或模型配额域产生。即使还有未试
                     // 密钥也先服从同一退避，避免在共享配额域内无间隔连打；轮换
                     // 本身仍不额外消耗渠道的同 key 重试预算。
@@ -503,7 +674,8 @@ pub(super) fn upstream_error_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        FailoverPolicy, KeyCooldowns, RetryBackoff, exponential_delay, jitter_delay, retry_delay,
+        ChannelCooldowns, FailoverPolicy, KeyCooldowns, RetryBackoff, exponential_delay,
+        jitter_delay, retry_delay,
     };
     use std::time::{Duration, Instant};
 
@@ -583,6 +755,117 @@ mod tests {
         let entries = cooldowns.inner.lock().expect("冷却表锁不应被污染");
         assert!(!entries.contains_key(&1));
         assert_eq!(entries.get(&2), Some(&live_until));
+    }
+
+    // ---- 渠道冷却表 ----
+
+    /// 冷却到期后一毫秒的时刻，供恢复断言使用。
+    fn after(now: Instant, millis: u64) -> Instant {
+        now.checked_add(Duration::from_millis(millis.max(1)))
+            .expect("测试时间应可计算")
+    }
+
+    #[test]
+    fn upstream_policy_failure_cools_channel_immediately() {
+        let cooldowns = ChannelCooldowns::new();
+        let now = Instant::now();
+        cooldowns.mark_policy_failure(1, now);
+
+        assert!(
+            !cooldowns.is_available(1, now),
+            "上游 402/403 应立即冷却渠道"
+        );
+        assert_eq!(
+            cooldowns.cooling_channels(now),
+            vec![(1, now.checked_add(Duration::from_secs(5 * 60)).unwrap(), 0)],
+            "冷却行应含到期时刻，连续可重试失败计数为 0"
+        );
+
+        // 到期自然恢复：恢复后计数随之清空。
+        let later = after(now, 5 * 60 * 1000);
+        assert!(cooldowns.is_available(1, later), "到期后渠道应恢复可用");
+        assert!(cooldowns.cooling_channels(later).is_empty());
+    }
+
+    #[test]
+    fn retryable_failures_accumulate_across_requests_until_threshold() {
+        let cooldowns = ChannelCooldowns::new();
+        let mut now = Instant::now();
+        // 每次记账之间穿插可用性检查，模拟跨请求的先查后记。
+        cooldowns.mark_retryable_failure(7, now);
+        now = after(now, 1);
+        assert!(cooldowns.is_available(7, now), "单次失败只计不冷却");
+        cooldowns.mark_retryable_failure(7, now);
+        now = after(now, 1);
+        assert!(cooldowns.is_available(7, now), "两次失败仍不冷却");
+        cooldowns.mark_retryable_failure(7, now);
+
+        assert!(!cooldowns.is_available(7, now), "第三次连续失败进入冷却");
+        assert_eq!(
+            cooldowns.cooling_channels(now),
+            vec![(7, now.checked_add(Duration::from_secs(5 * 60)).unwrap(), 3)]
+        );
+    }
+
+    #[test]
+    fn success_clears_the_failure_streak() {
+        let cooldowns = ChannelCooldowns::new();
+        let now = Instant::now();
+        cooldowns.mark_retryable_failure(7, now);
+        cooldowns.mark_retryable_failure(7, now);
+        cooldowns.clear(7);
+
+        assert!(cooldowns.is_available(7, now), "成功清零后立即可用");
+        assert!(
+            cooldowns.cooling_channels(now).is_empty(),
+            "清零不留展示记录"
+        );
+
+        // 清零后须重新计满才冷却。
+        cooldowns.mark_retryable_failure(7, now);
+        cooldowns.mark_retryable_failure(7, now);
+        assert!(cooldowns.is_available(7, now), "重新累计未满不冷却");
+    }
+
+    #[test]
+    fn expired_cooldown_releases_the_channel_and_resets_the_streak() {
+        let cooldowns = ChannelCooldowns::new();
+        let now = Instant::now();
+        cooldowns.mark_retryable_failure(7, now);
+        cooldowns.mark_retryable_failure(7, now);
+        cooldowns.mark_retryable_failure(7, now);
+
+        let expired = after(now, 5 * 60 * 1000);
+        cooldowns.prune_expired(expired);
+        assert!(cooldowns.is_available(7, expired), "到期自然恢复");
+        // 到期后计数从零重新累计：两次失败不足以再冷却。
+        cooldowns.mark_retryable_failure(7, expired);
+        cooldowns.mark_retryable_failure(7, after(expired, 1));
+        assert!(
+            cooldowns.is_available(7, after(expired, 1)),
+            "恢复后的渠道应回到无失败状态"
+        );
+    }
+
+    #[test]
+    fn capacity_stops_admitting_new_channels() {
+        let cooldowns = ChannelCooldowns::new();
+        let now = Instant::now();
+        for id in 0..super::MAX_CHANNEL_COOLDOWNS as i64 {
+            cooldowns.mark_retryable_failure(id, now);
+        }
+        // 表满后新渠道不再接纳：记不上账，也就不会被冷却。
+        let outsider = super::MAX_CHANNEL_COOLDOWNS as i64 + 1;
+        cooldowns.mark_retryable_failure(outsider, now);
+        assert!(
+            cooldowns.is_available(outsider, now),
+            "容量上限应停止接纳新渠道"
+        );
+        assert!(cooldowns.cooling_channels(now).is_empty());
+        // 已在表内的渠道仍按阈值正常冷却。
+        cooldowns.mark_retryable_failure(0, now);
+        cooldowns.mark_retryable_failure(0, now);
+        assert!(!cooldowns.is_available(0, now), "表内渠道不受上限影响");
     }
 
     #[test]
@@ -710,6 +993,7 @@ mod tests {
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
                 injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         }
     }
@@ -766,6 +1050,7 @@ mod tests {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
                 key_cooldowns: &KeyCooldowns::new(),
+                channel_cooldowns: &ChannelCooldowns::new(),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
@@ -806,6 +1091,7 @@ mod tests {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
                 key_cooldowns: &KeyCooldowns::new(),
+                channel_cooldowns: &ChannelCooldowns::new(),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
@@ -855,6 +1141,7 @@ mod tests {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
                 key_cooldowns: &KeyCooldowns::new(),
+                channel_cooldowns: &ChannelCooldowns::new(),
                 deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
@@ -863,6 +1150,136 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    // ---- 渠道冷却的 failover 语义 ----
+
+    #[tokio::test]
+    async fn cooled_channel_is_skipped_but_remaining_candidates_proceed() {
+        let first = vec![key(1, "a")];
+        let second = vec![key(2, "b")];
+        let records = vec![
+            record_with_keys(1, first.clone(), 0),
+            record_with_keys(2, second.clone(), 0),
+        ];
+        let route = route_of(&records, &[(1, first[0].id), (2, second[0].id)]);
+        let cooldowns = ChannelCooldowns::new();
+        cooldowns.mark_policy_failure(1, Instant::now());
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let seen_for_attempt = seen.clone();
+
+        let response = run_failover(
+            &route,
+            &records,
+            "m",
+            move |record, _key| {
+                seen_for_attempt.lock().unwrap().push(record.id);
+                Box::pin(async { Outbound::Success(ok_response()) })
+            },
+            no_failure_log(),
+            FailoverPolicy {
+                inbound_protocol: Protocol::OpenAiChat,
+                retry_backoff: RetryBackoff::from_ms(1, 1, 1),
+                key_cooldowns: &KeyCooldowns::new(),
+                channel_cooldowns: &cooldowns,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![2],
+            "冷却中的渠道虽在候选列表但不出站，后续候选照常"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_402_cools_the_channel_for_future_requests() {
+        let first = vec![key(1, "a")];
+        let second = vec![key(2, "b")];
+        let records = vec![
+            record_with_keys(1, first.clone(), 0),
+            record_with_keys(2, second.clone(), 0),
+        ];
+        let route = route_of(&records, &[(1, first[0].id), (2, second[0].id)]);
+        let cooldowns = ChannelCooldowns::new();
+
+        let response = run_failover(
+            &route,
+            &records,
+            "m",
+            move |record, _key| {
+                let record_id = record.id;
+                Box::pin(async move {
+                    if record_id == 1 {
+                        Outbound::Fatal {
+                            channel: "ch-1".to_string(),
+                            status: 402,
+                            message: "上游余额不足".to_string(),
+                        }
+                    } else {
+                        Outbound::Success(ok_response())
+                    }
+                })
+            },
+            no_failure_log(),
+            FailoverPolicy {
+                inbound_protocol: Protocol::OpenAiChat,
+                retry_backoff: RetryBackoff::from_ms(1, 1, 1),
+                key_cooldowns: &KeyCooldowns::new(),
+                channel_cooldowns: &cooldowns,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !cooldowns.is_available(1, Instant::now()),
+            "上游 402 应立即冷却该渠道"
+        );
+        assert!(cooldowns.is_available(2, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn local_billing_denial_does_not_cool_the_channel() {
+        let keys = vec![key(1, "a")];
+        let records = vec![record_with_keys(1, keys.clone(), 0)];
+        let route = route_of(&records, &[(1, keys[0].id)]);
+        let cooldowns = ChannelCooldowns::new();
+
+        // 唯一渠道计费拒绝：候选耗尽后以 402 返回下游，渠道不进冷却。
+        let response = run_failover(
+            &route,
+            &records,
+            "m",
+            move |_record, _key| {
+                Box::pin(async {
+                    Outbound::BillingDenied {
+                        channel: "ch-1".to_string(),
+                        message: "余额或令牌累计上限不足以覆盖本次出站尝试".to_string(),
+                    }
+                })
+            },
+            no_failure_log(),
+            FailoverPolicy {
+                inbound_protocol: Protocol::OpenAiChat,
+                retry_backoff: RetryBackoff::from_ms(1, 1, 1),
+                key_cooldowns: &KeyCooldowns::new(),
+                channel_cooldowns: &cooldowns,
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "计费拒绝耗尽候选后仍以 402 返回下游"
+        );
+        assert!(
+            cooldowns.is_available(1, Instant::now()),
+            "本地计费拒绝是下游域故障，不得冷却渠道"
         );
     }
 }

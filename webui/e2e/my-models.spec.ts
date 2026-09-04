@@ -13,7 +13,7 @@ async function createPlan(
   body: { display_name: string; groups: string[]; discount_bp?: number },
 ): Promise<number> {
   const resp = await page.request.post('/api/plans', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: {
       display_name: body.display_name,
       note: '',
@@ -33,7 +33,7 @@ async function createPlan(
 
 async function assignPlan(page: Page, userId: number, planId: number): Promise<void> {
   const resp = await page.request.put(`/api/users/${userId}/plan`, {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: { plan_id: planId },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();

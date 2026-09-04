@@ -1,13 +1,10 @@
-import {
-  captureSessionGeneration,
-  hasSession,
-  invalidateSession,
-} from '@/lib/session';
+import { captureSessionGeneration, hasSession, invalidateSession } from '@/lib/session';
 import { ApiClientError, type ApiErrorBody } from '@/api/types';
 import type {
   BalanceAdjustmentResult,
   BulkDeleteResult,
   Channel,
+  ChannelHealthView,
   ChannelModelOrder,
   ChannelModelTarget,
   ChannelProbeResult,
@@ -247,6 +244,11 @@ export const apiClient = {
    */
   listChannelSummaries(): Promise<ChannelSummary[]> {
     return apiFetch('/channels/summary');
+  },
+
+  /** 渠道健康：当前冷却中的渠道与到期时刻；root-only，冷却表为进程内状态。 */
+  getChannelHealth(): Promise<ChannelHealthView> {
+    return apiFetch('/channels/health');
   },
 
   createChannel(body: Channel): Promise<ChannelView> {

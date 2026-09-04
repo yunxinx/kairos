@@ -1,4 +1,4 @@
-import type { APIRequestContext, Page } from '@playwright/test';
+import type { Page } from '@playwright/test';
 import { authedTest as test, expect } from './fixtures';
 import { e2eRootHeaders } from './helpers/session';
 import { MS_PER_DAY, seedRequestLogs, utcDayStart } from './helpers/seed-logs';
@@ -9,17 +9,17 @@ import { formatCount, formatTokensMillions } from '../src/lib/format';
 
 test.describe.configure({ mode: 'serial' });
 
-async function fetchStats(request: APIRequestContext, days: number): Promise<StatsView> {
-  const resp = await request.get(`/api/stats?days=${days}`, {
-    headers: await e2eRootHeaders(request),
+async function fetchStats(page: Page, days: number): Promise<StatsView> {
+  const resp = await page.request.get(`/api/stats?days=${days}`, {
+    headers: await e2eRootHeaders(page),
   });
   expect(resp.ok()).toBeTruthy();
   return (await resp.json()) as StatsView;
 }
 
-async function fetchLifetimeStats(request: APIRequestContext): Promise<LifetimeStats> {
-  const resp = await request.get('/api/stats/lifetime', {
-    headers: await e2eRootHeaders(request),
+async function fetchLifetimeStats(page: Page): Promise<LifetimeStats> {
+  const resp = await page.request.get('/api/stats/lifetime', {
+    headers: await e2eRootHeaders(page),
   });
   expect(resp.ok()).toBeTruthy();
   return (await resp.json()) as LifetimeStats;
@@ -197,16 +197,13 @@ async function showHeatmapTooltip(page: Page) {
 }
 
 test.describe('overview page', () => {
-  test('renders summary cards, daily points, and shares matching /stats', async ({
-    page,
-    request,
-  }) => {
+  test('renders summary cards, daily points, and shares matching /stats', async ({ page }) => {
     const { today, yesterday } = seedOverviewLogs(Date.now());
     await page.goto('/overview');
     await expect(page.getByRole('heading', { name: /overview/i })).toBeVisible();
 
-    const stats = await fetchStats(request, 7);
-    const lifetime = await fetchLifetimeStats(request);
+    const stats = await fetchStats(page, 7);
+    const lifetime = await fetchLifetimeStats(page);
     await expectCardsMatchStats(page, stats);
     await expectLifetimeMatch(page, lifetime);
 
@@ -386,12 +383,12 @@ test.describe('overview page', () => {
     expect(await main.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
   });
 
-  test('switches the days window and updates cards to match /stats', async ({ page, request }) => {
+  test('switches the days window and updates cards to match /stats', async ({ page }) => {
     const { eightDaysAgo } = seedOverviewLogs(Date.now());
     await page.goto('/overview');
 
-    const stats7 = await fetchStats(request, 7);
-    const lifetime = await fetchLifetimeStats(request);
+    const stats7 = await fetchStats(page, 7);
+    const lifetime = await fetchLifetimeStats(page);
     await expectCardsMatchStats(page, stats7);
     await expectLifetimeMatch(page, lifetime);
     await expect(
@@ -405,7 +402,7 @@ test.describe('overview page', () => {
     await page.locator('#overview-days').click();
     await page.getByRole('option', { name: /90 days/i }).click();
 
-    const stats90 = await fetchStats(request, 90);
+    const stats90 = await fetchStats(page, 90);
     expect(stats90.summary.request_count).toBeGreaterThan(stats7.summary.request_count);
     await expectCardsMatchStats(page, stats90);
     await expectLifetimeMatch(page, lifetime);
@@ -420,7 +417,7 @@ test.describe('overview page', () => {
 
     await page.locator('#overview-days').click();
     await page.getByRole('option', { name: /1 day/i }).click();
-    const stats1 = await fetchStats(request, 1);
+    const stats1 = await fetchStats(page, 1);
     expect(stats1.daily).toHaveLength(24);
     await expectCardsMatchStats(page, stats1);
     await expectLifetimeMatch(page, lifetime);

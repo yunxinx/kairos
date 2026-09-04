@@ -13,7 +13,8 @@
 //!   reasoning 的 encrypted_content 经 part 逃生舱无损回传；finish_reason 由
 //!   `status`/`incomplete_details.reason` 双轨映射。
 //! - 流式：事件名驱动的 SSE（`response.created`/`response.output_text.delta`/
-//!   `response.completed` 等），`response.completed` 携带最终 usage。
+//!   `response.completed` 等），`response.completed` 携带最终 usage；流内
+//!   失败以 `error` 事件承载（`response.failed` 归 finish Error 语义）。
 //! - Responses 有状态特性（`store`/`previous_response_id`/`conversation`）Out of
 //!   Scope：入站留存到逃生舱，出站时显式 warning 并丢弃（不静默吞掉）。
 
@@ -26,9 +27,10 @@ use thiserror::Error;
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FILE_ID_KEY, FILE_NAME_KEY, FinishReason,
     FinishReasonUnified, Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool,
-    ToolChoice, Usage, Warning, apply_provider_extra, capture_unknown_fields, warning_feature,
+    ToolChoice, Usage, Warning, apply_provider_extra, capture_unknown_fields,
+    part_provider_options, warn_dropped_provider_options, warning_feature,
 };
-use crate::core::stream::SseFrame;
+use crate::core::stream::{ErrorMessageShape, SseFrame, decode_failed_frame};
 
 // ---- 错误 ----
 
@@ -254,6 +256,22 @@ enum WireStreamEvent {
         #[serde(default)]
         response: Option<Value>,
     },
+    /// 流内错误事件：官方文档为顶层 `message`，部分上游为嵌套
+    /// `error.message`（配额类错误帧的实测形状），两者都认。
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        error: Option<WireStreamErrorBody>,
+    },
+}
+
+/// `error` 事件嵌套形状的载荷。
+#[derive(Debug, Clone, Deserialize)]
+struct WireStreamErrorBody {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 /// `response.created` 的 response 首部：id/model。
@@ -705,6 +723,20 @@ fn decode_reasoning_item(item: &Value) -> Result<Message, DecodeError> {
 /// previous_response_id/conversation）显式警告并丢弃。目标协议无法表达的内容
 /// 追加到 `warnings`。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
+    // 消息级与 part 级逃生舱统一在此检查：本族键（text/reasoning 面板、
+    // item_id、detail/filename/file_id 等）由各编码位按形状读写；非本族
+    // 条目（如跨族缓存断点、thinking 签名）无法表达，逐处告警。
+    for message in &request.messages {
+        warn_dropped_provider_options(
+            &message.provider_options,
+            OPENAI_PROVIDER,
+            "消息级",
+            warnings,
+        );
+        for provider_options in part_provider_options(&message.content) {
+            warn_dropped_provider_options(provider_options, OPENAI_PROVIDER, "内容级", warnings);
+        }
+    }
     // Responses 无以下采样与输出控制参数：显式丢弃并记 warning（不静默吞掉）。
     if request.top_k.is_some() {
         warnings.push(Warning::unsupported(
@@ -822,6 +854,13 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
                     .tools
                     .iter()
                     .map(|t| {
+                        // 工具级逃生舱（如缓存断点）仅本族键有承载形态，跨族丢弃告警。
+                        warn_dropped_provider_options(
+                            &t.provider_options,
+                            OPENAI_PROVIDER,
+                            "工具级",
+                            warnings,
+                        );
                         let mut tool = serde_json::Map::new();
                         tool.insert("type".into(), json!("function"));
                         tool.insert("name".into(), json!(t.name));
@@ -1680,7 +1719,8 @@ fn encode_usage(usage: &Usage) -> Value {
 /// `output_item.added` 开启块（message→text、function_call→tool、
 /// reasoning→reasoning），`output_text.delta`/`function_call_arguments.delta`/
 /// `reasoning_summary_text.delta` 产出增量，`output_item.done` 收尾（function_call
-/// 在此解析出完整 arguments），`response.completed`/`incomplete` 产出 Finish。
+/// 在此解析出完整 arguments），`response.completed`/`incomplete` 产出 Finish，
+/// `error` 事件产出 IR Error（流内报错不再静默吞掉）。
 #[derive(Default)]
 pub struct StreamDecoder {
     /// 按 output_index 维护进行中的工具调用（arguments 跨帧累积）。
@@ -1708,7 +1748,13 @@ impl StreamDecoder {
     pub fn process(&mut self, value: &Value) -> DecodeStreamChunk {
         let wire = match serde_json::from_value::<WireStreamEvent>(value.clone()) {
             Ok(wire) => wire,
-            Err(_) => return DecodeStreamChunk::delivery(Vec::new()),
+            Err(err) => {
+                return DecodeStreamChunk::delivery(decode_failed_frame(
+                    &err,
+                    value,
+                    ErrorMessageShape::TopLevelOnErrorType,
+                ));
+            }
         };
 
         let mut events = Vec::new();
@@ -1927,6 +1973,12 @@ impl StreamDecoder {
                     provider_metadata: HashMap::new(),
                 });
             }
+            WireStreamEvent::Error { message, error } => {
+                let text = message
+                    .or_else(|| error.and_then(|body| body.message))
+                    .unwrap_or_default();
+                events.push(StreamEvent::Error { message: text });
+            }
         }
 
         DecodeStreamChunk { events, is_output }
@@ -1948,8 +2000,10 @@ impl DecodeStreamChunk {
 ///
 /// 维护进行中的块状态，把事件还原为 Responses 事件流：`response.created`/
 /// `response.output_item.added`/`response.output_text.delta`/`response.output_text.
-/// done`/`response.output_item.done`/`response.completed`。调用方负责把每帧包成
-/// SSE 发送；`StreamStart` 的 warnings 随 `response.created` 的 `gateway` 字段下发。
+/// done`/`response.output_item.done`/`response.completed`。`output_text.done` 与
+/// 终端 `response.completed` 的 `response.output` 按官方契约承载完整文本与完整
+/// 条目数组；流收尾时未显式关闭的块在此补收。调用方负责把每帧包成 SSE 发送；
+/// `StreamStart` 的 warnings 随 `response.created` 的 `gateway` 字段下发。
 #[derive(Default)]
 pub struct StreamEncoder {
     /// 进行中的文本块 id（`output_item.added` 记录，`output_item.done` 消费）。
@@ -1972,6 +2026,16 @@ pub struct StreamEncoder {
     reasoning_indexes: HashMap<String, usize>,
     /// 进行中工具调用的 output_index（按 call_id）。
     tool_indexes: HashMap<String, usize>,
+    /// 进行中文本块已累积的完整文本：`output_text.done` 与最终 message 项
+    /// 按官方契约承载全文，而非恒空。
+    text_accumulated: String,
+    /// reasoning 项按 item_id 累积的 summary 文本（最终项回传）。
+    reasoning_texts: HashMap<String, String>,
+    /// reasoning 项 start 事件携带的 encrypted_content（最终项原样回传）。
+    reasoning_encrypted: HashMap<String, Option<Value>>,
+    /// 已收尾 output 项的最终形状（按 output_index 归序后进 `response.completed`
+    /// 的 `response.output`，官方契约要求终端帧承载完整条目数组）。
+    final_items: Vec<(usize, Value)>,
 }
 
 /// 进行中的工具调用（出站侧）。
@@ -1995,6 +2059,128 @@ impl StreamEncoder {
         let index = self.next_item_index;
         self.next_item_index += 1;
         index
+    }
+
+    /// 关闭进行中的文本块：以累积全文下发 `output_text.done`/
+    /// `content_part.done`/`output_item.done` 三帧，并把最终 message 项登记
+    /// 进完成集（供 `response.completed` 的 output 数组承载）。
+    fn close_text_block(&mut self) -> Vec<SseFrame> {
+        let Some(item_id) = self.text_id.clone() else {
+            return Vec::new();
+        };
+        let output_index = self.text_index.take().unwrap_or(0);
+        self.text_id = None;
+        let full_text = std::mem::take(&mut self.text_accumulated);
+        let item = json!({
+            "type": "message",
+            "id": item_id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": full_text, "annotations": [] }],
+        });
+        self.final_items.push((output_index, item.clone()));
+        vec![
+            SseFrame::named(
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": full_text,
+                })
+                .to_string(),
+            ),
+            SseFrame::named(
+                "response.content_part.done",
+                json!({
+                    "type": "response.content_part.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": full_text, "annotations": [] },
+                })
+                .to_string(),
+            ),
+            SseFrame::named(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    /// 关闭 reasoning 项：以累积 summary 与 encrypted_content 构造最终条目，
+    /// 登记进完成集并下发 `summary_part.done` + `output_item.done`。
+    /// 无 start 也无增量的 id 无内容可收，跳过（不产出幽灵条目）。
+    fn close_reasoning_item(&mut self, ir_id: &str) -> Vec<SseFrame> {
+        let base_id = strip_summary_suffix(ir_id).to_string();
+        let Some(output_index) = self.reasoning_indexes.remove(&base_id) else {
+            return Vec::new();
+        };
+        let encrypted = self.reasoning_encrypted.remove(&base_id).flatten();
+        let text = self.reasoning_texts.remove(&base_id).unwrap_or_default();
+        let mut item = serde_json::Map::new();
+        item.insert("type".into(), json!("reasoning"));
+        item.insert("id".into(), json!(base_id));
+        match encrypted {
+            Some(enc) => item.insert("encrypted_content".into(), enc),
+            None => item.insert("encrypted_content".into(), Value::Null),
+        };
+        item.insert(
+            "summary".into(),
+            json!([{ "type": "summary_text", "text": text }]),
+        );
+        let item = Value::Object(item);
+        self.final_items.push((output_index, item.clone()));
+        vec![
+            SseFrame::named(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": base_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                })
+                .to_string(),
+            ),
+            SseFrame::named(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    /// 关闭 function_call 项：构造最终条目、登记进完成集并产出
+    /// `output_item.done`（arguments 为累积的完整参数串）。
+    fn close_function_call(&mut self, call_id: &str, tool_name: &str, arguments: &str) -> SseFrame {
+        let output_index = self.tool_indexes.remove(call_id).unwrap_or(0);
+        let item = json!({
+            "type": "function_call",
+            "id": format!("fc_{call_id}"),
+            "call_id": call_id,
+            "name": tool_name,
+            "arguments": arguments,
+        });
+        self.final_items.push((output_index, item.clone()));
+        SseFrame::named(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item,
+            })
+            .to_string(),
+        )
     }
 
     /// 编码一个 IR 流事件，返回需要下发的 SSE 帧（可能为空）。
@@ -2034,6 +2220,7 @@ impl StreamEncoder {
                 self.text_id = Some(id.clone());
                 let output_index = self.next_output_index();
                 self.text_index = Some(output_index);
+                self.text_accumulated.clear();
                 let item_id = provider_options
                     .get(OPENAI_PROVIDER)
                     .and_then(|o| o.get(ITEM_ID))
@@ -2045,7 +2232,12 @@ impl StreamEncoder {
                         json!({
                             "type": "response.output_item.added",
                             "output_index": output_index,
-                            "item": { "type": "message", "id": item_id, "phase": "final_answer" },
+                            "item": {
+                                "type": "message",
+                                "id": item_id,
+                                "role": "assistant",
+                                "content": [],
+                            },
                         })
                         .to_string(),
                     ),
@@ -2065,6 +2257,7 @@ impl StreamEncoder {
             StreamEvent::TextDelta { id, delta, .. } => {
                 let item_id = self.text_id.as_deref().unwrap_or(id);
                 let output_index = self.text_index.unwrap_or(0);
+                self.text_accumulated.push_str(delta);
                 vec![SseFrame::named(
                     "response.output_text.delta",
                     json!({
@@ -2077,44 +2270,7 @@ impl StreamEncoder {
                     .to_string(),
                 )]
             }
-            StreamEvent::TextEnd { id, .. } => {
-                let item_id = self.text_id.as_deref().unwrap_or(id).to_string();
-                let output_index = self.text_index.take().unwrap_or(0);
-                self.text_id = None;
-                vec![
-                    SseFrame::named(
-                        "response.output_text.done",
-                        json!({
-                            "type": "response.output_text.done",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "text": "",
-                        })
-                        .to_string(),
-                    ),
-                    SseFrame::named(
-                        "response.content_part.done",
-                        json!({
-                            "type": "response.content_part.done",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "part": { "type": "output_text", "text": "", "annotations": [] },
-                        })
-                        .to_string(),
-                    ),
-                    SseFrame::named(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": { "type": "message", "id": item_id, "role": "assistant" },
-                        })
-                        .to_string(),
-                    ),
-                ]
-            }
+            StreamEvent::TextEnd { .. } => self.close_text_block(),
             StreamEvent::ReasoningStart {
                 id,
                 provider_options,
@@ -2128,8 +2284,11 @@ impl StreamEncoder {
                     .get(OPENAI_PROVIDER)
                     .and_then(|o| o.get(REASONING_ENCRYPTED));
                 let output_index = self.next_output_index();
-                self.reasoning_indexes
-                    .insert(strip_summary_suffix(id).to_string(), output_index);
+                let base_id = strip_summary_suffix(id).to_string();
+                self.reasoning_indexes.insert(base_id.clone(), output_index);
+                self.reasoning_encrypted
+                    .insert(base_id.clone(), encrypted.cloned());
+                self.reasoning_texts.insert(base_id, String::new());
                 let mut item = serde_json::Map::new();
                 item.insert("type".into(), json!("reasoning"));
                 item.insert("id".into(), json!(item_id));
@@ -2148,45 +2307,46 @@ impl StreamEncoder {
                 )]
             }
             StreamEvent::ReasoningDelta { id, delta, .. } => {
-                let item_id = strip_summary_suffix(id);
-                let output_index = self.reasoning_indexes.get(item_id).copied().unwrap_or(0);
-                vec![SseFrame::named(
+                let base_id = strip_summary_suffix(id).to_string();
+                // 无 start 事件的增量：惰性补齐 output_index 并补发 added 事件，
+                // 使下游看到的流序与官方契约一致（added 先于任何 delta）。
+                let (output_index, mut frames) = match self.reasoning_indexes.get(&base_id) {
+                    Some(index) => (*index, Vec::new()),
+                    None => {
+                        let index = self.next_output_index();
+                        self.reasoning_indexes.insert(base_id.clone(), index);
+                        self.reasoning_encrypted.insert(base_id.clone(), None);
+                        self.reasoning_texts.insert(base_id.clone(), String::new());
+                        let added = SseFrame::named(
+                            "response.output_item.added",
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": index,
+                                "item": { "type": "reasoning", "id": base_id, "summary": [] },
+                            })
+                            .to_string(),
+                        );
+                        (index, vec![added])
+                    }
+                };
+                self.reasoning_texts
+                    .entry(base_id.clone())
+                    .or_default()
+                    .push_str(delta);
+                frames.push(SseFrame::named(
                     "response.reasoning_summary_text.delta",
                     json!({
                         "type": "response.reasoning_summary_text.delta",
-                        "item_id": item_id,
+                        "item_id": base_id,
                         "output_index": output_index,
                         "summary_index": 0,
                         "delta": delta,
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
-            StreamEvent::ReasoningEnd { id, .. } => {
-                let item_id = strip_summary_suffix(id);
-                let output_index = self.reasoning_indexes.remove(item_id).unwrap_or(0);
-                vec![
-                    SseFrame::named(
-                        "response.reasoning_summary_part.done",
-                        json!({
-                            "type": "response.reasoning_summary_part.done",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "summary_index": 0,
-                        })
-                        .to_string(),
-                    ),
-                    SseFrame::named(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": { "type": "reasoning", "id": item_id },
-                        })
-                        .to_string(),
-                    ),
-                ]
-            }
+            StreamEvent::ReasoningEnd { id, .. } => self.close_reasoning_item(id),
             StreamEvent::ToolInputStart { id, tool_name, .. } => {
                 let output_index = self.next_output_index();
                 self.tool_indexes.insert(id.clone(), output_index);
@@ -2235,22 +2395,7 @@ impl StreamEncoder {
                 let Some(tool) = self.tools.remove(id) else {
                     return Vec::new();
                 };
-                let output_index = self.tool_indexes.remove(id).unwrap_or(0);
-                vec![SseFrame::named(
-                    "response.output_item.done",
-                    json!({
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "item": {
-                            "type": "function_call",
-                            "id": format!("fc_{id}"),
-                            "call_id": id,
-                            "name": tool.tool_name,
-                            "arguments": tool.arguments,
-                        },
-                    })
-                    .to_string(),
-                )]
+                vec![self.close_function_call(id, &tool.tool_name, &tool.arguments)]
             }
             StreamEvent::ToolCall {
                 tool_call_id,
@@ -2259,49 +2404,34 @@ impl StreamEncoder {
                 ..
             } => {
                 // 兜底：非增量路径（如直接以完整工具调用编码）同样关闭 function_call 项。
-                let output_index = self.tool_indexes.remove(tool_call_id).unwrap_or(0);
-                vec![SseFrame::named(
-                    "response.output_item.done",
-                    json!({
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "item": {
-                            "type": "function_call",
-                            "id": format!("fc_{tool_call_id}"),
-                            "call_id": tool_call_id,
-                            "name": tool_name,
-                            "arguments": input.to_string(),
-                        },
-                    })
-                    .to_string(),
-                )]
+                self.tools.remove(tool_call_id);
+                vec![self.close_function_call(tool_call_id, tool_name, &input.to_string())]
             }
             StreamEvent::Finish {
                 finish_reason,
                 usage,
                 ..
             } => {
-                // 上游解码器（如 openai_chat）可能不发 ToolInputEnd，靠累积器 flush 收尾；
-                // 流结束前把仍打开的 function_call 项逐个关闭，避免下游收到未闭合工具。
+                // 流结束前把未收尾的项逐个关闭：上游解码器（如 openai_chat）可能
+                // 不发 TextEnd/ToolInputEnd，靠此处 flush 收尾，避免下游收到未闭合
+                // 条目或残缺的终端 output 数组。
+                let mut frames = self.close_text_block();
+                let mut open_reasoning: Vec<(usize, String)> = self
+                    .reasoning_indexes
+                    .iter()
+                    .map(|(id, index)| (*index, id.clone()))
+                    .collect();
+                open_reasoning.sort_unstable_by_key(|(index, _)| *index);
+                for (_, id) in open_reasoning {
+                    frames.extend(self.close_reasoning_item(&id));
+                }
                 let pending: Vec<(String, OpenStreamTool)> =
                     std::mem::take(&mut self.tools).into_iter().collect();
-                let mut pending_tools = Vec::new();
                 for (call_id, tool) in pending {
-                    let output_index = self.tool_indexes.remove(&call_id).unwrap_or(0);
-                    pending_tools.push(SseFrame::named(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": {
-                                "type": "function_call",
-                                "id": format!("fc_{call_id}"),
-                                "call_id": call_id,
-                                "name": tool.tool_name,
-                                "arguments": tool.arguments,
-                            },
-                        })
-                        .to_string(),
+                    frames.push(self.close_function_call(
+                        &call_id,
+                        &tool.tool_name,
+                        &tool.arguments,
                     ));
                 }
                 let (status, incomplete) = encode_status(finish_reason);
@@ -2318,12 +2448,15 @@ impl StreamEncoder {
                 response.insert("status".into(), json!(status));
                 let model = self.inbound_model.as_deref().unwrap_or(&self.model);
                 response.insert("model".into(), json!(model));
-                response.insert("output".into(), Value::Array(Vec::new()));
+                // 官方契约：终端帧的 response.output 承载完整条目数组（按
+                // output_index 归序），不再恒空。
+                self.final_items.sort_by_key(|(index, _)| *index);
+                let output: Vec<Value> = self.final_items.drain(..).map(|(_, item)| item).collect();
+                response.insert("output".into(), Value::Array(output));
                 if let Some(reason) = incomplete {
                     response.insert("incomplete_details".into(), json!({ "reason": reason }));
                 }
                 response.insert("usage".into(), encode_usage(usage));
-                let mut frames = pending_tools;
                 frames.push(SseFrame::named(
                     "response.completed",
                     json!({ "type": "response.completed", "response": response }).to_string(),
@@ -2494,6 +2627,68 @@ mod tests {
             body,
             json!({ "error": { "message": "Overloaded", "type": "api_error", "code": null } })
         );
+    }
+
+    /// 流内 `error` 事件解码为 IR Error：官方顶层 `message` 与嵌套
+    /// `error.message` 两种形状都认，不产出其他事件。流首错误帧即此形状，
+    /// 网关 peek 窗口对 IR Error 的归类（可 failover）由此打通。
+    #[test]
+    fn stream_error_event_decodes_to_ir_error() {
+        let top_level = json!({
+            "type": "error",
+            "code": "insufficient_quota",
+            "message": "quota exceeded",
+        });
+        let decoded = StreamDecoder::default().process(&top_level);
+        assert!(!decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "quota exceeded".to_string(),
+            }]
+        );
+
+        let nested = json!({
+            "type": "error",
+            "error": {
+                "type": "insufficient_quota",
+                "code": "insufficient_quota",
+                "message": "You exceeded your current quota",
+            },
+        });
+        let decoded = StreamDecoder::default().process(&nested);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "You exceeded your current quota".to_string(),
+            }]
+        );
+    }
+
+    /// 形状畸形的错误帧（顶层 message 类型不符导致解析失败）仍提取错误语义；
+    /// 未建模的事件类型留痕后跳过，不误判为错误。
+    #[test]
+    fn malformed_frames_surface_error_semantics_or_skip() {
+        let malformed = json!({
+            "type": "error",
+            "message": 42,
+            "error": { "message": "boom" },
+        });
+        let decoded = StreamDecoder::default().process(&malformed);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "boom".to_string(),
+            }]
+        );
+
+        let unmodeled = json!({
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "text": "done",
+        });
+        let decoded = StreamDecoder::default().process(&unmodeled);
+        assert_eq!(decoded.events, Vec::new());
     }
 
     /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。
@@ -2746,6 +2941,210 @@ mod tests {
         assert_eq!(
             provider_options["openai"][REASONING_ENCRYPTED], "enc_stream",
             "流式 reasoning 应携带 encrypted_content"
+        );
+    }
+
+    /// 流式出站 message 项形状对齐官方契约：added 携带 `role` 与空 `content`
+    /// 初始形态（无非官方 `phase`），done 与终端 `response.completed` 的
+    /// output 数组承载完整条目。
+    #[test]
+    fn stream_message_item_shape_matches_official_contract() {
+        let mut encoder = StreamEncoder::new(None);
+        let mut frames = Vec::new();
+        for event in [
+            StreamEvent::ResponseMetadata {
+                id: "resp_1".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            StreamEvent::TextStart {
+                id: "msg_1".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "msg_1".to_string(),
+                delta: "Hel".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "msg_1".to_string(),
+                delta: "lo".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextEnd {
+                id: "msg_1".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::Finish {
+                finish_reason: FinishReason {
+                    unified: FinishReasonUnified::Stop,
+                    raw: None,
+                },
+                usage: Usage::default(),
+                provider_metadata: HashMap::new(),
+            },
+        ] {
+            frames.extend(encoder.encode(&event));
+        }
+
+        let added = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_item.added"))
+            .expect("应有 added 帧");
+        let payload: Value = serde_json::from_str(&added.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["item"],
+            json!({ "type": "message", "id": "msg_1", "role": "assistant", "content": [] }),
+            "added 项应为 role + 空 content 初始形态，无 phase"
+        );
+
+        let text_done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_text.done"))
+            .expect("应有 text done 帧");
+        let payload: Value = serde_json::from_str(&text_done.data).expect("载荷应为 JSON");
+        assert_eq!(payload["text"], json!("Hello"), "done 应承载累积全文");
+
+        let item_done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_item.done"))
+            .expect("应有 item done 帧");
+        let payload: Value = serde_json::from_str(&item_done.data).expect("载荷应为 JSON");
+        let final_item = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": "Hello", "annotations": [] }],
+        });
+        assert_eq!(payload["item"], final_item, "done 项应承载完整条目");
+
+        let completed = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.completed"))
+            .expect("应有 completed 帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["response"]["output"],
+            json!([final_item]),
+            "终端帧 output 应承载完整条目数组"
+        );
+    }
+
+    /// 上游不发 TextEnd 时（如 chat 解码器的流形状），文本块在流收尾处补收：
+    /// done 帧与终端 output 数组仍然齐备且全文完整。
+    #[test]
+    fn stream_finish_closes_unclosed_text_block() {
+        let mut encoder = StreamEncoder::new(None);
+        let mut frames = Vec::new();
+        for event in [
+            StreamEvent::ResponseMetadata {
+                id: "resp_2".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            StreamEvent::TextStart {
+                id: "msg_2".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "msg_2".to_string(),
+                delta: "你好".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::Finish {
+                finish_reason: FinishReason {
+                    unified: FinishReasonUnified::Stop,
+                    raw: None,
+                },
+                usage: Usage::default(),
+                provider_metadata: HashMap::new(),
+            },
+        ] {
+            frames.extend(encoder.encode(&event));
+        }
+
+        let done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_text.done"))
+            .expect("收尾应补发 text done 帧");
+        let payload: Value = serde_json::from_str(&done.data).expect("载荷应为 JSON");
+        assert_eq!(payload["text"], json!("你好"));
+
+        let completed = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.completed"))
+            .expect("应有 completed 帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["response"]["output"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// 无 start 事件的 reasoning 增量：惰性补发 added（output_index 新分配，
+    /// 不回落 0 与既有项冲突），流序保持 added 先于 delta 的官方契约。
+    #[test]
+    fn reasoning_delta_without_start_allocates_index_and_synthesizes_added() {
+        let mut encoder = StreamEncoder::new(None);
+        // 先占用 output_index 0（文本块）。
+        encoder
+            .encode(&StreamEvent::TextStart {
+                id: "msg_1".to_string(),
+                provider_options: HashMap::new(),
+            })
+            .len();
+        let frames = encoder.encode(&StreamEvent::ReasoningDelta {
+            id: "rs_9:0".to_string(),
+            delta: "推理中".to_string(),
+            provider_options: HashMap::new(),
+        });
+
+        assert_eq!(
+            frames[0].event.as_deref(),
+            Some("response.output_item.added"),
+            "首帧应为补发的 added"
+        );
+        let payload: Value = serde_json::from_str(&frames[0].data).expect("载荷应为 JSON");
+        assert_eq!(payload["output_index"], json!(1), "应分配新索引而非 0");
+        assert_eq!(payload["item"]["type"], json!("reasoning"));
+
+        let payload: Value = serde_json::from_str(&frames[1].data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["output_index"],
+            json!(1),
+            "delta 应与补发的 added 同索引"
+        );
+
+        // 收尾：done 帧承载累积 summary，终端数组包含 reasoning 项。
+        let mut frames = encoder.encode(&StreamEvent::ReasoningEnd {
+            id: "rs_9:0".to_string(),
+            provider_options: HashMap::new(),
+        });
+        frames.extend(encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: None,
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        }));
+        let item_done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_item.done"))
+            .expect("应有 reasoning done 帧");
+        let payload: Value = serde_json::from_str(&item_done.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["item"]["summary"],
+            json!([{ "type": "summary_text", "text": "推理中" }]),
+            "done 项应承载累积 summary"
+        );
+        let completed = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.completed"))
+            .expect("应有 completed 帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["response"]["output"].as_array().map(Vec::len),
+            Some(2)
         );
     }
 

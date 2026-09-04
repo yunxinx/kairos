@@ -91,7 +91,8 @@ pub mod warning_feature {
     pub const THINKING: &str = "thinking";
     /// JSON 输出设置（response_format）在目标协议无对应表达。
     pub const RESPONSE_FORMAT: &str = "response_format";
-    /// 请求级 provider 逃生舱设置在目标协议无法表达，已丢弃。
+    /// provider 逃生舱设置（请求级/消息级/内容级/工具级）在目标协议无法
+    /// 表达，已丢弃。
     pub const PROVIDER_OPTIONS: &str = "provider_options";
     /// tool 消息携带非 tool_result 的内容 part，无法表达已丢弃。
     pub const TOOL_RESULT: &str = "tool_result";
@@ -117,6 +118,65 @@ pub mod warning_feature {
 /// 各适配器入站解码把本协议白名单外的顶层字段收进该键，同族出站原样回写，
 /// 跨族出站丢弃并记 [`warning_feature::UNKNOWN_FIELDS`] warning。
 pub const PROVIDER_EXTRA_KEY: &str = "extra";
+
+/// 消息级 / 内容级 / 工具级逃生舱的跨族丢弃告警。
+///
+/// `provider_options` 中不属于 `family`（本协议 provider 键）的条目在目标
+/// 协议无承载，逐 provider 记 [`warning_feature::PROVIDER_OPTIONS`]；本族
+/// 条目由各适配器按形状自行读写，不经本函数告警。请求级逃生舱的同一语义
+/// 由各适配器出站编码另行处理（需放行字段记忆集与未知字段 extra）。
+pub(crate) fn warn_dropped_provider_options(
+    provider_options: &ProviderOptions,
+    family: &str,
+    level: &str,
+    warnings: &mut Vec<Warning>,
+) {
+    for (provider, value) in provider_options {
+        if provider == family {
+            continue;
+        }
+        let carried = match value {
+            Value::Object(map) => !map.is_empty(),
+            Value::Null => false,
+            _ => true,
+        };
+        if carried {
+            warnings.push(Warning::unsupported(
+                warning_feature::PROVIDER_OPTIONS,
+                format!("{provider} 的{level}逃生舱设置无法表达，已丢弃"),
+            ));
+        }
+    }
+}
+
+/// 遍历 content parts 携带的逃生舱：出站可承载形态的 part 逐个产出
+/// `provider_options`，Custom part 跳过。
+///
+/// Custom part 整块丢弃时已记 [`warning_feature::CUSTOM`] 告警，其逃生舱
+/// 随整块丢弃不再单独告警；其余 part 一律视为有承载形态，由调用方按
+/// 本族键判定去留（配合 [`warn_dropped_provider_options`] 使用）。
+pub(crate) fn part_provider_options(
+    parts: &[ContentPart],
+) -> impl Iterator<Item = &ProviderOptions> {
+    parts.iter().filter_map(|part| match part {
+        ContentPart::Text {
+            provider_options, ..
+        }
+        | ContentPart::Reasoning {
+            provider_options, ..
+        }
+        | ContentPart::Media {
+            provider_options, ..
+        }
+        | ContentPart::ToolCall {
+            provider_options, ..
+        }
+        | ContentPart::ToolResult {
+            provider_options, ..
+        } => Some(provider_options),
+        ContentPart::Custom { .. } => None,
+    })
+}
 
 /// 媒体 part 逃生舱约定键：文件名。
 ///
@@ -692,6 +752,10 @@ pub enum StreamEvent {
         provider_options: ProviderOptions,
     },
     /// 生命周期：流开始，携带本次转换的 warnings。
+    ///
+    /// 流式解码中途发现的 warnings（如响应流中无法下发的媒体 part）以再次
+    /// 出现的 StreamStart 下发：累积器按追加处理，各协议入站编码器转为独立
+    /// warnings 帧下发。
     StreamStart {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<Warning>,

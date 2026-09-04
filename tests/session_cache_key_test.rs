@@ -2,12 +2,13 @@
 //!
 //! 主接缝：端到端 HTTP 黑盒，断言 mock 上游收到的出站请求体。覆盖回写开关
 //! 三态（off 不写、auto 不覆盖下游显式键、always 无条件覆盖）、显式
-//! `x-kairos-session-id` 头与前缀哈希兜底两种会话标识来源，以及直通路径
-//! 不经过回写。回写只发生在 IR 路径，用例统一经别名或跨协议入站强制。
+//! `x-kairos-session-id` 头与前缀哈希兜底两种会话标识来源，以及直通路径与
+//! IR 路径应用同一回写补丁。IR 路径用例经别名或跨协议入站强制，直通用例
+//! 走同协议无别名渠道。
 
 mod common;
 
-use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior};
+use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior, collect_sse_frames};
 use kairos::config::SessionCacheKeyMode;
 use serde_json::{Value, json};
 
@@ -422,11 +423,161 @@ async fn session_identity_survives_process_reload() {
     );
 }
 
-/// 直通快路径（同协议无别名）字节直搬：开关在场也不改写请求体。
+/// 直通路径应用同一回写补丁：always 渠道上无条件覆盖下游显式键、缺席时
+/// 写入；流式直通同样回写。会话标识与 IR 路径同源（显式头派生摘要）。
 #[tokio::test]
-async fn passthrough_path_skips_writeback() {
+async fn passthrough_path_applies_writeback_in_always_mode() {
     let (mut gw, _upstreams) = TestGateway::start_with_multi(1, |bases| {
         seed_with_mode(&bases[0], SessionCacheKeyMode::Always)
+    })
+    .await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+    gw.upstream
+        .push_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+    gw.upstream.push_behavior(UpstreamBehavior::Sse(vec![
+        json!({"id": "c1", "object": "chat.completion.chunk", "model": TEST_MODEL,
+               "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}, "finish_reason": null}]})
+            .to_string(),
+        json!({"id": "c1", "object": "chat.completion.chunk", "model": TEST_MODEL,
+               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+               "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}})
+            .to_string(),
+    ]));
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", gw.base_url());
+
+    // 非流式：下游显式键被无条件覆盖为网关派生标识。
+    let resp = client
+        .post(&url)
+        .bearer_auth(TEST_TOKEN_KEY)
+        .header("x-kairos-session-id", "sess-1")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "prompt_cache_key": "downstream-key",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 非流式：下游缺席时写入派生标识。
+    let resp = client
+        .post(&url)
+        .bearer_auth(TEST_TOKEN_KEY)
+        .header("x-kairos-session-id", "sess-1")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 流式直通：同样回写，且 include_usage 补丁照常注入。
+    let resp = client
+        .post(&url)
+        .bearer_auth(TEST_TOKEN_KEY)
+        .header("x-kairos-session-id", "sess-stream")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let _ = collect_sse_frames(resp).await;
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 3);
+    for body in received.iter().take(2) {
+        let cache_key = body["prompt_cache_key"]
+            .as_str()
+            .expect("always 直通应回写缓存亲和键");
+        assert_eq!(cache_key.len(), 64, "缓存键应为固定长度摘要");
+        assert_ne!(cache_key, "sess-1", "上游不应收到下游原始会话标识");
+    }
+    assert_eq!(
+        received[0]["prompt_cache_key"], received[1]["prompt_cache_key"],
+        "覆盖与写入应得到同一派生标识"
+    );
+    let stream_cache_key = received[2]["prompt_cache_key"]
+        .as_str()
+        .expect("流式直通应回写缓存亲和键");
+    assert_eq!(stream_cache_key.len(), 64);
+    assert_eq!(
+        received[2]["stream_options"]["include_usage"],
+        json!(true),
+        "流式直通的 include_usage 补丁应保留"
+    );
+}
+
+/// 直通路径 auto 语义：下游显式键保留，缺席时回写。
+#[tokio::test]
+async fn passthrough_path_auto_keeps_explicit_and_fills_absent() {
+    let (mut gw, _upstreams) = TestGateway::start_with_multi(1, |bases| {
+        seed_with_mode(&bases[0], SessionCacheKeyMode::Auto)
+    })
+    .await;
+    gw.upstream
+        .set_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+    gw.upstream
+        .push_behavior(UpstreamBehavior::Json(chat_upstream_response()));
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", gw.base_url());
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(TEST_TOKEN_KEY)
+        .header("x-kairos-session-id", "sess-1")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "prompt_cache_key": "downstream-key",
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(TEST_TOKEN_KEY)
+        .header("x-kairos-session-id", "sess-2")
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let received = gw.upstream.received();
+    assert_eq!(received.len(), 2);
+    assert_eq!(
+        received[0]["prompt_cache_key"],
+        json!("downstream-key"),
+        "auto 直通不应覆盖下游显式键"
+    );
+    let cache_key = received[1]["prompt_cache_key"]
+        .as_str()
+        .expect("auto 直通应在缺席时回写");
+    assert_eq!(cache_key.len(), 64);
+    assert_ne!(cache_key, "sess-2");
+}
+
+/// 直通路径 off 语义：出站体不带补丁键；下游显式键原样透传。
+#[tokio::test]
+async fn passthrough_path_off_leaves_body_untouched() {
+    let (mut gw, _upstreams) = TestGateway::start_with_multi(1, |bases| {
+        seed_with_mode(&bases[0], SessionCacheKeyMode::Off)
     })
     .await;
     gw.upstream
@@ -439,6 +590,7 @@ async fn passthrough_path_skips_writeback() {
         .header("x-kairos-session-id", "sess-1")
         .json(&json!({
             "model": TEST_MODEL,
+            "prompt_cache_key": "downstream-key",
             "messages": [{ "role": "user", "content": "hi" }]
         }))
         .send()
@@ -448,8 +600,9 @@ async fn passthrough_path_skips_writeback() {
 
     let received = gw.upstream.received();
     assert_eq!(received.len(), 1);
-    assert!(
-        received[0].get("prompt_cache_key").is_none(),
-        "直通路径不应改写请求体"
+    assert_eq!(
+        received[0]["prompt_cache_key"],
+        json!("downstream-key"),
+        "off 直通不改写下游显式键"
     );
 }

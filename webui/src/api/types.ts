@@ -105,6 +105,8 @@ export interface Channel {
   session_cache_key: SessionCacheKeyMode;
   /** 自动缓存断点注入；缺省 false，仅对 Anthropic Messages 渠道生效。 */
   injects_cache_breakpoints: boolean;
+  /** 下游断开时是否立即取消上游消费；缺省 true（断开即止损）。 */
+  abort_on_disconnect: boolean;
 }
 
 /** 渠道上的一把上游密钥；模型白/黑名单为可选的逗号名单。 */
@@ -158,7 +160,24 @@ export function channelWriteBody(view: ChannelView): Channel {
     reasoning_output: view.reasoning_output,
     session_cache_key: view.session_cache_key,
     injects_cache_breakpoints: view.injects_cache_breakpoints,
+    abort_on_disconnect: view.abort_on_disconnect,
   };
+}
+
+/** 冷却中渠道的一行健康展示。 */
+export interface ChannelHealthEntry {
+  channel_id: number;
+  /** 渠道名；取自当前快照，已删除渠道的残留冷却记录不出现。 */
+  channel: string;
+  /** 冷却到期时刻（unix 毫秒）。 */
+  cooldown_until: number;
+  /** 触发冷却时的连续可重试失败计数（上游 402/403 即时冷却时为 0）。 */
+  consecutive_failures: number;
+}
+
+/** `GET /channels/health` 响应：当前冷却中的渠道清单，无冷却时为空数组。 */
+export interface ChannelHealthView {
+  channels: ChannelHealthEntry[];
 }
 
 /** 同名渠道顺序表里的一行：某个可调用名在多条渠道上的完整尝试顺序。 */

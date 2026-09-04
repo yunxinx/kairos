@@ -49,6 +49,11 @@ pub enum StoreError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("设置数据库文件 {path} 权限失败: {source}")]
+    SetPermissions {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "WAL checkpoint 被活动读事务阻塞（WAL 帧 {log_frames}，已 checkpoint {checkpointed_frames}）"
     )]
@@ -92,6 +97,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// 缺库文件时自动创建（`create_if_missing`），迁移脚本内建在 `migrations/`。
 /// 连接选项统一治理 SQLite 的坏默认值：外键强制、写锁排队、WAL 日志模式。
+/// 连接建立后立即把库文件与既有边车收紧为 owner-only 权限。
 pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
@@ -111,6 +117,8 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
         .await
         .map_err(StoreError::Connect)?;
 
+    tighten_database_file_permissions(path).await?;
+
     sqlx::migrate!()
         .run(&pool)
         .await
@@ -119,6 +127,43 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
     ids::initialize(&pool).await?;
 
     Ok(pool)
+}
+
+/// 把数据库文件与既有边车（WAL/SHM）的权限收紧为 owner-only（0o600）。
+///
+/// 库文件承载渠道密钥、令牌 key 与对话 body，不能按进程 umask 宽松落盘。
+/// SQLite 创建 `-wal`/`-journal`/`-shm` 边车时按库文件当时的权限原样派生
+/// （不受 umask 影响），因此只需在首次写事务前归一库文件；连接阶段可能已
+/// 产生的边车在此一并归一，其后新建的自然继承 0o600。边车尚未创建是正常
+/// 状态（首次写事务才落盘），缺席时跳过。
+async fn tighten_database_file_permissions(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut wal_path = path.to_path_buf();
+    wal_path.as_mut_os_string().push("-wal");
+    let mut shm_path = path.to_path_buf();
+    shm_path.as_mut_os_string().push("-shm");
+    let targets = [path.to_path_buf(), wal_path, shm_path];
+    tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
+        for target in targets {
+            match std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StoreError::SetPermissions {
+                        path: target,
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| StoreError::SetPermissions {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(err.to_string()),
+    })?
 }
 
 /// 写一条冒烟记录，返回时间有序 id。
@@ -202,6 +247,16 @@ pub(crate) struct PendingRequestLog {
     pub(crate) log: RequestLog,
     /// 费用计算阶段已失败时保留原因；此类记录不得执行扣费。
     pub(crate) settlement_error: Option<String>,
+    /// 出站尝试是否确认到达上游；usage 缺失告警据此区分「上游未达」与
+    /// 「可能已产生费用」两类。存量队列行缺该字段时按未知处理，归入
+    /// 可能已产生费用一侧。
+    #[serde(default = "default_upstream_reached")]
+    pub(crate) upstream_reached: bool,
+}
+
+/// `upstream_reached` 缺省值：未知可达性按「可能已产生费用」告警。
+fn default_upstream_reached() -> bool {
+    true
 }
 
 /// 落一条请求日志，返回时间有序 id。
@@ -355,6 +410,17 @@ pub(crate) async fn enqueue_pending_request_log(
     };
     if let Some(attempt_id) = pending.log.billing_attempt_id.as_deref() {
         mark_billing_attempt_result_persisted(&mut tx, attempt_id).await?;
+        // 入队时已结算且带计费身份的日志表示该尝试以「释放预留」结束：
+        // 结果缺失上游 usage 时不产生费用，预留归还与对账日志入队必须在
+        // 同一事务内成立，否则崩溃后要么额度滞留、要么日志缺失。回报
+        // usage 的尝试保持预留，由后台按实际用量结算。
+        if pending.log.settled && pending.settlement_error.is_none() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or(0);
+            release_billing_attempt_on(&mut tx, attempt_id, now).await?;
+        }
     }
     tx.commit().await.map_err(StoreError::Query)?;
     Ok(persisted_id)
@@ -998,6 +1064,10 @@ pub(crate) struct BillingAttemptRecovery {
     /// 费用计算错误的稳定文本；存在时恢复记录必须保持未结算。
     #[serde(default)]
     pub result_settlement_error: Option<String>,
+    /// 出站尝试是否确认到达上游；恢复重建的日志据此区分 usage 缺失告警
+    /// 的两类事件码。存量元数据缺该字段时按未知（可能已产生费用）处理。
+    #[serde(default = "default_upstream_reached")]
+    pub upstream_reached: bool,
 }
 
 /// 在计费预留行中保存已生成的结果，供 outbox 写入失败或进程崩溃后的恢复任务
@@ -1032,6 +1102,7 @@ pub(crate) async fn persist_billing_attempt_result(
     }
     recovery.result = Some(Box::new(pending.log.clone()));
     recovery.result_settlement_error = pending.settlement_error.clone();
+    recovery.upstream_reached = pending.upstream_reached;
     let encoded = serde_json::to_vec(&recovery)
         .map_err(|err| StoreError::InvalidResource(format!("费用结果无法编码: {err}")))?;
     let now = SystemTime::now()
@@ -1178,7 +1249,11 @@ pub async fn reserve_billing_attempt(
     Ok(true)
 }
 
-/// 标记预留已经进入实际出站调用阶段；恢复任务据此区分可释放和未知费用。
+/// 标记预留已经进入实际出站调用阶段。
+///
+/// 进入出站后预留不再被无条件释放：合法出口只有两条——按上游明确回报的
+/// usage 结算，或结果缺失 usage（含连接未建立）时随结果入队释放。恢复
+/// 任务据此把 dispatched 且无结果的预留视为未知费用并按释放处理。
 pub async fn mark_billing_attempt_dispatched(
     pool: &SqlitePool,
     attempt_id: &str,
@@ -1321,30 +1396,46 @@ pub async fn settle_billing_attempt(
     Ok(())
 }
 
-/// provider 尚未调用时释放预留；已 dispatch 的 attempt 不允许走退款路径。
+/// 释放预留，归还准入时冻结的额度；幂等（已释放、已结算或不存在时无操作）。
+///
+/// 未派发的尝试与已派发但确认无上游费用的尝试（连接未建立、结果缺失
+/// usage）都以释放结束：`status='reserved'` 即可释放，`dispatched` 不再
+/// 限制出口。已派发尝试的释放由结果入队路径触发，保证「日志照落」与
+/// 「额度归还」一致。
 pub async fn release_billing_attempt(
     pool: &SqlitePool,
     attempt_id: &str,
 ) -> Result<(), StoreError> {
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    release_billing_attempt_on(&mut conn, attempt_id, now).await
+}
+
+/// 在已有连接/事务上释放预留，供结果入队与崩溃恢复在同一事务内完成。
+async fn release_billing_attempt_on(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+    now: i64,
+) -> Result<(), StoreError> {
     sqlx::query(
         "UPDATE billing_reservations SET status = 'released', updated_at = ? \
-         WHERE attempt_id = ? AND status = 'reserved' AND dispatched = 0",
+         WHERE attempt_id = ? AND status = 'reserved'",
     )
-    .bind(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or(0),
-    )
+    .bind(now)
     .bind(attempt_id)
-    .execute(pool)
+    .execute(conn)
     .await
     .map_err(StoreError::Query)?;
     Ok(())
 }
 
-/// 扫描进程崩溃留下的预留：尚未进入 provider 阶段的释放，已进入阶段的生成
-/// 保守结算记录。所有动作都在各自的短写事务中完成，和正常入队共享同一唯一键。
+/// 扫描进程崩溃留下的预留：尚未进入出站阶段的释放，已进入出站且无结果的
+/// 按释放处理（费用未知交人工对账）。带明确 usage 的完整结果仍重建入队，
+/// 由后台按实际用量结算。所有动作都在各自的短写事务中完成，和正常入队
+/// 共享同一唯一键。
 pub(crate) async fn recover_orphan_billing_attempts(
     pool: &SqlitePool,
     max_age: Duration,
@@ -1409,9 +1500,6 @@ pub(crate) async fn recover_orphan_billing_attempts(
         let request_id: String = row.try_get("request_id").map_err(StoreError::Query)?;
         let token_key: String = row.try_get("token_key").map_err(StoreError::Query)?;
         let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
-        let reserved_cost: i64 = row
-            .try_get("reserved_cost_usd_micros")
-            .map_err(StoreError::Query)?;
         let metadata: Vec<u8> = row
             .try_get("recovery_metadata")
             .map_err(StoreError::Query)?;
@@ -1437,6 +1525,7 @@ pub(crate) async fn recover_orphan_billing_attempts(
                             request_body: None,
                             result: None,
                             result_settlement_error: Some(reason.clone()),
+                            upstream_reached: true,
                         },
                         Some(reason),
                     )
@@ -1455,10 +1544,13 @@ pub(crate) async fn recover_orphan_billing_attempts(
             request_body,
             result,
             result_settlement_error,
+            upstream_reached,
         } = recovery;
-        let (mut log, settlement_error) = if let Some(result) = result {
+        let (log, settlement_error) = if let Some(result) = result {
             (*result, result_settlement_error.or(metadata_error.clone()))
         } else {
+            // 出站结果未知：无法确认上游是否产生费用，因此不结算。以零费用
+            // 已结算的日志记录事实，预留释放、告警交人工对账。
             let log = RequestLog {
                 id: 0,
                 created_at: now,
@@ -1479,10 +1571,10 @@ pub(crate) async fn recover_orphan_billing_attempts(
                 cache_write_1h_tokens: 0,
                 usage_reported: false,
                 price,
-                base_cost_usd_micros: conservative_base_from_charge(reserved_cost, discount_bp),
+                base_cost_usd_micros: 0,
                 discount_bp,
-                cost_usd_micros: reserved_cost,
-                settled: false,
+                cost_usd_micros: 0,
+                settled: true,
                 request_id: Some(request_id),
                 billing_attempt_id: Some(attempt_id.clone()),
                 request_body,
@@ -1490,19 +1582,10 @@ pub(crate) async fn recover_orphan_billing_attempts(
             };
             (log, result_settlement_error)
         };
-        if !log.usage_reported && settlement_error.is_none() {
-            // 结果可能来自旧版本：当时缺失 usage 的日志尚未把预留金额写进
-            // result。恢复时按当前预留补齐费用与基础成本，避免崩溃窗口把
-            // 请求错误地当成零费用。
-            log.cost_usd_micros = reserved_cost;
-            if log.base_cost_usd_micros == 0 {
-                log.base_cost_usd_micros =
-                    conservative_base_from_charge(reserved_cost, discount_bp);
-            }
-        }
         let mut pending = PendingRequestLog {
             log,
             settlement_error,
+            upstream_reached,
         };
         let outbox_id = ids::next_id()?;
         let request_body = pending.log.request_body.take();
@@ -1562,6 +1645,11 @@ pub(crate) async fn recover_orphan_billing_attempts(
             }
         }
         mark_billing_attempt_result_persisted(&mut tx, &attempt_id).await?;
+        // 与结果入队同一事务内释放：结果缺失 usage 的已派发尝试不产生费用，
+        // 交给人工对账；带结算错误或明确 usage 的记录保持预留原状。
+        if pending.log.settled && pending.settlement_error.is_none() {
+            release_billing_attempt_on(&mut tx, &attempt_id, now).await?;
+        }
         tx.commit().await.map_err(StoreError::Query)?;
         if let Some(reason) = metadata_error {
             record_system_error(
@@ -1578,21 +1666,6 @@ pub(crate) async fn recover_orphan_billing_attempts(
         recovered = recovered.saturating_add(1);
     }
     Ok(recovered)
-}
-
-/// 由折后金额反推在整数截断下可能对应的原价上界。
-///
-/// 结算预留只保存折后金额，恢复任务无法重新获得原始 usage 时使用此上界
-/// 记录基础成本，避免把整笔预留错误显示为毛利。免费折扣不可逆，返回 0。
-fn conservative_base_from_charge(charge: i64, discount_bp: i64) -> i64 {
-    if charge <= 0 || discount_bp <= 0 {
-        return 0;
-    }
-    let numerator = (charge as i128 + 1)
-        .saturating_mul(billing::DEFAULT_DISCOUNT_BP as i128)
-        .saturating_sub(1);
-    let estimate = numerator / discount_bp as i128;
-    i64::try_from(estimate).unwrap_or(i64::MAX)
 }
 
 /// 令牌首次出现时建立累计结算行，并把初始余额记入所属用户钱包；已存在则原样返回。
@@ -3055,6 +3128,7 @@ mod tests {
             PendingRequestLog {
                 log,
                 settlement_error: None,
+                upstream_reached: true,
             },
         )
         .await
@@ -3116,6 +3190,7 @@ mod tests {
             request_body: None,
             result: Some(Box::new(result)),
             result_settlement_error: None,
+            upstream_reached: true,
         })
         .expect("恢复元数据应可编码");
         sqlx::query(
@@ -3298,6 +3373,7 @@ mod tests {
             request_body: None,
             result: None,
             result_settlement_error: None,
+            upstream_reached: true,
         })
         .expect("恢复元数据应可编码");
         sqlx::query(
@@ -3331,6 +3407,158 @@ mod tests {
             .await
             .expect("应能读取待结算请求");
         assert!(pending.is_empty());
+    }
+
+    /// 已派发但崩溃时没有结果：恢复任务不结算，释放预留并入队零费用已结算
+    /// 的日志行，钱包不动。
+    #[tokio::test]
+    async fn orphan_dispatched_attempt_without_result_is_released() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-orphan-dispatched").await;
+        initialize_token_settlement(&mut conn, "sk-orphan-dispatched", 10_000, 1)
+            .await
+            .expect("应能初始化余额");
+        let metadata = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "orphan".to_string(),
+            model: "model".to_string(),
+            outbound_model: None,
+            channel: "channel".to_string(),
+            channel_key: Some("key-1".to_string()),
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price: PriceSnapshot::default(),
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            request_body: None,
+            result: None,
+            result_settlement_error: None,
+            upstream_reached: true,
+        })
+        .expect("恢复元数据应可编码");
+        sqlx::query(
+            "INSERT INTO billing_reservations \
+             (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+              token_limit_usd_micros, recovery_metadata, status, dispatched, result_persisted, \
+              created_at, updated_at) \
+             VALUES ('attempt-orphan-dispatched', 'request-orphan-dispatched', \
+                     'sk-orphan-dispatched', 1, 123, NULL, ?, 'reserved', 1, 0, 0, 0)",
+        )
+        .bind(metadata)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写入模拟遗留预留");
+        drop(conn);
+
+        assert_eq!(
+            recover_orphan_billing_attempts(&pool, Duration::ZERO, 16)
+                .await
+                .expect("恢复任务应成功"),
+            1
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_reservations \
+             WHERE attempt_id = 'attempt-orphan-dispatched'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取预留状态");
+        assert_eq!(status, "released", "已派发且无结果的尝试以释放结束");
+
+        let pending = load_pending_request_logs(&pool, 16)
+            .await
+            .expect("应能读取恢复记录");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].log.cost_usd_micros, 0, "无结果不产生费用");
+        assert_eq!(pending[0].log.base_cost_usd_micros, 0);
+        assert!(pending[0].log.settled, "释放即终态，后台无需再结算");
+        assert!(!pending[0].log.usage_reported);
+        assert!(
+            pending[0].upstream_reached,
+            "恢复的可达性未知，按可能已计费告警"
+        );
+
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("应能读取余额");
+        assert_eq!(balance, 10_000, "恢复释放不得扣减钱包");
+    }
+
+    /// 释放是已派发尝试的合法终态：释放后重复入队的结果不再结算——对
+    /// `released` 预留结算必须显式报错，重复结果也无法再写回预留。
+    #[tokio::test]
+    async fn released_attempt_rejects_late_settlement() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-released").await;
+        initialize_token_settlement(&mut conn, "sk-released", 10_000, 1)
+            .await
+            .expect("应能初始化余额");
+        let reserved = reserve_billing_attempt(
+            &pool,
+            BillingAttemptReservation {
+                attempt_id: "attempt-released",
+                request_id: "request-released",
+                token_key: "sk-released",
+                user_id: 1,
+                cost_usd_micros: 123,
+                token_limit_usd_micros: None,
+                recovery_metadata: br#"{"token_name":"t","model":"m","channel":"c","inbound_protocol":"openai_chat","started":0,"price":{"input_micros":0,"output_micros":0,"cache_read_micros":0,"cache_write_micros":0,"cache_write_1h_micros":0},"discount_bp":10000}"#,
+            },
+        )
+        .await
+        .expect("应能预留");
+        assert!(reserved);
+        release_billing_attempt(&pool, "attempt-released")
+            .await
+            .expect("已派发预留也应可释放");
+
+        // 结算对已释放预留报错：费用与钱包都不能再变更。
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("应能开启事务");
+        assert!(matches!(
+            settle_billing_attempt(&mut tx, "attempt-released", 123).await,
+            Err(StoreError::InvalidResource(_))
+        ));
+        tx.commit().await.expect("应能提交事务");
+        let balance: i64 =
+            sqlx::query_scalar("SELECT balance_usd_micros FROM user_balance WHERE user_id = 1")
+                .fetch_one(&pool)
+                .await
+                .expect("应能读取余额");
+        assert_eq!(balance, 10_000, "释放后的结算不得扣款");
+
+        // 重复结果无法写回已释放的预留：重建元数据时同样显式报错。
+        let mut log = sample_log(1, true);
+        log.billing_attempt_id = Some("attempt-released".to_string());
+        assert!(matches!(
+            persist_billing_attempt_result(
+                &pool,
+                "attempt-released",
+                &PendingRequestLog {
+                    log,
+                    settlement_error: None,
+                    upstream_reached: true,
+                },
+            )
+            .await,
+            Err(StoreError::InvalidResource(_))
+        ));
+
+        // 释放幂等：重复释放不报错，状态保持 released。
+        release_billing_attempt(&pool, "attempt-released")
+            .await
+            .expect("重复释放应无操作成功");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_reservations WHERE attempt_id = 'attempt-released'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取预留状态");
+        assert_eq!(status, "released");
     }
 
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
@@ -3504,6 +3732,62 @@ mod tests {
         assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
     }
 
+    /// 新建库文件与 WAL/SHM 边车都以 owner-only 权限落盘：库内容含渠道
+    /// 密钥、令牌 key 与对话 body，不能按进程 umask 宽松创建。
+    #[tokio::test]
+    async fn open_creates_database_files_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let path = dir.path().join("owner-only.db");
+        let pool = open(&path).await.expect("应能建库");
+        insert_smoke(&pool, "wal-priming")
+            .await
+            .expect("应能写入触发 WAL 落盘");
+        pool.close().await;
+
+        let mode = std::fs::metadata(&path)
+            .expect("应能读取库文件")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "新建库文件应为 0600");
+
+        for sidecar in [
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            let Ok(metadata) = std::fs::metadata(&sidecar) else {
+                // 边车在 checkpoint 后可能已截断移除；存在即必须 owner-only。
+                continue;
+            };
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "{sidecar} 应按库文件权限派生为 0600"
+            );
+        }
+    }
+
+    /// 既有库文件以更宽权限落盘（历史版本或外部创建）时，打开后归一为 0600。
+    #[tokio::test]
+    async fn open_normalizes_loose_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let path = dir.path().join("loose.db");
+        std::fs::File::create(&path).expect("应能创建空库文件");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("应能设置宽权限");
+
+        let _pool = open(&path).await.expect("应能打开既有库");
+
+        let mode = std::fs::metadata(&path)
+            .expect("应能读取库文件")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "既有库文件应归一为 0600");
+    }
+
     /// 业务表一律 STRICT：错类型写入直接报错，而非按亲和性静默收下。逐表探测，
     /// 任一表回退成非 STRICT 都会被此测试捕获。探测方向：INTEGER 列写 TEXT/REAL；
     /// `settings` 无 INTEGER 列，用 BLOB 写 TEXT 列（STRICT 拒绝，非 STRICT 的
@@ -3537,6 +3821,7 @@ mod tests {
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
                 injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         )
         .await

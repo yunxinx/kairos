@@ -34,9 +34,12 @@ use thiserror::Error;
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, MediaSource,
     Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool, ToolChoice, Usage,
-    Warning, apply_provider_extra, capture_unknown_fields, warning_feature,
+    Warning, apply_provider_extra, capture_unknown_fields, part_provider_options,
+    warn_dropped_provider_options, warning_feature,
 };
-use crate::core::stream::{SseFrame, merge_provider_options};
+use crate::core::stream::{
+    ErrorMessageShape, SseFrame, decode_failed_frame, merge_provider_options,
+};
 
 /// 本适配器的 provider 逃生舱键。
 const PROVIDER_KEY: &str = "google";
@@ -688,6 +691,13 @@ pub fn encode_request_for_model(
             .tools
             .iter()
             .map(|tool| {
+                // 工具级逃生舱（如缓存断点）仅本族键有承载形态，跨族丢弃告警。
+                warn_dropped_provider_options(
+                    &tool.provider_options,
+                    PROVIDER_KEY,
+                    "工具级",
+                    warnings,
+                );
                 let mut declaration = Map::new();
                 declaration.insert("name".into(), json!(tool.name));
                 if let Some(description) = &tool.description {
@@ -835,6 +845,15 @@ fn encode_messages(
     messages: &[Message],
     warnings: &mut Vec<Warning>,
 ) -> (Option<Value>, Vec<Value>) {
+    // 消息级与 part 级逃生舱统一在此检查：本族键（思考签名、functionCall id）
+    // 由 encode_part 按形状读写；非本族条目（如跨族缓存断点）无法表达，逐处告警。
+    for message in messages {
+        warn_dropped_provider_options(&message.provider_options, PROVIDER_KEY, "消息级", warnings);
+        for provider_options in part_provider_options(&message.content) {
+            warn_dropped_provider_options(provider_options, PROVIDER_KEY, "内容级", warnings);
+        }
+    }
+
     let system_text: String = messages
         .iter()
         .filter(|message| message.role == Role::System)
@@ -1048,6 +1067,18 @@ struct WireResponse {
     model_version: Option<String>,
     #[serde(default, alias = "response_id")]
     response_id: Option<String>,
+    /// 流内错误帧（顶层 `{"error": {...}}`，google.rpc Status 形状）。
+    #[serde(default)]
+    error: Option<WireStreamError>,
+}
+
+/// 流内错误帧的 `error` 对象：`message` 承载失败原因；code/status 不参与
+/// IR 映射（未知字段容忍）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireStreamError {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1230,17 +1261,36 @@ pub struct StreamDecoder {
     /// 最近一次出现的 usage 折算值：`usageMetadata` 逐 chunk 累计，末 chunk
     /// 的值即终值。
     last_usage: Option<Usage>,
+    /// 流式解码中累积的 warnings（如无法下发的媒体 part）：经 IR 流式
+    /// warnings 通道（StreamStart）上抛，不在解码路径静默丢弃。
+    warnings: Vec<Warning>,
 }
 
 impl StreamDecoder {
     /// 解码单个上游 chunk 为若干 IR 流事件。
     ///
-    /// 形状不符的 chunk 跳过（产出空事件）：流式面对的是已建立连接的上游，
-    /// 单个坏块不值得整条流报废，异常流由网关的流完整性校验归类。
+    /// 形状不符的 chunk 留痕后跳过（错误语义可安全提取时映射 IR Error）：
+    /// 流式面对的是已建立连接的上游，单个坏块不值得整条流报废，异常流由
+    /// 网关的流完整性校验归类。流内错误帧产出 IR Error，交由网关终止流。
     pub fn process(&mut self, chunk: &Value) -> DecodeStreamChunk {
-        let Ok(wire) = serde_json::from_value::<WireResponse>(chunk.clone()) else {
-            return DecodeStreamChunk::delivery(Vec::new());
+        let wire = match serde_json::from_value::<WireResponse>(chunk.clone()) {
+            Ok(wire) => wire,
+            Err(err) => {
+                return DecodeStreamChunk::delivery(decode_failed_frame(
+                    &err,
+                    chunk,
+                    ErrorMessageShape::NestedOnly,
+                ));
+            }
         };
+
+        // 错误帧只产出 IR Error：网关消费到即向下游下发错误帧并终止流，
+        // 其余字段（id/model 等）随流终止失去意义。
+        if let Some(error) = &wire.error {
+            return DecodeStreamChunk::delivery(vec![StreamEvent::Error {
+                message: error.message.clone().unwrap_or_default(),
+            }]);
+        }
 
         let mut events = Vec::new();
         let mut is_output = false;
@@ -1333,7 +1383,15 @@ impl StreamDecoder {
                             provider_options: HashMap::new(),
                         });
                     }
-                    // 响应流不承载媒体与工具结果 part。
+                    // 响应流不承载媒体与工具结果 part：媒体丢弃时经流式 warnings
+                    // 通道显式告警，不再静默；工具结果为空载荷保持静默。
+                    ContentPart::Media { media_type, .. } => {
+                        self.warnings.push(Warning::unsupported(
+                            warning_feature::MEDIA,
+                            format!("响应流不承载媒体内容（{media_type}），已丢弃"),
+                        ));
+                        self.flush_warnings(&mut events);
+                    }
                     _ => {}
                 }
             }
@@ -1375,6 +1433,16 @@ impl StreamDecoder {
         }
 
         DecodeStreamChunk { events, is_output }
+    }
+
+    /// 把累积的流式解码 warnings 以 StreamStart 事件上抛（IR 流式 warnings
+    /// 通道）：各协议入站编码器将其转为 warnings 帧下发，流式累积路径并入
+    /// 响应 warnings。流中 warnings 发现晚于首帧时允许 StreamStart 再次出现。
+    fn flush_warnings(&mut self, events: &mut Vec<StreamEvent>) {
+        if !self.warnings.is_empty() {
+            let warnings = std::mem::take(&mut self.warnings);
+            events.push(StreamEvent::StreamStart { warnings });
+        }
     }
 
     fn close_reasoning(&mut self, events: &mut Vec<StreamEvent>) {
@@ -2320,6 +2388,76 @@ mod tests {
         );
         assert_eq!(contents[1]["parts"][1]["text"], json!("明天呢？"));
         assert!(warnings.is_empty());
+    }
+
+    /// 流内错误帧解码为 IR Error（message 取自 error 对象），不产出其他事件。
+    ///
+    /// 流首错误帧即此形状：网关 peek 窗口对 IR Error 的归类（可 failover）
+    /// 由此打通，无需网关侧改动。
+    #[test]
+    fn stream_error_frame_decodes_to_ir_error() {
+        let error_chunk = json!({
+            "error": {
+                "code": 429,
+                "message": "Resource has been exhausted",
+                "status": "RESOURCE_EXHAUSTED",
+            }
+        });
+        let decoded = StreamDecoder::default().process(&error_chunk);
+        assert!(!decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "Resource has been exhausted".to_string(),
+            }]
+        );
+    }
+
+    /// 形状畸形的错误帧（其余字段类型不符导致整帧解析失败）仍提取错误语义：
+    /// 留痕后以顶层 error.message 映射 IR Error，不静默为空。
+    #[test]
+    fn malformed_error_frame_still_surfaces_error_semantics() {
+        let chunk = json!({
+            "error": { "code": 500, "message": "boom", "status": "INTERNAL" },
+            "candidates": "not-an-array",
+        });
+        let decoded = StreamDecoder::default().process(&chunk);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "boom".to_string(),
+            }]
+        );
+    }
+
+    /// 解析失败且无错误语义的 chunk：留痕后跳过（空事件），不中断流。
+    #[test]
+    fn malformed_frame_without_error_semantics_is_skipped() {
+        let chunk = json!({ "candidates": "not-an-array" });
+        let decoded = StreamDecoder::default().process(&chunk);
+        assert_eq!(decoded.events, Vec::new());
+    }
+
+    /// 流式 image part（inlineData）无法在响应流下发：解码 warning 沿流式
+    /// 路径以 StreamStart 事件上抛（IR 流式 warnings 通道），不再静默丢弃。
+    #[test]
+    fn stream_image_part_surfaces_media_warning() {
+        let chunk = json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                { "inlineData": { "mimeType": "image/png", "data": "aGVsbG8=" } }
+            ] }, "index": 0 }],
+        });
+        let decoded = StreamDecoder::default().process(&chunk);
+        assert!(!decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::StreamStart {
+                warnings: vec![Warning::unsupported(
+                    warning_feature::MEDIA,
+                    "响应流不承载媒体内容（image/png），已丢弃",
+                )],
+            }]
+        );
     }
 
     /// 流式 chunk 序列解码：元数据一次、思维链与正文块切换先收后开、

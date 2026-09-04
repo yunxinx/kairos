@@ -32,6 +32,7 @@ fn single_key_channel(
         reasoning_output: Default::default(),
         session_cache_key: Default::default(),
         injects_cache_breakpoints: false,
+        abort_on_disconnect: true,
     }
 }
 

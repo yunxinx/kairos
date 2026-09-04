@@ -1,6 +1,6 @@
 import { expect, test } from './fixtures';
 import { E2E_ADMIN_EMAIL, E2E_ADMIN_ORIGIN, E2E_ADMIN_PASSWORD } from './helpers/gateway';
-import { e2eRootHeaders } from './helpers/session';
+import { e2eRootHeaders, loginViaApi } from './helpers/session';
 import { seedUser } from './helpers/users';
 
 test.describe.configure({ mode: 'serial' });
@@ -68,7 +68,7 @@ test.describe('email password login', () => {
     await seedUser(page, { email: secondEmail, role: 'user' });
 
     const rootToken = await page.request.post('/api/tokens', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
       data: {
         name: 'cache-a-only',
         balance_usd_micros: null,
@@ -77,10 +77,7 @@ test.describe('email password login', () => {
       },
     });
     expect(rootToken.ok(), await rootToken.text()).toBeTruthy();
-    const secondLogin = await page.request.post('/api/login', {
-      data: { email: secondEmail, password: 'password1' },
-    });
-    expect(secondLogin.ok(), await secondLogin.text()).toBeTruthy();
+    await loginViaApi(page, secondEmail, 'password1');
     const secondToken = await page.request.post('/api/tokens', {
       headers: { Origin: E2E_ADMIN_ORIGIN },
       data: {
@@ -92,6 +89,9 @@ test.describe('email password login', () => {
     });
     expect(secondToken.ok(), await secondToken.text()).toBeTruthy();
 
+    // 切换回 root 前先清掉第二用户的会话：否则 /login 被已登录守卫弹回概览，
+    // UI 登录表单不会渲染。
+    await page.context().clearCookies();
     await page.goto('/login');
     await page.locator('#login-email').fill(E2E_ADMIN_EMAIL);
     await page.locator('#login-password').fill(E2E_ADMIN_PASSWORD);

@@ -1576,3 +1576,90 @@ fn usage_cache_write_folds_into_prompt_for_gemini() {
         "cache_write 经 Gemini 往返折叠进 input"
     );
 }
+
+/// 跨族出站丢弃矩阵：消息级 / part 级 / 工具级缓存断点（anthropic 逃生舱）
+/// 跨族出站必发 unsupported warning（feature 锁 `provider_options` 词汇表），
+/// 同族（anthropic）出站断点被原生承载，保持零告警。
+#[test]
+fn cross_family_escape_hatches_warn_and_same_family_stays_silent() {
+    let cache_breakpoint = || json!({ "type": "ephemeral" });
+    let request = ChatRequest {
+        model: "matrix-model".to_string(),
+        messages: vec![
+            // 消息级：断点约定挂在 system 消息级。
+            Message {
+                role: Role::System,
+                content: vec![text_part("你是天气助手")],
+                provider_options: options(&[(
+                    "anthropic",
+                    json!({ "cache_control": cache_breakpoint() }),
+                )]),
+            },
+            // part 级：断点挂在 Text part 上。
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::Text {
+                    text: "上海天气如何？".to_string(),
+                    provider_options: options(&[(
+                        "anthropic",
+                        json!({ "cache_control": cache_breakpoint() }),
+                    )]),
+                }],
+                provider_options: HashMap::new(),
+            },
+        ],
+        stream: false,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        max_tokens: None,
+        reasoning: None,
+        n: None,
+        stop: Vec::new(),
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        response_format: None,
+        tools: vec![Tool {
+            name: "get_weather".to_string(),
+            description: None,
+            // 合法 object schema：避免无关的 input_schema 兼容整形告警干扰断言。
+            parameters: Some(json!({ "type": "object", "properties": {} })),
+            // 工具级：断点挂在 Tool.provider_options 上。
+            provider_options: options(&[(
+                "anthropic",
+                json!({ "cache_control": cache_breakpoint() }),
+            )]),
+        }],
+        tool_choice: None,
+        parallel_tool_calls: None,
+        provider_options: HashMap::new(),
+        warnings: Vec::new(),
+    };
+
+    let levels = ["消息级", "内容级", "工具级"];
+    for protocol in [
+        Protocol::OpenAiChat,
+        Protocol::OpenAiResponses,
+        Protocol::Gemini,
+    ] {
+        let (_, warnings) = encode_request_wire(protocol, &request);
+        for level in levels {
+            assert!(
+                warnings.iter().any(|warning| matches!(warning,
+                    Warning::Unsupported { feature, details: Some(details) }
+                        if feature == "provider_options" && details.contains("anthropic") && details.contains(level)
+                )),
+                "{protocol:?} 出站应有 {level} 逃生舱丢弃告警: {warnings:?}"
+            );
+        }
+    }
+
+    // 同族：anthropic 出站原生承载各层级断点，零告警。
+    let mut warnings = Vec::new();
+    crate::core::anthropic_messages::encode_request(&request, &mut warnings);
+    assert!(
+        warnings.is_empty(),
+        "anthropic 同族断点出站不应告警: {warnings:?}"
+    );
+}

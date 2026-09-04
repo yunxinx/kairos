@@ -17,6 +17,7 @@ mod throttle;
 mod webui;
 
 pub use admin::{router as admin_router, router_with_writer as admin_router_with_writer};
+pub use failover::ChannelCooldowns;
 pub use http::{Deps, router, router_with_writer};
 pub use logging::{RequestLogWriter, unix_millis};
 pub use webui::is_available as webui_available;

@@ -8,7 +8,7 @@ export async function seedUser(
   body: { email: string; role: ManagementRole; password?: string; display_name?: string },
 ): Promise<{ id: number }> {
   const resp = await page.request.post('/api/users', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: {
       display_name: body.display_name ?? body.email,
       password: body.password ?? 'password1',

@@ -303,9 +303,13 @@
     "disable": "Disable",
     "enabled": "Enabled",
     "enabledGuide": "Disabled channels are excluded from routing and failover.",
+    "health": "Health",
+    "cooling": "Cooling down",
+    "cooldownRemaining": "{time} left",
     "goneOnSave": "This channel has been deleted and can no longer be saved.",
     "baseUrl": "Base URL",
     "apiKey": "Upstream API key",
+    "apiKeyKeepPlaceholder": "Leave empty to keep the current key",
     "modelGroup": "Default model group",
     "modelGroupGuide": "New callable names are added to this group on save. Ungrouped means they are not added automatically.",
     "reasoningOutput": {
@@ -325,6 +329,10 @@
     "injectsCacheBreakpoints": {
       "label": "Auto cache breakpoint injection",
       "guide": "When enabled, cache breakpoints are injected into outbound requests in order: last tool, last system block, tail block of the last injectable message (up to 4, existing breakpoints count against the budget). Only applies to Anthropic Messages channels."
+    },
+    "abortOnDisconnect": {
+      "label": "Abort upstream on disconnect",
+      "guide": "When enabled, a downstream disconnect stops reading the upstream immediately; usage already received is settled and unbilled cost is released. When disabled, the upstream keeps streaming to completion and settles on actual usage."
     },
     "models": "Models",
     "modelsTitle": "Models",

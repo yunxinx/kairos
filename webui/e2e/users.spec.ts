@@ -1,6 +1,6 @@
 import { authedTest as test, expect } from './fixtures';
-import { E2E_ADMIN_ORIGIN } from './helpers/gateway';
-import { e2eRootHeaders } from './helpers/session';
+import { E2E_ADMIN_EMAIL, E2E_ADMIN_ORIGIN, E2E_ADMIN_PASSWORD } from './helpers/gateway';
+import { e2eRootHeaders, loginViaApi } from './helpers/session';
 import { seedModelGroup } from './helpers/models';
 import { clickRowAction } from './helpers/table';
 import { seedUser } from './helpers/users';
@@ -64,15 +64,12 @@ test.describe('users page', () => {
 
     const created = await seedUser(page, { email: 'e2e-tokens@example.com', role: 'user' });
     const tokenResp = await page.request.post('/api/tokens', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
       data: { name: 'will-not-belong', balance_usd_micros: null, enabled: true },
     });
     expect(tokenResp.ok()).toBeTruthy();
 
-    const session = await page.request.post('/api/login', {
-      data: { email: 'e2e-tokens@example.com', password: 'password1' },
-    });
-    expect(session.ok()).toBeTruthy();
+    await loginViaApi(page, 'e2e-tokens@example.com', 'password1');
     const own = await page.request.post('/api/tokens', {
       headers: { Origin: E2E_ADMIN_ORIGIN },
       data: { name: 'owned', balance_usd_micros: null, enabled: true },
@@ -80,6 +77,8 @@ test.describe('users page', () => {
     expect(own.ok()).toBeTruthy();
     // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态。
     const owned = (await own.json()) as { id: number; token_key: string };
+    // 以第二用户身份建完令牌后切回 root：/users 是 admin-only 页面。
+    await loginViaApi(page, E2E_ADMIN_EMAIL, E2E_ADMIN_PASSWORD);
 
     await page.goto('/users');
     const tokenOwner = page.locator(`[data-testid="user-row"][data-user-id="${created.id}"]`);

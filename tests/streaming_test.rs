@@ -7,6 +7,7 @@
 mod common;
 
 use common::{TEST_MODEL, TEST_TOKEN_KEY, TestGateway, UpstreamBehavior, collect_sse_frames};
+use futures_util::StreamExt;
 use serde_json::json;
 
 /// 发起流式 Chat Completions 请求。
@@ -177,9 +178,9 @@ async fn streaming_usage_is_billed() {
     assert_eq!(row.3, 4250, "日志应记录费用 4250");
 }
 
-/// 流式上游返回非 2xx：状态码原样透传，已发出的尝试按预留金额结算。
+/// 流式上游返回非 2xx：状态码原样透传，缺失 usage 的已发出尝试不产生费用。
 #[tokio::test]
-async fn streaming_upstream_error_is_passthrough_and_billed_by_reservation() {
+async fn streaming_upstream_error_releases_reservation_without_charge() {
     let mut gw = TestGateway::start().await;
     gw.upstream.set_behavior(UpstreamBehavior::Status429);
 
@@ -198,8 +199,8 @@ async fn streaming_upstream_error_is_passthrough_and_billed_by_reservation() {
     .fetch_one(&gw.pool)
     .await
     .expect("令牌余额应存在");
-    assert!(row.0 < 5_000_000, "已发出的流式失败应按预留金额扣费");
-    assert!(row.1 > 0, "已发出的流式失败应增加累计结算");
+    assert_eq!(row.0, 5_000_000, "缺失 usage 的流式失败不应扣费");
+    assert_eq!(row.1, 0, "缺失 usage 的流式失败不增加累计结算");
 }
 
 /// 流中途上游报错（Anthropic 200 后 `event: error`）：错误以入站协议错误帧
@@ -268,8 +269,8 @@ async fn midstream_error_delivers_error_frame_and_settles() {
     .fetch_one(&gw.pool)
     .await
     .expect("应有结算日志");
-    assert!(row.1 > 0, "缺失 usage 时应使用保守预留");
-    assert_eq!(row.0, 5_000_000 - row.1, "钱包应扣除该尝试的结算费用");
+    assert_eq!(row.1, 0, "缺失 usage 时释放预留而非保守结算");
+    assert_eq!(row.0, 5_000_000, "钱包不应被扣减");
 }
 
 /// anthropic 双渠道 seed（同一模型，供流式 failover 用例使用）。
@@ -303,6 +304,258 @@ fn anthropic_message_start() -> String {
         "message": { "type": "message", "role": "assistant", "id": "msg_1", "model": "claude-sonnet", "content": [] }
     }))
     .unwrap()
+}
+
+/// 把单个 SSE JSON 帧编码为原始字节块，供 `GappedRawSse` 使用。
+fn raw_frame(value: serde_json::Value) -> Vec<u8> {
+    format!("data: {value}\n\n").into_bytes()
+}
+
+fn anthropic_content_start() -> serde_json::Value {
+    json!({
+        "type": "content_block_start", "index": 0, "content_block": { "type": "text" }
+    })
+}
+
+fn anthropic_text_delta(text: &str) -> serde_json::Value {
+    json!({
+        "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text }
+    })
+}
+
+fn anthropic_message_delta(usage: serde_json::Value) -> serde_json::Value {
+    json!({
+        "type": "message_delta",
+        "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+        "usage": usage
+    })
+}
+
+/// 流建立后上游沉默超过渠道空闲超时：空闲超时仍会终止流（流不再受总时限
+/// 约束的语义不放松空闲约束），缺失 usage 的尝试释放预留。
+#[tokio::test]
+async fn idle_timeout_terminates_stream_after_established() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = kairos::config::Protocol::AnthropicMessages;
+        seed.channels[0].timeout_ms = 50;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::GappedRawSse {
+        prefix: vec![
+            raw_frame(serde_json::from_str(&anthropic_message_start()).unwrap()),
+            raw_frame(anthropic_content_start()),
+            raw_frame(anthropic_text_delta("你好")),
+        ],
+        gap_ms: 200,
+        tail: vec![raw_frame(anthropic_message_delta(
+            json!({ "input_tokens": 25, "output_tokens": 12 }),
+        ))],
+    });
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let frames = collect_sse_frames(resp).await;
+    assert!(
+        frames
+            .iter()
+            .any(|f| f.data["choices"][0]["delta"]["content"] == json!("你好")),
+        "流首内容帧应照常下发"
+    );
+    let last = frames.last().expect("应有终止帧");
+    assert_eq!(
+        last.data["error"]["message"],
+        json!("上游流未正常收尾，已中断"),
+        "空闲超时中断应以错误帧收场"
+    );
+
+    common::wait_for_request_persistence(&gw.pool).await;
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT cost_usd_micros, usage_reported FROM request_log WHERE token_key = ?",
+    )
+    .bind(TEST_TOKEN_KEY)
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应有结算日志");
+    assert_eq!(row.0, 0, "缺失 usage 的空闲中断应释放预留");
+    assert_eq!(row.1, 0, "空闲中断时上游未回报 usage");
+}
+
+/// 长流回归：流建立后累计时长超过请求总时限（120s）仍继续可读并正常收尾。
+///
+/// 下游读到首块后暂停虚拟时钟——此刻请求路径的数据库操作已全部完成；此后
+/// 时钟自动推进驱动上游两段各 100s 的沉默（均小于渠道空闲超时 120s），
+/// 累计越过总时限。结算依赖 SQLite 真实时钟，暂停期间无法落库，故本用例
+/// 断言转发与收尾语义；结算语义由空闲中断用例与常规流式用例覆盖。
+#[tokio::test]
+async fn stream_continues_past_request_total_deadline() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = kairos::config::Protocol::AnthropicMessages;
+        seed.channels[0].timeout_ms = 120_000;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::GappedRawSse {
+        prefix: vec![
+            raw_frame(serde_json::from_str(&anthropic_message_start()).unwrap()),
+            raw_frame(anthropic_content_start()),
+            raw_frame(anthropic_text_delta("你")),
+        ],
+        gap_ms: 100_000,
+        tail: vec![
+            raw_frame(anthropic_text_delta("好")),
+            raw_frame(anthropic_message_delta(json!({
+                "input_tokens": 25, "output_tokens": 12
+            }))),
+            raw_frame(json!({ "type": "message_stop" })),
+        ],
+    });
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    // 读到首块内容后暂停时钟，请求路径已结束，流内不再有数据库操作。
+    let mut downstream = resp.bytes_stream();
+    let mut seen = Vec::new();
+    while !seen.windows(3).any(|window| window == "你".as_bytes()) {
+        let chunk = downstream
+            .next()
+            .await
+            .expect("正文前响应流不应结束")
+            .expect("响应块应可读");
+        seen.extend_from_slice(&chunk);
+    }
+    tokio::time::pause();
+
+    // 总时限过后的块照常读取与下发，流正常收尾而非被截断。
+    let mut tail = seen;
+    while let Some(chunk) = downstream.next().await {
+        tail.extend_from_slice(&chunk.expect("响应块应可读"));
+    }
+    let text = String::from_utf8_lossy(&tail);
+    assert!(
+        text.contains("\"finish_reason\":\"stop\""),
+        "流应在总时限过后正常收尾: {text}"
+    );
+    assert!(!text.contains("\"error\""), "长流不应被总时限截断出错误帧");
+}
+
+/// 断连即取消（渠道开关缺省开）：下游断开后立即停止上游消费，usage 载荷
+/// 在更后的块里、取消时未被嗅探，预留全额释放（计费宽容原语）。
+#[tokio::test]
+async fn downstream_disconnect_aborts_upstream_and_releases_reservation() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = kairos::config::Protocol::AnthropicMessages;
+        seed
+    })
+    .await;
+    // 前缀内容让下游读到正文；随后一块大体积无 usage 填充帧承担断连检测，
+    // 最后 usage 帧在取消发生后才到达，不应被消费或计费。
+    let padding = " ".repeat(256 * 1024);
+    gw.upstream.set_behavior(UpstreamBehavior::GappedRawSse {
+        prefix: vec![
+            raw_frame(serde_json::from_str(&anthropic_message_start()).unwrap()),
+            raw_frame(anthropic_content_start()),
+            raw_frame(anthropic_text_delta("你好")),
+        ],
+        gap_ms: 100,
+        tail: vec![
+            raw_frame(anthropic_text_delta(&padding)),
+            raw_frame(anthropic_message_delta(json!({
+                "input_tokens": 25, "output_tokens": 12
+            }))),
+            raw_frame(json!({ "type": "message_stop" })),
+        ],
+    });
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let mut downstream = resp.bytes_stream();
+    let mut seen = Vec::new();
+    while !seen.windows(6).any(|window| window == "你好".as_bytes()) {
+        let chunk = downstream
+            .next()
+            .await
+            .expect("正文前响应流不应结束")
+            .expect("响应块应可读");
+        seen.extend_from_slice(&chunk);
+    }
+    drop(downstream);
+
+    // 结算行随断连取消入队：直接轮询行出现（outbox 计数在入队前本就为 0）。
+    let mut settled: Option<(i64, i64)> = None;
+    for _ in 0..250 {
+        settled = sqlx::query_as(
+            "SELECT cost_usd_micros, usage_reported FROM request_log WHERE token_key = ?",
+        )
+        .bind(TEST_TOKEN_KEY)
+        .fetch_optional(&gw.pool)
+        .await
+        .expect("应能查询日志");
+        if settled.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = settled.expect("断连取消后应落结算日志");
+    assert_eq!(row.0, 0, "断连取消后未嗅探到 usage，应释放预留");
+    assert_eq!(row.1, 0, "断连取消时 usage 帧不应被消费");
+}
+
+/// 断连止损开关关闭：维持原语义，继续消费上游至收尾，按实际 usage 结算。
+#[tokio::test]
+async fn downstream_disconnect_without_abort_keeps_consuming() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = kairos::config::Protocol::AnthropicMessages;
+        seed.channels[0].abort_on_disconnect = false;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::GappedRawSse {
+        prefix: vec![
+            raw_frame(serde_json::from_str(&anthropic_message_start()).unwrap()),
+            raw_frame(anthropic_content_start()),
+            raw_frame(anthropic_text_delta("你好")),
+        ],
+        gap_ms: 100,
+        tail: vec![raw_frame(anthropic_message_delta(json!({
+            "input_tokens": 25, "output_tokens": 12
+        })))],
+    });
+
+    let resp = send_stream(&gw.base_url()).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let mut downstream = resp.bytes_stream();
+    let mut seen = Vec::new();
+    while !seen.windows(6).any(|window| window == "你好".as_bytes()) {
+        let chunk = downstream
+            .next()
+            .await
+            .expect("正文前响应流不应结束")
+            .expect("响应块应可读");
+        seen.extend_from_slice(&chunk);
+    }
+    drop(downstream);
+
+    // 上游尾部 usage 被继续消费：按实际 usage 结算，费用落在日志与余额。
+    let mut cost = 0;
+    for _ in 0..200 {
+        let rows: Vec<i64> =
+            sqlx::query_scalar("SELECT cost_usd_micros FROM request_log WHERE token_key = ?")
+                .bind(TEST_TOKEN_KEY)
+                .fetch_all(&gw.pool)
+                .await
+                .expect("应能查询日志");
+        if let Some(value) = rows.into_iter().find(|cost| *cost > 0) {
+            cost = value;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(cost > 0, "开关关闭时断连后仍应消费尾部 usage 并结算");
 }
 
 fn anthropic_text_stream(text: &str) -> Vec<String> {
@@ -374,7 +627,7 @@ async fn pre_first_chunk_error_fails_over_to_next_channel() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].0, "ch-0");
     assert_ne!(rows[0].1, 200);
-    assert!(rows[0].2 > 0, "无 usage 的首渠道应按预留结算");
+    assert!(rows[0].2 == 0, "无 usage 的首渠道不产生费用");
     assert_eq!(rows[1].0, "ch-1");
     assert_eq!(rows[1].1, 200);
     assert!(rows[1].2 > 0, "次渠道按 usage 计费");
@@ -404,7 +657,7 @@ async fn empty_stream_fails_over_to_next_channel() {
 }
 
 /// 上游流缺收尾事件（内容后即断）归类为异常：下游收到错误帧而非合成
-/// 缺少正常收尾时仍记录错误并按预留结算。
+/// 成功 Finish；缺失 usage 的尝试释放预留、不产生费用。
 #[tokio::test]
 async fn unterminated_stream_delivers_error_frame_and_settles() {
     let mut gw = TestGateway::start_with(|base| {
@@ -454,5 +707,5 @@ async fn unterminated_stream_delivers_error_frame_and_settles() {
     .fetch_one(&gw.pool)
     .await
     .expect("应有结算日志");
-    assert!(row.0 > 0, "缺失 usage 时应使用保守预留");
+    assert_eq!(row.0, 0, "缺失 usage 时释放预留而非保守结算");
 }

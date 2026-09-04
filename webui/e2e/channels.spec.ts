@@ -11,7 +11,7 @@ async function savedChannelModels(
   name: string,
 ): Promise<string[] | undefined> {
   const resp = await page.request.get('/api/channels', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
   });
   const channels = (await resp.json()) as Array<{ name: string; models: string[] }>;
   return channels.find((item) => item.name === name)?.models;
@@ -144,6 +144,8 @@ test.describe('channel resource page', () => {
 
       // 二次同步：别名保留、主名已选择；关闭按钮不保存并返回；别名维度筛选可用；搜索/反选作用于可见行。
       await okRow.getByTestId('channel-edit').click();
+      // 编辑表单不回填密钥：同步上游列表前先输入一把明文密钥。
+      await page.getByTestId('channel-key-api').fill('sk-upstream');
       await page.getByTestId('channel-sync-models').click();
       await page.getByTestId('channel-sync-run').click();
       await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();
@@ -277,7 +279,10 @@ test.describe('channel resource page', () => {
       await page.mouse.move(0, 0);
       await expect(syncError).toBeHidden({ timeout: 5_000 });
       await page.getByTestId('channel-sync-back').click();
+      // 表单已有改动：取消触发脏关闭确认，接受后窗口才真正关闭。
+      page.once('dialog', (dialog) => dialog.accept());
       await page.getByRole('button', { name: 'Cancel' }).click();
+      await expect(page.getByTestId('channel-editor-name')).toHaveCount(0);
 
       await page.getByTestId('create-channel').click();
       await page.locator('[id^="channel-editor-name"]').fill('fail-channel');
@@ -311,6 +316,7 @@ test.describe('channel resource page', () => {
 
       // 三开窗校验：chip 复制、删主名保留别名（同步视图呈「仅别名生效」虚线态）。
       await okRow.getByTestId('channel-edit').click();
+      await page.getByTestId('channel-key-api').fill('sk-upstream');
       await expect(page.getByTestId('channel-model-chip')).toHaveCount(2);
       // 点击 chip 复制别名到剪贴板。
       await aliasChip.click();
@@ -338,6 +344,8 @@ test.describe('channel resource page', () => {
       await page.getByTestId('channel-editor-tab-basic').click();
       await page.locator('[id^="channel-editor-name"]').fill('ok-channel-v2');
       await page.getByTestId('channel-save').click();
+      // 删除已登记模型触发应用内移除确认，需确认后才真正保存。
+      await page.getByTestId('channel-removal-confirm').click();
       await expect(okRow).toHaveCount(0);
       const renamedRow = page.locator(
         '[data-testid="channel-row"][data-channel-name="ok-channel-v2"]',
@@ -364,7 +372,7 @@ test.describe('channel manual model add', () => {
     const manualId = 'manual-only-id';
     try {
       const tokenResp = await page.request.post('/api/tokens', {
-        headers: await e2eRootHeaders(page.request),
+        headers: await e2eRootHeaders(page),
         data: { name: 'manual-add-token', balance_usd_micros: null, enabled: true },
       });
       expect(tokenResp.ok()).toBeTruthy();
@@ -478,6 +486,8 @@ test.describe('channel manual model add', () => {
       expect(afterSave.message).toContain('价格');
 
       await channelRow.getByTestId('channel-edit').click();
+      // 编辑表单不回填密钥：同步上游列表前先输入一把明文密钥。
+      await page.getByTestId('channel-key-api').fill('sk-upstream');
       await expect(
         page.locator(`[data-testid="channel-model-chip"][data-model="${manualId}"]`),
       ).toBeVisible();
@@ -678,7 +688,7 @@ test.describe('channel editor model overflow', () => {
     await expect(channelRow).toBeVisible();
 
     const listed = await page.request.get('/api/channels', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
     });
     const channels = (await listed.json()) as Array<{
       name: string;
@@ -693,15 +703,16 @@ test.describe('channel editor model overflow', () => {
     }>;
     const saved = channels.find((item) => item.name === channelName);
     expect(saved?.keys).toHaveLength(2);
+    // 读取面一律掩码：明文只存在于创建/更新请求里。
     expect(saved?.keys[0]).toMatchObject({
       name: 'primary',
-      api_key: 'sk-primary',
+      api_key: '******',
       weight: 3,
       enabled: true,
     });
     expect(saved?.keys[1]).toMatchObject({
       name: 'secondary',
-      api_key: 'sk-secondary',
+      api_key: '******',
       weight: 2,
       enabled: false,
       models: ['gpt-4o-mini'],
@@ -738,7 +749,7 @@ test.describe('channel editor model overflow', () => {
     await expect(page.getByTestId('channel-form')).toHaveCount(0);
 
     const afterDelete = await page.request.get('/api/channels', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
     });
     const afterChannels = (await afterDelete.json()) as Array<{
       name: string;
@@ -749,7 +760,9 @@ test.describe('channel editor model overflow', () => {
     expect(afterSaved?.keys[0].name).toBe('primary');
   });
 
-  test('create form shows api key in plaintext; edit masks until unlocked', async ({ page }) => {
+  test('create form takes plaintext api keys; edit keeps them blank and never echoes plaintext', async ({
+    page,
+  }) => {
     const longKey = `sk-${'a'.repeat(40)}`;
     await seedChannel(page, {
       name: 'mask-key-channel',
@@ -759,16 +772,34 @@ test.describe('channel editor model overflow', () => {
 
     await page.goto('/channels');
     await page.getByTestId('create-channel').click();
-    await expect(page.getByTestId('channel-key-api')).toHaveAttribute('type', 'text');
+    // 创建态同样以密码框输入明文（无明文回显形态），可正常填写。
+    const createKeyInput = page.getByTestId('channel-key-api');
+    await expect(createKeyInput).toHaveAttribute('type', 'password');
+    await createKeyInput.fill('sk-brand-new');
+    await expect(createKeyInput).toHaveValue('sk-brand-new');
+    // 表单已有改动：取消触发脏关闭确认，接受后窗口才真正关闭。
+    page.once('dialog', (dialog) => dialog.accept());
     await page.getByRole('button', { name: /cancel|取消/i }).click();
 
     await page.getByTestId('channels-search').fill('mask-key-channel');
     await page.getByTestId('channel-edit').click();
-    await expect(page.getByTestId('secret-input-masked')).toHaveValue(
-      `${longKey.slice(0, 8)}******${longKey.slice(-8)}`,
-    );
-    await page.getByTestId('secret-reveal').click();
-    await expect(page.getByTestId('channel-key-api')).toHaveValue(longKey);
-    await expect(page.getByTestId('channel-key-api')).toHaveAttribute('type', 'text');
+    const apiKeyInput = page.getByTestId('channel-key-api');
+    // 编辑不回填：输入为空、不提供明文 reveal，占位提示留空保留原密钥。
+    await expect(apiKeyInput).toHaveValue('');
+    await expect(apiKeyInput).toHaveAttribute('type', 'password');
+    await expect(apiKeyInput).toHaveAttribute('placeholder', 'Leave empty to keep the current key');
+    await expect(page.getByTestId('secret-reveal')).toHaveCount(0);
+
+    // 读取面一律掩码：响应含 * 哨兵，明文不出现在页面任何位置。
+    const listed = await page.request.get('/api/channels', {
+      headers: await e2eRootHeaders(page),
+    });
+    const channels = (await listed.json()) as Array<{
+      name: string;
+      keys: Array<{ api_key: string }>;
+    }>;
+    const saved = channels.find((item) => item.name === 'mask-key-channel');
+    expect(saved?.keys[0].api_key).toBe(`${longKey.slice(0, 8)}******${longKey.slice(-8)}`);
+    expect(await page.content()).not.toContain(longKey);
   });
 });

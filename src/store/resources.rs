@@ -67,6 +67,16 @@ pub struct Channel {
     /// 缺省 `false`，存量渠道出站行为不变。
     #[serde(default)]
     pub injects_cache_breakpoints: bool,
+    /// 下游断开时是否立即取消上游流消费：开启（缺省）则在下游断连后停止
+    /// 读取上游字节流并按已嗅探 usage 结算；关闭则维持既有语义，继续消费
+    /// 上游至自然收尾、按实际 usage 结算。
+    #[serde(default = "default_abort_on_disconnect")]
+    pub abort_on_disconnect: bool,
+}
+
+/// serde 缺省：渠道未写 `abort_on_disconnect` 时下游断连即取消上游消费。
+fn default_abort_on_disconnect() -> bool {
+    true
 }
 
 /// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
@@ -714,7 +724,7 @@ pub async fn list_channel_records_on_conn(
 
 const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, models_json, \
     model_aliases_json, timeout_ms, max_retries, enabled, model_group, reasoning_output, \
-    session_cache_key, injects_cache_breakpoints FROM channels";
+    session_cache_key, injects_cache_breakpoints, abort_on_disconnect FROM channels";
 
 /// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
@@ -728,6 +738,9 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
         .map_err(StoreError::Query)?;
     let injects_cache_breakpoints: i64 = row
         .try_get("injects_cache_breakpoints")
+        .map_err(StoreError::Query)?;
+    let abort_on_disconnect: i64 = row
+        .try_get("abort_on_disconnect")
         .map_err(StoreError::Query)?;
     // 先解析集合字段（错误信息需要引用 name），再构造结构体以避免移动后借用。
     let models: Vec<String> = serde_json::from_str(
@@ -757,6 +770,7 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             reasoning_output: reasoning_output_from_wire(&reasoning_output_wire)?,
             session_cache_key: session_cache_key_from_wire(&session_cache_key_wire)?,
             injects_cache_breakpoints: injects_cache_breakpoints != 0,
+            abort_on_disconnect: abort_on_disconnect != 0,
         },
         keys: Vec::new(),
     })
@@ -909,8 +923,8 @@ pub async fn insert_channel(
         "INSERT INTO channels \
          (name, protocol, base_url, models_json, model_aliases_json, \
           timeout_ms, max_retries, enabled, model_group, reasoning_output, session_cache_key, \
-          injects_cache_breakpoints) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          injects_cache_breakpoints, abort_on_disconnect) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -924,6 +938,7 @@ pub async fn insert_channel(
     .bind(reasoning_output_to_wire(channel.reasoning_output))
     .bind(session_cache_key_to_wire(channel.session_cache_key))
     .bind(channel.injects_cache_breakpoints)
+    .bind(channel.abort_on_disconnect)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -976,7 +991,7 @@ pub async fn update_channel(
            models_json = ?, model_aliases_json = ?, \
            timeout_ms = ?, max_retries = ?, enabled = ?, \
            model_group = ?, reasoning_output = ?, session_cache_key = ?, \
-           injects_cache_breakpoints = ? \
+           injects_cache_breakpoints = ?, abort_on_disconnect = ? \
          WHERE id = ?",
     )
     .bind(&channel.name)
@@ -991,6 +1006,7 @@ pub async fn update_channel(
     .bind(reasoning_output_to_wire(channel.reasoning_output))
     .bind(session_cache_key_to_wire(channel.session_cache_key))
     .bind(channel.injects_cache_breakpoints)
+    .bind(channel.abort_on_disconnect)
     .bind(id)
     .execute(&mut *conn)
     .await
@@ -1888,7 +1904,32 @@ mod tests {
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
             injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         }
+    }
+
+    /// 把期望渠道的密钥条目替换为读取面掩码形态：wire 读回的 `api_key`
+    /// 不含明文。
+    fn with_masked_keys(mut channel: Channel) -> Channel {
+        channel.keys = channel
+            .keys
+            .iter()
+            .map(|key| {
+                StoredChannelKey::new(
+                    0,
+                    0,
+                    key.name.clone(),
+                    key.api_key.clone(),
+                    key.weight,
+                    key.enabled,
+                    key.models.clone(),
+                    key.blocked_models.clone(),
+                    0,
+                )
+                .to_wire()
+            })
+            .collect();
+        channel
     }
 
     fn stored_key(
@@ -2131,7 +2172,11 @@ mod tests {
         let records = list_channel_records(&pool).await.expect("应能读渠道");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, id);
-        assert_eq!(records[0].channel, sample_channel());
+        assert_eq!(
+            records[0].channel,
+            with_masked_keys(sample_channel()),
+            "wire 读回的密钥应为掩码形态"
+        );
 
         // reasoning 输出模式与会话缓存键回写模式三态落库往返；缺省（未写
         // JSON 字段）为 auto / off。
@@ -2187,6 +2232,23 @@ mod tests {
                 .expect("应能读回该渠道");
             assert_eq!(record.channel.injects_cache_breakpoints, on);
         }
+
+        // 断连止损开关落库往返；缺省开启，存量渠道行为随缺省保持一致。
+        assert!(sample_channel().abort_on_disconnect, "缺省应开启");
+        for on in [true, false] {
+            let mut channel = sample_channel();
+            channel.name = format!("abort-{on}");
+            channel.abort_on_disconnect = on;
+            let flag_id = insert_channel(&mut conn, &channel)
+                .await
+                .expect("应能写渠道");
+            let records = list_channel_records(&pool).await.expect("应能读渠道");
+            let record = records
+                .iter()
+                .find(|record| record.id == flag_id)
+                .expect("应能读回该渠道");
+            assert_eq!(record.channel.abort_on_disconnect, on);
+        }
     }
 
     /// 按 id 整体替换：可改字段也可改名，id 保持不变，不产生重复行。
@@ -2208,7 +2270,11 @@ mod tests {
         let records = list_channel_records(&pool).await.expect("应能读渠道");
         assert_eq!(records.len(), 1, "覆盖后仍为单行");
         assert_eq!(records[0].id, id, "改名不应改变 id");
-        assert_eq!(records[0].channel, updated, "字段与改名应整体生效");
+        assert_eq!(
+            records[0].channel,
+            with_masked_keys(updated),
+            "字段与改名应整体生效"
+        );
     }
 
     /// 按 id 删除渠道后读回为空；重复删除同一 id 幂等成功。
@@ -2739,6 +2805,7 @@ mod tests {
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
                 injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         )
         .await

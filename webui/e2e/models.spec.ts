@@ -134,7 +134,7 @@ test.describe('models page', () => {
     await expect(sharedRow.getByTestId('order-save')).toBeDisabled();
 
     const listed = await page.request.get('/api/channel-model-orders', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
     });
     const orders = (await listed.json()) as Array<{ model: string; channel_ids: number[] }>;
     expect(orders.find((order) => order.model === 'e2e-order-shared')?.channel_ids).toEqual([
@@ -237,7 +237,7 @@ test.describe('models page', () => {
     await page.locator('[id^="pricing-editor-input"]').fill('1.000001');
     await page.locator('[id^="pricing-editor-output"]').fill('2.5');
     await page.locator('[id^="pricing-editor-cache-read"]').fill('0.000001');
-    await page.locator('[id^="pricing-editor-cache-write"]').fill('');
+    await page.getByRole('textbox', { name: 'Cache write', exact: true }).fill('');
     await page.getByTestId('pricing-save-entry').click();
 
     await expect(canonical.getByTestId('inventory-unpriced')).toHaveCount(0);
@@ -247,7 +247,7 @@ test.describe('models page', () => {
     await expect(canonical.getByTestId('price-cache-write')).toHaveText('—');
 
     const listed = await page.request.get('/api/prices', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
     });
     const prices = (await listed.json()) as Array<{
       model: string;
@@ -680,7 +680,7 @@ test.describe('models page', () => {
     await expect(rowB.getByTestId('price-output')).toHaveText('5');
 
     const listed = await page.request.get('/api/prices', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
     });
     const prices = (await listed.json()) as Array<{
       channel_id: number;
@@ -693,7 +693,8 @@ test.describe('models page', () => {
     const rightPrice = prices.find(
       (item) => item.channel_id === right.id && item.model === 'e2e-keep',
     );
-    expect(leftPrice).toBeUndefined();
+    // 移除模型登记不级联删价：A 渠道的价格行保留，可单独取消定价。
+    expect(leftPrice?.input_micros).toBe(1_000_000);
     expect(rightPrice?.input_micros).toBe(4_000_000);
   });
 
@@ -763,13 +764,16 @@ test.describe('models page', () => {
     await expect(unifiedOption.getByTestId('group-source-channel')).toHaveText('Unified model');
     await expectSourceStatus(ordinaryOption, 'unlisted', 'e2e-src-ch', 'group-source-channel');
 
+    // 删除渠道同步清理统一模型与模型组引用：唯一成员所在渠道没了，
+    // 空成员的统一模型整体移除；组保留，两个成员引用都被清掉。
     await deleteChannel(page, channel.id);
     await page.reload();
-    await assertSourceKind(page, 'gone', null);
-    await page.getByTestId('models-tab-groups').click();
     await expect(
-      groupRow.locator('[data-testid="group-member-line"][data-model="e2e-src-u"]'),
-    ).toBeVisible();
+      page.locator('[data-testid="unified-row"][data-unified-id="e2e-src-u"]'),
+    ).toHaveCount(0);
+    await page.getByTestId('models-tab-groups').click();
+    await expect(groupRow).toBeVisible();
+    await expect(groupRow.locator('[data-testid="group-member-line"]')).toHaveCount(0);
   });
 
   test('same name on two channels is two independent group members', async ({ page }) => {
@@ -839,7 +843,7 @@ test.describe('models page', () => {
     await expect(groupRow).toHaveCount(0);
 
     const listed = await page.request.get('/api/tokens', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
     });
     const tokens = (await listed.json()) as Array<{ token_key: string; model_group: string }>;
     expect(tokens.find((item) => item.token_key === token.token_key)?.model_group).toBe('');

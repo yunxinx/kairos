@@ -13,9 +13,9 @@ use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FILE_ID_KEY, FILE_NAME_KEY, FinishReason,
     FinishReasonUnified, MediaSource, Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role,
     StreamEvent, Tool, ToolChoice, Usage, Warning, apply_provider_extra, capture_unknown_fields,
-    warning_feature,
+    part_provider_options, warn_dropped_provider_options, warning_feature,
 };
-use crate::core::stream::SseFrame;
+use crate::core::stream::{ErrorMessageShape, SseFrame, decode_failed_frame};
 
 // ---- 错误 ----
 
@@ -308,6 +308,9 @@ struct WireStreamChunk {
     choices: Vec<WireStreamChoice>,
     #[serde(default)]
     usage: Option<WireUsage>,
+    /// 流内错误帧（顶层 `{"error": {...}}`）：上游在 200 之后于流内报错。
+    #[serde(default)]
+    error: Option<WireStreamError>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -355,6 +358,15 @@ struct WireStreamToolCallFunction {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+}
+
+/// 流内错误帧的 `error` 对象：`message` 承载失败原因；type/param/code 因兼容
+/// 生态形状差异不做结构化捕获（未知字段容忍）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WireStreamError {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 // ---- 入站解码：wire 请求 → IR ----
@@ -835,6 +847,27 @@ pub fn encode_request_with(
                         "OpenAI Chat Completions 无 reasoning 内容块，system 消息中的推理内容已丢弃",
                     ));
                 }
+                // system 归并为单条置顶文本后，消息级与 part 级逃生舱（如缓存
+                // 断点）均无承载，跨族设置显式告警。
+                warn_dropped_provider_options(
+                    &message.provider_options,
+                    "openai",
+                    "消息级",
+                    warnings,
+                );
+                for part in &message.content {
+                    if let ContentPart::Text {
+                        provider_options, ..
+                    } = part
+                    {
+                        warn_dropped_provider_options(
+                            provider_options,
+                            "openai",
+                            "内容级",
+                            warnings,
+                        );
+                    }
+                }
                 if let Some(text) = text_parts(&message.content)
                     && !text.is_empty()
                 {
@@ -925,6 +958,13 @@ pub fn encode_request_with(
                     .tools
                     .iter()
                     .map(|t| {
+                        // 工具级逃生舱（如缓存断点）仅本族键有承载形态，跨族丢弃告警。
+                        warn_dropped_provider_options(
+                            &t.provider_options,
+                            "openai",
+                            "工具级",
+                            warnings,
+                        );
                         let mut tool = serde_json::Map::new();
                         tool.insert("type".into(), json!("function"));
                         let mut function = serde_json::Map::new();
@@ -987,6 +1027,14 @@ fn encode_message(
     options: ChatEncodeOptions,
     warnings: &mut Vec<Warning>,
 ) -> Value {
+    // 消息级逃生舱（如缓存断点）跨族无承载，显式告警。
+    warn_dropped_provider_options(&message.provider_options, "openai", "消息级", warnings);
+    // part 级逃生舱统一在此检查：本族键（detail/file_id/filename 等）由各
+    // 编码位按形状读写；非本族条目（如跨族缓存断点、thinking 签名）无法
+    // 表达，逐 part 告警。
+    for provider_options in part_provider_options(&message.content) {
+        warn_dropped_provider_options(provider_options, "openai", "内容级", warnings);
+    }
     // System 消息已在请求级归并为单条置顶，不进入本函数。
     if message
         .content
@@ -1431,8 +1479,22 @@ impl StreamDecoder {
     pub fn process(&mut self, chunk: &Value) -> DecodeStreamChunk {
         let wire = match serde_json::from_value::<WireStreamChunk>(chunk.clone()) {
             Ok(wire) => wire,
-            Err(_) => return DecodeStreamChunk::delivery(Vec::new()),
+            Err(err) => {
+                return DecodeStreamChunk::delivery(decode_failed_frame(
+                    &err,
+                    chunk,
+                    ErrorMessageShape::NestedOnly,
+                ));
+            }
         };
+
+        // 错误帧只产出 IR Error：网关消费到即向下游下发错误帧并终止流，
+        // 其余字段（id/model 等）随流终止失去意义。
+        if let Some(error) = &wire.error {
+            return DecodeStreamChunk::delivery(vec![StreamEvent::Error {
+                message: error.message.clone().unwrap_or_default(),
+            }]);
+        }
 
         let mut events = Vec::new();
         let mut is_output = false;
@@ -2683,6 +2745,54 @@ mod tests {
             }
             other => panic!("应产出 Finish 事件，实际 {other:?}"),
         }
+    }
+
+    /// 流内错误帧解码为 IR Error（message 取自 error 对象），不产出其他事件。
+    ///
+    /// 流首错误帧即此形状：网关 peek 窗口对 IR Error 的归类（可 failover）
+    /// 由此打通，无需网关侧改动。
+    #[test]
+    fn stream_error_frame_decodes_to_ir_error() {
+        let error_chunk = json!({
+            "error": {
+                "message": "You exceeded your current quota",
+                "type": "insufficient_quota",
+                "code": "429",
+            }
+        });
+        let decoded = StreamDecoder::default().process(&error_chunk);
+        assert!(!decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "You exceeded your current quota".to_string(),
+            }]
+        );
+    }
+
+    /// 形状畸形的错误帧（其余字段类型不符导致整帧解析失败）仍提取错误语义：
+    /// 留痕后以顶层 error.message 映射 IR Error，不静默为空。
+    #[test]
+    fn malformed_error_frame_still_surfaces_error_semantics() {
+        let chunk = json!({
+            "error": { "message": "boom", "code": "internal" },
+            "choices": "not-an-array",
+        });
+        let decoded = StreamDecoder::default().process(&chunk);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "boom".to_string(),
+            }]
+        );
+    }
+
+    /// 解析失败且无错误语义的帧：留痕后跳过（空事件），不中断流。
+    #[test]
+    fn malformed_frame_without_error_semantics_is_skipped() {
+        let chunk = json!({ "choices": "not-an-array" });
+        let decoded = StreamDecoder::default().process(&chunk);
+        assert_eq!(decoded.events, Vec::new());
     }
 
     /// 思维链增量解码为 reasoning 成对事件（DeepSeek/OpenRouter 双别名）。

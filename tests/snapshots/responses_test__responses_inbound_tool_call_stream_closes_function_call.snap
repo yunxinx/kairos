@@ -19,8 +19,9 @@ expression: frames
     "event": "response.output_item.added",
     "data": {
       "item": {
+        "content": [],
         "id": "0",
-        "phase": "final_answer",
+        "role": "assistant",
         "type": "message"
       },
       "output_index": 0,
@@ -75,6 +76,50 @@ expression: frames
     }
   },
   {
+    "event": "response.output_text.done",
+    "data": {
+      "content_index": 0,
+      "item_id": "0",
+      "output_index": 0,
+      "text": "Let me check.",
+      "type": "response.output_text.done"
+    }
+  },
+  {
+    "event": "response.content_part.done",
+    "data": {
+      "content_index": 0,
+      "item_id": "0",
+      "output_index": 0,
+      "part": {
+        "annotations": [],
+        "text": "Let me check.",
+        "type": "output_text"
+      },
+      "type": "response.content_part.done"
+    }
+  },
+  {
+    "event": "response.output_item.done",
+    "data": {
+      "item": {
+        "content": [
+          {
+            "annotations": [],
+            "text": "Let me check.",
+            "type": "output_text"
+          }
+        ],
+        "id": "0",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "output_index": 0,
+      "type": "response.output_item.done"
+    }
+  },
+  {
     "event": "response.output_item.done",
     "data": {
       "item": {
@@ -95,7 +140,28 @@ expression: frames
         "id": "chatcmpl-9",
         "model": "gpt-4o",
         "object": "response",
-        "output": [],
+        "output": [
+          {
+            "content": [
+              {
+                "annotations": [],
+                "text": "Let me check.",
+                "type": "output_text"
+              }
+            ],
+            "id": "0",
+            "role": "assistant",
+            "status": "completed",
+            "type": "message"
+          },
+          {
+            "arguments": "{\"city\":\"SF\"}",
+            "call_id": "call_1",
+            "id": "fc_call_1",
+            "name": "get_weather",
+            "type": "function_call"
+          }
+        ],
         "status": "completed",
         "usage": {
           "input_tokens": 10,

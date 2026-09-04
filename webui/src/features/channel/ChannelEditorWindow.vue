@@ -112,6 +112,7 @@ interface EditorKey {
   /** 编辑会话内稳定身份；不能用数组下标作为 Vue key。 */
   editorId: string;
   name: string;
+  /** 明文不回显：编辑既有渠道时始终以空串起步，留空提交即由后端按名称保留原值。 */
   api_key: string;
   /** 权重输入草稿；保存时按无符号整数解析，空值按 1 处理。 */
   weight: string;
@@ -140,7 +141,7 @@ function keyToEditor(key: ChannelKey): EditorKey {
   return {
     editorId: newEditorKeyId(),
     name: key.name,
-    api_key: key.api_key,
+    api_key: '',
     weight: String(key.weight),
     enabled: key.enabled,
     models: (key.models ?? []).join(', '),
@@ -203,6 +204,7 @@ const initialValues = {
   reasoningOutput: props.initial?.reasoning_output ?? 'auto',
   sessionCacheKey: props.initial?.session_cache_key ?? 'off',
   injectsCacheBreakpoints: props.initial?.injects_cache_breakpoints ?? false,
+  abortOnDisconnect: props.initial?.abort_on_disconnect ?? true,
 };
 
 const editorName = ref(initialValues.name);
@@ -221,6 +223,7 @@ const editorGroup = ref(initialValues.modelGroup);
 const editorReasoningOutput = ref<ReasoningOutputMode>(initialValues.reasoningOutput);
 const editorSessionCacheKey = ref<SessionCacheKeyMode>(initialValues.sessionCacheKey);
 const editorInjectsCacheBreakpoints = ref(initialValues.injectsCacheBreakpoints);
+const editorAbortOnDisconnect = ref(initialValues.abortOnDisconnect);
 /** 手动添加模型 ID 的输入草稿；点添加后 trim 写入 `editorModels`。 */
 const addModelDraft = ref('');
 
@@ -241,7 +244,8 @@ const dirty = computed(
     editorGroup.value !== initialValues.modelGroup ||
     editorReasoningOutput.value !== initialValues.reasoningOutput ||
     editorSessionCacheKey.value !== initialValues.sessionCacheKey ||
-    editorInjectsCacheBreakpoints.value !== initialValues.injectsCacheBreakpoints,
+    editorInjectsCacheBreakpoints.value !== initialValues.injectsCacheBreakpoints ||
+    editorAbortOnDisconnect.value !== initialValues.abortOnDisconnect,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -264,6 +268,7 @@ const reasoningOutputOptions = computed(() =>
 
 const sessionCacheKeyInputId = `channel-editor-session-cache-key-${uid}`;
 const injectsCacheBreakpointsInputId = `channel-editor-injects-cache-breakpoints-${uid}`;
+const abortOnDisconnectInputId = `channel-editor-abort-on-disconnect-${uid}`;
 const sessionCacheKeyOptions = computed(() =>
   SESSION_CACHE_KEY_MODES.map((value) => ({
     value,
@@ -494,9 +499,14 @@ function handleSave(removalConfirmed = false) {
       rules: [{ kind: 'required' }, { kind: 'uint' }],
     },
   ];
+  // 名称与既有密钥一致的行留空即由后端按名称保留原值；其余行（含新建渠道）仍必填。
+  const preservedKeyNames = new Set((props.initial?.keys ?? []).map((key) => key.name.trim()));
   editorKeys.value.forEach((key, index) => {
     specs.push({ name: `keyName${index}`, value: key.name, rules: [{ kind: 'required' }] });
-    specs.push({ name: `keyApi${index}`, value: key.api_key, rules: [{ kind: 'required' }] });
+    const keepsStoredKey = props.initial !== null && preservedKeyNames.has(key.name.trim());
+    if (!keepsStoredKey) {
+      specs.push({ name: `keyApi${index}`, value: key.api_key, rules: [{ kind: 'required' }] });
+    }
     if (key.weight.trim() !== '' && parseOptionalUint(key.weight) === null) {
       specs.push({ name: `keyWeight${index}`, value: key.weight, rules: [{ kind: 'uint' }] });
     }
@@ -539,6 +549,7 @@ function handleSave(removalConfirmed = false) {
     reasoning_output: editorReasoningOutput.value,
     session_cache_key: editorSessionCacheKey.value,
     injects_cache_breakpoints: editorInjectsCacheBreakpoints.value,
+    abort_on_disconnect: editorAbortOnDisconnect.value,
   };
   if (props.initial === null) {
     saveMutation.mutate(edited);
@@ -721,11 +732,24 @@ function handleSave(removalConfirmed = false) {
                     :error="fieldError(`keyApi${index}`)"
                   >
                     <template #default="{ hintId, invalid }">
+                      <!-- 创建要求明文；编辑不回填不提供查看，留空即保留原值。 -->
                       <FormPasswordInput
+                        v-if="initial === null"
                         :id="`${uid}-channel-editor-key-apikey-${index}`"
                         v-model="key.api_key"
                         autocomplete="off"
-                        :mask-while-hidden="initial !== null"
+                        :invalid="invalid"
+                        :hint-id="hintId"
+                        data-testid="channel-key-api"
+                        v-on="fieldInputHandlers(`keyApi${index}`)"
+                      />
+                      <FormTextInput
+                        v-else
+                        :id="`${uid}-channel-editor-key-apikey-${index}`"
+                        v-model="key.api_key"
+                        type="password"
+                        autocomplete="off"
+                        :placeholder="t('channel.apiKeyKeepPlaceholder')"
                         :invalid="invalid"
                         :hint-id="hintId"
                         data-testid="channel-key-api"
@@ -1023,6 +1047,19 @@ function handleSave(removalConfirmed = false) {
                 </template>
               </FormField>
             </div>
+            <FormField
+              field-name="abortOnDisconnect"
+              layout="inline"
+              :label="t('channel.abortOnDisconnect.label')"
+              :input-id="abortOnDisconnectInputId"
+              :guide="t('channel.abortOnDisconnect.guide')"
+            >
+              <FormSwitch
+                :id="abortOnDisconnectInputId"
+                v-model="editorAbortOnDisconnect"
+                data-testid="channel-editor-abort-on-disconnect"
+              />
+            </FormField>
           </div>
         </div>
       </div>

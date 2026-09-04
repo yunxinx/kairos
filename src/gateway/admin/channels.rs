@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::gateway::{logging, routing};
 use crate::store;
+use crate::store::channel_keys::api_key_requests_preservation;
 use crate::store::resources::{Channel, ChannelRecord};
 
 use super::auth::{ManagementCapability, ManagementIdentity};
@@ -90,7 +91,8 @@ async fn list_channel_summaries(
 
 /// 渠道读视图：库生成的稳定身份 + 定义字段（同级展开序列化）。
 ///
-/// 写契约仍是无 id 的 `Channel`；id 只随读响应返回。
+/// 写契约仍是无 id 的 `Channel`；id 只随读响应返回。密钥条目随读取面掩码，
+/// 明文不回显。
 #[derive(Debug, Serialize)]
 struct ChannelView {
     id: i64,
@@ -138,6 +140,7 @@ async fn create_channel(
     let mut channel = body.map_err(AdminError::bad_body)?;
     normalize_channel_group(&mut channel);
     validate_channel(&channel)?;
+    require_plaintext_keys(&channel)?;
     let mut tx = begin_write(&deps).await?;
     reject_unknown_group_on_conn(&mut tx, &channel.model_group).await?;
     let channels = crate::store::resources::list_channel_records_on_conn(&mut tx)
@@ -242,6 +245,7 @@ async fn update_channel(
         None,
     )?;
     let previous = current.channel.clone();
+    resolve_preserved_keys(&mut channel, &current.keys)?;
     crate::store::resources::update_channel(&mut tx, id, &channel)
         .await
         .map_err(AdminError::Store)?;
@@ -511,9 +515,6 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
         if key.name.trim().is_empty() {
             return Err(AdminError::InvalidBody("密钥 name 不能为空".to_string()));
         }
-        if key.api_key.trim().is_empty() {
-            return Err(AdminError::InvalidBody("密钥 api_key 不能为空".to_string()));
-        }
         if key.weight < 0 {
             return Err(AdminError::InvalidBody(
                 "密钥 weight 不能小于 0".to_string(),
@@ -525,6 +526,44 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
                 key.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// 创建渠道要求每把密钥都是明文：空串或掩码串在创建时没有「原值」可保留，
+/// 一律拒绝，避免把掩码形态当成真实密钥存库。
+fn require_plaintext_keys(channel: &Channel) -> Result<(), AdminError> {
+    for key in &channel.keys {
+        if key.api_key.trim().is_empty() {
+            return Err(AdminError::InvalidBody("密钥 api_key 不能为空".to_string()));
+        }
+        if api_key_requests_preservation(&key.api_key) {
+            return Err(AdminError::InvalidBody(
+                "密钥 api_key 不能为掩码形态，请提供明文".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 更新渠道时把「保留原值」的密钥条目解析为库中明文。
+///
+/// 空串或掩码串（含 `*`）按 `name` 匹配当前渠道的既有密钥，从其
+/// `StoredChannelKey` 取原值替换，明文不经 wire 往返；`name` 无匹配时没有
+/// 原值可保留，按非空校验失败处理。
+fn resolve_preserved_keys(
+    channel: &mut Channel,
+    current: &[crate::store::resources::StoredChannelKey],
+) -> Result<(), AdminError> {
+    for key in &mut channel.keys {
+        if !api_key_requests_preservation(&key.api_key) {
+            continue;
+        }
+        let preserved = current
+            .iter()
+            .find(|stored| stored.name == key.name)
+            .ok_or_else(|| AdminError::InvalidBody("密钥 api_key 不能为空".to_string()))?;
+        key.api_key = preserved.expose_api_key().to_string();
     }
     Ok(())
 }

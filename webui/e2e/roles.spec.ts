@@ -1,6 +1,6 @@
 import { expect, test } from './fixtures';
 import { E2E_ADMIN_ORIGIN } from './helpers/gateway';
-import { e2eRootHeaders } from './helpers/session';
+import { e2eRootHeaders, loginViaApi } from './helpers/session';
 import { seedModelGroup } from './helpers/models';
 import type { Page } from '@playwright/test';
 import { openSession, seedUser } from './helpers/users';
@@ -10,7 +10,7 @@ async function createPlan(
   body: { display_name: string; groups: string[]; note?: string },
 ): Promise<number> {
   const resp = await page.request.post('/api/plans', {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: {
       display_name: body.display_name,
       note: body.note ?? '',
@@ -31,7 +31,7 @@ async function createPlan(
 
 async function assignPlan(page: Page, userId: number, planId: number): Promise<void> {
   const resp = await page.request.put(`/api/users/${userId}/plan`, {
-    headers: await e2eRootHeaders(page.request),
+    headers: await e2eRootHeaders(page),
     data: { plan_id: planId },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
@@ -119,10 +119,7 @@ test.describe('role navigation', () => {
     });
     await assignPlan(page, user.id, planId);
 
-    const session = await page.request.post('/api/login', {
-      data: { email: 'nav-withdraw@example.com', password: 'password1' },
-    });
-    expect(session.ok(), await session.text()).toBeTruthy();
+    await loginViaApi(page, 'nav-withdraw@example.com', 'password1');
     const created = await page.request.post('/api/tokens', {
       headers: { Origin: E2E_ADMIN_ORIGIN },
       data: {
@@ -133,17 +130,16 @@ test.describe('role navigation', () => {
       },
     });
     expect(created.ok(), await created.text()).toBeTruthy();
-    const owned = (await created.json()) as { token_key: string };
 
     const planResp = await page.request.get(`/api/plans`, {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
     });
     expect(planResp.ok(), await planResp.text()).toBeTruthy();
     const plans = (await planResp.json()) as Array<{ id: number }>;
     const withdrawPlan = plans.find((plan) => plan.id === planId);
     expect(withdrawPlan).toBeTruthy();
     const withdraw = await page.request.put(`/api/plans/${planId}`, {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
       data: {
         display_name: 'Withdraw Plan',
         note: '',
@@ -161,7 +157,8 @@ test.describe('role navigation', () => {
 
     await openSession(page, 'nav-withdraw@example.com');
     await page.goto('/tokens');
-    const row = page.locator(`[data-testid="token-row"][data-token-key="${owned.token_key}"]`);
+    // 行内只展示掩码 key：按令牌名定位。
+    const row = page.locator('[data-testid="token-row"]', { hasText: 'withdraw-me' });
     await expect(row.getByTestId('token-group-unusable')).toBeVisible();
     await row.getByTestId('token-edit').click();
     await expect(page.getByTestId('token-group-unusable-hint')).toBeVisible();

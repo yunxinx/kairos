@@ -63,6 +63,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
             injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         },
         Channel {
             name: "ch-1".to_string(),
@@ -85,6 +86,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             reasoning_output: Default::default(),
             session_cache_key: Default::default(),
             injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         },
     ];
     seed
@@ -114,6 +116,7 @@ fn three_channel_seed(bases: &[String]) -> common::Seed {
         reasoning_output: Default::default(),
         session_cache_key: Default::default(),
         injects_cache_breakpoints: false,
+        abort_on_disconnect: true,
     });
     seed
 }
@@ -586,10 +589,10 @@ async fn failover_bills_succeeding_channel_price_once() {
     .await
     .expect("令牌余额应存在");
     assert!(
-        balance.0 < 5_000_000 - PRICE_B,
-        "无 usage 的失败 hop 也应按预留结算"
+        balance.0 == 5_000_000 - PRICE_B,
+        "无 usage 的失败 hop 不产生费用，只扣成功 hop"
     );
-    assert!(balance.1 > PRICE_B, "累计结算应包含失败 hop 的保守费用");
+    assert!(balance.1 == PRICE_B, "累计结算只包含成功 hop 的实际费用");
 }
 
 /// 首渠道 5xx、次渠道成功：failover 到下一渠道。

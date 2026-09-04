@@ -77,8 +77,9 @@ pub(super) struct Billing {
     pub(super) calculation_error: Option<BillingError>,
     /// 上游结果是否显式包含 usage。
     ///
-    /// 该状态不能由 token 数值推断：显式回报的全零 usage 是可信结果，而没有
-    /// usage 字段的结果必须由结算队列按本次出站尝试的保守预留处理。
+    /// 该状态不能由 token 数值推断：显式回报的全零 usage 是可信结果，按
+    /// 实际值结算；缺失 usage 字段的结果不产生费用，由结果入队路径释放
+    /// 预留并告警。
     pub(super) usage_reported: bool,
     pub(super) request_body: Option<Bytes>,
     pub(super) response_body: Option<Vec<u8>>,
@@ -198,6 +199,10 @@ pub(super) struct RequestLogDraft<'a> {
     pub(super) request_id: &'a str,
     /// 实际出站调用的唯一计费身份；未进入出站阶段的请求日志为 `None`。
     pub(super) billing_attempt_id: Option<&'a str>,
+    /// 出站尝试是否确认到达上游：收到响应、或发送错误为非连接类时为
+    /// `true`；连接失败（TCP 未建立）为 `false`。仅对带计费身份且缺失
+    /// usage 的日志参与告警分类，未出站的日志该值不产生作用。
+    pub(super) upstream_reached: bool,
     /// 请求级绝对截止时刻；设置后队列持久化不得越过该时刻。
     pub(super) deadline: Option<tokio::time::Instant>,
 }
@@ -247,28 +252,6 @@ async fn queue_request_log_inner(
         .billing
         .calculation_error
         .map(|err| format!("费用计算失败，未执行结算: {err}"));
-    let reserved_fallback = if !draft.billing.usage_reported
-        && settlement_error.is_none()
-        && draft.billing_attempt_id.is_some()
-    {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT reserved_cost_usd_micros FROM billing_reservations \
-             WHERE attempt_id = ? AND status = 'reserved'",
-        )
-        .bind(draft.billing_attempt_id)
-        .fetch_optional(&deps.pool)
-        .await
-        .map_err(store::StoreError::Query)?
-    } else {
-        None
-    };
-    let cost_usd_micros = reserved_fallback.unwrap_or(draft.billing.cost_usd_micros);
-    // 折后预留额由整数截断得到，反推原价时取同一折扣下可能产生该实收额的
-    // 最大原价，确保兜底记录不会把渠道成本低估。折扣为 0 时无法从实收额
-    // 推导原价，只能保留现有原价字段并通过告警暴露该不确定性。
-    let base_cost_usd_micros = reserved_fallback
-        .map(|charge| conservative_base_from_charge(charge, draft.billing.discount_bp))
-        .unwrap_or(draft.billing.base_cost_usd_micros);
     let log = store::RequestLog {
         id: 0,
         created_at: now,
@@ -289,14 +272,14 @@ async fn queue_request_log_inner(
         cache_write_1h_tokens: draft.billing.usage.cache_write_1h_tokens,
         usage_reported: draft.billing.usage_reported,
         price: draft.billing.price,
-        base_cost_usd_micros,
+        base_cost_usd_micros: draft.billing.base_cost_usd_micros,
         discount_bp: draft.billing.discount_bp,
-        cost_usd_micros,
-        // 出站尝试即使实际费用为零也必须由后台消费预留，只有从未出站的零费用
-        // 日志可以在入队时直接视为已结算。
+        cost_usd_micros: draft.billing.cost_usd_micros,
+        // 结算终态在入队时确定：回报 usage 的出站尝试（含显式全零）由后台
+        // 按实际用量消费预留；缺失 usage 的尝试不产生费用，入队即视为已
+        // 结算，预留随入队事务释放；从未出站的零费用日志天然无预留可消费。
         settled: settlement_error.is_none()
-            && draft.billing_attempt_id.is_none()
-            && cost_usd_micros == 0,
+            && (draft.billing_attempt_id.is_none() || !draft.billing.usage_reported),
         request_id: Some(draft.request_id.to_string()),
         billing_attempt_id: draft.billing_attempt_id.map(str::to_string),
         request_body: clip_logged_body(
@@ -308,6 +291,7 @@ async fn queue_request_log_inner(
     let pending = store::PendingRequestLog {
         log,
         settlement_error,
+        upstream_reached: draft.upstream_reached,
     };
     if let Some(attempt_id) = pending.log.billing_attempt_id.as_deref() {
         // 先把完整结果写入预留行，再写 outbox。两步任一步骤后进程崩溃时，
@@ -317,23 +301,6 @@ async fn queue_request_log_inner(
     store::enqueue_pending_request_log(&deps.pool, pending).await?;
     deps.request_log_writer.wake();
     Ok(())
-}
-
-/// 由折后金额反推可产生该金额的原价上界。
-///
-/// 折后计算使用向下取整：`charge = floor(base * discount / 10000)`。因此
-/// `((charge + 1) * 10000 - 1) / discount` 是所有可能原价中的最大值；使用
-/// 上界可以避免缺失 usage 时把基础成本记成低于实际的数值。免费折扣没有
-/// 可逆信息，返回 0 并由调用方通过 usage 缺失告警暴露该事实。
-fn conservative_base_from_charge(charge: i64, discount_bp: i64) -> i64 {
-    if charge <= 0 || discount_bp <= 0 {
-        return 0;
-    }
-    let numerator = (charge as i128 + 1)
-        .saturating_mul(billing::DEFAULT_DISCOUNT_BP as i128)
-        .saturating_sub(1);
-    let estimate = numerator / discount_bp as i128;
-    i64::try_from(estimate).unwrap_or(i64::MAX)
 }
 
 const REQUEST_LOG_BATCH_SIZE: i64 = 16;
@@ -386,6 +353,7 @@ async fn drain_pending_request_logs(
         for item in pending {
             let log = item.log.clone();
             let usage_reported = item.log.usage_reported;
+            let upstream_reached = item.upstream_reached;
             if let Err(err) = process_pending_request_log(pool, usage_warning_gate, item).await {
                 // 结算事务失败时只隔离当前记录并继续消费后续记录。隔离本身
                 // 也失败才向上返回；此时保留队列状态，下一轮仍会重试该动作。
@@ -402,6 +370,7 @@ async fn drain_pending_request_logs(
                     usage_warning_gate,
                     &log,
                     usage_reported,
+                    upstream_reached,
                     Some(reason),
                     None,
                 )
@@ -426,6 +395,7 @@ async fn process_pending_request_log(
             usage_warning_gate,
             &pending.log,
             pending.log.usage_reported,
+            pending.upstream_reached,
             Some(reason),
             None,
         )
@@ -433,7 +403,11 @@ async fn process_pending_request_log(
         return Ok(());
     }
 
-    if pending.log.cost_usd_micros > 0 || pending.log.billing_attempt_id.is_some() {
+    // 结算只针对仍需财务动作的记录：已结算的入队记录（缺失 usage 的出站
+    // 尝试）以释放为终态，预留已在入队事务中归还，这里只落最终日志。
+    if pending.log.cost_usd_micros > 0
+        || (pending.log.billing_attempt_id.is_some() && !pending.log.settled)
+    {
         let mut tx = pool
             .begin_with("BEGIN IMMEDIATE")
             .await
@@ -462,6 +436,7 @@ async fn process_pending_request_log(
                     usage_warning_gate,
                     &pending.log,
                     pending.log.usage_reported,
+                    pending.upstream_reached,
                     None,
                     touch_error,
                 )
@@ -485,6 +460,7 @@ async fn process_pending_request_log(
                     usage_warning_gate,
                     &pending.log,
                     pending.log.usage_reported,
+                    pending.upstream_reached,
                     Some(reason),
                     None,
                 )
@@ -510,6 +486,7 @@ async fn process_pending_request_log(
         usage_warning_gate,
         &pending.log,
         pending.log.usage_reported,
+        pending.upstream_reached,
         None,
         touch_error,
     )
@@ -554,6 +531,7 @@ async fn record_request_log_notes(
     usage_warning_gate: &mut UsageWarningGate,
     log: &store::RequestLog,
     usage_reported: bool,
+    upstream_reached: bool,
     settlement_error: Option<String>,
     touch_error: Option<String>,
 ) {
@@ -561,11 +539,38 @@ async fn record_request_log_notes(
         && log.billing_attempt_id.is_some()
         && usage_warning_gate.should_warn(&log.token_key, &log.model, &log.channel)
     {
+        // 两类告警共用去重门控：上游未达是确定无费用的对账提示，已受理
+        // 而缺失 usage 则提示可能产生费用，都需要人工复核。
+        let (event_code, message) = if upstream_reached {
+            (
+                "billing.usage_missing",
+                format!(
+                    "上游已受理但未回报 usage，可能已产生费用；本次未计费、预留已释放，请人工对账（request_id={} token={} model={} channel={} protocol={}）",
+                    log.request_id.as_deref().unwrap_or(""),
+                    log.token_name,
+                    log.model,
+                    log.channel,
+                    log.inbound_protocol,
+                ),
+            )
+        } else {
+            (
+                "billing.upstream_unreached",
+                format!(
+                    "上游连接未建立，本次出站尝试未产生费用、预留已释放（request_id={} token={} model={} channel={} protocol={}）",
+                    log.request_id.as_deref().unwrap_or(""),
+                    log.token_name,
+                    log.model,
+                    log.channel,
+                    log.inbound_protocol,
+                ),
+            )
+        };
         store::record_system_warn(
             pool,
             "billing",
             &store::SystemLogEvent::new(
-                "billing.usage_missing",
+                event_code,
                 serde_json::json!({
                     "request_id": log.request_id,
                     "token_name": log.token_name,
@@ -573,18 +578,10 @@ async fn record_request_log_notes(
                     "channel": log.channel,
                     "inbound_protocol": log.inbound_protocol,
                     "usage_reported": false,
-                    "amount_source": "reservation",
-                    "base_cost_usd_micros": log.base_cost_usd_micros,
-                    "cost_usd_micros": log.cost_usd_micros,
+                    "upstream_reached": upstream_reached,
+                    "reservation_released": true,
                 }),
-                format!(
-                    "上游未回报 usage，本次按保守预留结算（request_id={} token={} model={} channel={} protocol={}）",
-                    log.request_id.as_deref().unwrap_or(""),
-                    log.token_name,
-                    log.model,
-                    log.channel,
-                    log.inbound_protocol,
-                ),
+                message,
             ),
         )
         .await;
@@ -641,16 +638,7 @@ pub(super) fn new_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_logged_body, conservative_base_from_charge, utf8_prefix_len};
-
-    #[test]
-    fn conservative_base_cost_reverses_discount_rounding() {
-        // 50 micro-USD 实收、50% 折扣时，向下取整可能来自 100 或 101 原价，
-        // 返回 101 才能覆盖整数截断带来的一个微元区间。
-        assert_eq!(conservative_base_from_charge(50, 5_000), 101);
-        assert_eq!(conservative_base_from_charge(50, 10_000), 50);
-        assert_eq!(conservative_base_from_charge(50, 0), 0);
-    }
+    use super::{clip_logged_body, utf8_prefix_len};
 
     #[test]
     fn clip_logged_body_stops_on_utf8_char_boundary() {

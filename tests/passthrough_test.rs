@@ -374,10 +374,16 @@ async fn stream_passthrough_preserves_unclosed_mixed_event_tail() {
     assert_eq!(downstream.as_ref(), expected);
 }
 
-/// 下游读到首块后断开，直通任务仍继续消费上游尾部 usage 并完成结算。
+/// 断连止损开关关闭：下游读到首块后断开，直通任务仍继续消费上游尾部
+/// usage 并按实际 usage 结算。
 #[tokio::test]
 async fn stream_passthrough_settles_after_downstream_disconnect() {
-    let mut gw = TestGateway::start().await;
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].abort_on_disconnect = false;
+        seed
+    })
+    .await;
     gw.upstream.set_behavior(UpstreamBehavior::DelayedRawSse {
         chunks: vec![
             b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec(),
@@ -413,6 +419,104 @@ async fn stream_passthrough_settles_after_downstream_disconnect() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(settled, 45, "断连后仍应消费尾部 usage 并结算");
+}
+
+/// 断连即取消（渠道开关缺省开）：下游断开后立即停止上游消费，usage 载荷
+/// 在更后的块里、取消时未被嗅探，预留全额释放并落日志。
+#[tokio::test]
+async fn stream_passthrough_aborts_upstream_on_downstream_disconnect() {
+    let mut gw = TestGateway::start().await;
+    // 前缀正文让下游读到内容；随后一块大体积无 usage 填充块承担断连检测，
+    // usage 块在取消发生后才到达，不应被消费或计费。
+    let padding = format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+        "x".repeat(256 * 1024)
+    );
+    gw.upstream.set_behavior(UpstreamBehavior::GappedRawSse {
+        prefix: vec![b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec()],
+        gap_ms: 100,
+        tail: vec![
+            padding.into_bytes(),
+            b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n".to_vec(),
+        ],
+    });
+
+    let resp = send_stream(&gw.base_url()).await;
+    let mut downstream = resp.bytes_stream();
+    let mut prefix = Vec::new();
+    while !prefix.windows(5).any(|window| window == b"first") {
+        let chunk = downstream
+            .next()
+            .await
+            .expect("正文前响应流不应结束")
+            .expect("响应块应可读");
+        prefix.extend_from_slice(&chunk);
+    }
+    drop(downstream);
+
+    // 取消后按已嗅探 usage（此处为零）结算：预留释放、费用为零。
+    let mut settled: Option<i64> = None;
+    for _ in 0..250 {
+        let cost: Option<i64> =
+            sqlx::query_scalar("SELECT cost_usd_micros FROM request_log WHERE token_key = ?")
+                .bind(TEST_TOKEN_KEY)
+                .fetch_optional(&gw.pool)
+                .await
+                .expect("应能查询日志");
+        if cost.is_some() {
+            settled = cost;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(settled, Some(0), "断连取消应释放预留而非保守结算");
+}
+
+/// 长流回归：直通流在请求总时限（120s）过后仍继续转发。
+///
+/// 下游读到首块后暂停虚拟时钟——请求路径的数据库操作已全部完成；时钟自动
+/// 推进驱动上游两段各 100s 的沉默（均小于渠道空闲超时 120s）。结算依赖
+/// SQLite 真实时钟，暂停期间无法落库，本用例断言转发与收尾语义。
+#[tokio::test]
+async fn stream_passthrough_continues_past_request_total_deadline() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].timeout_ms = 120_000;
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::GappedRawSse {
+        prefix: vec![b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_vec()],
+        gap_ms: 100_000,
+        tail: vec![
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_vec(),
+            b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n".to_vec(),
+        ],
+    });
+
+    let resp = send_stream(&gw.base_url()).await;
+    let mut downstream = resp.bytes_stream();
+    let mut seen = Vec::new();
+    while !seen.windows(5).any(|window| window == b"first") {
+        let chunk = downstream
+            .next()
+            .await
+            .expect("正文前响应流不应结束")
+            .expect("响应块应可读");
+        seen.extend_from_slice(&chunk);
+    }
+    tokio::time::pause();
+
+    let mut tail = seen;
+    while let Some(chunk) = downstream.next().await {
+        tail.extend_from_slice(&chunk.expect("响应块应可读"));
+    }
+    let text = String::from_utf8_lossy(&tail);
+    assert!(
+        text.contains("\"finish_reason\":\"stop\"") && text.contains("[DONE]"),
+        "总时限过后的块应照常直通并正常收尾: {text}"
+    );
+    assert!(!text.contains("data: {\"error\""), "长流不应被截断出错误帧");
 }
 
 /// 快路径不免认证：未认证请求不触发直通出站，返回 401。
@@ -549,6 +653,7 @@ fn channel_of(name: &str, protocol: config::Protocol, base_url: &str) -> Channel
         reasoning_output: Default::default(),
         session_cache_key: Default::default(),
         injects_cache_breakpoints: false,
+        abort_on_disconnect: true,
     }
 }
 
@@ -875,6 +980,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
                 injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
             Channel {
                 name: "backup".to_string(),
@@ -897,6 +1003,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 reasoning_output: Default::default(),
                 session_cache_key: Default::default(),
                 injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         ];
         seed

@@ -61,6 +61,9 @@ async fn main() -> anyhow::Result<()> {
     let catalog_sync_interval_days = snapshot.catalog_sync_interval_days;
     let snapshot = runtime::snapshot_handle(snapshot);
     let request_log_writer = gateway::RequestLogWriter::start(pool.clone());
+    // 渠道冷却表由协议面记账、管理面健康端点展示，两面共享同一实例；
+    // 状态只在内存，重启即清空（自愈语义的一部分）。
+    let channel_cooldowns = gateway::ChannelCooldowns::new();
 
     // 可选的管理面：配置了 `admin_listen` 才启动独立管理监听；未配置即管理面
     // 整体关闭，协议监听不注册任何管理路由。管理面与协议面物理隔离。
@@ -70,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
             snapshot.clone(),
             cfg.database.path.clone(),
             request_log_writer.clone(),
+            channel_cooldowns.clone(),
         );
         let admin_addr = format!("{}:{}", admin_listen.host, admin_listen.port);
         let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
@@ -102,7 +106,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let listen = format!("{}:{}", cfg.listen.host, cfg.listen.port);
-    let app = gateway::router_with_writer(pool, snapshot, request_log_writer).await;
+    let app =
+        gateway::router_with_writer(pool, snapshot, request_log_writer, channel_cooldowns).await;
 
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     println!("kairos 网关监听 {listen}");

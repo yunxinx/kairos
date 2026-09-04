@@ -28,6 +28,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { CHANNEL_SUMMARY_KEY, invalidateChannelCaches } from '@/composables/useChannelDirectory';
+import { useChannelHealth } from '@/composables/useChannelHealth';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -77,6 +78,16 @@ const channels = computed(() => channelsQuery.data.value ?? []);
 const showTableSkeleton = computed(
   () => channelsQuery.isPending.value && !channelsQuery.data.value,
 );
+
+const { enabled: healthEnabled, cooldowns } = useChannelHealth();
+
+/** 冷却剩余量 → `分:秒` 计时形态；无轮询，取渲染时刻的快照。 */
+function formatCooldownRemaining(untilMillis: number): string {
+  const totalSeconds = Math.max(0, Math.ceil((untilMillis - Date.now()) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
 
 const statusOptions = computed(() => {
   const enabled = channels.value.filter((channel) => channel.enabled).length;
@@ -304,11 +315,16 @@ function openProbe(channel: ChannelView) {
             <TableHead>{{ t('channel.requestProtocol') }}</TableHead>
             <TableHead>{{ t('channel.models') }}</TableHead>
             <TableHead align="center">{{ t('channel.status') }}</TableHead>
+            <TableHead v-if="healthEnabled" align="center">{{ t('channel.health') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="6" />
+          <TableRowsSkeleton
+            v-if="showTableSkeleton"
+            has-select-column
+            :columns="healthEnabled ? 7 : 6"
+          />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"
@@ -346,6 +362,24 @@ function openProbe(channel: ChannelView) {
                   {{ channel.enabled ? t('channel.statusEnabled') : t('channel.statusDisabled') }}
                 </button>
               </TableCell>
+              <TableCell v-if="healthEnabled" align="center" data-testid="channel-health">
+                <span
+                  v-if="cooldowns.get(channel.id)"
+                  class="inline-flex items-center justify-center gap-1.5"
+                  data-testid="channel-cooldown"
+                >
+                  <span class="badge badge-danger" data-testid="channel-cooldown-badge">
+                    {{ t('channel.cooling') }}
+                  </span>
+                  <span class="text-fg-muted text-xs" data-testid="channel-cooldown-remaining">
+                    {{
+                      t('channel.cooldownRemaining', {
+                        time: formatCooldownRemaining(cooldowns.get(channel.id)!.cooldown_until),
+                      })
+                    }}
+                  </span>
+                </span>
+              </TableCell>
               <TableCell align="center">
                 <span class="inline-flex items-center justify-center gap-1">
                   <button
@@ -382,7 +416,7 @@ function openProbe(channel: ChannelView) {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="6" class="h-24 whitespace-normal">
+              <TableCell :colspan="healthEnabled ? 7 : 6" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}

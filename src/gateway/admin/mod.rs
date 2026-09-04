@@ -17,6 +17,7 @@ mod auth;
 mod billing;
 mod catalog;
 mod channels;
+mod health;
 mod logs;
 mod models;
 mod my_models;
@@ -48,6 +49,7 @@ use crate::{
 };
 
 use self::auth::{AdminAuth, ManagementIdentity};
+use super::failover::ChannelCooldowns;
 use super::logging::RequestLogWriter;
 use super::network::OutboundClients;
 use super::throttle::AuthThrottle;
@@ -135,6 +137,8 @@ pub(super) struct AdminDeps {
     pub(super) reload_lock: Arc<Mutex<()>>,
     /// 结算队列写入器；管理面重放成功后通过同一通知通道立即唤醒后台消费。
     pub(super) request_log_writer: RequestLogWriter,
+    /// 渠道冷却表：与协议面共享同一实例，健康端点只读展示当前冷却中的渠道。
+    pub(super) channel_cooldowns: ChannelCooldowns,
 }
 
 /// 开启 SQLite 写事务并立即取得写保留锁。
@@ -159,12 +163,14 @@ pub fn router(
     pool: SqlitePool,
     snapshot: crate::runtime::SnapshotHandle,
     db_path: std::path::PathBuf,
+    channel_cooldowns: ChannelCooldowns,
 ) -> Router {
     router_with_writer(
         pool.clone(),
         snapshot,
         db_path,
         RequestLogWriter::start(pool),
+        channel_cooldowns,
     )
 }
 
@@ -174,6 +180,7 @@ pub fn router_with_writer(
     snapshot: crate::runtime::SnapshotHandle,
     db_path: std::path::PathBuf,
     request_log_writer: RequestLogWriter,
+    channel_cooldowns: ChannelCooldowns,
 ) -> Router {
     // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
     // builder 事先记下错误时失败；本路径未设置会失败的选项。
@@ -192,10 +199,12 @@ pub fn router_with_writer(
         db_path,
         reload_lock: Arc::new(Mutex::new(())),
         request_log_writer,
+        channel_cooldowns,
     };
     let root_only = Router::new()
         .merge(channels::routes())
         .merge(channels::model_routes())
+        .merge(health::routes())
         .merge(models::order_routes())
         .merge(probes::routes())
         .merge(settings::routes())
