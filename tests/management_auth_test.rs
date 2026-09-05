@@ -63,6 +63,7 @@ async fn create_user(gw: &TestGateway, email: &str, rate_limit_rpm: Option<u64>)
 async fn login_user(gw: &TestGateway, email: &str) -> String {
     let response = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": email, "password": "password1" }))
         .send()
         .await
@@ -86,7 +87,7 @@ async fn create_user_token(gw: &TestGateway, session: &str, name: &str) -> Strin
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    response.json::<Value>().await.expect("令牌响应应可解析")["token_key"]
+    response.json::<Value>().await.expect("令牌响应应可解析")["plaintext_key"]
         .as_str()
         .expect("应有令牌 key")
         .to_string()
@@ -107,6 +108,7 @@ async fn seeded_root_can_login_and_logout() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let denied = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "root@localhost", "password": "password1" }))
         .send()
         .await
@@ -115,6 +117,7 @@ async fn seeded_root_can_login_and_logout() {
 
     let login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "root@localhost",
             "password": TEST_ROOT_PASSWORD
@@ -152,8 +155,15 @@ async fn seeded_root_can_login_and_logout() {
 async fn session_cookie_is_http_only_and_secure_for_https() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let login = |forwarded_proto: Option<&str>| {
+        // 同源守卫的 scheme 判定依赖 X-Forwarded-Proto：模拟 HTTPS 反代时
+        // Origin 也必须是 https 形态（反代场景下浏览器侧即 https 源）。
+        let origin = match forwarded_proto {
+            Some("https") => format!("https://{}", gw.admin_addr.expect("管理面应启用")),
+            _ => gw.admin_origin(),
+        };
         let mut request = reqwest::Client::new()
             .post(admin_url(&gw, "/login"))
+            .header(reqwest::header::ORIGIN, origin)
             .json(&json!({
                 "email": common::TEST_ROOT_EMAIL,
                 "password": common::TEST_ROOT_PASSWORD
@@ -164,6 +174,7 @@ async fn session_cookie_is_http_only_and_secure_for_https() {
         request
     };
 
+    // 纯 HTTP 部署（内网场景）：Cookie 不加 Secure 以便浏览器收存，签发即可用。
     let http = login(None).send().await.expect("HTTP 登录应可达");
     assert_eq!(http.status(), StatusCode::OK);
     let http_cookie = http
@@ -174,10 +185,14 @@ async fn session_cookie_is_http_only_and_secure_for_https() {
     assert!(http_cookie.contains("Path=/api"));
     assert!(http_cookie.contains("HttpOnly"));
     assert!(http_cookie.contains("SameSite=Strict"));
-    assert!(http_cookie.contains("; Secure"));
+    assert!(
+        !http_cookie.contains("; Secure"),
+        "纯 HTTP 请求签发的 Cookie 不应带 Secure"
+    );
     let body: Value = http.json().await.expect("登录响应应可解析");
     assert!(body.get("token").is_none());
 
+    // HTTPS 反代部署（X-Forwarded-Proto 可见）：Cookie 附带 Secure。
     let https = login(Some("https"))
         .send()
         .await
@@ -208,6 +223,47 @@ async fn session_cookie_is_http_only_and_secure_for_https() {
         .expect("登出应清理 Cookie");
     assert!(cleared.contains("Max-Age=0"));
     assert!(cleared.contains("; Secure"));
+}
+
+/// 登录端点的同源守卫：跨站无 Origin / 伪造 Origin 的登录被 403，
+/// 同源登录照常放行（与受保护写端点同一防线，堵 login-CSRF）。
+#[tokio::test]
+async fn login_requires_same_origin() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let body = json!({
+        "email": common::TEST_ROOT_EMAIL,
+        "password": common::TEST_ROOT_PASSWORD
+    });
+    let client = reqwest::Client::new();
+
+    // 缺 Origin：非浏览器直连默认被拒（契约变化：脚本调用需显式携带 Origin）。
+    let missing = client
+        .post(admin_url(&gw, "/login"))
+        .json(&body)
+        .send()
+        .await
+        .expect("登录请求应可达");
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+
+    // 跨站 Origin：被同源守卫拒绝。
+    let cross = client
+        .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, "https://evil.example")
+        .json(&body)
+        .send()
+        .await
+        .expect("登录请求应可达");
+    assert_eq!(cross.status(), StatusCode::FORBIDDEN);
+
+    // 同源 Origin：正常换取会话。
+    let same = client
+        .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
+        .json(&body)
+        .send()
+        .await
+        .expect("登录请求应可达");
+    assert_eq!(same.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -424,6 +480,7 @@ async fn update_me_email_and_password_with_current() {
 
     let old_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "root-renamed@example.com",
             "password": TEST_ROOT_PASSWORD
@@ -435,6 +492,7 @@ async fn update_me_email_and_password_with_current() {
 
     let new_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "root-renamed@example.com",
             "password": "password1"
@@ -485,6 +543,7 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
 
     let user_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "user@example.com", "password": "password1" }))
         .send()
         .await
@@ -493,6 +552,7 @@ async fn rbac_forbids_cross_role_writes_and_protects_last_root() {
 
     let admin_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "admin@example.com", "password": "password1" }))
         .send()
         .await
@@ -606,6 +666,7 @@ async fn malformed_management_credentials_do_not_throttle_login() {
 
     let login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": common::TEST_ROOT_EMAIL,
             "password": common::TEST_ROOT_PASSWORD
@@ -652,6 +713,7 @@ async fn user_rate_limit_and_stats_roundtrip() {
     // 用户登录并创建令牌
     let login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "rpm-user@example.com",
             "password": "password1"
@@ -677,7 +739,7 @@ async fn user_rate_limit_and_stats_roundtrip() {
     .await;
     assert_eq!(token_res.status(), StatusCode::CREATED);
     let token_view: Value = token_res.json().await.expect("json");
-    let token_key = token_view["token_key"]
+    let token_key = token_view["plaintext_key"]
         .as_str()
         .expect("token_key")
         .to_string();
@@ -753,6 +815,7 @@ async fn login_rejects_oversized_and_control_char_input() {
 
     let oversized = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": format!("{}@x.com", "a".repeat(400)),
             "password": "password1"
@@ -764,6 +827,7 @@ async fn login_rejects_oversized_and_control_char_input() {
 
     let control_chars = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "a\nb@c.com", "password": "password1" }))
         .send()
         .await
@@ -776,6 +840,7 @@ async fn login_rejects_oversized_and_control_char_input() {
 
     let oversized_password = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "root@localhost",
             "password": "x".repeat(200)
@@ -884,6 +949,7 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
 
     let login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "shared-rpm@example.com",
             "password": "password1"
@@ -911,7 +977,7 @@ async fn user_rate_limit_bucket_is_shared_across_tokens() {
         .await;
         assert_eq!(token_res.status(), StatusCode::CREATED);
         keys.push(
-            token_res.json::<Value>().await.expect("json")["token_key"]
+            token_res.json::<Value>().await.expect("json")["plaintext_key"]
                 .as_str()
                 .expect("token_key")
                 .to_string(),

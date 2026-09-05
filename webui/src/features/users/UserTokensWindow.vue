@@ -88,9 +88,9 @@ const toggleMutation = useMutation({
               <TableCell class="max-w-32 font-medium">
                 <span class="block truncate" :title="token.name">{{ token.name }}</span>
               </TableCell>
-              <!-- 接口只返回脱敏 key：运营按 id 操作，不需要（也拿不到）明文。 -->
+              <!-- 接口只返回指纹：运营按 id 操作，不需要（也拿不到）明文。 -->
               <TableCell>
-                <span class="text-fg-muted font-mono text-xs">{{ token.token_key }}</span>
+                <span class="text-fg-muted font-mono text-xs">******</span>
               </TableCell>
               <TableCell class="font-mono text-xs" data-testid="user-token-model-group">
                 <span class="inline-flex items-center gap-1">

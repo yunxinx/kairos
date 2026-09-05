@@ -261,7 +261,7 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建令牌");
-    let new_key = created["token_key"]
+    let new_key = created["plaintext_key"]
         .as_str()
         .expect("应返回生成的 key")
         .to_string();
@@ -271,20 +271,21 @@ async fn token_crud_roundtrip_and_immediate_effect() {
         new_key[3..].chars().all(|c| c.is_ascii_alphanumeric()),
         "随机部分应为大小写字母与数字"
     );
+    let new_id = created["id"].as_i64().expect("应返回库生成 id");
 
-    // 列表反映新令牌。
+    // 列表反映新令牌；明文 key 只在创建响应存在一次，列表读到的不是明文。
     let list: Value = admin_get(&gw, "/tokens")
         .await
         .json()
         .await
         .expect("令牌列表应可解析");
-    assert!(
-        list.as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["token_key"] == new_key),
-        "新建令牌应出现在列表"
-    );
+    let listed = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == new_id)
+        .expect("新建令牌应出现在列表");
+    assert_ne!(listed["token_key"], new_key, "列表不得回显明文 key");
 
     // 新建令牌在请求路径即时可用：充值（余额调整属 04 票，测试内用相对量原语
     // 绕过）后请求成功。新建令牌已有零额余额行，故可被 `adjust_balance` 充值。
@@ -303,7 +304,6 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     );
 
     // 删除后立即失效：请求路径认证失败（401），列表也移除。
-    let new_id = common::token_id(&gw.pool, &new_key).await;
     let resp = reqwest::Client::new()
         .delete(format!("{}/tokens/{new_id}", gw.admin_base_url()))
         .header(reqwest::header::COOKIE, &gw.session)
@@ -325,11 +325,7 @@ async fn token_crud_roundtrip_and_immediate_effect() {
         .await
         .expect("令牌列表应可解析");
     assert!(
-        !list
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["token_key"] == new_key),
+        !list.as_array().unwrap().iter().any(|t| t["id"] == new_id),
         "删除后令牌应移出列表"
     );
 }
@@ -350,10 +346,11 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建令牌");
-    let life_key = created["token_key"]
+    let life_key = created["plaintext_key"]
         .as_str()
         .expect("应返回生成的 key")
         .to_string();
+    let life_id = created["id"].as_i64().expect("应返回库生成 id");
     assert_eq!(created["enabled"], true);
     assert!(
         created["created_at"].as_i64().unwrap_or(0) > 0,
@@ -383,7 +380,7 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["token_key"] == life_key)
+        .find(|t| t["id"] == life_id)
         .cloned()
         .expect("新建令牌应在列表");
     assert!(
@@ -392,7 +389,6 @@ async fn token_lifecycle_fields_and_disable_take_effect() {
     );
 
     // 禁用后立即在认证处拒绝（401）。
-    let life_id = common::token_id(&gw.pool, &life_key).await;
     let resp = admin_put(
         &gw,
         &format!("/tokens/{life_id}"),
@@ -1642,7 +1638,7 @@ async fn runtime_resources_survive_process_restart() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建令牌");
-    let restart_key = created["token_key"]
+    let restart_key = created["plaintext_key"]
         .as_str()
         .expect("应返回生成的 key")
         .to_string();
@@ -1760,7 +1756,7 @@ async fn empty_db_bootstraps_via_admin_api() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建令牌");
-    let boot_key = created["token_key"]
+    let boot_key = created["plaintext_key"]
         .as_str()
         .expect("应返回生成的 key")
         .to_string();
@@ -1828,7 +1824,7 @@ async fn deleting_token_clears_balance_row() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建令牌");
-    let cycle_key = created["token_key"]
+    let cycle_key = created["plaintext_key"]
         .as_str()
         .expect("应返回生成的 key")
         .to_string();
@@ -2750,7 +2746,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
 
     let before: (i64,) =
         sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能读余额");
@@ -2768,7 +2764,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
     assert_eq!(settled["settled"], true);
     let after_settle: (i64,) =
         sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能读余额");
@@ -2795,7 +2791,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
     assert_eq!(waived["settled"], true);
     let after_waive: (i64,) =
         sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能读余额");
@@ -2833,6 +2829,7 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
 
     let login = reqwest::Client::new()
         .post(format!("{}/login", gw.admin_base_url()))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "historical-debt@example.com",
             "password": "password1"
@@ -3451,7 +3448,7 @@ async fn channel_probe_success_skips_billing_and_logging() {
 
     let balance_before: (i64,) =
         sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应有余额");
@@ -3501,7 +3498,7 @@ async fn channel_probe_success_skips_billing_and_logging() {
 
     let balance_after: (i64,) =
         sqlx::query_as("SELECT ub.balance_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应有余额");
@@ -4205,6 +4202,7 @@ async fn create_admin_session(gw: &TestGateway) -> String {
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let resp = reqwest::Client::new()
         .post(format!("{}/login", gw.admin_base_url()))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "health-admin@example.com",
             "password": "password1"

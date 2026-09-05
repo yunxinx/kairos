@@ -34,7 +34,7 @@ async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
          FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id \
          WHERE t.token_key = ?",
     )
-    .bind(key)
+    .bind(kairos::store::token_key_fingerprint(key))
     .fetch_one(&gw.pool)
     .await
     .expect("用户余额应存在")
@@ -44,7 +44,7 @@ async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
 async fn settled_micros(gw: &TestGateway, key: &str) -> i64 {
     wait_for_request_persistence(&gw.pool).await;
     sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-        .bind(key)
+        .bind(kairos::store::token_key_fingerprint(key))
         .fetch_one(&gw.pool)
         .await
         .expect("令牌累计结算应存在")
@@ -422,7 +422,7 @@ async fn actual_cost_overrun_isolated_without_debt() {
         "SELECT ub.balance_usd_micros FROM tokens t \
          JOIN user_balance ub ON ub.user_id = t.user_id WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("用户余额应存在");
@@ -748,7 +748,7 @@ async fn plan_discount_applies_to_charge_and_log() {
         .expect("应能充值");
     sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
         .bind(user.id)
-        .bind(TEST_TOKEN_KEY)
+        .bind(common::fingerprint(TEST_TOKEN_KEY))
         .execute(&mut *conn)
         .await
         .expect("应能把测试令牌改挂折扣用户");
@@ -808,7 +808,7 @@ async fn zero_discount_allows_zero_balance_and_logs_settled() {
         .expect("应能设置免费套餐");
     sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
         .bind(user.id)
-        .bind(TEST_TOKEN_KEY)
+        .bind(common::fingerprint(TEST_TOKEN_KEY))
         .execute(&mut *conn)
         .await
         .expect("应能把测试令牌改挂免费用户");
@@ -873,7 +873,7 @@ async fn discounted_max_tokens_estimate_uses_discounted_amount() {
         .expect("应能充值");
     sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
         .bind(user.id)
-        .bind(TEST_TOKEN_KEY)
+        .bind(common::fingerprint(TEST_TOKEN_KEY))
         .execute(&mut *conn)
         .await
         .expect("应能改挂令牌");

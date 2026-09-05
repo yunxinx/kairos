@@ -501,6 +501,14 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
             crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
         )));
     }
+    if channel.request_timeout_ms == 0
+        || channel.request_timeout_ms > crate::store::resources::MAX_REQUEST_TIMEOUT_MS
+    {
+        return Err(AdminError::InvalidBody(format!(
+            "request_timeout_ms 必须在 1..={} 之间",
+            crate::store::resources::MAX_REQUEST_TIMEOUT_MS
+        )));
+    }
     if channel.max_retries > crate::store::resources::MAX_CHANNEL_RETRIES {
         return Err(AdminError::InvalidBody(format!(
             "max_retries 不能超过 {}",

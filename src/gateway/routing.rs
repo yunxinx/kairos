@@ -155,6 +155,7 @@ mod tests {
             models: models.iter().map(|s| s.to_string()).collect(),
             model_aliases: Default::default(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),

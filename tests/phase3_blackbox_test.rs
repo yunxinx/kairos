@@ -420,7 +420,7 @@ async fn gemini_passthrough_zero_rewrite_and_alias_forces_ir() {
          JOIN token_balance tb ON tb.token_key = t.token_key \
          WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询余额与结算");

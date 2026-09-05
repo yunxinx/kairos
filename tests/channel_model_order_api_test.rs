@@ -95,6 +95,7 @@ async fn create_admin_session(gw: &TestGateway) -> String {
 
     let response = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "order-admin@example.com",
             "password": "password1"

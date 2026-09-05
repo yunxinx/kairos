@@ -42,6 +42,7 @@ async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Resp
 async fn login(gw: &TestGateway, email: &str, password: &str) -> String {
     let resp = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": email, "password": password }))
         .send()
         .await
@@ -188,7 +189,10 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
     .await;
     assert_eq!(token_resp.status(), StatusCode::CREATED);
     let token: Value = token_resp.json().await.expect("令牌应可解析");
-    let key = token["token_key"].as_str().expect("应有 key").to_string();
+    let key = token["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
     let token_row_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
@@ -340,7 +344,10 @@ async fn admin_tokens_follow_plan_group_allowlist() {
     .await;
     assert_eq!(created_token.status(), StatusCode::CREATED);
     let token: Value = created_token.json().await.expect("令牌应可解析");
-    let key = token["token_key"].as_str().expect("应有 key").to_string();
+    let key = token["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
     let token_id = token["id"].as_i64().expect("应有 id");
 
     admin_json(

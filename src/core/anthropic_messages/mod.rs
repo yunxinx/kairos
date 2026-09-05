@@ -1051,6 +1051,27 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if !request.stop.is_empty() {
         obj.insert("stop_sequences".into(), json!(request.stop));
     }
+    // Anthropic 无以下采样与输出控制参数：显式丢弃并记 warning（不静默吞掉，
+    // 与 responses/gemini 出站面的同类丢弃同规）。
+    for (feature, present) in [
+        (warning_feature::N, request.n.is_some()),
+        (warning_feature::SEED, request.seed.is_some()),
+        (
+            warning_feature::PRESENCE_PENALTY,
+            request.presence_penalty.is_some(),
+        ),
+        (
+            warning_feature::FREQUENCY_PENALTY,
+            request.frequency_penalty.is_some(),
+        ),
+    ] {
+        if present {
+            warnings.push(Warning::unsupported(
+                feature,
+                format!("Anthropic 无 {feature} 承载，已丢弃"),
+            ));
+        }
+    }
     // JSON 结构化输出在 Anthropic 无请求侧承载（官方走 tools 变体，未实现）；
     // type=text 等价于缺省（无输出形状约束），不告警。
     if let Some(response_format) = &request.response_format
@@ -2106,6 +2127,11 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
     let usage = wire.usage.map(convert_usage).unwrap_or_default();
     let raw = wire.stop_reason.clone();
     let unified = map_stop_reason(raw.as_deref());
+    let warnings = if raw.as_deref() == Some("pause_turn") {
+        vec![pause_turn_warning()]
+    } else {
+        Vec::new()
+    };
 
     Ok(ChatResponse {
         id: wire.id.unwrap_or_default(),
@@ -2114,7 +2140,7 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
         finish_reason: FinishReason { unified, raw },
         usage,
         provider_metadata: HashMap::new(),
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -2197,12 +2223,24 @@ fn convert_usage(wire: WireUsage) -> Usage {
 /// unified stop reason 映射（Anthropic stop_reason 值）。
 fn map_stop_reason(raw: Option<&str>) -> FinishReasonUnified {
     match raw {
-        Some("end_turn") | Some("stop_sequence") | Some("pause_turn") => FinishReasonUnified::Stop,
+        // `pause_turn` 是暂停待续而非正常结束：经网关无法向下游表达续传语义，
+        // 折叠为 Other（直通路径原样透传 raw），由调用方附 compatibility warning。
+        Some("end_turn") | Some("stop_sequence") => FinishReasonUnified::Stop,
+        Some("pause_turn") => FinishReasonUnified::Other,
         Some("max_tokens") | Some("model_context_window_exceeded") => FinishReasonUnified::Length,
         Some("refusal") => FinishReasonUnified::ContentFilter,
         Some("tool_use") => FinishReasonUnified::ToolCalls,
         _ => FinishReasonUnified::Other,
     }
+}
+
+/// `pause_turn` 终态的告警：经 IR 的响应无法承载续传语义，下游按普通流结束
+/// 处理；需要续传能力的客户端应使用直通路径（同协议同渠道）。
+fn pause_turn_warning() -> Warning {
+    Warning::unsupported(
+        warning_feature::PAUSE_TURN,
+        "Anthropic pause_turn（暂停待续）经网关无法续传，已按流结束处理",
+    )
 }
 
 /// 把 IR unified finish reason 映射为 Anthropic stop_reason。
@@ -2821,6 +2859,32 @@ pub fn encode_model_list(ids: &[String]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// `pause_turn` 终态：unified 归为 Other（非正常结束）并携带
+    /// pause_turn warning，下游可观测到续传语义的丢失。
+    #[test]
+    fn pause_turn_decodes_to_other_with_warning() {
+        let wire = json!({
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{ "type": "text", "text": "partial" }],
+            "stop_reason": "pause_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        });
+        let response = decode_response(&wire).expect("pause_turn 响应应可解码");
+        assert_eq!(
+            response.finish_reason.unified,
+            crate::core::ir::FinishReasonUnified::Other
+        );
+        assert_eq!(response.finish_reason.raw.as_deref(), Some("pause_turn"));
+        assert!(matches!(
+            response.warnings.as_slice(),
+            [Warning::Unsupported { feature, .. }] if feature == warning_feature::PAUSE_TURN
+        ));
+    }
+
     use super::*;
     use crate::core::stream::StreamAccumulator;
     use crate::core::testing::frames_to_snapshot;

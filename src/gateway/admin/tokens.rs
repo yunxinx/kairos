@@ -407,22 +407,35 @@ fn generate_token_key() -> String {
     format!("{TOKEN_KEY_PREFIX}{random_part}")
 }
 
+/// 创建响应：TokenView 之上附带一次性的明文 key。
+///
+/// 库内与后续所有读取面只存指纹；本字段是明文唯一的出现点，前端应即时展示
+/// 或复制，之后无法再从任何接口取回。
+#[derive(Debug, Serialize)]
+pub(super) struct TokenCreatedView {
+    #[serde(flatten)]
+    view: TokenView,
+    plaintext_key: String,
+}
+
 pub(super) async fn create_token(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<TokenCreate>, axum::extract::rejection::JsonRejection>,
-) -> Result<(axum::http::StatusCode, Json<TokenView>), AdminError> {
+) -> Result<(axum::http::StatusCode, Json<TokenCreatedView>), AdminError> {
     let create = body.map_err(AdminError::bad_body)?.0;
-    let token = Token {
-        token_key: {
-            let snapshot = deps.snapshot.read().await;
-            loop {
-                let candidate = generate_token_key();
-                if !snapshot.tokens.contains_key(&candidate) {
-                    break candidate;
-                }
+    let plaintext_key = {
+        let snapshot = deps.snapshot.read().await;
+        loop {
+            let candidate = generate_token_key();
+            let fingerprint = store::token_key_fingerprint(&candidate);
+            if !snapshot.tokens.contains_key(&fingerprint) {
+                break candidate;
             }
-        },
+        }
+    };
+    let token = Token {
+        token_key: store::token_key_fingerprint(&plaintext_key),
         name: create.name,
         // 新令牌尚无累计结算，因此初始余额与累计上限数值相同。
         limit_usd_micros: create.balance_usd_micros,
@@ -444,9 +457,13 @@ pub(super) async fn create_token(
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_token_record_by_key(&deps, &token.token_key).await?;
+    let view = token_view(&deps.pool, created).await?;
     Ok((
         axum::http::StatusCode::CREATED,
-        Json(token_view(&deps.pool, created).await?),
+        Json(TokenCreatedView {
+            view,
+            plaintext_key,
+        }),
     ))
 }
 

@@ -7,6 +7,7 @@ use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, Path, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -62,7 +63,12 @@ pub(super) fn signed_in_routes() -> Router<AdminDeps> {
 }
 
 pub(super) fn public_routes() -> Router<AdminDeps> {
-    Router::new().route("/login", post(login))
+    // 登录虽免认证，但写语义同权暴露 login-CSRF 面：与受保护端点一样要求
+    // 同源浏览器信号（SPA 登录请求自带 Origin；非浏览器脚本需显式携带）。
+    Router::new().route(
+        "/login",
+        post(login).route_layer(middleware::from_fn(super::auth::same_origin_guard)),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,7 +115,7 @@ struct LoginView {
 async fn login(
     State(deps): State<AdminDeps>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Result<Json<LoginBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<impl IntoResponse, AdminError> {
     let snapshot = deps.snapshot.read().await;
@@ -174,7 +180,16 @@ async fn login(
         ),
     )
     .await;
-    let secure = "; Secure";
+    // Secure 按请求协议条件附加：HTTPS 反代部署照常加固；纯 HTTP 内网部署
+    // 可用，但会话明文可被同网段观测，签发时告警一次（登录频率天然限频）。
+    let secure = if super::auth::request_is_secure(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
+    if secure.is_empty() {
+        tracing::warn!("管理会话 Cookie 未加 Secure（请求非 HTTPS）：明文传输下会话可被同网段窃听");
+    }
     let cookie = format!(
         "{SESSION_COOKIE}={token}; Path=/api; HttpOnly; SameSite=Strict{secure}; Max-Age={}",
         (expires_at - now).max(0) / 1000
@@ -212,7 +227,11 @@ async fn logout(
     users::revoke_session(&deps.pool, provided)
         .await
         .map_err(AdminError::Store)?;
-    let secure = "; Secure";
+    let secure = if super::auth::request_is_secure(request.headers()) {
+        "; Secure"
+    } else {
+        ""
+    };
     let clear = HeaderValue::from_str(&format!(
         "{SESSION_COOKIE}=; Path=/api; HttpOnly; SameSite=Strict{secure}; Max-Age=0"
     ))

@@ -47,7 +47,7 @@ async fn seed_request_log(gw: &TestGateway, created_at: i64, settled: bool, note
     )
     .bind(created_at)
     .bind(note)
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .bind(settled as i64)
     .execute(&gw.pool)
     .await
@@ -76,6 +76,7 @@ async fn cleanup_removes_only_old_settled_rows() {
     assert_eq!(admin.status(), StatusCode::CREATED);
     let admin_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "cleanup-admin@example.com",
             "password": "password1"

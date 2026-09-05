@@ -168,7 +168,7 @@ async fn streaming_usage_is_billed() {
          JOIN request_log ON request_log.token_key = t.token_key \
          WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询余额与日志");
@@ -195,7 +195,7 @@ async fn streaming_upstream_error_releases_reservation_without_charge() {
          JOIN token_balance tb ON tb.token_key = t.token_key \
          WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("令牌余额应存在");
@@ -265,7 +265,7 @@ async fn midstream_error_delivers_error_frame_and_settles() {
          JOIN request_log rl ON rl.token_key = t.token_key \
          WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应有结算日志");
@@ -374,7 +374,7 @@ async fn idle_timeout_terminates_stream_after_established() {
     let row: (i64, i64) = sqlx::query_as(
         "SELECT cost_usd_micros, usage_reported FROM request_log WHERE token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应有结算日志");
@@ -490,7 +490,7 @@ async fn downstream_disconnect_aborts_upstream_and_releases_reservation() {
         settled = sqlx::query_as(
             "SELECT cost_usd_micros, usage_reported FROM request_log WHERE token_key = ?",
         )
-        .bind(TEST_TOKEN_KEY)
+        .bind(common::fingerprint(TEST_TOKEN_KEY))
         .fetch_optional(&gw.pool)
         .await
         .expect("应能查询日志");
@@ -545,7 +545,7 @@ async fn downstream_disconnect_without_abort_keeps_consuming() {
     for _ in 0..200 {
         let rows: Vec<i64> =
             sqlx::query_scalar("SELECT cost_usd_micros FROM request_log WHERE token_key = ?")
-                .bind(TEST_TOKEN_KEY)
+                .bind(common::fingerprint(TEST_TOKEN_KEY))
                 .fetch_all(&gw.pool)
                 .await
                 .expect("应能查询日志");
@@ -703,7 +703,7 @@ async fn unterminated_stream_delivers_error_frame_and_settles() {
         "SELECT rl.cost_usd_micros FROM tokens t \
          JOIN request_log rl ON rl.token_key = t.token_key WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应有结算日志");

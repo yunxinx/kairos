@@ -537,6 +537,7 @@ mod tests {
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: resources::DEFAULT_MODEL_GROUP.to_string(),

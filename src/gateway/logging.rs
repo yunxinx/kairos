@@ -293,11 +293,8 @@ async fn queue_request_log_inner(
         settlement_error,
         upstream_reached: draft.upstream_reached,
     };
-    if let Some(attempt_id) = pending.log.billing_attempt_id.as_deref() {
-        // 先把完整结果写入预留行，再写 outbox。两步任一步骤后进程崩溃时，
-        // 恢复任务都能从同一条预留重建原始日志，而不是用空结果覆盖它。
-        store::persist_billing_attempt_result(&deps.pool, attempt_id, &pending).await?;
-    }
+    // 结果与预留状态变更在同一事务原子落库；结果进 outbox 后，预留行不再
+    // 持有载荷副本，崩溃恢复从预留重建的只有「无结果按零费用释放」一种形态。
     store::enqueue_pending_request_log(&deps.pool, pending).await?;
     deps.request_log_writer.wake();
     Ok(())
@@ -308,6 +305,8 @@ const REQUEST_LOG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// 只有超过正常请求总时限仍未写入结果的预留才进入恢复，给响应路径留下
 /// 足够时间处理短暂的数据库写锁或调度延迟。
 const BILLING_RECOVERY_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+/// 终态预留行的清理节奏：随写入循环节流到 10 分钟一次，而非每秒全量扫描。
+const RESERVATION_PURGE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 async fn run_request_log_writer(
     pool: sqlx::SqlitePool,
@@ -317,6 +316,9 @@ async fn run_request_log_writer(
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     retry.tick().await;
     let mut usage_warning_gate = UsageWarningGate::new();
+    let mut purge_tick = tokio::time::interval(RESERVATION_PURGE_INTERVAL);
+    purge_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    purge_tick.tick().await;
     loop {
         tokio::select! {
             wake = wake_receiver.recv() => {
@@ -325,6 +327,10 @@ async fn run_request_log_writer(
                 }
             }
             _ = retry.tick() => {}
+            _ = purge_tick.tick() => {
+                purge_terminal_reservations(&pool).await;
+                continue;
+            }
         }
         if let Err(err) = store::recover_orphan_billing_attempts(
             &pool,
@@ -338,6 +344,15 @@ async fn run_request_log_writer(
         if let Err(err) = drain_pending_request_logs(&pool, &mut usage_warning_gate).await {
             tracing::error!(error = %err, "后台请求日志持久化失败，将稍后重试");
         }
+    }
+}
+
+/// 按保留期分批清理终态预留行；失败只记 error，下一轮再试。
+async fn purge_terminal_reservations(pool: &sqlx::SqlitePool) {
+    let now = unix_millis();
+    let cutoff = now.saturating_sub(store::BILLING_RESERVATION_RETENTION_MILLIS);
+    if let Err(err) = store::purge_terminal_billing_reservations_before(pool, cutoff).await {
+        tracing::error!(error = %err, "终态计费预留清理失败，将稍后重试");
     }
 }
 

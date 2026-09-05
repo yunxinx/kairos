@@ -57,6 +57,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             models: vec![TEST_MODEL.to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -80,6 +81,7 @@ fn two_channel_seed(bases: &[String]) -> common::Seed {
             models: vec![TEST_MODEL.to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -110,6 +112,7 @@ fn three_channel_seed(bases: &[String]) -> common::Seed {
         models: vec![TEST_MODEL.to_string()],
         model_aliases: Default::default(),
         timeout_ms: 1000,
+        request_timeout_ms: 120_000,
         max_retries: 0,
         enabled: true,
         model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -140,6 +143,35 @@ async fn retryable_429_fails_over_to_next_channel() {
     assert_eq!(body["choices"][0]["message"]["content"], "ok");
 
     // 两个渠道都被请求过（首渠道失败一次，次渠道成功一次）。
+    assert_eq!(ups[0].received().len(), 1, "首渠道应收一次请求");
+    assert_eq!(ups[1].received().len(), 1, "次渠道应收一次请求");
+}
+
+/// 渠道级预首字节总时限：首渠道配置短预算，挂起上游在预算内超时并
+/// failover；次渠道按自己的预算重新起算并成功——预算按渠道重锚，
+/// 而非全请求共享一个全局池。
+#[tokio::test]
+async fn channel_request_budget_reanchors_on_failover() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].request_timeout_ms = 300;
+        seed.channels[0].timeout_ms = 1000;
+        seed.channels[1].max_retries = 0;
+        seed
+    })
+    .await;
+    ups[0].set_behavior(UpstreamBehavior::Hang);
+    ups[1].set_behavior(UpstreamBehavior::Json(ok_response()));
+
+    let started = std::time::Instant::now();
+    let resp = send_completion(&gw.base_url(), TEST_MODEL).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "failover 后应成功");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "首渠道应在短预算内超时而非等待全局长时限，实际 {:?}",
+        started.elapsed()
+    );
+
     assert_eq!(ups[0].received().len(), 1, "首渠道应收一次请求");
     assert_eq!(ups[1].received().len(), 1, "次渠道应收一次请求");
 }
@@ -456,7 +488,7 @@ async fn pinned_group_filters_after_ordering_without_reordering() {
     .await
     .expect("应能写模型组");
     sqlx::query("UPDATE tokens SET model_group = 'pinned' WHERE token_key = ?")
-        .bind(TEST_TOKEN_KEY)
+        .bind(common::fingerprint(TEST_TOKEN_KEY))
         .execute(&mut *conn)
         .await
         .expect("应能改测试令牌模型组");
@@ -584,7 +616,7 @@ async fn failover_bills_succeeding_channel_price_once() {
     let balance: (i64, i64) = sqlx::query_as(
         "SELECT ub.balance_usd_micros, tb.settled_usd_micros FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id JOIN token_balance tb ON tb.token_key = t.token_key WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("令牌余额应存在");

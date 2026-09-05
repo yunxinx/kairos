@@ -62,7 +62,7 @@ async fn responses_passthrough_forwards_and_bills() {
     common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能查询计费");
@@ -366,7 +366,7 @@ async fn responses_passthrough_streaming_bills() {
     common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能查询计费");

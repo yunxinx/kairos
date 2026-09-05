@@ -108,6 +108,9 @@ pub mod warning_feature {
     pub const PARALLEL_TOOL_CALLS: &str = "parallel_tool_calls";
     /// 请求级白名单外的顶层未知字段在目标协议无法表达，已丢弃。
     pub const UNKNOWN_FIELDS: &str = "unknown_fields";
+    /// Anthropic `pause_turn`（暂停待续）终态经 IR 无法承载续传语义，按
+    /// 普通流结束处理。
+    pub const PAUSE_TURN: &str = "pause_turn";
     /// 缓存断点超过目标协议预算（Anthropic 上限 4 个），按 render order
     /// 保留靠后者、牺牲最早者。
     pub const CACHE_BREAKPOINT: &str = "cache_breakpoint";

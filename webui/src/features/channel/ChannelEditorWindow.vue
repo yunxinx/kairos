@@ -46,7 +46,7 @@ const PROTOCOLS: Protocol[] = ['openai_chat', 'openai_responses', 'anthropic_mes
 type EditorTab = 'basic' | 'advanced';
 
 /** 高级设置页签内的字段：保存校验失败时需切回该页签才能看到错误。 */
-const ADVANCED_FIELDS: ReadonlySet<string> = new Set(['timeoutMs', 'maxRetries']);
+const ADVANCED_FIELDS: ReadonlySet<string> = new Set(['timeoutMs', 'requestTimeoutMs', 'maxRetries']);
 
 /** 两列网格末格留给 +N；露出奇数个 chip，避免把编辑器撑高。 */
 const EDITOR_MODEL_VISIBLE_COUNT = 9;
@@ -92,6 +92,7 @@ const nameInputId = `channel-editor-name-${uid}`;
 const protocolInputId = `channel-editor-protocol-${uid}`;
 const baseUrlInputId = `channel-editor-base-url-${uid}`;
 const timeoutMsInputId = `channel-editor-timeout-ms-${uid}`;
+const requestTimeoutMsInputId = `channel-editor-request-timeout-ms-${uid}`;
 const maxRetriesInputId = `channel-editor-max-retries-${uid}`;
 const enabledInputId = `channel-editor-enabled-${uid}`;
 const groupInputId = `channel-editor-group-${uid}`;
@@ -198,6 +199,7 @@ const initialValues = {
   models: props.initial ? [...props.initial.models] : ([] as string[]),
   aliases: props.initial ? { ...props.initial.model_aliases } : ({} as Record<string, string>),
   timeoutMs: String(props.initial?.timeout_ms ?? '30000'),
+  requestTimeoutMs: String(props.initial?.request_timeout_ms ?? '120000'),
   maxRetries: String(props.initial?.max_retries ?? '0'),
   enabled: props.initial?.enabled ?? true,
   modelGroup: props.initial?.model_group ?? DEFAULT_MODEL_GROUP,
@@ -217,6 +219,7 @@ const editorModels = ref<string[]>(initialValues.models);
 /** 别名映射草稿（别名 → 主模型名）：仅在同步表格中编辑。 */
 const editorAliasesMap = ref<Record<string, string>>(initialValues.aliases);
 const editorTimeoutMs = ref(initialValues.timeoutMs);
+const editorRequestTimeoutMs = ref(initialValues.requestTimeoutMs);
 const editorMaxRetries = ref(initialValues.maxRetries);
 const editorEnabled = ref(initialValues.enabled);
 const editorGroup = ref(initialValues.modelGroup);
@@ -239,6 +242,7 @@ const dirty = computed(
     !sameModelSet(editorModels.value, initialValues.models) ||
     !sameAliasMap(editorAliasesMap.value, initialValues.aliases) ||
     editorTimeoutMs.value !== initialValues.timeoutMs ||
+    editorRequestTimeoutMs.value !== initialValues.requestTimeoutMs ||
     editorMaxRetries.value !== initialValues.maxRetries ||
     editorEnabled.value !== initialValues.enabled ||
     editorGroup.value !== initialValues.modelGroup ||
@@ -494,6 +498,11 @@ function handleSave(removalConfirmed = false) {
       rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
     },
     {
+      name: 'requestTimeoutMs',
+      value: editorRequestTimeoutMs.value,
+      rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+    },
+    {
       name: 'maxRetries',
       value: editorMaxRetries.value,
       rules: [{ kind: 'required' }, { kind: 'uint' }],
@@ -528,8 +537,9 @@ function handleSave(removalConfirmed = false) {
     seenKeyNames.add(name);
   }
   const timeoutMs = parseOptionalUint(editorTimeoutMs.value);
+  const requestTimeoutMs = parseOptionalUint(editorRequestTimeoutMs.value);
   const maxRetries = parseOptionalUint(editorMaxRetries.value);
-  if (timeoutMs === null || maxRetries === null) {
+  if (timeoutMs === null || requestTimeoutMs === null || maxRetries === null) {
     return;
   }
   const keys = editorKeys.value.map(editorToKey);
@@ -543,6 +553,7 @@ function handleSave(removalConfirmed = false) {
     models,
     model_aliases: modelAliases,
     timeout_ms: timeoutMs,
+    request_timeout_ms: requestTimeoutMs,
     max_retries: maxRetries,
     enabled: editorEnabled.value,
     model_group: editorGroup.value,
@@ -1025,6 +1036,24 @@ function handleSave(removalConfirmed = false) {
                     :invalid="invalid"
                     :hint-id="hintId"
                     v-on="fieldInputHandlers('timeoutMs')"
+                  />
+                </template>
+              </FormField>
+              <FormField
+                field-name="requestTimeoutMs"
+                :label="t('channel.requestTimeoutMs')"
+                :input-id="requestTimeoutMsInputId"
+                :error="fieldError('requestTimeoutMs')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    :id="requestTimeoutMsInputId"
+                    v-model="editorRequestTimeoutMs"
+                    type="text"
+                    inputmode="numeric"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('requestTimeoutMs')"
                   />
                 </template>
               </FormField>

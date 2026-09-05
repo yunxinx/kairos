@@ -340,6 +340,7 @@ async fn session_identity_is_scoped_by_user() {
 
     let login = reqwest::Client::new()
         .post(format!("{}/login", gw.admin_base_url()))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "email": "cache-scope@example.com",
             "password": "password1"
@@ -362,7 +363,7 @@ async fn session_identity_is_scoped_by_user() {
         .await
         .expect("令牌创建应可达");
     assert_eq!(token.status(), reqwest::StatusCode::CREATED);
-    let user_token = token.json::<Value>().await.expect("令牌应可解析")["token_key"]
+    let user_token = token.json::<Value>().await.expect("令牌应可解析")["plaintext_key"]
         .as_str()
         .expect("应有令牌 key")
         .to_string();

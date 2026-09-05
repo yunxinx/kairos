@@ -485,6 +485,12 @@ fn raw_sse_response(body: Body) -> Response {
 /// 测试用下游令牌 key。
 pub const TEST_TOKEN_KEY: &str = "sk-test-token";
 
+/// 明文 key 的库内指纹形态：直连 SQL 断言绑定库列前统一经此换算。
+/// HTTP 认证头仍用明文，不经过本函数。
+pub fn fingerprint(key: &str) -> String {
+    kairos::store::token_key_fingerprint(key)
+}
+
 /// 测试用可用模型。
 pub const TEST_MODEL: &str = "gpt-4o";
 
@@ -538,6 +544,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
                 .into_iter()
                 .collect(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -605,10 +612,12 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         inserted.push((id, channel));
     }
     for token in &seed.tokens {
+        // 种子令牌的 key 以指纹形态入库：与生产库一致，认证以指纹查找。
+        let stored_key = store::token_key_fingerprint(&token.token_key);
         resources::insert_token(
             &mut conn,
             &Token {
-                token_key: token.token_key.clone(),
+                token_key: stored_key.clone(),
                 name: token.name.clone(),
                 limit_usd_micros: token
                     .limit_usd
@@ -625,7 +634,7 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         let initial_balance_usd_micros = (token.balance_usd * 1_000_000.0).round() as i64;
         store::initialize_token_settlement(
             &mut conn,
-            &token.token_key,
+            &stored_key,
             initial_balance_usd_micros,
             unix_millis(),
         )
@@ -676,10 +685,12 @@ pub const TEST_ROOT_PASSWORD: &str = "sk-admin-test";
 
 /// 按 key 查出令牌的库生成 id。
 ///
-/// 管理 API 按 id 寻址（明文 key 只对所有者返回），而多数测试手上只有播种时的 key。
+/// 管理 API 按 id 寻址（明文 key 只在创建响应返回一次），而多数测试手上只有
+/// 播种时的 key；库内以指纹存储，查找前先换算。
 pub async fn token_id(pool: &sqlx::SqlitePool, token_key: &str) -> i64 {
+    let fingerprint = store::token_key_fingerprint(token_key);
     sqlx::query_scalar("SELECT id FROM tokens WHERE token_key = ?")
-        .bind(token_key)
+        .bind(fingerprint)
         .fetch_one(pool)
         .await
         .expect("令牌应存在")
@@ -916,8 +927,13 @@ impl TestGateway {
 
 /// 用测试 root 邮箱密码换会话。管理面必须已经完成播种。
 async fn login_root_session(admin_base: &str) -> String {
+    // 登录端点要求同源浏览器信号；测试以自身 base 作为 Origin。
+    let origin = admin_base
+        .strip_suffix("/api")
+        .expect("管理基址应含 /api 前缀");
     let resp = reqwest::Client::new()
         .post(format!("{admin_base}/login"))
+        .header(reqwest::header::ORIGIN, origin)
         .json(&serde_json::json!({
             "email": TEST_ROOT_EMAIL,
             "password": TEST_ROOT_PASSWORD

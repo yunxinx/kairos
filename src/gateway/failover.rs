@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::config::Protocol;
 use crate::store::channel_keys::eligible_channel_keys;
+use crate::store::resources::MAX_REQUEST_TIMEOUT_MS;
 use crate::store::resources::{ChannelRecord, StoredChannelKey};
 
 use super::{protocol, routing};
@@ -314,8 +315,14 @@ pub(super) struct FailoverPolicy<'a> {
     pub(super) key_cooldowns: &'a KeyCooldowns,
     /// 渠道域跨请求冷却：循环入口跳过冷却中的渠道，失败记账、成功清零。
     pub(super) channel_cooldowns: &'a ChannelCooldowns,
-    /// 从入站开始计算的绝对截止时刻；所有渠道与密钥共享，切换不会续期。
-    pub(super) deadline: tokio::time::Instant,
+}
+
+/// 渠道级预首字节预算：`request_timeout_ms` 夹到合法区间，至少 1ms。
+///
+/// 预算在渠道入口重锚（连接、响应头、流首 peek、同渠道重试退避共享该渠道
+/// 的预算），换渠道 / 统一模型换成员时按新渠道重新起算。
+pub(super) fn channel_request_budget(channel: &crate::store::resources::Channel) -> Duration {
+    Duration::from_millis(channel.request_timeout_ms.clamp(1, MAX_REQUEST_TIMEOUT_MS))
 }
 
 /// 在请求总截止时刻内完成一次退避。返回 false 表示总预算已耗尽，调用方必须
@@ -335,7 +342,11 @@ pub(super) async fn run_failover<'a, A, L>(
     policy: FailoverPolicy<'_>,
 ) -> Response
 where
-    A: FnMut(&'a ChannelRecord, &'a StoredChannelKey) -> BoxFuture<'a, Outbound>,
+    A: FnMut(
+        &'a ChannelRecord,
+        &'a StoredChannelKey,
+        tokio::time::Instant,
+    ) -> BoxFuture<'a, Outbound>,
     L: Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()>,
 {
     let mut last_failure: Option<FinalFailure> = None;
@@ -357,6 +368,11 @@ where
         let Some(first_key_id) = route.selected_key_id(record.id) else {
             continue;
         };
+        // 预首字节预算在本渠道入口重锚：同渠道的密钥轮换与重试退避共享，
+        // 切换到下一渠道时由新渠道的 request_timeout_ms 重新起算。
+        let channel_deadline = tokio::time::Instant::now()
+            .checked_add(channel_request_budget(&record.channel))
+            .unwrap_or_else(tokio::time::Instant::now);
         // 轮换池：启用且允许该模型的密钥按存储顺序，旋转到粘性首选开头。
         // 准入已保证非空；快照在准入后变更时兜底跳过该渠道。
         let now = Instant::now();
@@ -374,18 +390,18 @@ where
         let mut retries_used = 0u32;
 
         loop {
-            if tokio::time::Instant::now() >= policy.deadline {
+            if tokio::time::Instant::now() >= channel_deadline {
                 last_failure = Some(FinalFailure {
                     channel: record.channel.name.clone(),
                     status: Some(504),
-                    message: "请求总时限已耗尽".to_string(),
+                    message: "渠道请求时限已耗尽".to_string(),
                     key_name: rotation.current().name.clone(),
                 });
                 break 'channels;
             }
             rotation.mark_attempted();
             let key = rotation.current();
-            match attempt(record, key).await {
+            match attempt(record, key, channel_deadline).await {
                 Outbound::Success(response) => {
                     policy.key_cooldowns.clear(key.id);
                     policy.channel_cooldowns.clear(record.id);
@@ -483,14 +499,14 @@ where
                     if matches!(advanced, Rotation::Fresh) {
                         if !wait_for_retry(
                             retry_delay(retries_used, retry_after, policy.retry_backoff),
-                            policy.deadline,
+                            channel_deadline,
                         )
                         .await
                         {
                             last_failure = Some(FinalFailure {
                                 channel,
                                 status: Some(504),
-                                message: "请求总时限已耗尽".to_string(),
+                                message: "渠道请求时限已耗尽".to_string(),
                                 key_name: key.name.clone(),
                             });
                             break 'channels;
@@ -513,14 +529,14 @@ where
                     }
                     if !wait_for_retry(
                         retry_delay(retries_used, retry_after, policy.retry_backoff),
-                        policy.deadline,
+                        channel_deadline,
                     )
                     .await
                     {
                         last_failure = Some(FinalFailure {
                             channel,
                             status: Some(504),
-                            message: "请求总时限已耗尽".to_string(),
+                            message: "渠道请求时限已耗尽".to_string(),
                             key_name: key.name.clone(),
                         });
                         break 'channels;
@@ -987,6 +1003,7 @@ mod tests {
                 models: vec!["m".to_string()],
                 model_aliases: Default::default(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries,
                 enabled: true,
                 model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -1029,7 +1046,7 @@ mod tests {
             &route,
             &records,
             "m",
-            move |_record, key| {
+            move |_record, key, _channel_deadline| {
                 seen_for_attempt.lock().unwrap().push(key.name.clone());
                 let key_name = key.name.clone();
                 Box::pin(async move {
@@ -1051,7 +1068,6 @@ mod tests {
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
                 key_cooldowns: &KeyCooldowns::new(),
                 channel_cooldowns: &ChannelCooldowns::new(),
-                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;
@@ -1075,7 +1091,7 @@ mod tests {
             &route,
             &records,
             "m",
-            move |_record, key| {
+            move |_record, key, _channel_deadline| {
                 seen_for_attempt.lock().unwrap().push(key.name.clone());
                 Box::pin(async {
                     Outbound::Retryable {
@@ -1092,7 +1108,6 @@ mod tests {
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
                 key_cooldowns: &KeyCooldowns::new(),
                 channel_cooldowns: &ChannelCooldowns::new(),
-                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;
@@ -1121,7 +1136,7 @@ mod tests {
             &route,
             &records,
             "m",
-            move |_record, key| {
+            move |_record, key, _channel_deadline| {
                 seen_for_attempt.lock().unwrap().push(key.name.clone());
                 let key_name = key.name.clone();
                 Box::pin(async move {
@@ -1142,7 +1157,6 @@ mod tests {
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
                 key_cooldowns: &KeyCooldowns::new(),
                 channel_cooldowns: &ChannelCooldowns::new(),
-                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;
@@ -1173,7 +1187,7 @@ mod tests {
             &route,
             &records,
             "m",
-            move |record, _key| {
+            move |record, _key, _channel_deadline| {
                 seen_for_attempt.lock().unwrap().push(record.id);
                 Box::pin(async { Outbound::Success(ok_response()) })
             },
@@ -1183,7 +1197,6 @@ mod tests {
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
                 key_cooldowns: &KeyCooldowns::new(),
                 channel_cooldowns: &cooldowns,
-                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;
@@ -1210,7 +1223,7 @@ mod tests {
             &route,
             &records,
             "m",
-            move |record, _key| {
+            move |record, _key, _channel_deadline| {
                 let record_id = record.id;
                 Box::pin(async move {
                     if record_id == 1 {
@@ -1230,7 +1243,6 @@ mod tests {
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
                 key_cooldowns: &KeyCooldowns::new(),
                 channel_cooldowns: &cooldowns,
-                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;
@@ -1254,7 +1266,7 @@ mod tests {
             &route,
             &records,
             "m",
-            move |_record, _key| {
+            move |_record, _key, _channel_deadline| {
                 Box::pin(async {
                     Outbound::BillingDenied {
                         channel: "ch-1".to_string(),
@@ -1268,7 +1280,6 @@ mod tests {
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
                 key_cooldowns: &KeyCooldowns::new(),
                 channel_cooldowns: &cooldowns,
-                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
             },
         )
         .await;

@@ -50,6 +50,11 @@ pub struct Channel {
     pub models: Vec<String>,
     pub model_aliases: HashMap<String, String>,
     pub timeout_ms: u64,
+    /// 渠道级预首字节总时限（毫秒）：约束该渠道的连接、响应头、流首 peek 与
+    /// 同渠道重试退避（共享本预算）；failover 换渠道时按新渠道预算重锚。
+    /// 缺省 [`DEFAULT_REQUEST_TIMEOUT_MS`]，与原全局硬编码一致。
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
     pub max_retries: u32,
     /// 是否启用：禁用的渠道不参与路由候选与失败切换。
     pub enabled: bool,
@@ -77,6 +82,11 @@ pub struct Channel {
 /// serde 缺省：渠道未写 `abort_on_disconnect` 时下游断连即取消上游消费。
 fn default_abort_on_disconnect() -> bool {
     true
+}
+
+/// serde 缺省：渠道未写 `request_timeout_ms` 时沿用原全局 120s 总时限。
+fn default_request_timeout_ms() -> u64 {
+    DEFAULT_REQUEST_TIMEOUT_MS
 }
 
 /// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
@@ -445,13 +455,14 @@ pub(crate) const SETTING_SESSION_CACHE_SECRET: &str = "session_cache_secret";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
 pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
-/// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片请求。
-pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 100 * 1024 * 1024;
+/// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片请求；请求体
+/// 整体缓冲进内存，缺省档位同时约束 128 并发下的峰值内存（50MB × 128）。
+pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 50 * 1024 * 1024;
 /// 上游非流式响应体上限缺省值（字节）：与入站上限同档，避免镜像/异常上游把
 /// 整段 JSON 读进内存撑爆进程。流式路径另有 `sse_reassembly_max_bytes`。
-pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024;
 /// 请求日志 body 截断缺省值（字节）：full_body 开启时单行日志的封顶，避免复用
-/// 入站 100MB 上限把 SQLite 撑慢。
+/// 入站上限把 SQLite 撑慢。
 pub const DEFAULT_LOG_BODY_MAX_BYTES: u64 = 1024 * 1024;
 /// 认证失败限流次数缺省值。
 pub const DEFAULT_AUTH_THROTTLE_MAX_FAILURES: u64 = 30;
@@ -475,6 +486,11 @@ pub const DEFAULT_ALLOW_PRIVATE_NETWORKS: bool = false;
 /// 单次渠道调用的服务端超时硬上限。管理面拒绝更大值，请求路径仍再次钳制，
 /// 使直接写库或旧快照也不能突破请求资源预算。
 pub const MAX_CHANNEL_TIMEOUT_MS: u64 = 120_000;
+/// 渠道级预首字节总时限缺省值（毫秒）：与原网关全局硬编码一致。
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
+/// 渠道级预首字节总时限上限（毫秒）：深度推理/大 prompt 的合法长首字节
+/// 允许到 10 分钟，再长的应走异步化而非占用活动请求容量。
+pub const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
 /// 每渠道同 key 重试硬上限；密钥轮换另受启用密钥数量的有限集合约束。
 pub const MAX_CHANNEL_RETRIES: u32 = 4;
 
@@ -723,8 +739,9 @@ pub async fn list_channel_records_on_conn(
 }
 
 const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, models_json, \
-    model_aliases_json, timeout_ms, max_retries, enabled, model_group, reasoning_output, \
-    session_cache_key, injects_cache_breakpoints, abort_on_disconnect FROM channels";
+    model_aliases_json, timeout_ms, request_timeout_ms, max_retries, enabled, model_group, \
+    reasoning_output, session_cache_key, injects_cache_breakpoints, abort_on_disconnect \
+    FROM channels";
 
 /// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
@@ -741,6 +758,9 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
         .map_err(StoreError::Query)?;
     let abort_on_disconnect: i64 = row
         .try_get("abort_on_disconnect")
+        .map_err(StoreError::Query)?;
+    let request_timeout_ms: i64 = row
+        .try_get("request_timeout_ms")
         .map_err(StoreError::Query)?;
     // 先解析集合字段（错误信息需要引用 name），再构造结构体以避免移动后借用。
     let models: Vec<String> = serde_json::from_str(
@@ -760,6 +780,7 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             base_url: row.try_get("base_url").map_err(StoreError::Query)?,
             keys: Vec::new(),
             timeout_ms: row.try_get("timeout_ms").map_err(StoreError::Query)?,
+            request_timeout_ms: request_timeout_ms.max(0) as u64,
             max_retries: row.try_get("max_retries").map_err(StoreError::Query)?,
             enabled: enabled != 0,
             name,
@@ -922,9 +943,9 @@ pub async fn insert_channel(
     let result = sqlx::query(
         "INSERT INTO channels \
          (name, protocol, base_url, models_json, model_aliases_json, \
-          timeout_ms, max_retries, enabled, model_group, reasoning_output, session_cache_key, \
-          injects_cache_breakpoints, abort_on_disconnect) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          timeout_ms, request_timeout_ms, max_retries, enabled, model_group, reasoning_output, \
+          session_cache_key, injects_cache_breakpoints, abort_on_disconnect) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -932,6 +953,7 @@ pub async fn insert_channel(
     .bind(&models_json)
     .bind(&aliases_json)
     .bind(channel.timeout_ms as i64)
+    .bind(channel.request_timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
     .bind(&channel.model_group)
@@ -989,7 +1011,7 @@ pub async fn update_channel(
         "UPDATE channels SET \
            name = ?, protocol = ?, base_url = ?, \
            models_json = ?, model_aliases_json = ?, \
-           timeout_ms = ?, max_retries = ?, enabled = ?, \
+           timeout_ms = ?, request_timeout_ms = ?, max_retries = ?, enabled = ?, \
            model_group = ?, reasoning_output = ?, session_cache_key = ?, \
            injects_cache_breakpoints = ?, abort_on_disconnect = ? \
          WHERE id = ?",
@@ -1000,6 +1022,7 @@ pub async fn update_channel(
     .bind(&models_json)
     .bind(&aliases_json)
     .bind(channel.timeout_ms as i64)
+    .bind(channel.request_timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
     .bind(&channel.model_group)
@@ -1898,6 +1921,7 @@ mod tests {
             models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
             model_aliases: aliases,
             timeout_ms: 120_000,
+            request_timeout_ms: 120_000,
             max_retries: 2,
             enabled: true,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
@@ -2799,6 +2823,7 @@ mod tests {
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),

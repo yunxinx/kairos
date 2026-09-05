@@ -60,6 +60,7 @@ async fn create_user(gw: &TestGateway, email: &str, role: &str) -> i64 {
 async fn login(gw: &TestGateway, email: &str, password: &str) -> String {
     let response = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({"email": email, "password": password}))
         .send()
         .await

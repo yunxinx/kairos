@@ -49,8 +49,6 @@ const REMAINING_WARN_RATIO = 0.5;
 const REMAINING_DANGER_RATIO = 0.2;
 /** 相对时间展示的刷新间隔（毫秒）。 */
 const RELATIVE_TIME_TICK_MS = 30_000;
-/** 复制成功后对号停留时长，与日志 body 复制反馈对齐。 */
-const COPY_FEEDBACK_MS = 2_000;
 
 const { t, locale } = useI18n();
 const { error } = useToast();
@@ -58,8 +56,6 @@ const queryClient = useQueryClient();
 
 const searchText = ref('');
 const statusFilter = ref<string[]>([]);
-const copiedKey = ref<string | null>(null);
-let copiedTimer: ReturnType<typeof setTimeout> | undefined;
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
@@ -102,7 +98,7 @@ const filteredTokens = computed(() => {
       if (!statuses.has(flag)) return false;
     }
     if (!q) return true;
-    return token.name.toLowerCase().includes(q) || token.token_key.toLowerCase().includes(q);
+    return token.name.toLowerCase().includes(q);
   });
 });
 
@@ -144,21 +140,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   if (relativeTimer !== undefined) clearInterval(relativeTimer);
-  if (copiedTimer !== undefined) clearTimeout(copiedTimer);
 });
-
-async function copyKey(key: string) {
-  try {
-    await navigator.clipboard.writeText(key);
-    copiedKey.value = key;
-    if (copiedTimer !== undefined) clearTimeout(copiedTimer);
-    copiedTimer = setTimeout(() => {
-      if (copiedKey.value === key) copiedKey.value = null;
-    }, COPY_FEEDBACK_MS);
-  } catch {
-    error(t('common.copyFailedTokenKey'));
-  }
-}
 
 /**
  * 该令牌累计结算占其可用余额上限的比例；未设上限返回 null（不画进度条）。
@@ -254,7 +236,7 @@ const toggleMutation = useMutation({
 });
 
 const togglingKey = computed(() =>
-  toggleMutation.isPending.value ? (toggleMutation.variables.value?.token_key ?? null) : null,
+  toggleMutation.isPending.value ? (toggleMutation.variables.value?.id ?? null) : null,
 );
 
 function openCreate(event: Event) {
@@ -386,27 +368,9 @@ function openBulkDelete() {
                 </span>
               </TableCell>
               <TableCell>
-                <span class="inline-flex items-center gap-1">
-                  <code class="code-chip rounded px-2 py-0.5 font-mono text-xs">
-                    {{ maskTokenKey(token.token_key) }}
-                  </code>
-                  <button
-                    type="button"
-                    class="btn btn-ghost btn-icon"
-                    data-testid="token-copy-key"
-                    :aria-label="
-                      copiedKey === token.token_key ? t('common.copied') : t('common.copy')
-                    "
-                    :title="copiedKey === token.token_key ? t('common.copied') : t('common.copy')"
-                    @click="copyKey(token.token_key)"
-                  >
-                    <UiIcon
-                      :name="copiedKey === token.token_key ? 'check' : 'copy'"
-                      :size="14"
-                      :class="copiedKey === token.token_key ? 'text-success' : undefined"
-                    />
-                  </button>
-                </span>
+                <code class="code-chip rounded px-2 py-0.5 font-mono text-xs">
+                  {{ maskTokenKey(token.token_key) }}
+                </code>
               </TableCell>
               <TableCell>
                 <div class="w-36" :title="quotaLabel(token)">
@@ -454,7 +418,7 @@ function openBulkDelete() {
                   class="badge cursor-pointer"
                   :class="token.enabled ? 'badge-success' : 'badge-danger'"
                   data-testid="token-toggle-enabled"
-                  :disabled="togglingKey === token.token_key"
+                  :disabled="togglingKey === token.id"
                   :aria-label="token.enabled ? t('tokens.disable') : t('tokens.enable')"
                   :title="token.enabled ? t('tokens.disable') : t('tokens.enable')"
                   @click="toggleMutation.mutate(token)"

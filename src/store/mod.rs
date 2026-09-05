@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    AssertSqlSafe, Row, SqliteConnection, SqlitePool,
+    AssertSqlSafe, Connection, Row, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 use thiserror::Error;
@@ -125,8 +125,195 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
         .map_err(StoreError::Migrate)?;
 
     ids::initialize(&pool).await?;
+    hash_legacy_token_key_plaintext(path).await?;
 
     Ok(pool)
+}
+
+/// 令牌 key 的库内存储形态：SHA-256 的十六进制指纹。
+///
+/// 明文只出现在两处边界——签发时的创建响应，与入站认证头。库内
+/// （tokens、token_balance、request_log、request_log_outbox、
+/// billing_reservations）一律只存指纹，WAL/备份/任何 DB 读取都还原不出
+/// 可用凭证。换算确定性且无盐：认证侧对呈现的明文做同一换算后查快照。
+pub fn token_key_fingerprint(token_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest: [u8; 32] = Sha256::digest(token_key.as_bytes()).into();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// 存量令牌 key 明文换算的完成标记（settings 表）；写入即代表库内已全量指纹化。
+const SETTING_TOKEN_KEYS_HASHED: &str = "token_keys_hashed";
+
+/// 把存量库中的令牌 key 明文原地换算为指纹。
+///
+/// 覆盖五张表：tokens、token_balance、request_log、request_log_outbox 与
+/// billing_reservations，其中 outbox 元数据与预留恢复元数据里的 JSON 载荷
+/// 同步重写。换算不可逆（明文从此只存在于创建响应与调用方），全部动作与
+/// 完成标记在同一写事务中提交，中断即整体回滚、重启重跑；已有标记时直接
+/// 返回。新库空表扫描为无操作。逐行 JSON 解析失败时保留原行并告警——那本
+/// 就是损坏数据，不能借换算之手伪造。
+///
+/// 子表 `token_balance` 外键引用 `tokens(token_key)` 且未声明 DEFERRABLE：
+/// 立即外键下「父行改键前子表先改、父行改键时子表仍指旧值」都会被拒。换算
+/// 走关闭外键的专用连接（启动路径独占，无并发写入者），提交前以
+/// `pragma_foreign_key_check` 复核引用一致性，不一致即回滚报错；应用连接池
+/// 的外键强制不受影响。
+pub(crate) async fn hash_legacy_token_key_plaintext(path: &Path) -> Result<(), StoreError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .foreign_keys(false);
+    let mut conn = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(StoreError::Connect)?;
+    let mut tx = conn
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+
+    // 完成标记与换算同事务读写：标记在场即代表此前已完成，直接返回。
+    let flagged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM settings WHERE setting_key = ?")
+        .bind(SETTING_TOKEN_KEYS_HASHED)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+    if flagged.is_some() {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Ok(());
+    }
+
+    // 先读后写：JSON 重写需要行上的明文 token_key 作为换算来源，与列更新
+    // 之前完成读取。
+    let outbox_rows: Vec<(i64, String, Vec<u8>)> =
+        sqlx::query("SELECT id, token_key, metadata FROM request_log_outbox")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<i64, _>("id").map_err(StoreError::Query)?,
+                    row.try_get::<String, _>("token_key")
+                        .map_err(StoreError::Query)?,
+                    row.try_get::<Vec<u8>, _>("metadata")
+                        .map_err(StoreError::Query)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+    for (outbox_id, token_key, metadata) in outbox_rows {
+        let Ok(mut pending) = serde_json::from_slice::<PendingRequestLog>(&metadata) else {
+            tracing::warn!(outbox_id, "存量 outbox 元数据无法解析，指纹换算跳过该行");
+            continue;
+        };
+        pending.log.token_key = token_key_fingerprint(&token_key);
+        let encoded = serde_json::to_vec(&pending).map_err(|err| {
+            StoreError::InvalidResource(format!("outbox 元数据重编码失败: {err}"))
+        })?;
+        sqlx::query("UPDATE request_log_outbox SET metadata = ? WHERE id = ?")
+            .bind(encoded)
+            .bind(outbox_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+    }
+
+    let reservation_rows: Vec<(String, Vec<u8>)> =
+        sqlx::query("SELECT token_key, recovery_metadata FROM billing_reservations")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>("token_key")
+                        .map_err(StoreError::Query)?,
+                    row.try_get::<Vec<u8>, _>("recovery_metadata")
+                        .map_err(StoreError::Query)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+    for (token_key, metadata) in reservation_rows {
+        let Ok(mut recovery) = serde_json::from_slice::<BillingAttemptRecovery>(&metadata) else {
+            tracing::warn!(token_key, "存量预留恢复元数据无法解析，指纹换算跳过该行");
+            continue;
+        };
+        if let Some(result) = recovery.result.as_deref_mut() {
+            result.token_key = token_key_fingerprint(&token_key);
+        }
+        let encoded = serde_json::to_vec(&recovery)
+            .map_err(|err| StoreError::InvalidResource(format!("恢复元数据重编码失败: {err}")))?;
+        sqlx::query("UPDATE billing_reservations SET recovery_metadata = ? WHERE token_key = ?")
+            .bind(encoded)
+            .bind(&token_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+    }
+
+    let plain_keys: Vec<String> = sqlx::query("SELECT token_key FROM tokens")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?
+        .into_iter()
+        .map(|row| {
+            row.try_get::<String, _>("token_key")
+                .map_err(StoreError::Query)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+
+    // 子表先改、父表后改：关闭外键后顺序不再是正确性依据，保留既有次序
+    // 仅利于阅读（对账表在凭证表之前）。
+    for plain in &plain_keys {
+        let fingerprint = token_key_fingerprint(plain);
+        for table in [
+            "UPDATE token_balance SET token_key = ? WHERE token_key = ?",
+            "UPDATE request_log SET token_key = ? WHERE token_key = ?",
+            "UPDATE request_log_outbox SET token_key = ? WHERE token_key = ?",
+            "UPDATE billing_reservations SET token_key = ? WHERE token_key = ?",
+        ] {
+            sqlx::query(table)
+                .bind(&fingerprint)
+                .bind(plain)
+                .execute(&mut *tx)
+                .await
+                .map_err(StoreError::Query)?;
+        }
+        sqlx::query("UPDATE tokens SET token_key = ? WHERE token_key = ?")
+            .bind(&fingerprint)
+            .bind(plain)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+    }
+
+    resources::set_setting(
+        &mut tx,
+        SETTING_TOKEN_KEYS_HASHED,
+        &serde_json::Value::Bool(true),
+    )
+    .await?;
+
+    // 提交前复核引用一致性：关外键写入不触发约束，损坏必须在此拦下而不是
+    // 落库后由运行期外键错误暴露。
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+    if violations > 0 {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Err(StoreError::InvalidResource(format!(
+            "令牌 key 指纹换算后仍有 {violations} 处悬挂引用，已回滚"
+        )));
+    }
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(())
 }
 
 /// 把数据库文件与既有边车（WAL/SHM）的权限收紧为 owner-only（0o600）。
@@ -355,6 +542,14 @@ fn validate_request_log(log: &RequestLog) -> Result<(), StoreError> {
 }
 
 /// 把待结算请求持久化到短事务队列；正文独立保存为 BLOB。
+/// 把一次出站尝试的结果持久化到结算队列；带计费身份的结果与预留状态变更
+/// （结果标记、缺 usage 的释放）在同一 `BEGIN IMMEDIATE` 事务内原子完成。
+///
+/// 原子性是防漏账的关键：事务未提交时预留仍是「无结果的 reserved」，由恢复
+/// 任务按孤儿释放；事务提交后结果、结果标记与预留处置同时生效——不存在
+/// 「结果已生成但未入队」的中间态，预留行也无需保留结果载荷副本。
+/// 幂等性由 outbox 对 `billing_attempt_id` 的唯一键承担：重复投递同一结果
+/// 逐字段比对放行，携带不同结果则报冲突，绝不静默覆盖。
 pub(crate) async fn enqueue_pending_request_log(
     pool: &SqlitePool,
     mut pending: PendingRequestLog,
@@ -370,6 +565,24 @@ pub(crate) async fn enqueue_pending_request_log(
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(StoreError::Query)?;
+    // 带计费身份的结果只能落在仍待结果的预留上：预留已终结说明结果曾被
+    // 消费（恢复重建或重复投递），继续入队结算会造成重复计费——显式报错，
+    // 由调用方保留原始结果交人工复核。
+    if let Some(attempt_id) = pending.log.billing_attempt_id.as_deref() {
+        let live: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM billing_reservations \
+             WHERE attempt_id = ? AND status = 'reserved'",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+        if live.is_none() {
+            return Err(StoreError::InvalidResource(format!(
+                "费用预留 {attempt_id} 不存在或已终止"
+            )));
+        }
+    }
     let inserted = sqlx::query(
         "INSERT INTO request_log_outbox \
          (id, token_key, user_id, cost_usd_micros, metadata, request_body, response_body, \
@@ -409,16 +622,31 @@ pub(crate) async fn enqueue_pending_request_log(
         id
     };
     if let Some(attempt_id) = pending.log.billing_attempt_id.as_deref() {
-        mark_billing_attempt_result_persisted(&mut tx, attempt_id).await?;
+        // 结果已随本事务进入 outbox：置位标记。载荷副本从未写入预留行，
+        // 无需清理。
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0);
+        let updated = sqlx::query(
+            "UPDATE billing_reservations SET result_persisted = 1, updated_at = ? \
+             WHERE attempt_id = ? AND status = 'reserved'",
+        )
+        .bind(now)
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::InvalidResource(format!(
+                "费用预留 {attempt_id} 不存在或已终止"
+            )));
+        }
         // 入队时已结算且带计费身份的日志表示该尝试以「释放预留」结束：
         // 结果缺失上游 usage 时不产生费用，预留归还与对账日志入队必须在
         // 同一事务内成立，否则崩溃后要么额度滞留、要么日志缺失。回报
         // usage 的尝试保持预留，由后台按实际用量结算。
         if pending.log.settled && pending.settlement_error.is_none() {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as i64)
-                .unwrap_or(0);
             release_billing_attempt_on(&mut tx, attempt_id, now).await?;
         }
     }
@@ -428,9 +656,10 @@ pub(crate) async fn enqueue_pending_request_log(
 
 /// 标记结果已进入 outbox，并清理预留行中的完整结果副本。
 ///
-/// 预留元数据只需在 outbox 尚未形成时支持崩溃恢复；结果进入 outbox 后，继续保留
-/// 请求体、响应体和 usage 会使同一份敏感数据在账务表中长期重复存储。元数据损坏时
-/// 不覆盖原始 BLOB，只更新状态位并交由隔离记录保留原文。
+/// 常规路径的结果随入队事务原子生效，预留行从不持有载荷副本；本函数仅供
+/// 崩溃恢复的重建路径使用——存量库中「旧两步写入在崩溃窗口留下的载荷副本」
+/// 重建入队后，由此清理解放。元数据损坏时不覆盖原始 BLOB，只更新状态位并
+/// 交由隔离记录保留原文。
 async fn mark_billing_attempt_result_persisted(
     conn: &mut SqliteConnection,
     attempt_id: &str,
@@ -1059,6 +1288,8 @@ pub(crate) struct BillingAttemptRecovery {
     #[serde(default)]
     pub request_body: Option<Vec<u8>>,
     /// 已生成但尚未进入 outbox 的完整结果；崩溃恢复优先使用它重建原始记录。
+    /// 新写入路径的结果随入队事务原子生效，本字段只承载旧两步写入在崩溃
+    /// 窗口留下的存量中间态，终态行清理后自然消失。
     #[serde(default)]
     pub result: Option<Box<RequestLog>>,
     /// 费用计算错误的稳定文本；存在时恢复记录必须保持未结算。
@@ -1068,64 +1299,6 @@ pub(crate) struct BillingAttemptRecovery {
     /// 的两类事件码。存量元数据缺该字段时按未知（可能已产生费用）处理。
     #[serde(default = "default_upstream_reached")]
     pub upstream_reached: bool,
-}
-
-/// 在计费预留行中保存已生成的结果，供 outbox 写入失败或进程崩溃后的恢复任务
-/// 使用。该更新不改变预留状态，重复写入同一结果保持幂等。
-pub(crate) async fn persist_billing_attempt_result(
-    pool: &SqlitePool,
-    attempt_id: &str,
-    pending: &PendingRequestLog,
-) -> Result<(), StoreError> {
-    let mut tx = pool
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(StoreError::Query)?;
-    let metadata = sqlx::query_scalar::<_, Vec<u8>>(
-        "SELECT recovery_metadata FROM billing_reservations \
-         WHERE attempt_id = ? AND status = 'reserved'",
-    )
-    .bind(attempt_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(StoreError::Query)?
-    .ok_or_else(|| StoreError::InvalidResource(format!("费用预留 {attempt_id} 不存在或已终止")))?;
-    let mut recovery: BillingAttemptRecovery = serde_json::from_slice(&metadata)
-        .map_err(|err| StoreError::InvalidResource(format!("费用恢复元数据无法解码: {err}")))?;
-    if let Some(existing) = recovery.result.as_deref() {
-        if existing == &pending.log && recovery.result_settlement_error == pending.settlement_error
-        {
-            tx.commit().await.map_err(StoreError::Query)?;
-            return Ok(());
-        }
-        return Err(StoreError::ReservationConflict);
-    }
-    recovery.result = Some(Box::new(pending.log.clone()));
-    recovery.result_settlement_error = pending.settlement_error.clone();
-    recovery.upstream_reached = pending.upstream_reached;
-    let encoded = serde_json::to_vec(&recovery)
-        .map_err(|err| StoreError::InvalidResource(format!("费用结果无法编码: {err}")))?;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
-    let updated = sqlx::query(
-        "UPDATE billing_reservations SET recovery_metadata = ?, updated_at = ? \
-         WHERE attempt_id = ? AND status = 'reserved'",
-    )
-    .bind(encoded)
-    .bind(now)
-    .bind(attempt_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(StoreError::Query)?;
-    if updated.rows_affected() != 1 {
-        return Err(StoreError::InvalidResource(format!(
-            "费用预留 {attempt_id} 不存在或已终止"
-        )));
-    }
-    tx.commit().await.map_err(StoreError::Query)?;
-    Ok(())
 }
 
 /// 在实际出站调用前为一次物理尝试原子预留费用。
@@ -1430,6 +1603,32 @@ async fn release_billing_attempt_on(
     .await
     .map_err(StoreError::Query)?;
     Ok(())
+}
+
+/// 长流存活心跳：把仍在等待结果的预留行 `updated_at` 推进到当前时刻。
+///
+/// 流式任务的上游消费不受请求总时限约束，可能远超恢复任务的孤儿阈值；心跳
+/// 让恢复扫描持续视为新鲜，避免把仍在消费中的长流误判为孤儿而释放预留。
+/// 幂等：行已离开「reserved 且无持久化结果」状态（已结算/已释放/结果已入队）
+/// 时不改动并返回 `false`，调用方可据此停止心跳。
+pub async fn touch_billing_attempt_heartbeat(
+    pool: &SqlitePool,
+    attempt_id: &str,
+) -> Result<bool, StoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    let updated = sqlx::query(
+        "UPDATE billing_reservations SET updated_at = ? \
+         WHERE attempt_id = ? AND status = 'reserved' AND result_persisted = 0",
+    )
+    .bind(now)
+    .bind(attempt_id)
+    .execute(pool)
+    .await
+    .map_err(StoreError::Query)?;
+    Ok(updated.rows_affected() > 0)
 }
 
 /// 扫描进程崩溃留下的预留：尚未进入出站阶段的释放，已进入出站且无结果的
@@ -2313,6 +2512,38 @@ pub async fn purge_settled_request_logs_before(
                 LIMIT ?)",
         )
         .bind(cutoff_created_at)
+        .bind(LOG_PURGE_BATCH_ROWS as i64)
+        .execute(pool)
+        .await
+        .map_err(StoreError::Query)?;
+        let affected = result.rows_affected();
+        removed += affected;
+        if affected < LOG_PURGE_BATCH_ROWS {
+            return Ok(removed);
+        }
+    }
+}
+
+/// 终态预留行的保留期：对账以 request_log（`billing_attempt_id` 关联）为准，
+/// 预留行在结算/释放后只余即时复核的冗余价值，保留 7 天。
+pub const BILLING_RESERVATION_RETENTION_MILLIS: i64 = 7 * 24 * 3_600_000;
+
+/// 分批删除早于截止时刻的终态预留行（已结算/已释放）；`reserved` 与带未消费
+/// 结果的行永不触碰，崩溃恢复语义不变。单批上限与请求日志清理一致，避免一次
+/// 长写事务挤占 `busy_timeout`。
+pub async fn purge_terminal_billing_reservations_before(
+    pool: &SqlitePool,
+    cutoff_updated_at: i64,
+) -> Result<u64, StoreError> {
+    let mut removed = 0u64;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM billing_reservations WHERE attempt_id IN ( \
+                SELECT attempt_id FROM billing_reservations \
+                WHERE status IN ('settled', 'released') AND updated_at < ? \
+                LIMIT ?)",
+        )
+        .bind(cutoff_updated_at)
         .bind(LOG_PURGE_BATCH_ROWS as i64)
         .execute(pool)
         .await
@@ -3485,6 +3716,296 @@ mod tests {
         assert_eq!(balance, 10_000, "恢复释放不得扣减钱包");
     }
 
+    /// 长流心跳把超龄预留行的 `updated_at` 推进到当前时刻：恢复扫描不再把
+    /// 仍在消费中的长流判为孤儿，预留保持 `reserved` 等待流结束后的结果。
+    /// 同库对照行未做心跳，按既有孤儿语义回收。
+    #[tokio::test]
+    async fn heartbeat_keeps_stale_reservation_out_of_recovery() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-heartbeat").await;
+        initialize_token_settlement(&mut conn, "sk-heartbeat", 10_000, 1)
+            .await
+            .expect("应能初始化余额");
+        let metadata = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "heartbeat".to_string(),
+            model: "model".to_string(),
+            outbound_model: None,
+            channel: "channel".to_string(),
+            channel_key: Some("key-1".to_string()),
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price: PriceSnapshot::default(),
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            request_body: None,
+            result: None,
+            result_settlement_error: None,
+            upstream_reached: true,
+        })
+        .expect("恢复元数据应可编码");
+        // updated_at = 0：已超过任何恢复阈值的长流（派发后始终未出结果）。
+        // 两行形状相同，仅一行做心跳。
+        sqlx::query(
+            "INSERT INTO billing_reservations \
+             (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+              token_limit_usd_micros, recovery_metadata, status, dispatched, result_persisted, \
+              created_at, updated_at) \
+             VALUES ('attempt-heartbeat', 'request-heartbeat', 'sk-heartbeat', 1, 123, NULL, ?, \
+                     'reserved', 1, 0, 0, 0), \
+                    ('attempt-stale', 'request-stale', 'sk-heartbeat', 1, 123, NULL, ?, \
+                     'reserved', 1, 0, 0, 0)",
+        )
+        .bind(&metadata)
+        .bind(&metadata)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写入超龄预留");
+        drop(conn);
+
+        let touched = touch_billing_attempt_heartbeat(&pool, "attempt-heartbeat")
+            .await
+            .expect("心跳应成功");
+        assert!(touched, "待恢复状态的预留应被心跳刷新");
+        let updated_at: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM billing_reservations WHERE attempt_id = 'attempt-heartbeat'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取心跳时刻");
+        assert!(updated_at > 0, "心跳应把 updated_at 推进到当前时刻");
+
+        // 生产比例的等价断言：心跳间隔（60s）远小于恢复阈值时，被心跳刷新的
+        // 行始终新鲜于阈值截点。此处以 60s 阈值断言「刷新后不被回收」，与
+        // 生产的 60s 心跳 / 10min 阈值同构。
+        assert_eq!(
+            recover_orphan_billing_attempts(&pool, Duration::from_secs(60), 16)
+                .await
+                .expect("恢复任务应成功"),
+            1,
+            "未心跳的对照行按孤儿语义回收"
+        );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_reservations WHERE attempt_id = 'attempt-heartbeat'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取预留状态");
+        assert_eq!(status, "reserved", "长流预留应保持等待结果");
+        let stale_status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_reservations WHERE attempt_id = 'attempt-stale'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取对照行状态");
+        assert_eq!(stale_status, "released", "未心跳的超龄行照常回收");
+    }
+
+    /// 预留离开「reserved 且无持久化结果」状态后心跳是空操作：不改动行，
+    /// 返回 `false` 让流任务停止心跳。
+    #[tokio::test]
+    async fn heartbeat_is_noop_for_terminal_reservations() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-heartbeat-terminal").await;
+        initialize_token_settlement(&mut conn, "sk-heartbeat-terminal", 10_000, 1)
+            .await
+            .expect("应能初始化余额");
+        let metadata = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "terminal".to_string(),
+            model: "model".to_string(),
+            outbound_model: None,
+            channel: "channel".to_string(),
+            channel_key: Some("key-1".to_string()),
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price: PriceSnapshot::default(),
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            request_body: None,
+            result: None,
+            result_settlement_error: None,
+            upstream_reached: true,
+        })
+        .expect("恢复元数据应可编码");
+        sqlx::query(
+            "INSERT INTO billing_reservations \
+             (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+              token_limit_usd_micros, recovery_metadata, status, dispatched, result_persisted, \
+              created_at, updated_at) \
+             VALUES ('attempt-released', 'request-released', 'sk-heartbeat-terminal', 1, 123, \
+                     NULL, ?, 'reserved', 1, 0, 0, 0), \
+                    ('attempt-resulted', 'request-resulted', 'sk-heartbeat-terminal', 1, 123, \
+                     NULL, ?, 'reserved', 1, 1, 0, 0)",
+        )
+        .bind(&metadata)
+        .bind(&metadata)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写入终态预留");
+        release_billing_attempt(&pool, "attempt-released")
+            .await
+            .expect("释放应成功");
+        let released_at: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM billing_reservations WHERE attempt_id = 'attempt-released'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取释放时刻");
+        drop(conn);
+
+        assert!(
+            !touch_billing_attempt_heartbeat(&pool, "attempt-released")
+                .await
+                .expect("心跳对已释放行应成功"),
+            "已释放预留不应被心跳刷新"
+        );
+        assert!(
+            !touch_billing_attempt_heartbeat(&pool, "attempt-resulted")
+                .await
+                .expect("心跳对已入队结果行应成功"),
+            "结果已持久化的预留不应被心跳刷新"
+        );
+        assert!(
+            !touch_billing_attempt_heartbeat(&pool, "attempt-missing")
+                .await
+                .expect("心跳对不存在的行应成功"),
+            "不存在的预留不应被心跳刷新"
+        );
+        let released_after: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM billing_reservations WHERE attempt_id = 'attempt-released'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取释放行的时刻");
+        assert_eq!(released_after, released_at, "空操作不得改动已释放行");
+        let resulted_at: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM billing_reservations WHERE attempt_id = 'attempt-resulted'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("应能读取已入队行的时刻");
+        assert_eq!(resulted_at, 0, "空操作不得改动结果已入队的行");
+    }
+
+    /// 终态预留行按保留期清理：已结算/已释放且超龄的行被删除，`reserved`
+    /// 与结果未消费的行不受影响。
+    #[tokio::test]
+    async fn terminal_reservations_are_purged_by_retention() {
+        let (_dir, pool) = test_pool().await;
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        seed_token(&mut conn, "sk-purge").await;
+        let metadata = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "purge".to_string(),
+            model: "model".to_string(),
+            outbound_model: None,
+            channel: "channel".to_string(),
+            channel_key: Some("key-1".to_string()),
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price: PriceSnapshot::default(),
+            discount_bp: billing::DEFAULT_DISCOUNT_BP,
+            request_body: None,
+            result: None,
+            result_settlement_error: None,
+            upstream_reached: true,
+        })
+        .expect("恢复元数据应可编码");
+        sqlx::query(
+            "INSERT INTO billing_reservations \
+             (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+              token_limit_usd_micros, recovery_metadata, status, dispatched, result_persisted, \
+              created_at, updated_at) \
+             VALUES ('attempt-settled-old', 'r1', 'sk-purge', 1, 1, NULL, ?, 'settled', 1, 1, 0, 0), \
+                    ('attempt-released-old', 'r2', 'sk-purge', 1, 1, NULL, ?, 'released', 1, 0, 0, 0), \
+                    ('attempt-reserved-old', 'r3', 'sk-purge', 1, 1, NULL, ?, 'reserved', 1, 0, 0, 0), \
+                    ('attempt-settled-new', 'r4', 'sk-purge', 1, 1, NULL, ?, 'settled', 1, 1, 0, ?)",
+        )
+        .bind(&metadata)
+        .bind(&metadata)
+        .bind(&metadata)
+        .bind(&metadata)
+        .bind(i64::MAX / 2)
+        .execute(&mut *conn)
+        .await
+        .expect("应能写入各状态预留");
+        drop(conn);
+
+        let removed = purge_terminal_billing_reservations_before(&pool, i64::MAX / 2)
+            .await
+            .expect("清理应成功");
+        assert_eq!(removed, 2, "仅删除超龄的终态行");
+
+        let remaining: Vec<String> =
+            sqlx::query("SELECT attempt_id FROM billing_reservations ORDER BY attempt_id")
+                .fetch_all(&pool)
+                .await
+                .expect("应能读取剩余行")
+                .into_iter()
+                .map(|row| row.try_get::<String, _>("attempt_id").expect("应有 id"))
+                .collect();
+        assert_eq!(
+            remaining,
+            vec![
+                "attempt-reserved-old".to_string(),
+                "attempt-settled-new".to_string()
+            ],
+            "reserved 与未超龄的行保留"
+        );
+    }
+
+    /// 恢复扫描候选查询命中部分索引：治理后的查询计划不再全表扫描。
+    #[tokio::test]
+    async fn recovery_scan_uses_partial_index() {
+        let (_dir, pool) = test_pool().await;
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT attempt_id FROM billing_reservations \
+             WHERE status = 'reserved' AND result_persisted = 0 AND updated_at <= 0 \
+             ORDER BY updated_at, attempt_id LIMIT 16",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("应能读取查询计划")
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("detail").expect("应有 detail 列"))
+        .collect();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_billing_reservations_recovery")),
+            "恢复候选查询应命中部分索引，实际计划: {plan:?}"
+        );
+    }
+
+    /// 用户统计聚合命中覆盖索引：index-only 扫描且无 GROUP BY 临时排序，
+    /// 用户页统计不再退化为整表扫描。
+    #[tokio::test]
+    async fn user_stats_aggregate_uses_covering_index() {
+        let (_dir, pool) = test_pool().await;
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT user_id, \
+                    COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens \
+             FROM request_log GROUP BY user_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("应能读取查询计划")
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("detail").expect("应有 detail 列"))
+        .collect();
+        assert!(
+            plan.iter().any(|detail| detail.contains("COVERING INDEX")),
+            "统计聚合应走覆盖索引，实际计划: {plan:?}"
+        );
+        // count(DISTINCT) 的逐组去重缓冲是聚合固有的；禁止的是 GROUP BY 的
+        // 临时排序（应由索引前缀序消解）。
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("TEMP B-TREE FOR GROUP BY")),
+            "GROUP BY 不应引入临时排序，实际计划: {plan:?}"
+        );
+    }
+
     /// 释放是已派发尝试的合法终态：释放后重复入队的结果不再结算——对
     /// `released` 预留结算必须显式报错，重复结果也无法再写回预留。
     #[tokio::test]
@@ -3531,14 +4052,13 @@ mod tests {
                 .expect("应能读取余额");
         assert_eq!(balance, 10_000, "释放后的结算不得扣款");
 
-        // 重复结果无法写回已释放的预留：重建元数据时同样显式报错。
+        // 重复结果无法写回已释放的预留：入队前置检查显式报错。
         let mut log = sample_log(1, true);
         log.billing_attempt_id = Some("attempt-released".to_string());
         assert!(matches!(
-            persist_billing_attempt_result(
+            enqueue_pending_request_log(
                 &pool,
-                "attempt-released",
-                &PendingRequestLog {
+                PendingRequestLog {
                     log,
                     settlement_error: None,
                     upstream_reached: true,
@@ -3815,6 +4335,7 @@ mod tests {
                 models: vec![],
                 model_aliases: std::collections::HashMap::new(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -4149,7 +4670,8 @@ mod tests {
             .await
             .expect("应能查余额");
         assert!(balance.is_none(), "孤儿余额行应被迁移清理");
-        let balance = get_admission_snapshot(&mut conn, "sk-live")
+        // 明文 key 在 open() 的指纹换算中转为 SHA-256，按指纹读取存量令牌。
+        let balance = get_admission_snapshot(&mut conn, &token_key_fingerprint("sk-live"))
             .await
             .expect("应能查余额")
             .expect("存量令牌应能读到用户钱包");
@@ -4165,11 +4687,11 @@ mod tests {
         .await
         .expect("应有 root 钱包");
         assert_eq!(wallet, (1_500_000, 200));
-        let owner: i64 =
-            sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = 'sk-live'")
-                .fetch_one(&mut *conn)
-                .await
-                .expect("令牌应有归属");
+        let owner: i64 = sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = ?")
+            .bind(token_key_fingerprint("sk-live"))
+            .fetch_one(&mut *conn)
+            .await
+            .expect("令牌应有归属");
         assert_eq!(owner, 1);
 
         let id = insert_smoke(&pool, "after-upgrade")

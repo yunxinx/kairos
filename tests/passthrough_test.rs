@@ -158,7 +158,7 @@ async fn stream_passthrough_forwards_and_bills_usage() {
          JOIN request_log ON request_log.token_key = t.token_key \
          WHERE t.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询余额与日志");
@@ -333,7 +333,7 @@ async fn stream_passthrough_replaces_upstream_done_after_settlement() {
     let settled: i64 = {
         common::wait_for_request_persistence(&gw.pool).await;
         sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("读到哨兵时结算应已落库")
@@ -342,27 +342,34 @@ async fn stream_passthrough_replaces_upstream_done_after_settlement() {
 }
 
 /// 未闭合的普通上游事件仍按已接收字节直搬，并与网关终止哨兵分隔。
+/// 首块是完整内容帧：peek 放行后，EOF 处的未闭合尾部由流水阶段的哨兵
+/// 过滤器收尾（首字节之前的残流已改为按 failover 语义上抛）。
 #[tokio::test]
 async fn stream_passthrough_separates_done_after_unclosed_event() {
     let mut gw = TestGateway::start().await;
     let upstream = b"event: custom\r\ndata: partial";
+    const CONTENT: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
     gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        CONTENT.to_vec(),
         upstream[..12].to_vec(),
         upstream[12..].to_vec(),
     ]));
 
     let resp = send_stream(&gw.base_url()).await;
     let downstream = resp.bytes().await.expect("响应流应可读");
-    let expected = [upstream.as_slice(), b"\n\ndata: [DONE]\n\n"].concat();
+    let expected = [CONTENT, upstream.as_slice(), b"\n\ndata: [DONE]\n\n"].concat();
     assert_eq!(downstream.as_ref(), expected);
 }
 
 /// 混合事件中的上游哨兵行被移除时，EOF 前其余字段不得丢失。
+/// 首块是完整内容帧：peek 放行后，未闭合尾部在流水阶段收尾。
 #[tokio::test]
 async fn stream_passthrough_preserves_unclosed_mixed_event_tail() {
     let mut gw = TestGateway::start().await;
     let upstream = b"event: custom\ndata: hello\ndata: [DONE]\nid: retained";
+    const CONTENT: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
     gw.upstream.set_behavior(UpstreamBehavior::RawSse(vec![
+        CONTENT.to_vec(),
         upstream[..7].to_vec(),
         upstream[7..35].to_vec(),
         upstream[35..].to_vec(),
@@ -370,7 +377,12 @@ async fn stream_passthrough_preserves_unclosed_mixed_event_tail() {
 
     let resp = send_stream(&gw.base_url()).await;
     let downstream = resp.bytes().await.expect("响应流应可读");
-    let expected = b"event: custom\ndata: hello\nid: retained\n\ndata: [DONE]\n\n";
+    let expected = [
+        CONTENT,
+        b"event: custom\ndata: hello\nid: retained".as_slice(),
+        b"\n\ndata: [DONE]\n\n",
+    ]
+    .concat();
     assert_eq!(downstream.as_ref(), expected);
 }
 
@@ -409,7 +421,7 @@ async fn stream_passthrough_settles_after_downstream_disconnect() {
     for _ in 0..100 {
         settled =
             sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-                .bind(TEST_TOKEN_KEY)
+                .bind(common::fingerprint(TEST_TOKEN_KEY))
                 .fetch_one(&gw.pool)
                 .await
                 .expect("应能查询余额");
@@ -459,7 +471,7 @@ async fn stream_passthrough_aborts_upstream_on_downstream_disconnect() {
     for _ in 0..250 {
         let cost: Option<i64> =
             sqlx::query_scalar("SELECT cost_usd_micros FROM request_log WHERE token_key = ?")
-                .bind(TEST_TOKEN_KEY)
+                .bind(common::fingerprint(TEST_TOKEN_KEY))
                 .fetch_optional(&gw.pool)
                 .await
                 .expect("应能查询日志");
@@ -647,6 +659,7 @@ fn channel_of(name: &str, protocol: config::Protocol, base_url: &str) -> Channel
         models: vec![TEST_MODEL.to_string()],
         model_aliases: Default::default(),
         timeout_ms: 1000,
+        request_timeout_ms: 120_000,
         max_retries: 0,
         enabled: true,
         model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -974,6 +987,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 models: vec![TEST_MODEL.to_string()],
                 model_aliases: Default::default(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -997,6 +1011,7 @@ async fn passthrough_failover_happens_before_first_byte() {
                 models: vec![TEST_MODEL.to_string()],
                 model_aliases: Default::default(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -1066,7 +1081,8 @@ async fn stream_passthrough_idle_timeout_ends_stream() {
     );
 }
 
-/// 未形成完整 SSE 帧的重装缓冲超过上限时向下游发错误事件，避免当成正常结束。
+/// 未形成完整 SSE 帧的重装缓冲超过上限：与 IR 路径同规，首字节之前按
+/// 可重试失败上抛换渠道（候选耗尽后 502 归因），不再把残缺流发给下游。
 #[tokio::test]
 async fn stream_passthrough_caps_reassembly_buffer() {
     let mut gw = TestGateway::start_with(|base| {
@@ -1079,12 +1095,12 @@ async fn stream_passthrough_caps_reassembly_buffer() {
     gw.upstream
         .set_behavior(UpstreamBehavior::RawSse(vec![vec![b'x'; 128]]));
     let resp = send_stream(&gw.base_url()).await;
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let bytes = resp.bytes().await.expect("超限后流应结束而非挂起");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let bytes = resp.bytes().await.expect("失败应即时返回而非挂起");
     let body = String::from_utf8_lossy(&bytes);
     assert!(
         body.contains("SSE 重装缓冲超过上限"),
-        "下游应看到截断错误，实际: {body}"
+        "下游应看到失败归因，实际: {body}"
     );
 }
 

@@ -202,6 +202,7 @@ async fn create_admin(gw: &TestGateway, email: &str, plan_id: i64) -> i64 {
 async fn login(gw: &TestGateway, email: &str) -> String {
     let response = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": email, "password": "password1" }))
         .send()
         .await
@@ -487,7 +488,7 @@ async fn matches_downstream_model_list_for_the_same_group() {
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
-    let token_key = created.json::<Value>().await.expect("令牌应可解析")["token_key"]
+    let token_key = created.json::<Value>().await.expect("令牌应可解析")["plaintext_key"]
         .as_str()
         .expect("应有明文 key")
         .to_string();

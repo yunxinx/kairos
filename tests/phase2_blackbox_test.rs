@@ -26,6 +26,7 @@ fn single_key_channel(
         models: vec![TEST_MODEL.to_string()],
         model_aliases: Default::default(),
         timeout_ms: 1000,
+        request_timeout_ms: 120_000,
         max_retries: 0,
         enabled: true,
         model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),

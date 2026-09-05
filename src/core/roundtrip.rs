@@ -1460,6 +1460,36 @@ fn unknown_fields_write_back_across_openai_protocols() {
     assert_eq!(chat_wire["metadata"], json!({ "request_tag": "t1" }));
 }
 
+/// 类型化请求字段的跨族丢弃可观测：IR 已建模但目标协议无承载的字段
+/// （n/seed/双 penalty → Anthropic）丢弃时记 unsupported warning，与
+/// responses/gemini 出站面的同类丢弃同规，不静默吞掉。
+#[test]
+fn typed_fields_without_carrier_warn_on_anthropic_outbound() {
+    let chat = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "n": 2,
+        "seed": 42,
+        "presence_penalty": 0.5,
+        "frequency_penalty": 0.5,
+    });
+    let ir = decode_request_wire(Protocol::OpenAiChat, &chat);
+    let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
+    assert!(wire.get("n").is_none() && wire.get("seed").is_none());
+    let features: Vec<&str> = warnings
+        .iter()
+        .filter_map(|warning| match warning {
+            Warning::Unsupported { feature, .. } => Some(feature.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        features,
+        vec!["n", "seed", "presence_penalty", "frequency_penalty"],
+        "四个无承载字段各记一条 unsupported warning"
+    );
+}
+
 /// 基线语义面：散布的多条 System 消息经全部有向对无损——三协议出站统一
 /// 归并（单条置顶 / 顶层 system / instructions），投影把 System 归一为
 /// 合并文本后往返相等，全程零告警。

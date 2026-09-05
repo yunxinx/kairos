@@ -51,7 +51,8 @@ use crate::{
 };
 
 use super::failover::{
-    ChannelCooldowns, FailoverPolicy, KeyCooldowns, Outbound, RetryBackoff, run_failover,
+    ChannelCooldowns, FailoverPolicy, KeyCooldowns, Outbound, RetryBackoff, channel_request_budget,
+    run_failover,
 };
 use super::logging::{
     Billing, RequestLogDraft, RequestLogWriter, new_request_id, protocol_name, queue_request_log,
@@ -67,11 +68,6 @@ use super::sse::{
 use super::throttle::AuthThrottle;
 
 use super::{protocol, routing};
-
-/// 入站请求的绝对总时限：只约束首字节之前的阶段——准入、计费预留、上游
-/// 连接、响应头与流首 peek（含 failover 重试预算）。流建立之后上游读取与
-/// 下游下发仅受渠道空闲超时约束；流任务的日志持久化以本值为上界预算。
-const REQUEST_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 网关依赖：存储连接池 + 出站 HTTP 客户端 + 运行时资源快照句柄。
 #[derive(Clone)]
@@ -462,9 +458,6 @@ async fn handle_request(
     // 协议模型名与流式标志都在请求体上，传 `None`。
     path_model: Option<(String, bool)>,
 ) -> Response {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(REQUEST_TOTAL_TIMEOUT)
-        .unwrap_or_else(tokio::time::Instant::now);
     let started = unix_millis();
     let request_id = new_request_id();
     // 准入时刻抓取快照引用：在途请求持有该引用直到结束，不受后续原子替换影响。
@@ -688,43 +681,51 @@ async fn handle_request(
     };
 
     // 5. 活动请求容量与 RPM 是两类独立约束：RPM 控制时间窗口内的请求数，
-    // Semaphore 控制同时占用 provider、下游响应和结算资源的请求数。等待使用
-    // 本请求的绝对截止时间，避免排队后又重新获得完整的 provider 超时预算。
-    let active_permit =
-        match tokio::time::timeout_at(deadline, deps.active_requests.clone().acquire_owned()).await
-        {
-            Ok(Ok(permit)) => Arc::new(Mutex::new(Some(permit))),
-            Ok(Err(_)) => {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "网关活动请求容量已关闭",
-                    &deps,
-                    full_body,
-                    Some(token),
-                    None,
-                    started,
-                    inbound_protocol,
-                    request_body_for_log,
-                    &request_id,
-                )
-                .await;
-            }
-            Err(_) => {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "网关活动请求容量暂时已满",
-                    &deps,
-                    full_body,
-                    Some(token),
-                    None,
-                    started,
-                    inbound_protocol,
-                    request_body_for_log,
-                    &request_id,
-                )
-                .await;
-            }
-        };
+    // Semaphore 控制同时占用 provider、下游响应和结算资源的请求数。排队等待
+    // 以首个候选渠道的预首字节预算为界——渠道级总时限自此起算，避免排队后
+    // 又重新获得完整的 provider 超时预算。
+    let first_channel = &snapshot.channels[hops[0].route.channel_indices[0]].channel;
+    let admission_deadline = tokio::time::Instant::now()
+        .checked_add(channel_request_budget(first_channel))
+        .unwrap_or_else(tokio::time::Instant::now);
+    let active_permit = match tokio::time::timeout_at(
+        admission_deadline,
+        deps.active_requests.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => Arc::new(Mutex::new(Some(permit))),
+        Ok(Err(_)) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "网关活动请求容量已关闭",
+                &deps,
+                full_body,
+                Some(token),
+                None,
+                started,
+                inbound_protocol,
+                request_body_for_log,
+                &request_id,
+            )
+            .await;
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "网关活动请求容量暂时已满",
+                &deps,
+                full_body,
+                Some(token),
+                None,
+                started,
+                inbound_protocol,
+                request_body_for_log,
+                &request_id,
+            )
+            .await;
+        }
+    };
 
     let inbound_anthropic_version = headers.get("anthropic-version");
 
@@ -752,7 +753,6 @@ async fn handle_request(
             &request_id,
             &session_identity,
             active_permit.clone(),
-            deadline,
         )
         .await;
         if response.status().is_success() {
@@ -1075,7 +1075,8 @@ struct OutboundCall<'a> {
     session_identity: &'a str,
     /// 由请求入口持有的活动容量许可；流式路径会把所有权转交给后台流水任务。
     active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
-    /// 从入站开始计算的绝对截止时刻；重试、退避与响应读取共享同一预算。
+    /// 本渠道入口重锚的预首字节截止时刻；同渠道重试退避与响应读取共享，
+    /// 切换渠道时由新渠道的 request_timeout_ms 重新起算。
     deadline: tokio::time::Instant,
 }
 
@@ -1093,7 +1094,7 @@ struct BillingAttemptStart<'a> {
     price: PriceSnapshot,
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
-    /// 请求级绝对截止时刻；出站响应读取与结果持久化共享同一预算。
+    /// 本渠道入口重锚的截止时刻；出站响应读取与结果持久化共享同一预算。
     deadline: tokio::time::Instant,
 }
 
@@ -1280,10 +1281,14 @@ async fn begin_billing_attempt(
     })?;
     if !reserved {
         // 计费拒绝发生在出站之前，属于下游钱包/令牌额度域而非渠道故障：
-        // 以独立变体上抛，避免被当成上游 402 记入渠道冷却。
+        // 以独立变体上抛，避免被当成上游 402 记入渠道冷却。文案带上预留
+        // 金额与口径——余额充足但低于保守预留的合法请求也能理解拒绝原因。
         return Err(Outbound::BillingDenied {
             channel: start.channel.name.clone(),
-            message: "余额或令牌累计上限不足以覆盖本次出站尝试".to_string(),
+            message: format!(
+                "余额或令牌累计上限不足以覆盖本次出站尝试的预检冻结额度 {}（按请求字节与缺省输出上限保守估算；实际费用按用量结算，结算后释放差额）",
+                super::admin::format_usd_micros(reserved_cost)
+            ),
         });
     }
     Ok(BillingAttempt { attempt_id, start })
@@ -1335,7 +1340,6 @@ async fn dispatch_hop(
     request_id: &str,
     session_identity: &str,
     active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
-    deadline: tokio::time::Instant,
 ) -> Response {
     let hop_dispatch = HopDispatch {
         deps,
@@ -1352,7 +1356,6 @@ async fn dispatch_hop(
         request_id,
         session_identity,
         active_permit,
-        deadline,
     };
     hop_with_failover(&hop_dispatch, &hop.route).await
 }
@@ -1382,8 +1385,6 @@ struct HopDispatch<'a> {
     session_identity: &'a str,
     /// 活动请求 permit 的所有权容器；流式任务创建后从此处取走并持有到结算结束。
     active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
-    /// 整个下游请求的绝对截止时刻，不因切换渠道或密钥而重置。
-    deadline: tokio::time::Instant,
 }
 
 impl<'a> HopDispatch<'a> {
@@ -1409,14 +1410,14 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
         route,
         &ctx.snapshot.channels,
         ctx.routed_model,
-        |record, key| {
+        |record, key, channel_deadline| {
             let passthrough = ctx.channel_is_passthrough(record);
             Box::pin(async move {
                 if passthrough {
                     if ctx.request.stream {
-                        passthrough_stream_completion(ctx, record, key).await
+                        passthrough_stream_completion(ctx, record, key, channel_deadline).await
                     } else {
-                        passthrough_non_stream_completion(ctx, record, key).await
+                        passthrough_non_stream_completion(ctx, record, key, channel_deadline).await
                     }
                 } else {
                     let mut call_ctx = OutboundCall {
@@ -1432,7 +1433,7 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
                         request_id: ctx.request_id,
                         session_identity: ctx.session_identity,
                         active_permit: ctx.active_permit.clone(),
-                        deadline: ctx.deadline,
+                        deadline: channel_deadline,
                     };
                     if ctx.request.stream {
                         stream_completion(&mut call_ctx, ctx.request, &record.channel, key, true)
@@ -1456,7 +1457,6 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
             retry_backoff: retry_backoff(ctx.snapshot),
             key_cooldowns: &ctx.deps.key_cooldowns,
             channel_cooldowns: &ctx.deps.channel_cooldowns,
-            deadline: ctx.deadline,
         },
     )
     .await
@@ -1472,6 +1472,7 @@ async fn passthrough_stream_completion(
     ctx: &HopDispatch<'_>,
     record: &ChannelRecord,
     key: &StoredChannelKey,
+    deadline: tokio::time::Instant,
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(
@@ -1510,7 +1511,7 @@ async fn passthrough_stream_completion(
         price,
         inbound_protocol: ctx.inbound_protocol,
         request_body: ctx.request_body.clone(),
-        deadline: ctx.deadline,
+        deadline,
     })
     .await
     {
@@ -1522,7 +1523,7 @@ async fn passthrough_stream_completion(
         return outbound;
     }
     let upstream = tokio::time::timeout(
-        remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
+        remaining_timeout(deadline, channel_idle(channel.timeout_ms)),
         ctx.deps
             .outbound_clients
             .for_policy(
@@ -1578,7 +1579,7 @@ async fn passthrough_stream_completion(
     if !resp.status().is_success() {
         let retry_after = parse_retry_after(resp.headers());
         let upstream_body = match tokio::time::timeout(
-            remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
+            remaining_timeout(deadline, channel_idle(channel.timeout_ms)),
             take_upstream_body(
                 resp,
                 &channel.name,
@@ -1656,7 +1657,7 @@ async fn passthrough_stream_completion(
         channel.protocol,
         idle,
         ctx.snapshot.sse_reassembly_max(),
-        ctx.deadline,
+        deadline,
     )
     .await;
     let peeked = match peek {
@@ -1718,9 +1719,9 @@ async fn passthrough_stream_completion(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(),
-        log_deadline: ctx
-            .deadline
-            .max(tokio::time::Instant::now() + REQUEST_TOTAL_TIMEOUT),
+        // 流任务持有 permit 直到结算完成；日志持久化预算按本渠道的预首字节
+        // 时限在流首重锚，长流结束时不受入站起算的旧时刻约束。
+        log_deadline: tokio::time::Instant::now() + channel_request_budget(channel),
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
     tokio::spawn(async move {
@@ -1747,6 +1748,7 @@ async fn passthrough_non_stream_completion(
     ctx: &HopDispatch<'_>,
     record: &ChannelRecord,
     key: &StoredChannelKey,
+    deadline: tokio::time::Instant,
 ) -> Outbound {
     let channel = &record.channel;
     let outbound = passthrough_patch_request(
@@ -1784,7 +1786,7 @@ async fn passthrough_non_stream_completion(
         price,
         inbound_protocol: ctx.inbound_protocol,
         request_body: ctx.request_body.clone(),
-        deadline: ctx.deadline,
+        deadline,
     })
     .await
     {
@@ -1796,7 +1798,7 @@ async fn passthrough_non_stream_completion(
         return outbound;
     }
     let upstream = tokio::time::timeout(
-        remaining_timeout(ctx.deadline, channel_idle(channel.timeout_ms)),
+        remaining_timeout(deadline, channel_idle(channel.timeout_ms)),
         ctx.deps
             .outbound_clients
             .for_policy(
@@ -1859,7 +1861,7 @@ async fn passthrough_non_stream_completion(
     let idle = channel_idle(channel.timeout_ms);
     let max_bytes = ctx.snapshot.max_response_bytes;
     let upstream_body = match tokio::time::timeout(
-        remaining_timeout(ctx.deadline, idle),
+        remaining_timeout(deadline, idle),
         take_upstream_body(resp, &channel.name, max_bytes, "直通非流式上游读体失败"),
     )
     .await
@@ -1928,7 +1930,7 @@ async fn passthrough_non_stream_completion(
                 request_id: ctx.request_id,
                 billing_attempt_id: Some(billing_attempt_id.id()),
                 upstream_reached: true,
-                deadline: Some(ctx.deadline),
+                deadline: Some(deadline),
             },
         )
         .await
@@ -1970,7 +1972,7 @@ async fn passthrough_non_stream_completion(
                 request_id: ctx.request_id,
                 billing_attempt_id: Some(billing_attempt_id.id()),
                 upstream_reached: true,
-                deadline: Some(ctx.deadline),
+                deadline: Some(deadline),
             },
         )
         .await
@@ -2045,9 +2047,14 @@ fn passthrough_patch_request(
     };
     if stream && let Value::Object(map) = &mut value {
         // 合并而非覆盖：下游自带的 stream_options 其他字段保留，仅补 include_usage。
+        // 既有值不是对象（null/标量）时整体换为对象——IR 路径本就重建该字段，
+        // 直通对齐后 include_usage 注入不因下游畸形值而缺席（缺席即计费缺据）。
         let stream_options = map
             .entry("stream_options".to_string())
             .or_insert_with(|| json!({}));
+        if !stream_options.is_object() {
+            *stream_options = json!({});
+        }
         if let Value::Object(so) = stream_options {
             so.insert("include_usage".into(), Value::Bool(true));
         }
@@ -2100,11 +2107,21 @@ enum PassthroughPeek {
     Content(Vec<Bytes>),
     /// 首帧前上游主动发送流内错误，可在下游收到响应头前切换渠道。
     UpstreamError(String),
-    /// 没有任何可转发字节时的空流、首帧超时或读取失败。
+    /// 首字节之前流被截断（空流、超时、读取失败或重装超限）：已缓冲的字节
+    /// 一并丢弃，按可重试语义上抛换渠道，对下游零痕迹。
     Interrupted(String),
 }
 
 /// 直通流在返回响应前检查首帧，保留原始字节块以便后续无损重放。
+///
+/// 直通路径不重编码响应，因此不能复用 IR 路径只保存 JSON 帧的 peek 结果；
+/// 这里保留已消费的网络块，并在流水任务开头先发送它们。检查同时受 SSE 重装
+/// 上限约束，避免上游长时间只发无法组成完整帧的字节时无限增长。
+///
+/// 语义与 IR 路径的 `peek_stream_head_until` 对齐：只有看到内容/收尾事件或
+/// 「已解出帧但无 IR 映射」的活性信号才算 Content；重装超限、读取失败、EOF
+/// 与首帧超时一律 Interrupted——此刻尚未向下游转发任何字节，failover 零痕迹，
+/// 不把 200 + 残缺流伪装成可交付响应。
 ///
 /// 直通路径不重编码响应，因此不能复用 IR 路径只保存 JSON 帧的 peek 结果；
 /// 这里保留已消费的网络块，并在流水任务开头先发送它们。检查同时受 SSE 重装
@@ -2168,6 +2185,11 @@ async fn peek_passthrough_stream_head_until(
                     _ => {}
                 }
             }
+            // 与 IR 路径同规的活性信号：已解出完整帧但无 IR 映射（如心跳帧）
+            // 说明上游存活，此后断流不能再安全地切换渠道。
+            if decoded.events.is_empty() {
+                content = true;
+            }
             if content {
                 return (PassthroughPeek::Content(peeked), byte_stream);
             }
@@ -2185,38 +2207,29 @@ async fn peek_passthrough_stream_head_until(
                 buffer.extend_from_slice(&bytes);
                 peeked.push(bytes);
                 if buffered_bytes > max_bytes {
-                    return (PassthroughPeek::Content(peeked), byte_stream);
+                    return (
+                        PassthroughPeek::Interrupted(SSE_REASSEMBLY_OVERFLOW_MESSAGE.to_string()),
+                        byte_stream,
+                    );
                 }
             }
             Ok(Some(Err(_))) => {
-                return if peeked.is_empty() {
-                    (
-                        PassthroughPeek::Interrupted("上游流读取失败".to_string()),
-                        byte_stream,
-                    )
-                } else {
-                    (PassthroughPeek::Content(peeked), byte_stream)
-                };
+                return (
+                    PassthroughPeek::Interrupted("上游流读取失败".to_string()),
+                    byte_stream,
+                );
             }
             Ok(None) => {
-                return if peeked.is_empty() {
-                    (
-                        PassthroughPeek::Interrupted("上游流未产出内容即结束（空流）".to_string()),
-                        byte_stream,
-                    )
-                } else {
-                    (PassthroughPeek::Content(peeked), byte_stream)
-                };
+                return (
+                    PassthroughPeek::Interrupted("上游流未产出内容即结束（空流）".to_string()),
+                    byte_stream,
+                );
             }
             Err(_) => {
-                return if peeked.is_empty() {
-                    (
-                        PassthroughPeek::Interrupted("上游流首帧超时".to_string()),
-                        byte_stream,
-                    )
-                } else {
-                    (PassthroughPeek::Content(peeked), byte_stream)
-                };
+                return (
+                    PassthroughPeek::Interrupted("上游流首帧超时".to_string()),
+                    byte_stream,
+                );
             }
         }
     }
@@ -2249,6 +2262,8 @@ async fn pipe_passthrough_stream<S>(
     let mut byte_stream = Box::pin(byte_stream);
     let mut pending = ctx.peeked.into_iter();
     let log_body_max = ctx.snapshot.log_body_max();
+    // 长流心跳：与 IR 流式路径同规，防止恢复任务把仍在消费中的长流误判孤儿。
+    let reservation_heartbeat = spawn_reservation_heartbeat(&ctx.deps, &ctx.billing_attempt_id);
 
     loop {
         let chunk = if let Some(chunk) = pending.next() {
@@ -2393,6 +2408,7 @@ async fn pipe_passthrough_stream<S>(
     {
         tracing::error!(error = %err, request_id = %ctx.request_id, "流式请求结果无法持久化");
     }
+    reservation_heartbeat.abort();
     // OpenAI 协议约定以 `data: [DONE]` 终止；Anthropic 以上游
     // message_stop 收尾，无需哨兵。
     if downstream_open && ctx.protocol == Protocol::OpenAiChat {
@@ -3066,9 +3082,9 @@ async fn stream_completion(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take(),
-        log_deadline: ctx
-            .deadline
-            .max(tokio::time::Instant::now() + REQUEST_TOTAL_TIMEOUT),
+        // 流任务持有 permit 直到结算完成；日志持久化预算按本渠道的预首字节
+        // 时限在流首重锚，长流结束时不受入站起算的旧时刻约束。
+        log_deadline: tokio::time::Instant::now() + channel_request_budget(channel),
     };
     tokio::spawn(async move {
         pipe_stream(byte_stream, tx, ctx).await;
@@ -3156,7 +3172,9 @@ async fn peek_stream_head(
     max_bytes: usize,
 ) -> (PeekHead, UpstreamByteStream) {
     let deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_secs(120))
+        .checked_add(Duration::from_millis(
+            crate::store::resources::DEFAULT_REQUEST_TIMEOUT_MS,
+        ))
         .unwrap_or_else(tokio::time::Instant::now);
     peek_stream_head_until(byte_stream, protocol, idle, max_bytes, deadline).await
 }
@@ -3268,6 +3286,40 @@ async fn peek_stream_head_until(
     }
 }
 
+/// 长流预留心跳间隔：远小于恢复任务的孤儿阈值，流任务存活期间持续刷新
+/// 预留行的 `updated_at`，使恢复扫描始终视为新鲜。
+const BILLING_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 为仍在消费中的流式尝试启动预留心跳。
+///
+/// 流建立后的上游消费不受请求总时限约束，可能远超恢复任务的孤儿阈值；心跳
+/// 以固定间隔把预留行 `updated_at` 推进到当前时刻，避免长流被误判为孤儿而
+/// 释放预留。预留离开待恢复状态时心跳自行退出；任务结束时由调用方 abort。
+/// 单次刷新失败只记 warn，不阻塞流转发。
+fn spawn_reservation_heartbeat(deps: &Deps, attempt_id: &str) -> tokio::task::JoinHandle<()> {
+    let pool = deps.pool.clone();
+    let attempt_id = attempt_id.to_string();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(BILLING_HEARTBEAT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // interval 的首次 tick 立即完成：跳过它，让首次刷新发生在一个完整间隔之后。
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match store::touch_billing_attempt_heartbeat(&pool, &attempt_id).await {
+                Ok(true) => {}
+                // 预留已终结（已结算/已释放/结果已入队）：无需继续心跳。
+                Ok(false) => break,
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    attempt_id = %attempt_id,
+                    "长流预留心跳刷新失败"
+                ),
+            }
+        }
+    })
+}
+
 /// 把上游 SSE 字节流逐帧解码 → 提取 usage → 重编码，推送到下游通道。
 ///
 /// 每收到一个完整 SSE 数据帧，解码为 IR 流事件；仅保留 finish 携带的 usage，
@@ -3284,6 +3336,9 @@ async fn pipe_stream<S>(
     use futures_util::StreamExt as _;
 
     let mut decoder = protocol::make_decoder(ctx.channel.protocol);
+    // 长流心跳：流式消费不受请求总时限约束，期间持续刷新预留行，防止恢复
+    // 任务把仍在消费中的长流误判为孤儿。结算完成后终止。
+    let reservation_heartbeat = spawn_reservation_heartbeat(&ctx.deps, &ctx.billing_attempt_id);
     // reasoning 兼容输出的自动挡按出站模型名判定：上游回报的思维链是否
     // 以 `delta.reasoning_content` 转发 chat 下游，由该渠道的开关决定。
     let outbound_model = routing::outbound_model(&ctx.channel, &ctx.routed_model);
@@ -3468,6 +3523,7 @@ async fn pipe_stream<S>(
     }
     // 先结算再发终止哨兵：下游读到终止时计费必定已落库。
     settle_and_log(&ctx, usage, usage_reported).await;
+    reservation_heartbeat.abort();
     // OpenAI 协议约定以 `data: [DONE]` 结束；Anthropic 以 message_stop 收尾。
     if downstream_open && let Some(terminator) = terminator {
         let _ = send_to_downstream(&tx, SseEvent::default().data(terminator), idle).await;
@@ -3547,9 +3603,11 @@ fn authenticate<'a>(
     headers: &HeaderMap,
 ) -> Result<&'a Token, AuthenticationError> {
     let key = extract_key(headers).ok_or(AuthenticationError::MissingToken)?;
+    // 库内与快照只存 key 的 SHA-256 指纹；呈现的明文先换算再查找。
+    let fingerprint = store::token_key_fingerprint(&key);
     let token = snapshot
         .tokens
-        .get(&key)
+        .get(&fingerprint)
         .ok_or(AuthenticationError::InvalidToken)?;
     if !token.enabled {
         return Err(AuthenticationError::DisabledToken);

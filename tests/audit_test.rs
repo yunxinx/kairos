@@ -262,6 +262,7 @@ async fn login_success_and_failure_are_audited() {
 
     let failed = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": common::TEST_ROOT_EMAIL, "password": "wrong-password" }))
         .send()
         .await

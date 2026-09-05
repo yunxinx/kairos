@@ -54,7 +54,7 @@ async fn large_body_over_axum_default_is_allowed() {
         "UPDATE user_balance SET balance_usd_micros = 10_000_000_000 \
          WHERE user_id = (SELECT user_id FROM tokens WHERE token_key = ?)",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .execute(&gw.pool)
     .await
     .expect("应能为大请求准备充足余额");

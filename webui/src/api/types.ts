@@ -58,6 +58,12 @@ export interface TokenCreate extends TokenAttributes {
   balance_usd_micros: number | null;
 }
 
+/** 创建响应在 TokenView 之上额外返回一次性的明文 key；此后任何接口都不再提供。 */
+export interface TokenCreatedView extends TokenView {
+  /** 明文 key，仅创建响应返回一次。 */
+  plaintext_key: string;
+}
+
 export interface BulkDeleteResult<T> {
   deleted: T[];
 }
@@ -94,6 +100,8 @@ export interface Channel {
   models: string[];
   model_aliases: Record<string, string>;
   timeout_ms: number;
+  /** 渠道级预首字节总时限（毫秒）；缺省 120000。 */
+  request_timeout_ms: number;
   max_retries: number;
   /** 是否启用：禁用的渠道不参与路由与失败切换。 */
   enabled: boolean;
@@ -154,6 +162,7 @@ export function channelWriteBody(view: ChannelView): Channel {
     models: view.models,
     model_aliases: view.model_aliases,
     timeout_ms: view.timeout_ms,
+    request_timeout_ms: view.request_timeout_ms,
     max_retries: view.max_retries,
     enabled: view.enabled,
     model_group: view.model_group,

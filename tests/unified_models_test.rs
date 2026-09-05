@@ -92,7 +92,7 @@ async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
          FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id \
          WHERE t.token_key = ?",
     )
-    .bind(key)
+    .bind(kairos::store::token_key_fingerprint(key))
     .fetch_one(&gw.pool)
     .await
     .expect("用户余额应存在")
@@ -364,6 +364,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             models: vec!["cheap".to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
@@ -387,6 +388,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             models: vec!["pricey".to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),

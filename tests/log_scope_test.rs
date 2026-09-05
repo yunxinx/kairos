@@ -44,6 +44,7 @@ async fn admin_json(
 async fn login(gw: &TestGateway, email: &str) -> String {
     let resp = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": email, "password": "password1" }))
         .send()
         .await
@@ -101,7 +102,7 @@ async fn spend_once(gw: &TestGateway, session: &str, user_id: i64, name: &str) -
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
-    let key = created.json::<Value>().await.expect("令牌应可解析")["token_key"]
+    let key = created.json::<Value>().await.expect("令牌应可解析")["plaintext_key"]
         .as_str()
         .expect("应有 key")
         .to_string();
@@ -329,6 +330,7 @@ async fn system_logs_show_users_only_their_own_audit_rows() {
     // 无 actor 的运维事件：登录失败只记邮箱，认不出是谁。
     let failed = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "alice@example.com", "password": "wrong-password" }))
         .send()
         .await

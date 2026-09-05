@@ -171,6 +171,25 @@ watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 type SavePayload =
   { kind: 'create'; body: TokenCreate } | { kind: 'update'; id: number; body: TokenUpdate };
 
+// 创建成功后窗体切换为「明文只出现一次」面板；此后任何接口都不再提供明文。
+const createdKey = ref<string | null>(null);
+const copied = ref(false);
+
+function finishCreate() {
+  createdKey.value = null;
+  emit('close');
+}
+
+async function copyCreatedKey() {
+  if (createdKey.value === null) return;
+  try {
+    await navigator.clipboard.writeText(createdKey.value);
+    copied.value = true;
+  } catch {
+    error(t('common.copyFailedTokenKey'));
+  }
+}
+
 const saveMutation = useMutation({
   mutationFn: async (payload: SavePayload) => {
     if (payload.kind === 'create') {
@@ -178,10 +197,15 @@ const saveMutation = useMutation({
     }
     return await apiClient.updateToken(payload.id, payload.body);
   },
-  onSuccess: async () => {
+  onSuccess: async (result) => {
     emit('dirty-change', false);
-    emit('close');
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
+    if ('plaintext_key' in result && typeof result.plaintext_key === 'string') {
+      createdKey.value = result.plaintext_key;
+      copied.value = false;
+      return;
+    }
+    emit('close');
   },
   onError: (err) => {
     error(extractApiError(err).message);
@@ -281,7 +305,24 @@ function handleSave() {
     @close="emit('close')"
     @pointerdown="emit('raise')"
   >
-    <form novalidate @submit.prevent="handleSave">
+    <!-- 明文只出现一次的确认面板：关闭或复制后无法再取回。 -->
+    <div v-if="createdKey !== null" class="card-body space-y-3" data-testid="token-created-panel">
+      <p class="text-sm">{{ t('tokens.createdKeyHint') }}</p>
+      <code
+        class="bg-surface-alt block break-all rounded px-2 py-1.5 font-mono text-xs"
+        data-testid="token-created-key"
+        >{{ createdKey }}</code
+      >
+      <div class="flex justify-end gap-2">
+        <button type="button" class="btn" data-testid="token-created-copy" @click="copyCreatedKey">
+          {{ copied ? t('common.copied') : t('common.copy') }}
+        </button>
+        <button type="button" class="btn btn-primary" data-testid="token-created-done" @click="finishCreate">
+          {{ t('common.done') }}
+        </button>
+      </div>
+    </div>
+    <form v-else novalidate @submit.prevent="handleSave">
       <div class="card-body space-y-3">
         <FormField
           field-name="name"

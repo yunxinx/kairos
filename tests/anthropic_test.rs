@@ -65,7 +65,7 @@ async fn openai_inbound_to_anthropic_channel_non_stream() {
         "SELECT settled_usd_micros, input_tokens FROM token_balance JOIN request_log \
          ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询计费");
@@ -195,7 +195,7 @@ async fn anthropic_passthrough_forwards_and_bills() {
         "SELECT settled_usd_micros, input_tokens FROM token_balance JOIN request_log \
          ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询计费");
@@ -246,7 +246,7 @@ async fn anthropic_passthrough_bills_1h_cache_write_tier() {
          cache_write_tokens FROM token_balance JOIN request_log \
          ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询计费");
@@ -327,7 +327,7 @@ async fn openai_inbound_to_anthropic_channel_streaming() {
     common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能查询计费");
@@ -387,7 +387,7 @@ async fn anthropic_passthrough_streaming_bills_split_usage() {
     common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能查询计费");

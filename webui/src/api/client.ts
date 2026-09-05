@@ -34,6 +34,7 @@ import type {
   TokenBalanceCommand,
   TokenCreate,
   TokenUpdate,
+  TokenCreatedView,
   TokenView,
   UnifiedModel,
   UpstreamModelsDraft,
@@ -199,7 +200,7 @@ export const apiClient = {
     return apiFetch('/tokens');
   },
 
-  createToken(body: TokenCreate): Promise<TokenView> {
+  createToken(body: TokenCreate): Promise<TokenCreatedView> {
     return apiFetch('/tokens', { method: 'POST', body: JSON.stringify(body) });
   },
 
