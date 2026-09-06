@@ -81,7 +81,10 @@ pub(super) struct LogEntry {
 
 impl LogEntry {
     /// 从存储行构造 wire 条目；完整 body 字节以 base64 编码，令牌 key 按管理面规则脱敏。
-    pub(super) fn from_store_log(log: store::RequestLog, reveal_topology: bool) -> Self {
+    pub(super) fn from_store_log(
+        log: store::request_log::RequestLog,
+        reveal_topology: bool,
+    ) -> Self {
         Self {
             id: log.id,
             created_at: log.created_at,
@@ -132,7 +135,7 @@ pub(super) struct LogQueryParams {
     settled: Option<bool>,
     discount_bp: Option<i64>,
     inbound_protocol: Option<String>,
-    sort_by: Option<store::RequestLogSortBy>,
+    sort_by: Option<store::request_log::RequestLogSortBy>,
     sort_dir: Option<store::SortDir>,
     page: Option<u64>,
     page_size: Option<u64>,
@@ -160,8 +163,10 @@ pub(super) async fn query_logs(
     let reveal_topology = identity
         .role()
         .at_least(crate::store::users::ManagementRole::Admin);
-    let mut filter =
-        store::RequestLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
+    let mut filter = store::request_log::RequestLogQuery::new(
+        params.page.unwrap_or(1),
+        params.page_size.unwrap_or(20),
+    );
     filter.user_id = identity.owner_scope();
     // token_key 是凭证，不是普通查询维度。普通用户已由 user_id 收窄，管理员
     // 使用名称和稳定日志 id 定位；禁用精确 key 过滤可避免脱敏展示旁出现存在性探测。
@@ -178,9 +183,10 @@ pub(super) async fn query_logs(
     filter.sort_by = params.sort_by.unwrap_or_default();
     filter.sort_dir = params.sort_dir.unwrap_or_default();
 
-    let (rows, total, unsettled_total) = store::query_request_log_page(&deps.pool, &filter)
-        .await
-        .map_err(AdminError::Store)?;
+    let (rows, total, unsettled_total) =
+        store::request_log::query_request_log_page(&deps.pool, &filter)
+            .await
+            .map_err(AdminError::Store)?;
     Ok(Json(LogPage {
         items: rows
             .into_iter()
@@ -201,7 +207,7 @@ pub(super) async fn get_log(
 ) -> Result<Json<LogEntry>, AdminError> {
     identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let id = parse_log_id(&raw)?;
-    let log = store::get_request_log(&deps.pool, id)
+    let log = store::request_log::get_request_log(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
         .filter(|log| {
@@ -253,7 +259,7 @@ async fn log_size(
     State(deps): State<AdminDeps>,
     Extension(_identity): Extension<ManagementIdentity>,
 ) -> Result<Json<LogSizeView>, AdminError> {
-    let stats = store::log_store_stats(&deps.pool, &deps.db_path)
+    let stats = store::request_log::log_store_stats(&deps.pool, &deps.db_path)
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(LogSizeView {
@@ -284,9 +290,10 @@ async fn cleanup_logs(
     }
     let now = crate::gateway::logging::unix_millis();
     let cutoff = now.saturating_sub((days as i64).saturating_mul(MS_PER_DAY));
-    let removed_request_logs = store::purge_settled_request_logs_before(&deps.pool, cutoff)
-        .await
-        .map_err(AdminError::Store)?;
+    let removed_request_logs =
+        store::request_log::purge_settled_request_logs_before(&deps.pool, cutoff)
+            .await
+            .map_err(AdminError::Store)?;
     let removed_system_logs = store::purge_system_logs_before(&deps.pool, cutoff)
         .await
         .map_err(AdminError::Store)?;

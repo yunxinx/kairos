@@ -284,7 +284,7 @@ async fn get_me(
         .as_ref()
         .map(|plan| plan.groups.clone())
         .unwrap_or_default();
-    let wallet = store::get_user_wallet(&deps.pool, user.id)
+    let wallet = store::settlement::get_user_wallet(&deps.pool, user.id)
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(MeView {
@@ -980,7 +980,7 @@ async fn user_admin_view(
         None => None,
     };
     let groups = visible_plan_groups(pool, identity, record.plan_id).await?;
-    let wallet = store::get_user_wallet(pool, record.id)
+    let wallet = store::settlement::get_user_wallet(pool, record.id)
         .await
         .map_err(AdminError::Store)?;
     let stats = match stats {
@@ -1027,7 +1027,7 @@ async fn list_management_users(
     let stats_map = users::list_users_stats(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
-    let wallets = store::list_user_wallets(&deps.pool)
+    let wallets = store::settlement::list_user_wallets(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
     let mut groups_by_plan: HashMap<i64, Vec<String>> = HashMap::new();

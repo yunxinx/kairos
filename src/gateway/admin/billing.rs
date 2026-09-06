@@ -70,7 +70,7 @@ async fn query_isolated(
         .limit
         .unwrap_or(100)
         .clamp(1, 500);
-    let rows = store::query_isolated_request_logs_scoped(
+    let rows = store::request_log::query_isolated_request_logs_scoped(
         &deps.pool,
         limit as i64,
         identity.role() == ManagementRole::Root,
@@ -111,7 +111,7 @@ async fn replay_isolated(
     if attempt_id.trim().is_empty() || attempt_id.len() > 128 {
         return Err(AdminError::InvalidBody("计费尝试标识无效".to_string()));
     }
-    let action = store::requeue_isolated_request_log(
+    let action = store::request_log::requeue_isolated_request_log(
         &deps.pool,
         &attempt_id,
         identity.role() == ManagementRole::Root,
@@ -122,10 +122,10 @@ async fn replay_isolated(
         other => AdminError::Store(other),
     })?;
     let action_name = match action {
-        store::IsolatedReplayAction::Requeued => "requeued",
-        store::IsolatedReplayAction::AlreadyQueued => "already_queued",
-        store::IsolatedReplayAction::AlreadySettled => "already_settled",
-        store::IsolatedReplayAction::NotFound => {
+        store::request_log::IsolatedReplayAction::Requeued => "requeued",
+        store::request_log::IsolatedReplayAction::AlreadyQueued => "already_queued",
+        store::request_log::IsolatedReplayAction::AlreadySettled => "already_settled",
+        store::request_log::IsolatedReplayAction::NotFound => {
             return Err(AdminError::NotFound(format!(
                 "隔离计费尝试 {attempt_id} 不存在"
             )));
@@ -163,7 +163,7 @@ async fn replay_isolated_by_id(
     if id <= 0 {
         return Err(AdminError::NotFound(format!("隔离 outbox {raw} 不存在")));
     }
-    let action = store::requeue_isolated_request_log_by_id(
+    let action = store::request_log::requeue_isolated_request_log_by_id(
         &deps.pool,
         id,
         identity.role() == ManagementRole::Root,
@@ -174,10 +174,10 @@ async fn replay_isolated_by_id(
         other => AdminError::Store(other),
     })?;
     let action_name = match action {
-        store::IsolatedReplayAction::Requeued => "requeued",
-        store::IsolatedReplayAction::AlreadyQueued => "already_queued",
-        store::IsolatedReplayAction::AlreadySettled => "already_settled",
-        store::IsolatedReplayAction::NotFound => {
+        store::request_log::IsolatedReplayAction::Requeued => "requeued",
+        store::request_log::IsolatedReplayAction::AlreadyQueued => "already_queued",
+        store::request_log::IsolatedReplayAction::AlreadySettled => "already_settled",
+        store::request_log::IsolatedReplayAction::NotFound => {
             return Err(AdminError::NotFound(format!("隔离 outbox {id} 不存在")));
         }
     };
@@ -232,7 +232,7 @@ async fn close_unsettled_log(
     identity.require_capability(ManagementCapability::SettleWaive)?;
     let id = parse_log_id(raw)?;
     let mut tx = begin_write(deps).await?;
-    let log = store::get_request_log_on_conn(&mut tx, id)
+    let log = store::request_log::get_request_log_on_conn(&mut tx, id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
@@ -249,19 +249,19 @@ async fn close_unsettled_log(
         reject_user_management(identity, &owner, None)?;
     }
     let outcome = if charge {
-        store::settle_unsettled_log(&mut tx, id).await
+        store::request_log::settle_unsettled_log(&mut tx, id).await
     } else {
-        store::waive_unsettled_log(&mut tx, id).await
+        store::request_log::waive_unsettled_log(&mut tx, id).await
     }
     .map_err(AdminError::Store)?;
     match outcome {
-        store::UnsettledLogAction::NotFound => {
+        store::request_log::UnsettledLogAction::NotFound => {
             return Err(AdminError::NotFound(format!("日志 {id} 不存在")));
         }
-        store::UnsettledLogAction::AlreadySettled => {
+        store::request_log::UnsettledLogAction::AlreadySettled => {
             return Err(AdminError::Conflict(format!("日志 {id} 已结算")));
         }
-        store::UnsettledLogAction::Closed => {}
+        store::request_log::UnsettledLogAction::Closed => {}
     }
     store::record_audit(
         &mut tx,
@@ -290,7 +290,7 @@ async fn close_unsettled_log(
     .await
     .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
-    let log = store::get_request_log(&deps.pool, id)
+    let log = store::request_log::get_request_log(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;

@@ -13,6 +13,8 @@
 
 #![allow(dead_code)]
 
+pub mod admin;
+
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -632,7 +634,7 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         .await
         .expect("应能播种令牌");
         let initial_balance_usd_micros = (token.balance_usd * 1_000_000.0).round() as i64;
-        store::initialize_token_settlement(
+        store::settlement::initialize_token_settlement(
             &mut conn,
             &stored_key,
             initial_balance_usd_micros,

@@ -255,7 +255,7 @@ async fn queue_request_log_inner(
         .billing
         .calculation_error
         .map(|err| format!("费用计算失败，未执行结算: {err}"));
-    let log = store::RequestLog {
+    let log = store::request_log::RequestLog {
         id: 0,
         created_at: now,
         token_name: draft.token.name.clone(),
@@ -292,14 +292,14 @@ async fn queue_request_log_inner(
         ),
         response_body: clip_logged_body(draft.billing.response_body, max_bytes),
     };
-    let pending = store::PendingRequestLog {
+    let pending = store::request_log::PendingRequestLog {
         log,
         settlement_error,
         upstream_reached: draft.upstream_reached,
     };
     // 结果与预留状态变更在同一事务原子落库；结果进 outbox 后，预留行不再
     // 持有载荷副本，崩溃恢复从预留重建的只有「无结果按零费用释放」一种形态。
-    store::enqueue_pending_request_log(&deps.pool, pending).await?;
+    store::request_log::enqueue_pending_request_log(&deps.pool, pending).await?;
     deps.request_log_writer.wake();
     Ok(())
 }
@@ -336,7 +336,7 @@ async fn run_request_log_writer(
                 continue;
             }
         }
-        if let Err(err) = store::recover_orphan_billing_attempts(
+        if let Err(err) = store::settlement::recover_orphan_billing_attempts(
             &pool,
             BILLING_RECOVERY_MAX_AGE,
             REQUEST_LOG_BATCH_SIZE,
@@ -354,8 +354,10 @@ async fn run_request_log_writer(
 /// 按保留期分批清理终态预留行；失败只记 error，下一轮再试。
 async fn purge_terminal_reservations(pool: &sqlx::SqlitePool) {
     let now = unix_millis();
-    let cutoff = now.saturating_sub(store::BILLING_RESERVATION_RETENTION_MILLIS);
-    if let Err(err) = store::purge_terminal_billing_reservations_before(pool, cutoff).await {
+    let cutoff = now.saturating_sub(store::settlement::BILLING_RESERVATION_RETENTION_MILLIS);
+    if let Err(err) =
+        store::settlement::purge_terminal_billing_reservations_before(pool, cutoff).await
+    {
         tracing::error!(error = %err, "终态计费预留清理失败，将稍后重试");
     }
 }
@@ -365,7 +367,8 @@ async fn drain_pending_request_logs(
     usage_warning_gate: &mut UsageWarningGate,
 ) -> Result<(), store::StoreError> {
     loop {
-        let pending = store::load_pending_request_logs(pool, REQUEST_LOG_BATCH_SIZE).await?;
+        let pending =
+            store::request_log::load_pending_request_logs(pool, REQUEST_LOG_BATCH_SIZE).await?;
         if pending.is_empty() {
             return Ok(());
         }
@@ -377,7 +380,7 @@ async fn drain_pending_request_logs(
                 // 结算事务失败时只隔离当前记录并继续消费后续记录。隔离本身
                 // 也失败才向上返回；此时保留队列状态，下一轮仍会重试该动作。
                 let reason = format!("持久化请求日志失败: {err}");
-                store::isolate_pending_request_log(
+                store::request_log::isolate_pending_request_log(
                     pool,
                     log.id,
                     &reason,
@@ -402,13 +405,14 @@ async fn drain_pending_request_logs(
 async fn process_pending_request_log(
     pool: &sqlx::SqlitePool,
     usage_warning_gate: &mut UsageWarningGate,
-    mut pending: store::PendingRequestLog,
+    mut pending: store::request_log::PendingRequestLog,
 ) -> Result<(), store::StoreError> {
     if let Some(reason) = pending.settlement_error.take() {
         pending.log.settled = false;
         // 费用计算失败是确定性故障：原始记录保留在隔离状态，主队列继续
         // 消费其它请求；人工修复价格或数据后可按 request_id 重放。
-        store::isolate_pending_request_log(pool, pending.log.id, &reason, None).await?;
+        store::request_log::isolate_pending_request_log(pool, pending.log.id, &reason, None)
+            .await?;
         record_request_log_notes(
             pool,
             usage_warning_gate,
@@ -433,14 +437,20 @@ async fn process_pending_request_log(
             .map_err(store::StoreError::Query)?;
         let settlement = match pending.log.billing_attempt_id.as_deref() {
             Some(attempt_id) => {
-                store::settle_billing_attempt(&mut tx, attempt_id, pending.log.cost_usd_micros)
-                    .await
+                store::settlement::settle_billing_attempt(
+                    &mut tx,
+                    attempt_id,
+                    pending.log.cost_usd_micros,
+                )
+                .await
             }
-            None => {
-                store::settle_charge(&mut tx, &pending.log.token_key, pending.log.cost_usd_micros)
-                    .await
-                    .map(|_| ())
-            }
+            None => store::settlement::settle_charge(
+                &mut tx,
+                &pending.log.token_key,
+                pending.log.cost_usd_micros,
+            )
+            .await
+            .map(|_| ()),
         };
         match settlement {
             Ok(()) => {
@@ -467,7 +477,7 @@ async fn process_pending_request_log(
                 tx.rollback().await.map_err(store::StoreError::Query)?;
                 // 隔离写入与失败详情是独立事务，避免一个坏请求再次阻塞后续
                 // 记录。指数间隔由存储层按失败次数计算，持续保留原始结果。
-                store::isolate_pending_request_log(
+                store::request_log::isolate_pending_request_log(
                     pool,
                     pending.log.id,
                     &reason,
@@ -516,9 +526,9 @@ async fn process_pending_request_log(
 /// 在一个事务内写最终日志、刷新最后使用时间并删除队列项。
 async fn finish_pending_request_log(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    log: &store::RequestLog,
+    log: &store::request_log::RequestLog,
 ) -> Result<Option<String>, store::StoreError> {
-    store::insert_request_log_with_id_on(tx, log, log.id).await?;
+    store::request_log::insert_request_log_with_id_on(tx, log, log.id).await?;
     let touch_error = if log.channel.is_empty() {
         None
     } else {
@@ -527,7 +537,7 @@ async fn finish_pending_request_log(
             .err()
             .map(|err| err.to_string())
     };
-    store::delete_pending_request_log_on(tx, log.id).await?;
+    store::request_log::delete_pending_request_log_on(tx, log.id).await?;
     Ok(touch_error)
 }
 
@@ -548,7 +558,7 @@ async fn rollback_request_log_transaction(
 async fn record_request_log_notes(
     pool: &sqlx::SqlitePool,
     usage_warning_gate: &mut UsageWarningGate,
-    log: &store::RequestLog,
+    log: &store::request_log::RequestLog,
     usage_reported: bool,
     upstream_reached: bool,
     settlement_error: Option<String>,

@@ -99,7 +99,7 @@ pub(super) fn available_balance(
 }
 
 async fn token_view(pool: &SqlitePool, record: TokenRecord) -> Result<TokenView, AdminError> {
-    let settled = store::get_token_settled(pool, &record.token.token_key)
+    let settled = store::settlement::get_token_settled(pool, &record.token.token_key)
         .await
         .map_err(AdminError::Store)?;
     TokenView::from_record(record, settled)
@@ -109,7 +109,7 @@ async fn token_view_masked(
     pool: &SqlitePool,
     record: TokenRecord,
 ) -> Result<TokenView, AdminError> {
-    let settled = store::get_token_settled(pool, &record.token.token_key)
+    let settled = store::settlement::get_token_settled(pool, &record.token.token_key)
         .await
         .map_err(AdminError::Store)?;
     TokenView::from_record_masked(record, settled)
@@ -129,7 +129,7 @@ pub(super) async fn list_user_tokens(
     let records = store::resources::list_token_records_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
-    let settled = store::list_token_settled_for_user(&deps.pool, id)
+    let settled = store::settlement::list_token_settled_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
     let views = records
@@ -149,7 +149,7 @@ pub(super) async fn list_tokens(
     let records = store::resources::list_token_records_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
-    let settled = store::list_token_settled_for_user(&deps.pool, identity.user_id())
+    let settled = store::settlement::list_token_settled_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
     let views = records
@@ -453,7 +453,7 @@ pub(super) async fn create_token(
     crate::store::resources::insert_token(&mut tx, &token, now)
         .await
         .map_err(AdminError::Store)?;
-    crate::store::initialize_token_settlement(&mut tx, &token.token_key, 0, now)
+    crate::store::settlement::initialize_token_settlement(&mut tx, &token.token_key, 0, now)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
@@ -564,10 +564,10 @@ pub(super) async fn delete_token(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
     reject_cross_owner_mutation(&identity, &deleted)?;
-    let settled = store::get_token_settled_on_conn(&mut tx, &deleted.token.token_key)
+    let settled = store::settlement::get_token_settled_on_conn(&mut tx, &deleted.token.token_key)
         .await
         .map_err(AdminError::Store)?;
-    store::delete_token_balance(&mut tx, &deleted.token.token_key)
+    store::settlement::delete_token_balance(&mut tx, &deleted.token.token_key)
         .await
         .map_err(AdminError::Store)?;
     store::resources::delete_token(&mut tx, id)
@@ -595,7 +595,7 @@ async fn delete_tokens(
         records.push(record);
     }
     for record in &records {
-        store::delete_token_balance(&mut tx, &record.token.token_key)
+        store::settlement::delete_token_balance(&mut tx, &record.token.token_key)
             .await
             .map_err(AdminError::Store)?;
         store::resources::delete_token(&mut tx, record.id)

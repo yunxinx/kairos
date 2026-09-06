@@ -3,6 +3,8 @@
 mod common;
 
 use common::TestGateway;
+use common::admin::{chat_request, make_successful_request};
+use common::{TEST_MODEL, TEST_TOKEN_KEY};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -397,4 +399,45 @@ async fn delete_token_returns_the_balance_observed_before_settlement_cleanup() {
     let deleted: Value = deleted.json().await.expect("删除响应应可解析");
     assert_eq!(deleted["settled_usd_micros"], 3_000_000);
     assert_eq!(deleted["balance_usd_micros"], 7_000_000);
+}
+
+/// 余额调整为相对量：扣减至零余额 → 计费准入拒绝（402）；充值后恢复可用。
+#[tokio::test]
+async fn balance_adjustment_reflected_in_admission() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
+    let resp = client
+        .post(format!("{admin}/users/1/balance-adjustments"))
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
+        .json(&json!({ "operation_id": "admin-balance-3", "delta_usd_micros": -5_000_000, "reason": "manual_adjustment" }))
+        .send()
+        .await
+        .expect("应可调整余额");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let adjustment: Value = resp.json().await.expect("余额操作应可解析");
+    assert_eq!(adjustment["after_balance_usd_micros"], 0);
+
+    // 零余额：计费准入拒绝。
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYMENT_REQUIRED,
+        "零余额应 402"
+    );
+
+    // 充值后恢复可用。
+    let resp = client
+        .post(format!("{admin}/users/1/balance-adjustments"))
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
+        .json(&json!({ "operation_id": "admin-balance-4", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
+        .send()
+        .await
+        .expect("应可充值");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    make_successful_request(&mut gw).await;
 }

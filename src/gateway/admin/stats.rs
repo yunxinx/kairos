@@ -101,8 +101,8 @@ async fn get_stats(
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
-    let days = store::clamp_stats_days(params.days);
-    let stats = store::query_stats(&deps.pool, days, identity.owner_scope())
+    let days = store::request_log::clamp_stats_days(params.days);
+    let stats = store::request_log::query_stats(&deps.pool, days, identity.owner_scope())
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(StatsView {
@@ -188,7 +188,7 @@ async fn get_lifetime_stats(
     Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<LifetimeStatsView>, AdminError> {
     identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
-    let stats = store::query_lifetime_stats(&deps.pool, identity.owner_scope())
+    let stats = store::request_log::query_lifetime_stats(&deps.pool, identity.owner_scope())
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(LifetimeStatsView {

@@ -2440,7 +2440,7 @@ mod tests {
         )
         .await
         .expect("应能写令牌");
-        crate::store::initialize_token_settlement(&mut conn, "sk-a", 3_000_000, 1)
+        crate::store::settlement::initialize_token_settlement(&mut conn, "sk-a", 3_000_000, 1)
             .await
             .expect("应能初始化余额");
         let before = list_tokens(&pool).await.expect("应能读令牌");
@@ -2464,7 +2464,7 @@ mod tests {
         .await
         .expect("应能更新令牌");
 
-        let balance = crate::store::get_admission_snapshot(&mut conn, "sk-a")
+        let balance = crate::store::settlement::get_admission_snapshot(&mut conn, "sk-a")
             .await
             .expect("应能读余额")
             .expect("余额应存在");

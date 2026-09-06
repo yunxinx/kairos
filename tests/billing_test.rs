@@ -743,7 +743,7 @@ async fn plan_discount_applies_to_charge_and_log() {
         .execute(&mut *conn)
         .await
         .expect("应能设置套餐折扣");
-    kairos::store::adjust_user_balance(&mut conn, user.id, 5_000_000)
+    kairos::store::settlement::adjust_user_balance(&mut conn, user.id, 5_000_000)
         .await
         .expect("应能充值");
     sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
@@ -868,7 +868,7 @@ async fn discounted_max_tokens_estimate_uses_discounted_amount() {
         .await
         .expect("应能设置折扣");
     // 原价粗估为 10_000 微元，折后 8_000；余额 9_000 只够折后。
-    kairos::store::adjust_user_balance(&mut conn, user.id, 9_000)
+    kairos::store::settlement::adjust_user_balance(&mut conn, user.id, 9_000)
         .await
         .expect("应能充值");
     sqlx::query("UPDATE tokens SET user_id = ? WHERE token_key = ?")
