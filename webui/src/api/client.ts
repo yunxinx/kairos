@@ -295,7 +295,12 @@ export const apiClient = {
     });
   },
 
-  /** 按渠道草稿拉取上游模型列表；渠道无需已保存。 */
+  /**
+   * 按渠道草稿或已保存渠道拉取上游模型列表；草稿无需已保存。
+   *
+   * 两种形态：新建时传草稿（协议/地址/密钥/超时）；编辑既有渠道时传
+   * `channel_id`，密钥与地址取库中定义——表单不持有明文也能同步。
+   */
   listUpstreamModels(body: UpstreamModelsDraft): Promise<UpstreamModelsView> {
     return apiFetch('/channels/models', { method: 'POST', body: JSON.stringify(body) });
   },

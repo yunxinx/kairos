@@ -156,8 +156,7 @@ test.describe('channel resource page', () => {
 
       // 二次同步：别名保留、主名已选择；关闭按钮不保存并返回；别名维度筛选可用；搜索/反选作用于可见行。
       await okRow.getByTestId('channel-edit').click();
-      // 编辑表单不回填密钥：同步上游列表前先输入一把明文密钥。
-      await page.getByTestId('channel-key-api').fill('sk-upstream');
+      // 编辑既有渠道：同步走已保存渠道的密钥，无需在表单里重填明文。
       await page.getByTestId('channel-sync-models').click();
       await page.getByTestId('channel-sync-run').click();
       await expect(miniRow.getByTestId('channel-sync-status-selected')).toBeVisible();

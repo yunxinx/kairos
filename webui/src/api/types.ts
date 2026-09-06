@@ -733,13 +733,15 @@ export interface ChannelProbeResult {
   upstream_body: string | null;
 }
 
-/** 拉取上游模型列表的草稿请求：渠道无需已保存。 */
-export interface UpstreamModelsDraft {
-  protocol: Protocol;
-  base_url: string;
-  api_key: string;
-  timeout_ms: number;
-}
+/** 拉取上游模型列表的请求：按未保存草稿（自带密钥）或已保存渠道（密钥取库中定义）。 */
+export type UpstreamModelsDraft =
+  | {
+      protocol: Protocol;
+      base_url: string;
+      api_key: string;
+      timeout_ms: number;
+    }
+  | { channel_id: number };
 
 /** 上游模型列表响应：模型 id 数组（上游顺序）。 */
 export interface UpstreamModelsView {

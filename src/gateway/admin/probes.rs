@@ -227,6 +227,17 @@ fn elapsed_ms(started: Instant) -> u64 {
 const UPSTREAM_MODELS_PATH: &str = "/models";
 const GEMINI_UPSTREAM_MODELS_PATH: &str = "/v1beta/models";
 
+/// 拉取上游模型列表的来源：按渠道草稿（未保存，密钥随请求）或按已保存渠道
+/// （密钥与地址取库中定义）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, untagged)]
+enum UpstreamModelsSource {
+    /// 渠道草稿：新建向导在保存前同步模型；密钥为调用方提供的明文。
+    Draft(UpstreamModelsDraft),
+    /// 已保存渠道：编辑器对既有渠道同步模型，无需在表单里回显或重填密钥。
+    Channel { channel_id: i64 },
+}
+
 /// 拉取上游模型列表的草稿请求：仅含出站相关字段，渠道无需已保存。
 ///
 /// 管理面新建渠道向导可在保存前同步模型；`timeout_ms` 沿用为本次请求超时。
@@ -239,55 +250,41 @@ struct UpstreamModelsDraft {
     timeout_ms: u64,
 }
 
+/// 解析后的出站请求材料：认证密钥与模型列表 URL 所需的协议、地址与超时。
+struct UpstreamTarget {
+    protocol: Protocol,
+    base_url: String,
+    key: StoredChannelKey,
+    timeout_ms: u64,
+}
+
 /// 上游模型列表响应：模型 id 数组，保持上游返回顺序，排序由调用方负责。
 #[derive(Debug, Serialize)]
 struct UpstreamModelsView {
     models: Vec<String>,
 }
 
-/// 按渠道草稿拉取上游模型列表：GET `{base_url}/models`。
+/// 按渠道草稿或已保存渠道拉取上游模型列表：GET `{base_url}/models`。
 ///
 /// OpenAI（chat/responses）与 Anthropic（messages）的模型列表同为
 /// `{"data": [{"id": ...}]}` 形态，故统一解析；认证头按协议复用 `OutboundAuth`。
 /// 上游不可达/非 2xx/响应形态非法均映射为 502 `upstream_error`。
 async fn list_upstream_models(
     State(deps): State<AdminDeps>,
-    body: Result<Json<UpstreamModelsDraft>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<UpstreamModelsSource>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UpstreamModelsView>, AdminError> {
-    let Json(draft) = body.map_err(AdminError::bad_body)?;
-    if draft.base_url.trim().is_empty() {
-        return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
-    }
-    reject_non_http_url(&draft.base_url)?;
-    if draft.api_key.trim().is_empty() {
-        return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
-    }
-    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
-        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
-        .contains(&draft.timeout_ms)
-    {
-        return Err(AdminError::InvalidBody(format!(
-            "timeout_ms 必须在 {}..={} 之间",
-            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
-            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
-        )));
-    }
-    let key = StoredChannelKey::new(
-        0,
-        0,
-        "draft".to_string(),
-        draft.api_key,
-        1,
-        true,
-        None,
-        None,
-        0,
-    );
-    let models_path = match draft.protocol {
+    let Json(source) = body.map_err(AdminError::bad_body)?;
+    let target = match source {
+        UpstreamModelsSource::Draft(draft) => resolve_draft_target(draft)?,
+        UpstreamModelsSource::Channel { channel_id } => {
+            resolve_saved_channel_target(&deps, channel_id).await?
+        }
+    };
+    let models_path = match target.protocol {
         Protocol::Gemini => GEMINI_UPSTREAM_MODELS_PATH,
         _ => UPSTREAM_MODELS_PATH,
     };
-    let url = format!("{}{}", draft.base_url.trim_end_matches('/'), models_path);
+    let url = format!("{}{}", target.base_url.trim_end_matches('/'), models_path);
     let snapshot = deps.snapshot.read().await.clone();
     let allow_private_networks = snapshot.allow_private_networks;
     let network_policy =
@@ -299,8 +296,8 @@ async fn list_upstream_models(
         .outbound_clients
         .for_policy(&network_policy, network_policy.target_allowlisted(&url))
         .get(&url)
-        .timeout(Duration::from_millis(draft.timeout_ms))
-        .apply_outbound_auth(draft.protocol, &key)
+        .timeout(Duration::from_millis(target.timeout_ms))
+        .apply_outbound_auth(target.protocol, &target.key)
         .send()
         .await;
     let response = match send {
@@ -319,8 +316,74 @@ async fn list_upstream_models(
             status_code,
         )));
     }
-    let models = parse_upstream_models(&body_text, draft.protocol)?;
+    let models = parse_upstream_models(&body_text, target.protocol)?;
     Ok(Json(UpstreamModelsView { models }))
+}
+
+/// 草稿形态：地址、协议、密钥与超时都由请求体给出，渠道无需已保存。
+fn resolve_draft_target(draft: UpstreamModelsDraft) -> Result<UpstreamTarget, AdminError> {
+    if draft.base_url.trim().is_empty() {
+        return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
+    }
+    reject_non_http_url(&draft.base_url)?;
+    if draft.api_key.trim().is_empty() {
+        return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
+    }
+    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
+        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
+        .contains(&draft.timeout_ms)
+    {
+        return Err(AdminError::InvalidBody(format!(
+            "timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
+            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+        )));
+    }
+    // 草稿密钥不属于任何渠道：id 置 0，仅承载认证明文。
+    let key = StoredChannelKey::new(
+        0,
+        0,
+        "draft".to_string(),
+        draft.api_key,
+        1,
+        true,
+        None,
+        None,
+        0,
+    );
+    Ok(UpstreamTarget {
+        protocol: draft.protocol,
+        base_url: draft.base_url,
+        key,
+        timeout_ms: draft.timeout_ms,
+    })
+}
+
+/// 已保存渠道形态：地址、协议、超时取库中定义，密钥选第一把启用的。
+///
+/// 编辑器对既有渠道同步模型走这里——密钥不回显也不要求重填，管理面无需
+/// 在表单里持有明文。渠道没有任何启用密钥时明确拒绝，而不是回落到草稿。
+async fn resolve_saved_channel_target(
+    deps: &AdminDeps,
+    channel_id: i64,
+) -> Result<UpstreamTarget, AdminError> {
+    let record = read_channel_record(deps, channel_id).await?;
+    let channel = &record.channel;
+    reject_non_http_url(&channel.base_url)?;
+    let key = record
+        .keys
+        .iter()
+        .find(|key| key.enabled)
+        .ok_or_else(|| AdminError::InvalidBody(format!("渠道 {channel_id} 没有启用的密钥")))?
+        .clone();
+    Ok(UpstreamTarget {
+        protocol: channel.protocol,
+        base_url: channel.base_url.clone(),
+        key,
+        timeout_ms: channel
+            .timeout_ms
+            .clamp(1, crate::store::resources::MAX_CHANNEL_TIMEOUT_MS),
+    })
 }
 
 /// 按协议解析上游模型列表：OpenAI/Anthropic 为 `{"data":[{"id"}]}`；

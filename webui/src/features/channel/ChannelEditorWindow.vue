@@ -438,8 +438,30 @@ const syncApiKey = computed(
   () => editorKeys.value.find((key) => key.api_key.trim() !== '')?.api_key ?? '',
 );
 
-/** 出站三要素缺一即无法拉取上游模型。 */
-const canSync = computed(() => editorBaseUrl.value.trim() !== '' && syncApiKey.value.trim() !== '');
+/**
+ * 同步来源：编辑既有渠道走已保存渠道（库中密钥，表单不持有明文也能同步）；
+ * 新建走表单草稿，要求地址与至少一把非空密钥已填。已保存渠道没有启用密钥
+ * 时后端会明确报错，前端不再预判禁用。
+ */
+const syncSource = computed<
+  | { kind: 'channel'; channelId: number }
+  | { kind: 'draft'; protocol: Protocol; baseUrl: string; apiKey: string }
+>(() => {
+  if (props.initial !== null) {
+    return { kind: 'channel', channelId: props.initial.id };
+  }
+  return {
+    kind: 'draft',
+    protocol: editorProtocol.value,
+    baseUrl: editorBaseUrl.value.trim(),
+    apiKey: syncApiKey.value,
+  };
+});
+
+/** 新建时出站三要素缺一即无法拉取上游模型；编辑始终可用（走已保存定义）。 */
+const canSync = computed(
+  () => syncSource.value.kind === 'channel' || (syncSource.value.baseUrl !== '' && syncSource.value.apiKey !== ''),
+);
 
 /** 草稿超时解析结果；非法传 null，由同步视图兜底缺省值。 */
 const syncTimeoutMs = computed(() => parseOptionalUint(editorTimeoutMs.value));
@@ -1139,9 +1161,7 @@ function handleSave(removalConfirmed = false) {
       v-else
       :models="editorModels"
       :aliases="editorAliasesMap"
-      :protocol="editorProtocol"
-      :base-url="editorBaseUrl.trim()"
-      :api-key="syncApiKey"
+      :source="syncSource"
       :timeout-ms="syncTimeoutMs"
       :stack-order="stackOrder"
       @back="handleSyncBack"
