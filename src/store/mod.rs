@@ -241,7 +241,12 @@ pub(crate) async fn hash_legacy_token_key_plaintext(path: &Path) -> Result<(), S
             .collect::<Result<Vec<_>, StoreError>>()?;
     for (token_key, metadata) in reservation_rows {
         let Ok(mut recovery) = serde_json::from_slice::<BillingAttemptRecovery>(&metadata) else {
-            tracing::warn!(token_key, "存量预留恢复元数据无法解析，指纹换算跳过该行");
+            // 告警只打指纹：此处 token_key 还是库中明文遗留 key，直接输出会把
+            // 可用凭证写进进程日志。
+            tracing::warn!(
+                token_key = %token_key_fingerprint(&token_key),
+                "存量预留恢复元数据无法解析，指纹换算跳过该行"
+            );
             continue;
         };
         if let Some(result) = recovery.result.as_deref_mut() {
@@ -420,6 +425,14 @@ pub struct RequestLog {
     /// 同一个 `request_id` 可以产生多条不同的 attempt；该字段把最终日志与唯一的
     /// 预留、上游结果和钱包扣款对应起来。未进入出站阶段的请求日志为 `None`。
     pub billing_attempt_id: Option<String>,
+    /// 该行是否对应已实际派发上游的尝试。
+    ///
+    /// `false` 表示「未出站即终局」：请求在建立任何上游连接前就被网关终止
+    ///（准入前置失败、全部渠道冷却 / 无可用密钥、本地计费拒绝、出站安全
+    /// 策略拒绝等）。这类行零费用、无渠道归属，统计侧单列计数，不并入
+    /// 出站请求口径。存量行与旧 outbox 元数据缺该字段时按已派发处理。
+    #[serde(default = "default_dispatched")]
+    pub dispatched: bool,
     /// 可选的入站请求原始字节（仅 `logging.full_body` 开启时保存）。
     pub request_body: Option<Vec<u8>>,
     /// 可选的入站响应原始字节（仅 `logging.full_body` 开启时保存）。
@@ -443,6 +456,11 @@ pub(crate) struct PendingRequestLog {
 
 /// `upstream_reached` 缺省值：未知可达性按「可能已产生费用」告警。
 fn default_upstream_reached() -> bool {
+    true
+}
+
+/// `dispatched` 缺省值：存量行与旧元数据按已派发处理，统计口径不回溯改变。
+fn default_dispatched() -> bool {
     true
 }
 
@@ -484,8 +502,9 @@ pub(crate) async fn insert_request_log_with_id_on(
           cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
           cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
           base_cost_usd_micros, discount_bp, cost_usd_micros, \
-          settled, usage_reported, request_id, billing_attempt_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+          settled, usage_reported, request_id, billing_attempt_id, request_body, response_body, \
+          dispatched) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(id) DO NOTHING",
     )
     .bind(id)
@@ -519,6 +538,7 @@ pub(crate) async fn insert_request_log_with_id_on(
     .bind(&log.billing_attempt_id)
     .bind(&log.request_body)
     .bind(&log.response_body)
+    .bind(log.dispatched as i64)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -1776,6 +1796,8 @@ pub(crate) async fn recover_orphan_billing_attempts(
                 settled: true,
                 request_id: Some(request_id),
                 billing_attempt_id: Some(attempt_id.clone()),
+                // 能进入恢复的预留都已标记 dispatched（未派发的在更早分支释放）。
+                dispatched: true,
                 request_body,
                 response_body: None,
             };
@@ -2292,7 +2314,7 @@ async fn query_request_logs_on(
          cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
-         settled, usage_reported, request_id, billing_attempt_id FROM request_log",
+         settled, usage_reported, request_id, billing_attempt_id, dispatched FROM request_log",
     );
     push_request_log_filters(&mut qb, filter);
     push_request_log_order(&mut qb, filter);
@@ -2328,7 +2350,7 @@ pub async fn get_request_log_on_conn(
          cache_write_tokens, cache_write_1h_tokens, input_price_usd_micros, output_price_usd_micros, \
          cache_read_price_usd_micros, cache_write_price_usd_micros, cache_write_1h_price_usd_micros, \
          base_cost_usd_micros, discount_bp, cost_usd_micros, \
-         settled, usage_reported, request_id, billing_attempt_id, request_body, response_body \
+         settled, usage_reported, request_id, billing_attempt_id, dispatched, request_body, response_body \
          FROM request_log WHERE id = ?",
     )
     .bind(id)
@@ -2663,10 +2685,16 @@ pub struct Stats {
 }
 
 /// 时间窗汇总。令牌数/渠道数来自资源表（当前存量），其余来自 `request_log`。
+///
+/// 除 `not_dispatched` 外的全部指标只统计已派发出站的行（`dispatched = 1`），
+/// 维持既有出站请求口径；`not_dispatched` 单列统计「未出站即终局」的请求数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatsSummary {
     pub request_count: u64,
     pub success_count: u64,
+    /// 未出站即终局的请求数：全部渠道冷却 / 无可用密钥、本地计费拒绝、出站
+    /// 安全策略拒绝与准入前置失败等，从未建立上游连接。
+    pub not_dispatched: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// 实收（折后）合计。
@@ -2705,10 +2733,11 @@ pub struct CostShare {
 
 /// 全量累计：不受 `/stats` 时间窗影响。
 ///
-/// 口径：`request_count` 按 `request_id` 去重（存量无 id 的行回退到主键），
-/// 表示下游入站次数；`total_tokens` 含全部请求日志行（含未结算），
-/// `cost_usd_micros` 统计所有已结算出站尝试（包括失败尝试）。并列展示时
-/// 不要把 token 合计当成已入账费用的用量。
+/// 口径：`request_count` 只统计已派发出站的行，按 `request_id` 去重（存量无
+/// id 的行回退到主键），表示实际打到上游的请求数；未出站即终局的请求不并入
+///（在 `/stats` 的 `not_dispatched` 单列可见）。`total_tokens` 含全部已派发
+/// 请求日志行（含未结算），`cost_usd_micros` 统计所有已结算出站尝试（包括
+/// 失败尝试）。并列展示时不要把 token 合计当成已入账费用的用量。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifetimeStats {
     pub request_count: u64,
@@ -2720,6 +2749,9 @@ pub struct LifetimeStats {
 
 /// 聚合 `days` 天（已夹取）内的 stats。费用统计所有已结算尝试，成功数仍只
 /// 统计 HTTP 2xx，避免失败尝试扣费后在财务报表中消失。
+///
+/// 出站口径的指标只统计 `dispatched = 1` 的行；`not_dispatched` 单列统计
+/// 未出站即终局的请求数，二者互不并入。
 ///
 /// `user_id` 为 `Some` 时只统计该用户名下的流量（普通用户视图），并省略渠道数。
 pub async fn query_stats(
@@ -2748,7 +2780,7 @@ pub async fn query_stats(
          COALESCE(SUM(CASE WHEN settled = 1 \
              THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
            AS gross_profit_usd_micros \
-         FROM request_log WHERE created_at >= ?{}",
+         FROM request_log WHERE created_at >= ? AND dispatched = 1{}",
         user_scope_clause(user_id)
     );
     let mut summary_query = sqlx::query(AssertSqlSafe(summary_sql)).bind(from_created_at);
@@ -2756,6 +2788,22 @@ pub async fn query_stats(
         summary_query = summary_query.bind(user_id);
     }
     let summary_row = summary_query
+        .fetch_one(pool)
+        .await
+        .map_err(StoreError::Query)?;
+
+    // 未出站即终局的请求数与出站口径分列统计：同一时间窗、同一归属范围。
+    let not_dispatched_sql = format!(
+        "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS not_dispatched \
+         FROM request_log WHERE created_at >= ? AND dispatched = 0{}",
+        user_scope_clause(user_id)
+    );
+    let mut not_dispatched_query =
+        sqlx::query(AssertSqlSafe(not_dispatched_sql)).bind(from_created_at);
+    if let Some(user_id) = user_id {
+        not_dispatched_query = not_dispatched_query.bind(user_id);
+    }
+    let not_dispatched_row = not_dispatched_query
         .fetch_one(pool)
         .await
         .map_err(StoreError::Query)?;
@@ -2786,6 +2834,11 @@ pub async fn query_stats(
         success_count: as_count(
             summary_row
                 .try_get("success_count")
+                .map_err(StoreError::Query)?,
+        ),
+        not_dispatched: as_count(
+            not_dispatched_row
+                .try_get("not_dispatched")
                 .map_err(StoreError::Query)?,
         ),
         input_tokens: as_count(
@@ -2830,6 +2883,9 @@ pub async fn query_stats(
 
 /// 全量累计：请求数、已结算费用和四分量 token 合计。
 ///
+/// 与 `/stats` 同口径：只统计 `dispatched = 1` 的行；未出站即终局的请求
+/// 不进入本聚合。
+///
 /// `user_id` 为 `Some` 时只累计该用户名下的流量。
 pub async fn query_lifetime_stats(
     pool: &SqlitePool,
@@ -2846,8 +2902,8 @@ pub async fn query_lifetime_stats(
            AS gross_profit_usd_micros, \
          COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
            AS total_tokens \
-         FROM request_log{}",
-        lifetime_user_scope_clause(user_id)
+         FROM request_log WHERE dispatched = 1{}",
+        user_scope_clause(user_id)
     );
     let mut query = sqlx::query(AssertSqlSafe(sql));
     if let Some(user_id) = user_id {
@@ -2916,7 +2972,7 @@ async fn query_hourly_buckets(
                         THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
                    COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
-            FROM request_log WHERE created_at >= ?{} \
+            FROM request_log WHERE created_at >= ? AND dispatched = 1{} \
             GROUP BY hour \
          ) agg ON agg.hour = strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) \
          ORDER BY calendar.ts",
@@ -2966,7 +3022,7 @@ async fn query_daily_buckets(
                         THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
                    COALESCE(SUM(CASE WHEN settled = 1 \
                         THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
-            FROM request_log WHERE created_at >= ?{} \
+            FROM request_log WHERE created_at >= ? AND dispatched = 1{} \
             GROUP BY day \
          ) agg ON agg.day = calendar.day \
          ORDER BY calendar.day",
@@ -3010,7 +3066,7 @@ async fn query_cost_share(
          COALESCE(SUM(CASE WHEN settled = 1 \
              THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
            AS gross_profit_usd_micros \
-         FROM request_log WHERE created_at >= ?{} \
+         FROM request_log WHERE created_at >= ? AND dispatched = 1{} \
          GROUP BY {column} \
          ORDER BY cost_usd_micros DESC, name ASC",
         user_scope_clause(user_id)
@@ -3060,15 +3116,6 @@ pub(crate) fn as_count(value: i64) -> u64 {
 fn user_scope_clause(user_id: Option<i64>) -> &'static str {
     if user_id.is_some() {
         " AND user_id = ?"
-    } else {
-        ""
-    }
-}
-
-/// 同 [`user_scope_clause`]，但用于本身没有 `WHERE` 的查询。
-fn lifetime_user_scope_clause(user_id: Option<i64>) -> &'static str {
-    if user_id.is_some() {
-        " WHERE user_id = ?"
     } else {
         ""
     }
@@ -3305,6 +3352,10 @@ fn map_request_log_row(
         billing_attempt_id: row
             .try_get("billing_attempt_id")
             .map_err(StoreError::Query)?,
+        dispatched: row
+            .try_get::<i64, _>("dispatched")
+            .map_err(StoreError::Query)?
+            != 0,
         request_body: if include_body {
             row.try_get("request_body").map_err(StoreError::Query)?
         } else {
@@ -4743,6 +4794,7 @@ mod tests {
                     settled: true,
                     request_id: None,
                     billing_attempt_id: None,
+                    dispatched: true,
                     request_body: None,
                     response_body: None,
                 },
@@ -4866,6 +4918,7 @@ mod tests {
                     settled: true,
                     request_id: None,
                     billing_attempt_id: None,
+                    dispatched: true,
                     request_body: None,
                     response_body: None,
                 },
@@ -4956,6 +5009,7 @@ mod tests {
                     settled: true,
                     request_id: None,
                     billing_attempt_id: None,
+                    dispatched: true,
                     request_body: None,
                     response_body: None,
                 },
@@ -5020,6 +5074,7 @@ mod tests {
                 settled: true,
                 request_id: None,
                 billing_attempt_id: None,
+                dispatched: true,
                 request_body: None,
                 response_body: None,
             },
@@ -5054,6 +5109,7 @@ mod tests {
                 settled: true,
                 request_id: None,
                 billing_attempt_id: None,
+                dispatched: true,
                 request_body: None,
                 response_body: None,
             },
@@ -5115,6 +5171,7 @@ mod tests {
                 settled: true,
                 request_id: None,
                 billing_attempt_id: None,
+                dispatched: true,
                 request_body: None,
                 response_body: None,
             },
@@ -5184,6 +5241,7 @@ mod tests {
                 settled: true,
                 request_id: None,
                 billing_attempt_id: None,
+                dispatched: true,
                 request_body: None,
                 response_body: None,
             },
@@ -5250,6 +5308,7 @@ mod tests {
                 settled: false,
                 request_id: None,
                 billing_attempt_id: None,
+                dispatched: true,
                 request_body: None,
                 response_body: None,
             },
@@ -5284,6 +5343,7 @@ mod tests {
                 settled: true,
                 request_id: None,
                 billing_attempt_id: None,
+                dispatched: true,
                 request_body: None,
                 response_body: None,
             },
@@ -5328,6 +5388,7 @@ mod tests {
             settled,
             request_id: None,
             billing_attempt_id: None,
+            dispatched: true,
             request_body: None,
             response_body: None,
         }

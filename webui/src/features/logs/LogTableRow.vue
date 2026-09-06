@@ -107,7 +107,18 @@ function handleRowClick(event: MouseEvent) {
     @click="handleRowClick"
   >
     <TableCell class="text-fg-muted font-mono text-xs whitespace-nowrap">
-      {{ formatUnixMillis(entry.created_at, locale) }}
+      <div class="flex flex-col items-start gap-0.5">
+        <span>{{ formatUnixMillis(entry.created_at, locale) }}</span>
+        <!-- 未出站即终局的请求（余额拒绝、无可用渠道等）：仅在字段明确为 false 时渲染。 -->
+        <span
+          v-if="entry.dispatched === false"
+          class="badge badge-neutral text-fg-muted w-fit px-1 py-0 text-[9px] font-medium"
+          :title="t('logs.notDispatched')"
+          data-testid="log-not-dispatched"
+        >
+          {{ t('logs.notDispatched') }}
+        </span>
+      </div>
     </TableCell>
 
     <TableCell v-if="visible.token">

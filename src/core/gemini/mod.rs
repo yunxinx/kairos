@@ -8,12 +8,16 @@
 //!   提升为 `systemInstruction`；part 变体 `text`/`thought`/`functionCall`/
 //!   `functionResponse`/`inlineData`/`fileData` 双向映射；思考签名经 part 逃生舱
 //!   `provider_options["google"]["thought_signature"]` 无损往返——签名与上游
-//!   绑定，丢了下一轮就会被拒。
+//!   绑定，丢了下一轮就会被拒；出站模型为 Gemini 3 代且回放的 functionCall
+//!   缺签名时注入官方 `skip_thought_signature_validator` 哨兵规避 400（同
+//!   消息内已见带签名调用的并行形状豁免）。
 //! - 工具：定义走 `tools[].functionDeclarations`，选择走
 //!   `toolConfig.functionCallingConfig`（`AUTO/NONE/ANY` +
 //!   `allowedFunctionNames`）。wire 传统上不带调用 id：入站按 `sha256(名字|入参)`
 //!   生成稳定 id（跨轮重放同一调用得到同一 id），工具结果按名字与前文调用配对；
-//!   上游显式给了 id 时经 `provider_options["google"]["function_call_id"]` 往返。
+//!   上游显式给了 id 时经 `provider_options["google"]["function_call_id"]` 往返；
+//!   functionResponse 紧随含 functionCall 的 model 轮（结果居中时先落独立
+//!   user content，保住顺序）。
 //! - 响应侧：`candidates[0].content.parts` + `finishReason` 双轨映射（含
 //!   functionCall part 时 finish 归 `ToolCalls`）；usage 输入侧为
 //!   「`promptTokenCount` 含缓存」的减法约定（与 OpenAI 系同口径），
@@ -51,6 +55,15 @@ const FUNCTION_CALL_ID_KEY: &str = "function_call_id";
 const THINKING_CONFIG_KEY: &str = "thinking_config";
 /// 请求级逃生舱键：安全档位（`safetySettings` 原始形状）。
 const SAFETY_SETTINGS_KEY: &str = "safety_settings";
+/// 请求级逃生舱键：`generationConfig` 未建模子字段的保真通道（原始形状）。
+///
+/// 官方持续给 `generationConfig` 增补子字段（`responseLogprobs` 等），未及
+/// 类型化的子字段收进本键，同族出站合回 `generationConfig`（不覆盖类型化
+/// 字段），不告警——与其它逃生舱字段的同族保真语义一致。
+const GENERATION_CONFIG_EXTRA_KEY: &str = "generation_config_extra";
+/// Gemini 3 代对回放 functionCall 的 thoughtSignature 校验哨兵：签名不可得
+/// 时的官方占位值，缺失签名的回放会被 400 拒绝。
+const SKIP_THOUGHT_SIGNATURE_VALIDATOR: &str = "skip_thought_signature_validator";
 
 // ---- 错误 ----
 
@@ -226,7 +239,8 @@ struct WireFunctionCallingConfig {
     allowed_function_names: Option<Vec<String>>,
 }
 
-/// 生成参数面板；整块原样进逃生舱，逐字段另提升进 IR 类型化旋钮。
+/// 生成参数面板；类型化字段逐个提升进 IR 旋钮，未建模子字段经 flatten 收集
+/// 进 `unknown`（同族经 `generation_config_extra` 逃生舱回写）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireGenerationConfig {
@@ -242,12 +256,19 @@ struct WireGenerationConfig {
     stop_sequences: Option<Vec<String>>,
     #[serde(default, alias = "candidate_count")]
     candidate_count: Option<u32>,
+    /// 确定性采样种子，官方 `generationConfig.seed` 字段。
+    #[serde(default)]
+    seed: Option<u64>,
     #[serde(default, alias = "response_mime_type")]
     response_mime_type: Option<String>,
     #[serde(default, alias = "response_schema")]
     response_schema: Option<Value>,
     #[serde(default, alias = "thinking_config")]
     thinking_config: Option<Value>,
+    /// 未建模子字段（含 snake_case 别名形态的原始键）：flatten 保留原键名，
+    /// 同族往返在 Value 相等语义下无损（重编码键序为字典序，不承诺字节形状）。
+    #[serde(flatten)]
+    unknown: Map<String, Value>,
 }
 
 // ---- 请求解码：wire → IR ----
@@ -264,7 +285,11 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     })?;
 
     let mut messages = Vec::new();
+    // systemInstruction 的非文本 part（媒体等）在本协议无承载：解码即丢弃，
+    // 与响应侧媒体丢弃同规显式告警，不静默。
+    let mut warnings = Vec::new();
     if let Some(system) = &wire.system_instruction {
+        warn_non_text_system_parts(system, &mut warnings);
         let text = system_instruction_text(system);
         if !text.is_empty() {
             messages.push(Message {
@@ -354,7 +379,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     let mut n = None;
     let mut response_format = None;
     let mut reasoning = None;
-    let mut warnings = Vec::new();
+    let mut seed = None;
 
     if let Some(config) = &wire.generation_config {
         temperature = config.temperature;
@@ -363,6 +388,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         max_tokens = config.max_output_tokens;
         stop = config.stop_sequences.clone().unwrap_or_default();
         n = config.candidate_count;
+        seed = config.seed;
         // 多候选入站即记录有损：IR 保留原值（同族出站原样回写），但上游实际
         // 只返回一个候选，跨族出站时另行告警。
         if let Some(count) = config.candidate_count
@@ -378,6 +404,14 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         if let Some(thinking) = &config.thinking_config {
             google_options.insert(THINKING_CONFIG_KEY.into(), thinking.clone());
             reasoning = reasoning_from_thinking_config(thinking);
+        }
+        // 未建模子字段进逃生舱：同族合回 generationConfig（保真往返、零告警），
+        // 跨族随 provider_options 整体告警丢弃。
+        if !config.unknown.is_empty() {
+            google_options.insert(
+                GENERATION_CONFIG_EXTRA_KEY.into(),
+                Value::Object(config.unknown.clone()),
+            );
         }
     }
 
@@ -424,7 +458,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         stop,
         presence_penalty: None,
         frequency_penalty: None,
-        seed: None,
+        seed,
         response_format,
         tools,
         tool_choice,
@@ -488,6 +522,52 @@ fn system_instruction_text(value: &Value) -> String {
             })
             .unwrap_or_default(),
         _ => String::new(),
+    }
+}
+
+/// systemInstruction 非文本 part 的丢弃告警。
+///
+/// 媒体 part（inlineData/fileData）与响应侧媒体丢弃同词汇（MEDIA）；其余
+/// 既无文本也非媒体的形状（functionCall 等或未知键）按 CUSTOM 告警。携带
+/// 文本与媒体并存的 part 只告警媒体侧（文本已保留）。
+fn warn_non_text_system_parts(system: &Value, warnings: &mut Vec<Warning>) {
+    let Some(parts) = system
+        .as_object()
+        .and_then(|object| object.get("parts"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for part in parts {
+        let media = ["inlineData", "inline_data", "fileData", "file_data"]
+            .iter()
+            .find_map(|key| part.get(*key));
+        if let Some(media) = media {
+            let media_type = media
+                .get("mimeType")
+                .or_else(|| media.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("未知类型");
+            warnings.push(Warning::unsupported(
+                warning_feature::MEDIA,
+                format!("Gemini 系统指令不支持媒体内容（{media_type}），已丢弃"),
+            ));
+        } else if part.get("text").is_none() {
+            let keys = part
+                .as_object()
+                .map(|object| {
+                    object
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join("、")
+                })
+                .unwrap_or_else(|| "未知形状".to_string());
+            warnings.push(Warning::unsupported(
+                warning_feature::CUSTOM,
+                format!("Gemini 系统指令仅支持文本 part，非文本 part（{keys}）已丢弃"),
+            ));
+        }
     }
 }
 
@@ -636,7 +716,8 @@ pub fn encode_request_for_model(
     outbound_model: &str,
     warnings: &mut Vec<Warning>,
 ) -> Value {
-    let (system_instruction, contents) = encode_messages(&request.messages, warnings);
+    let (system_instruction, contents) =
+        encode_messages(&request.messages, outbound_model, warnings);
 
     let mut obj = Map::new();
     if let Some(system_instruction) = system_instruction {
@@ -670,6 +751,10 @@ pub fn encode_request_for_model(
         } else {
             generation.insert("candidateCount".into(), json!(n));
         }
+    }
+    if let Some(seed) = request.seed {
+        // 官方 `generationConfig.seed` 字段承载确定性采样，IR seed 双向映射。
+        generation.insert("seed".into(), json!(seed));
     }
     if let Some((mime_type, schema)) = generation_output_format(request, warnings) {
         generation.insert("responseMimeType".into(), json!(mime_type));
@@ -734,7 +819,6 @@ pub fn encode_request_for_model(
             warning_feature::FREQUENCY_PENALTY,
             request.frequency_penalty.is_some(),
         ),
-        (warning_feature::SEED, request.seed.is_some()),
     ] {
         if present {
             warnings.push(Warning::unsupported(
@@ -747,10 +831,26 @@ pub fn encode_request_for_model(
         obj.insert("safetySettings".into(), safety.clone());
     }
 
+    // generationConfig 未建模子字段（同族来源经逃生舱保真）：合回面板，
+    // 不覆盖类型化字段已写的键。合并在空判定之前——仅有未建模子字段的请求
+    // 也要还原整个面板。
+    if let Some(extra) = google_options.and_then(|options| options.get(GENERATION_CONFIG_EXTRA_KEY))
+        && let Value::Object(extra) = extra
+    {
+        for (key, field) in extra {
+            generation.entry(key.clone()).or_insert(field.clone());
+        }
+    }
     if !generation.is_empty() {
         obj.insert("generationConfig".into(), Value::Object(generation));
     }
-    apply_provider_extra(&mut obj, request, PROVIDER_KEY, warnings);
+    apply_provider_extra(
+        &mut obj,
+        request,
+        PROVIDER_KEY,
+        crate::core::ir::ExtraWriteback::WholeFamily,
+        warnings,
+    );
     Value::Object(obj)
 }
 
@@ -839,10 +939,14 @@ fn encode_tool_config(choice: &ToolChoice) -> Value {
 /// IR 消息序列 → `systemInstruction` + `contents[]`。
 ///
 /// system 消息按官方单指令形状合并为一条 `systemInstruction`；工具结果以
-/// `functionResponse` part 并入下一条 user content（末尾无后续时单独成一条
-/// user content）。
+/// `functionResponse` part 承载——下一条 user 消息在场时并入其 content 开头，
+/// 遇到 model 轮或序列结尾时先落为独立 user content（Gemini 要求
+/// functionResponse 紧随含 functionCall 的 model 轮，后续 model 轮插进
+/// 中间会被上游拒绝）。出站模型为 Gemini 3 代时，assistant 回放的无签名
+/// functionCall 注入 [`SKIP_THOUGHT_SIGNATURE_VALIDATOR`] 哨兵。
 fn encode_messages(
     messages: &[Message],
+    outbound_model: &str,
     warnings: &mut Vec<Warning>,
 ) -> (Option<Value>, Vec<Value>) {
     // 消息级与 part 级逃生舱统一在此检查：本族键（思考签名、functionCall id）
@@ -880,6 +984,7 @@ fn encode_messages(
     // 已见调用 id → 函数名：Gemini 的工具结果按名字配对，跨族来源（如 chat
     // 的 tool 消息）不携带函数名，编码时从上文调用回填空名字。
     let mut call_names: HashMap<String, String> = HashMap::new();
+    let gemini3 = is_gemini3_model(outbound_model);
 
     for message in messages {
         for part in &message.content {
@@ -915,13 +1020,58 @@ fn encode_messages(
         }
 
         let mut parts = Vec::new();
-        if message.role == Role::User && !pending_results.is_empty() {
-            parts.append(&mut pending_results);
+        if !pending_results.is_empty() {
+            if message.role == Role::User {
+                parts.append(&mut pending_results);
+            } else {
+                // Gemini 要求 functionResponse 紧随含 functionCall 的 model 轮：
+                // 后续 model 轮之前必须先把 pending 结果落为独立 user content，
+                // 否则结果被推迟到模型回答之后，顺序破坏会被上游拒绝。
+                contents.push(json!({
+                    "role": "user",
+                    "parts": std::mem::take(&mut pending_results),
+                }));
+            }
         }
+        // Gemini 3 签名哨兵状态（消息内作用域）：同一条 assistant 消息里已见
+        // 带签名调用时，后续无签名调用是并行调用的合法形状，跳过注入。
+        let mut saw_signed_call = false;
+        let mut sentinel_tools: Vec<&str> = Vec::new();
         for part in &message.content {
-            if let Some(block) = encode_part(part, warnings) {
+            let mut block = encode_part(part, warnings);
+            if let (
+                Some(block),
+                ContentPart::ToolCall {
+                    tool_name,
+                    provider_options,
+                    ..
+                },
+            ) = (&mut block, part)
+            {
+                let signed = provider_options
+                    .get(PROVIDER_KEY)
+                    .and_then(|options| options.get(THOUGHT_SIGNATURE_KEY))
+                    .is_some();
+                if signed {
+                    saw_signed_call = true;
+                } else if gemini3 && !saw_signed_call {
+                    block["thoughtSignature"] = json!(SKIP_THOUGHT_SIGNATURE_VALIDATOR);
+                    sentinel_tools.push(tool_name);
+                }
+            }
+            if let Some(block) = block {
                 parts.push(block);
             }
+        }
+        if !sentinel_tools.is_empty() {
+            warnings.push(Warning::compatibility(
+                warning_feature::THOUGHT_SIGNATURE,
+                format!(
+                    "Gemini 3 校验回放的 functionCall 缺 thoughtSignature，已为工具 {} 注入 \
+                     skip_thought_signature_validator 哨兵规避 400；签名丢失常见于应用侧未随消息持久化签名",
+                    sentinel_tools.join("、")
+                ),
+            ));
         }
         if parts.is_empty() {
             continue;
@@ -936,6 +1086,49 @@ fn encode_messages(
         contents.push(json!({ "role": "user", "parts": pending_results }));
     }
     (system_instruction, contents)
+}
+
+/// 判定出站模型是否按 Gemini 3 代行为处理（thoughtSignature 校验等）。
+///
+/// 判定法：`gemini-` 段前缀（字符串首或 `/` 之后，覆盖 `models/` 前缀与
+/// 路径接入形态）且不属于已知旧代际——`gemini-1*`、`gemini-2*`（版本号后
+/// 须紧跟 `.`/`-` 或结尾，`gemini-2.5` 即旧代际）、`gemini-pro`/`gemini-pro-
+/// vision` 旧名（须为字符串结尾）与 `gemini-robotics-er-1.5`。Google 模型
+/// ID 开放命名，未识别的新 ID 继承最新行为；家族别名（如 nano-banana）无
+/// `gemini-` 前缀，不在此列。
+fn is_gemini3_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let mut is_gemini = false;
+    let mut is_known_older = false;
+    let mut rest = model.as_str();
+    while let Some(offset) = rest.find("gemini-") {
+        let tail = &rest[offset..];
+        if offset == 0 || rest[..offset].ends_with('/') {
+            is_gemini = true;
+            let after = &tail["gemini-".len()..];
+            // 版本号后紧跟 `.`/`-` 或结尾才算已知代际（`gemini-2.5` 命中，
+            // `gemini-25` 这类不存在的前缀不误判）。
+            let known_generation = |digit: char| {
+                let mut chars = after.chars();
+                chars.next() == Some(digit) && matches!(chars.next(), None | Some('.') | Some('-'))
+            };
+            let robotics = "robotics-er-1.5";
+            if known_generation('1')
+                || known_generation('2')
+                || after == "pro"
+                || after == "pro-vision"
+                || (after.starts_with(robotics)
+                    && after[robotics.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| next == '.' || next == '-'))
+            {
+                is_known_older = true;
+            }
+        }
+        rest = &rest[offset + "gemini-".len()..];
+    }
+    is_gemini && !is_known_older
 }
 
 /// 工具结果名字为空时从上文调用回填（Gemini 按名字配对，名字是配对身份）；
@@ -1010,12 +1203,31 @@ fn encode_part(part: &ContentPart, warnings: &mut Vec<Warning>) -> Option<Value>
             data,
             provider_options,
         } => {
-            let block = match data {
-                MediaSource::Data { base64 } => {
-                    json!({ "inlineData": { "mimeType": media_type, "data": base64 } })
+            // IR 的 media_type 允许仅顶层段的类别标记（如 chat 远程 image_url
+            // 的 `image`），标记值不是合法 IANA 类型、不得写上 wire。fileData
+            // 的 mimeType 可省（上游按 fileUri 推断）；inlineData 无法省略
+            // （缺类型字节无从解释），完整类型未知时丢弃并告警。
+            let block = if !crate::core::ir::is_full_media_type(media_type) {
+                match data {
+                    MediaSource::Url { url } => json!({ "fileData": { "fileUri": url } }),
+                    MediaSource::Data { .. } => {
+                        warnings.push(Warning::unsupported(
+                            warning_feature::MEDIA,
+                            format!(
+                                "Gemini inlineData 需要完整媒体类型，{media_type:?} 无法承载，已丢弃"
+                            ),
+                        ));
+                        return None;
+                    }
                 }
-                MediaSource::Url { url } => {
-                    json!({ "fileData": { "mimeType": media_type, "fileUri": url } })
+            } else {
+                match data {
+                    MediaSource::Data { base64 } => {
+                        json!({ "inlineData": { "mimeType": media_type, "data": base64 } })
+                    }
+                    MediaSource::Url { url } => {
+                        json!({ "fileData": { "mimeType": media_type, "fileUri": url } })
+                    }
                 }
             };
             (block, provider_options)
@@ -1067,9 +1279,21 @@ struct WireResponse {
     model_version: Option<String>,
     #[serde(default, alias = "response_id")]
     response_id: Option<String>,
+    /// 安全拦截反馈：请求级内容审查拒绝生成时 candidates 为空、本对象携带
+    /// `blockReason`（SAFETY 等枚举值）。
+    #[serde(default, alias = "prompt_feedback")]
+    prompt_feedback: Option<WirePromptFeedback>,
     /// 流内错误帧（顶层 `{"error": {...}}`，google.rpc Status 形状）。
     #[serde(default)]
     error: Option<WireStreamError>,
+}
+
+/// `promptFeedback` 对象：`blockReason` 为拦截原因枚举。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WirePromptFeedback {
+    #[serde(default, alias = "block_reason")]
+    block_reason: Option<String>,
 }
 
 /// 流内错误帧的 `error` 对象：`message` 承载失败原因；code/status 不参与
@@ -1103,6 +1327,18 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
     let candidate = wire.candidates.first();
     let mut content = Vec::new();
     let mut has_function_call = false;
+    let mut warnings = Vec::new();
+    if wire.candidates.len() > 1 {
+        // 与请求侧 candidateCount 告警同词汇：网关只读取首个候选，其余丢弃
+        // 属有损面，显式可观测。
+        warnings.push(Warning::compatibility(
+            warning_feature::N,
+            format!(
+                "Gemini 响应携带 {} 个候选，仅读取首个，其余已丢弃",
+                wire.candidates.len()
+            ),
+        ));
+    }
     if let Some(candidate) = candidate
         && let Some(content_value) = &candidate.content
     {
@@ -1112,11 +1348,31 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
             content.push(decoded);
         }
     }
-    let raw_finish = candidate.and_then(|c| c.finish_reason.clone());
-    let unified = match raw_finish.as_deref() {
-        Some("STOP") if has_function_call => FinishReasonUnified::ToolCalls,
-        _ => map_finish_reason(raw_finish.as_deref()),
+    // 安全拦截：candidates 为空 + promptFeedback.blockReason 表示请求级审查
+    // 拒绝生成（非流式零内容、流式零事件都会让下游无从感知原因），映射为
+    // ContentFilter 结束并携带告警，拦截原因随 warning details 下发。
+    let blocked_reason = wire
+        .prompt_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.block_reason.clone())
+        .filter(|_| wire.candidates.is_empty());
+    let raw_finish = candidate
+        .and_then(|c| c.finish_reason.clone())
+        .or_else(|| blocked_reason.clone());
+    let unified = if blocked_reason.is_some() {
+        FinishReasonUnified::ContentFilter
+    } else {
+        match raw_finish.as_deref() {
+            Some("STOP") if has_function_call => FinishReasonUnified::ToolCalls,
+            _ => map_finish_reason(raw_finish.as_deref()),
+        }
     };
+    if let Some(block) = &blocked_reason {
+        warnings.push(Warning::compatibility(
+            warning_feature::SAFETY,
+            format!("Gemini 安全拦截已拒绝生成（blockReason={block}），内容为空"),
+        ));
+    }
 
     Ok(ChatResponse {
         id: wire.response_id.unwrap_or_default(),
@@ -1132,18 +1388,27 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
             .map(convert_usage)
             .unwrap_or_default(),
         provider_metadata: HashMap::new(),
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
 /// unified finish reason 映射（Gemini finishReason 值）。
+///
+/// 安全与合规类拦截（SAFETY/RECITATION/BLOCKLIST/PROHIBITED_CONTENT/
+/// IMAGE_SAFETY/SPII/LANGUAGE）统一归 ContentFilter；MALFORMED_FUNCTION_CALL
+/// 是生成侧错误语义归 Error；未识别值归 Other 并保留原值。
 fn map_finish_reason(raw: Option<&str>) -> FinishReasonUnified {
     match raw {
         Some("STOP") => FinishReasonUnified::Stop,
         Some("MAX_TOKENS") => FinishReasonUnified::Length,
-        Some("SAFETY") | Some("RECITATION") | Some("BLOCKLIST") | Some("PROHIBITED_CONTENT") => {
-            FinishReasonUnified::ContentFilter
-        }
+        Some("SAFETY")
+        | Some("RECITATION")
+        | Some("BLOCKLIST")
+        | Some("PROHIBITED_CONTENT")
+        | Some("IMAGE_SAFETY")
+        | Some("SPII")
+        | Some("LANGUAGE") => FinishReasonUnified::ContentFilter,
+        Some("MALFORMED_FUNCTION_CALL") => FinishReasonUnified::Error,
         _ => FinishReasonUnified::Other,
     }
 }
@@ -1264,6 +1529,8 @@ pub struct StreamDecoder {
     /// 流式解码中累积的 warnings（如无法下发的媒体 part）：经 IR 流式
     /// warnings 通道（StreamStart）上抛，不在解码路径静默丢弃。
     warnings: Vec<Warning>,
+    /// 多候选告警只发一次：候选数逐 chunk 恒定，重复告警只会淹没真信号。
+    candidates_warned: bool,
 }
 
 impl StreamDecoder {
@@ -1308,6 +1575,20 @@ impl StreamDecoder {
         }
 
         let candidate = wire.candidates.first();
+        if wire.candidates.len() > 1 && !self.candidates_warned {
+            // 与请求侧 candidateCount 告警同词汇：只读取首个候选，其余丢弃
+            // 属有损面，经流式 warnings 通道可观测。候选数在整条流内恒定，
+            // 只告警首个多候选 chunk。
+            self.candidates_warned = true;
+            self.warnings.push(Warning::compatibility(
+                warning_feature::N,
+                format!(
+                    "Gemini 响应携带 {} 个候选，仅读取首个，其余已丢弃",
+                    wire.candidates.len()
+                ),
+            ));
+            self.flush_warnings(&mut events);
+        }
         if let Some(content) = candidate.and_then(|c| c.content.as_ref()) {
             for part in &content.parts {
                 // 无法识别的 part 跳过：与坏块跳过同理，不因个别未知形状中断流。
@@ -1395,6 +1676,41 @@ impl StreamDecoder {
                     _ => {}
                 }
             }
+        }
+
+        // 安全拦截：blockReason 在场且无候选时对流上是终态——产出 warning +
+        // Finish(ContentFilter) 让流非空且拦截原因可感知；否则零事件会被
+        // 网关 peek 误判为流中断而空转切换渠道。拦截 chunk 即终末帧，处理完
+        // 提前返回（同 chunk 的 usageMetadata 已并入，不再触发补达 Finish）。
+        let block_reason = wire
+            .prompt_feedback
+            .as_ref()
+            .and_then(|feedback| feedback.block_reason.clone())
+            .filter(|_| wire.candidates.is_empty());
+        if let Some(block) = block_reason {
+            self.warnings.push(Warning::compatibility(
+                warning_feature::SAFETY,
+                format!("Gemini 安全拦截已拒绝生成（blockReason={block}），内容为空"),
+            ));
+            self.flush_warnings(&mut events);
+            self.close_reasoning(&mut events);
+            self.close_text(&mut events);
+            self.last_finish_reason = Some(FinishReason {
+                unified: FinishReasonUnified::ContentFilter,
+                raw: Some(block),
+            });
+            if !self.finish_emitted {
+                self.finish_emitted = true;
+                events.push(StreamEvent::Finish {
+                    finish_reason: self.last_finish_reason.clone().unwrap_or(FinishReason {
+                        unified: FinishReasonUnified::Other,
+                        raw: None,
+                    }),
+                    usage: self.last_usage.clone().unwrap_or_default(),
+                    provider_metadata: HashMap::new(),
+                });
+            }
+            return DecodeStreamChunk { events, is_output };
         }
 
         // Finish 由 finishReason 触发：usage 逐 chunk 累计，中途出现不构成流
@@ -1583,14 +1899,39 @@ impl StreamEncoder {
                     return Vec::new();
                 };
                 let tool = self.open_tools.remove(index);
-                // 残缺参数收尾为 `{}`：functionCall.args 必须是对象。
-                let input = serde_json::from_str(&tool.arguments).unwrap_or_else(|_| json!({}));
-                self.part_frame(ContentPart::ToolCall {
+                // functionCall.args 必须是对象：无增量（空参数调用）合法，
+                // 残缺或非对象参数兜底为 {} 并先下发告警帧（与 chat 请求侧
+                // 同词汇），兼容处理可观测。
+                let (input, malformed) = if tool.arguments.trim().is_empty() {
+                    (json!({}), false)
+                } else {
+                    match serde_json::from_str::<Value>(&tool.arguments) {
+                        Ok(input @ Value::Object(_)) => (input, false),
+                        _ => (json!({}), true),
+                    }
+                };
+                let mut frames = Vec::new();
+                if malformed {
+                    let warning = Warning::compatibility(
+                        warning_feature::TOOL_ARGUMENTS,
+                        format!(
+                            "tool call {} 的流式参数非合法 JSON 对象，已兜底为空对象",
+                            tool.tool_name
+                        ),
+                    );
+                    if let Some(gateway) = crate::core::openai_chat::encode_warnings(&[warning]) {
+                        frames.push(SseFrame::data(
+                            json!({ "candidates": [], "gateway": gateway }).to_string(),
+                        ));
+                    }
+                }
+                frames.extend(self.part_frame(ContentPart::ToolCall {
                     tool_call_id: tool.id,
                     tool_name: tool.tool_name,
                     input,
                     provider_options: tool.provider_options,
-                })
+                }));
+                frames
             }
             StreamEvent::ToolCall {
                 tool_call_id,
@@ -1767,6 +2108,12 @@ fn encode_usage_metadata(usage: &Usage) -> Value {
 }
 
 /// 把 IR unified finish reason 映射为 Gemini finishReason。
+///
+/// `Error`/`Other` 不折为 STOP：STOP 语义是「模型自然完成」，把错误或未知
+/// 终态谎报为自然完成会让下游误判。两者都映射为官方枚举的 `OTHER`（Gemini
+/// 合法值，表示「其他原因终止」）——不用 `MALFORMED_FUNCTION_CALL`，它指称
+/// 「模型发起的工具调用畸形」这一特定成因，IR `Error` 是泛化错误语义（如
+/// 上游中途失败），乱用会让下游误判为工具调用问题。
 fn encode_finish_reason(finish_reason: &FinishReason) -> &'static str {
     match finish_reason.unified {
         FinishReasonUnified::Stop => "STOP",
@@ -1774,7 +2121,7 @@ fn encode_finish_reason(finish_reason: &FinishReason) -> &'static str {
         FinishReasonUnified::ContentFilter => "SAFETY",
         // Gemini 无「已完成工具调用」的独立终止原因：函数请求以 STOP 收尾。
         FinishReasonUnified::ToolCalls => "STOP",
-        FinishReasonUnified::Error | FinishReasonUnified::Other => "STOP",
+        FinishReasonUnified::Error | FinishReasonUnified::Other => "OTHER",
     }
 }
 
@@ -2185,6 +2532,8 @@ mod tests {
             wire["toolConfig"],
             json!({ "functionCallingConfig": { "mode": "ANY" } })
         );
+        // seed 走官方 generationConfig.seed 承载，不再是丢弃项。
+        assert_eq!(wire["generationConfig"]["seed"], json!(7));
         let features: Vec<&str> = warnings
             .iter()
             .map(|warning| match warning {
@@ -2199,7 +2548,6 @@ mod tests {
                 warning_feature::PARALLEL_TOOL_CALLS,
                 warning_feature::PRESENCE_PENALTY,
                 warning_feature::FREQUENCY_PENALTY,
-                warning_feature::SEED,
             ]
         );
 
@@ -2380,7 +2728,7 @@ mod tests {
             },
         ];
         let mut warnings = Vec::new();
-        let (_, contents) = encode_messages(&messages, &mut warnings);
+        let (_, contents) = encode_messages(&messages, "gemini-2.5-pro", &mut warnings);
         assert_eq!(contents.len(), 2, "工具结果应并入随后的 user content");
         assert_eq!(
             contents[1]["parts"][0]["functionResponse"]["name"],
@@ -2880,5 +3228,595 @@ mod tests {
             }
         }
         assert_eq!(decoded, events, "同族往返应还原等价事件序列");
+    }
+
+    // ---- 以下为本批协议兼容性修复的用例 ----
+
+    fn text_message(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentPart::Text {
+                text: text.to_string(),
+                provider_options: HashMap::new(),
+            }],
+            provider_options: HashMap::new(),
+        }
+    }
+
+    /// 工具结果居中的序列（tool → assistant → user）：functionResponse 必须先
+    /// 于后续 model 轮落为独立 user content，保住「紧随 functionCall」的顺序。
+    #[test]
+    fn mid_sequence_tool_result_lands_before_following_model_turn() {
+        let messages = vec![
+            text_message(Role::User, "上海天气？"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentPart::ToolCall {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "get_weather".to_string(),
+                    input: json!({ "city": "上海" }),
+                    provider_options: HashMap::new(),
+                }],
+                provider_options: HashMap::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: vec![ContentPart::ToolResult {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "get_weather".to_string(),
+                    output: json!({ "result": "晴" }),
+                    provider_options: HashMap::new(),
+                }],
+                provider_options: HashMap::new(),
+            },
+            text_message(Role::Assistant, "上海晴，26 度。"),
+            text_message(Role::User, "明天呢？"),
+        ];
+        let mut warnings = Vec::new();
+        let (_, contents) = encode_messages(&messages, "gemini-2.5-pro", &mut warnings);
+        assert!(warnings.is_empty());
+        // user(问) → model(functionCall) → user(functionResponse) → model(答) → user(新问)。
+        assert_eq!(contents.len(), 5, "顺序: {contents:?}");
+        assert_eq!(contents[1]["role"], "model");
+        assert_eq!(
+            contents[1]["parts"][0]["functionCall"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            contents[2]["role"], "user",
+            "functionResponse 应为独立 user content"
+        );
+        assert_eq!(
+            contents[2]["parts"][0]["functionResponse"]["name"],
+            json!("get_weather")
+        );
+        assert_eq!(contents[3]["role"], "model");
+        assert_eq!(contents[3]["parts"][0]["text"], json!("上海晴，26 度。"));
+        assert_eq!(contents[4]["parts"][0]["text"], json!("明天呢？"));
+    }
+
+    /// promptFeedback.blockReason（candidates 为空）：映射 ContentFilter 结束，
+    /// 拦截原因随 warning 可观测，不再解码成零内容零告警。
+    #[test]
+    fn prompt_block_reason_maps_to_content_filter_with_warning() {
+        let response = decode_response(&json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "usageMetadata": { "promptTokenCount": 10 }
+        }))
+        .expect("拦截响应应可解码");
+        assert_eq!(
+            response.finish_reason.unified,
+            FinishReasonUnified::ContentFilter
+        );
+        assert_eq!(response.finish_reason.raw.as_deref(), Some("SAFETY"));
+        assert!(response.content.is_empty());
+        assert!(matches!(
+            response.warnings.as_slice(),
+            [Warning::Compatibility { feature, details }]
+                if feature == warning_feature::SAFETY && details.as_deref().is_some_and(|d| d.contains("SAFETY"))
+        ));
+        // 有候选内容时 blockReason 不参与终态判定（内容面优先）。
+        let with_candidates = decode_response(&json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "promptFeedback": { "blockReason": "SAFETY" }
+        }))
+        .expect("应可解码");
+        assert_eq!(
+            with_candidates.finish_reason.unified,
+            FinishReasonUnified::Stop
+        );
+        assert!(with_candidates.warnings.is_empty());
+    }
+
+    /// 流式安全拦截：blockReason chunk 产出 warning + Finish(ContentFilter)，
+    /// 流非空且原因可感知（不再零事件被网关 peek 误判流中断）。
+    #[test]
+    fn stream_prompt_block_reason_produces_warning_and_finish() {
+        let chunk = json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "usageMetadata": { "promptTokenCount": 5 }
+        });
+        let decoded = StreamDecoder::default().process(&chunk);
+        assert!(!decoded.is_output);
+        match decoded.events.as_slice() {
+            [
+                StreamEvent::StreamStart { warnings },
+                StreamEvent::Finish {
+                    finish_reason,
+                    usage,
+                    ..
+                },
+            ] => {
+                assert!(matches!(
+                    warnings.as_slice(),
+                    [Warning::Compatibility { feature, details }]
+                        if feature == warning_feature::SAFETY && details.as_deref().is_some_and(|d| d.contains("SAFETY"))
+                ));
+                assert_eq!(finish_reason.unified, FinishReasonUnified::ContentFilter);
+                assert_eq!(finish_reason.raw.as_deref(), Some("SAFETY"));
+                assert_eq!(usage.input_tokens, 5);
+            }
+            other => panic!("应产出 warning + Finish，实际 {other:?}"),
+        }
+    }
+
+    /// generationConfig 未建模子字段经逃生舱同族往返保真；seed 走官方字段
+    /// 双向映射（不再是「Gemini 无 seed 承载」的丢弃项）。
+    #[test]
+    fn generation_config_unknown_subfields_roundtrip_and_seed_maps() {
+        let wire = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generationConfig": {
+                "temperature": 0.7,
+                "seed": 42,
+                "presencePenalty": 0.1,
+                "responseLogprobs": true
+            }
+        });
+        let request = decode_request(&wire).expect("应可解码");
+        assert_eq!(request.seed, Some(42));
+        assert_eq!(request.temperature, Some(0.7));
+        // penalty 未类型化：不进 IR 旋钮，原始子字段由逃生舱承载。
+        assert_eq!(request.presence_penalty, None);
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&request, &mut warnings);
+        assert!(warnings.is_empty(), "同族往返零告警: {warnings:?}");
+        assert_eq!(reencoded, wire, "未建模子字段应逐字段还原");
+
+        // 跨族 seed：chat 入站的 seed 经 IR 映射为 generationConfig.seed。
+        let chat = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "seed": 7
+        });
+        let ir = crate::core::openai_chat::decode_request(&chat).expect("chat 应可解码");
+        let mut warnings = Vec::new();
+        let wire = crate::core::gemini::encode_request(&ir, &mut warnings);
+        assert_eq!(wire["generationConfig"]["seed"], json!(7));
+        assert!(warnings.is_empty(), "seed 有承载不应告警: {warnings:?}");
+    }
+
+    /// finishReason 映射对齐 AI SDK 权威表：安全族归 ContentFilter、
+    /// MALFORMED_FUNCTION_CALL 归 Error。
+    #[test]
+    fn finish_reason_maps_safety_family_and_malformed_function_call() {
+        for (raw, unified) in [
+            ("IMAGE_SAFETY", FinishReasonUnified::ContentFilter),
+            ("SPII", FinishReasonUnified::ContentFilter),
+            ("LANGUAGE", FinishReasonUnified::ContentFilter),
+            ("MALFORMED_FUNCTION_CALL", FinishReasonUnified::Error),
+            ("OTHER", FinishReasonUnified::Other),
+        ] {
+            let response = decode_response(&json!({
+                "candidates": [{ "content": { "role": "model", "parts": [{ "text": "ok" }] }, "finishReason": raw }]
+            }))
+            .expect("应可解码");
+            assert_eq!(
+                response.finish_reason.unified, unified,
+                "finishReason {raw}"
+            );
+            assert_eq!(response.finish_reason.raw.as_deref(), Some(raw));
+        }
+    }
+
+    /// IR Error/Other 出站不再折为 STOP：映射为官方合法值 OTHER（诚实终态，
+    /// 不谎报自然完成）；同族往返 OTHER 还原为 Other。
+    #[test]
+    fn error_and_other_finish_encode_to_gemini_other() {
+        for unified in [FinishReasonUnified::Error, FinishReasonUnified::Other] {
+            let response = ChatResponse {
+                id: "resp-err".to_string(),
+                model: "gemini-2.5-pro".to_string(),
+                content: Vec::new(),
+                finish_reason: FinishReason { unified, raw: None },
+                usage: Usage::default(),
+                provider_metadata: HashMap::new(),
+                warnings: Vec::new(),
+            };
+            let encoded = encode_response(&response);
+            assert_eq!(
+                encoded["candidates"][0]["finishReason"],
+                json!("OTHER"),
+                "{unified:?} 应编码为 OTHER 而非 STOP"
+            );
+        }
+        // 同族往返：OTHER 解码回 Other（Error 编码折为 OTHER 后语义为 Other，
+        // 属双值单向折叠，诚实性优先于往返恒等）。
+        let back = decode_response(&json!({
+            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "" }] }, "finishReason": "OTHER" }]
+        }))
+        .expect("应可解码");
+        assert_eq!(back.finish_reason.unified, FinishReasonUnified::Other);
+        assert_eq!(back.finish_reason.raw.as_deref(), Some("OTHER"));
+    }
+
+    /// 流式残缺工具参数：兜底 `{}` 前先下发 gateway warnings 帧（TOOL_ARGUMENTS
+    /// 词汇与 chat 请求侧一致）；空参数（无增量）是合法形状，不告警。
+    #[test]
+    fn stream_malformed_tool_arguments_warn_and_fall_back() {
+        let drive = |deltas: &[&str]| -> Vec<SseFrame> {
+            let mut encoder = StreamEncoder::default();
+            encoder.encode(&StreamEvent::ToolInputStart {
+                id: "call_1".to_string(),
+                tool_name: "get_weather".to_string(),
+                provider_options: HashMap::new(),
+            });
+            for delta in deltas {
+                encoder.encode(&StreamEvent::ToolInputDelta {
+                    id: "call_1".to_string(),
+                    delta: delta.to_string(),
+                    provider_options: HashMap::new(),
+                });
+            }
+            encoder.encode(&StreamEvent::ToolInputEnd {
+                id: "call_1".to_string(),
+                provider_options: HashMap::new(),
+            })
+        };
+
+        // 残缺参数：告警帧 + 兜底空对象的 functionCall 帧。
+        let frames = drive(&["{oo", "ps"]);
+        assert_eq!(frames.len(), 2, "告警帧 + functionCall 帧: {frames:?}");
+        let warning: Value = serde_json::from_str(&frames[0].data).expect("告警帧载荷应为 JSON");
+        assert_eq!(
+            warning["gateway"]["warnings"][0]["feature"],
+            json!(warning_feature::TOOL_ARGUMENTS)
+        );
+        let part: Value = serde_json::from_str(&frames[1].data).expect("part 帧应为 JSON");
+        assert_eq!(
+            part["candidates"][0]["content"]["parts"][0]["functionCall"]["args"],
+            json!({}),
+            "残缺参数应兜底为空对象"
+        );
+
+        // 合法对象参数：零告警帧。
+        let frames = drive(&[r#"{"city""#, r#":"上海"}"#]);
+        assert_eq!(frames.len(), 1, "合法参数不产告警帧: {frames:?}");
+
+        // 空参数（无任何增量）是合法调用：零告警帧。
+        let frames = drive(&[]);
+        assert_eq!(frames.len(), 1, "空参数不产告警帧: {frames:?}");
+    }
+
+    /// fileData 的 mimeType 未知时省略字段（顶层段标记不是合法 IANA 类型）；
+    /// inlineData 需要完整类型，未知时丢弃并告警。
+    #[test]
+    fn file_data_omits_mime_type_when_not_full_and_inline_data_drops() {
+        let request = ChatRequest {
+            model: "gemini-2.5-pro".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![
+                    // chat 远程 image_url 解码出的类别标记 `image`（无子类型）。
+                    ContentPart::Media {
+                        media_type: "image".to_string(),
+                        data: MediaSource::Url {
+                            url: "https://example.com/a.png".to_string(),
+                        },
+                        provider_options: HashMap::new(),
+                    },
+                    ContentPart::Media {
+                        media_type: "image".to_string(),
+                        data: MediaSource::Data {
+                            base64: "aGVsbG8=".to_string(),
+                        },
+                        provider_options: HashMap::new(),
+                    },
+                ],
+                provider_options: HashMap::new(),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+        let file_data = &wire["contents"][0]["parts"][0]["fileData"];
+        assert_eq!(file_data["fileUri"], json!("https://example.com/a.png"));
+        assert!(
+            file_data.get("mimeType").is_none(),
+            "未知 mimeType 应省略字段: {file_data}"
+        );
+        // inlineData 无法省略 mimeType：标记类型丢弃并告警。
+        assert!(wire["contents"][0]["parts"].as_array().map(Vec::len) == Some(1));
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Unsupported { feature, .. }] if feature == warning_feature::MEDIA
+        ));
+    }
+
+    /// 响应携带多个候选时告警（与请求侧 candidateCount 同词汇）：网关只读取
+    /// 首个候选，其余丢弃可观测。非流式与流式同规。
+    #[test]
+    fn multiple_response_candidates_warn_first_only() {
+        let response = decode_response(&json!({
+            "candidates": [
+                { "content": { "role": "model", "parts": [{ "text": "a" }] }, "finishReason": "STOP" },
+                { "content": { "role": "model", "parts": [{ "text": "b" }] }, "index": 1 }
+            ]
+        }))
+        .expect("应可解码");
+        assert!(matches!(
+            response.warnings.as_slice(),
+            [Warning::Compatibility { feature, details }]
+                if feature == warning_feature::N && details.as_deref().is_some_and(|d| d.contains("2"))
+        ));
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentPart::Text { text, .. }] if text == "a"
+        ));
+
+        let mut decoder = StreamDecoder::default();
+        let multi = json!({
+            "candidates": [
+                { "content": { "role": "model", "parts": [{ "text": "a" }] } },
+                { "content": { "role": "model", "parts": [{ "text": "b" }] }, "index": 1 }
+            ]
+        });
+        let first = decoder.process(&multi);
+        assert!(first.events.iter().any(|event| matches!(
+            event,
+            StreamEvent::StreamStart { warnings }
+                if matches!(warnings.as_slice(), [Warning::Compatibility { feature, .. }]
+                    if feature == warning_feature::N)
+        )));
+        // 候选数在整条流内恒定：第二个多候选 chunk 不重复告警。
+        let second = decoder.process(&multi);
+        assert!(
+            second.events.iter().all(|event| !matches!(
+                event,
+                StreamEvent::StreamStart { warnings }
+                    if warnings
+                        .iter()
+                        .any(|w| matches!(w, Warning::Compatibility { feature, .. }
+                            if feature == warning_feature::N))
+            )),
+            "多候选告警只应发一次: {:?}",
+            second.events
+        );
+    }
+
+    /// systemInstruction 携带非文本 part：媒体按 MEDIA 告警（与响应侧丢弃同
+    /// 词汇）、其余非文本形状按 CUSTOM 告警，不再静默丢弃。
+    #[test]
+    fn system_instruction_non_text_parts_warn() {
+        let wire = json!({
+            "systemInstruction": { "parts": [
+                { "text": "你是天气助手" },
+                { "inlineData": { "mimeType": "image/png", "data": "aGVsbG8=" } },
+                { "functionCall": { "name": "f", "args": {} } }
+            ] },
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
+        });
+        let request = decode_request(&wire).expect("应可解码");
+        let features: Vec<(&str, String)> = request
+            .warnings
+            .iter()
+            .map(|warning| match warning {
+                Warning::Unsupported { feature, details } => {
+                    (feature.as_str(), details.clone().unwrap_or_default())
+                }
+                other => panic!("应为 unsupported: {other:?}"),
+            })
+            .collect();
+        assert_eq!(features.len(), 2, "{features:?}");
+        assert!(features[0].0 == warning_feature::MEDIA && features[0].1.contains("image/png"));
+        assert!(features[1].0 == warning_feature::CUSTOM && features[1].1.contains("functionCall"));
+        // 文本正常提取，媒体/未知 part 丢弃。
+        assert_eq!(text_parts(&request.messages[0].content), "你是天气助手");
+    }
+
+    /// Gemini 3 代判定：`gemini-` 段前缀且非已知 1/2 代/旧名；未识别的新 ID
+    /// 继承最新行为；家族别名与异族模型判否。
+    #[test]
+    fn gemini3_model_detection_follows_generation_patterns() {
+        for model in [
+            "gemini-3-pro",
+            "gemini-3-flash-thinking",
+            "models/gemini-3-pro",
+            "gemini-flash-latest",
+            "gemini-4-flash",
+        ] {
+            assert!(is_gemini3_model(model), "{model} 应判为 3 代行为");
+        }
+        for model in [
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-pro",
+            "gemini-pro-vision",
+            "gemini-robotics-er-1.5",
+            "models/gemini-2.5-pro",
+            "nano-banana-pro",
+            "gpt-4o",
+            "claude-sonnet-4-5",
+        ] {
+            assert!(!is_gemini3_model(model), "{model} 应判为非 3 代行为");
+        }
+    }
+
+    /// Gemini 3 回放无签名 functionCall：注入官方哨兵规避 400 并告警（列出
+    /// 工具名）；已带签名与 reasoning part 不注入；非 3 代模型不注入。
+    #[test]
+    fn gemini3_sentinel_injection_for_unsigned_function_calls() {
+        let assistant = |provider_options: Option<Value>| Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolCall {
+                tool_call_id: "call_1".to_string(),
+                tool_name: "get_weather".to_string(),
+                input: json!({ "city": "上海" }),
+                provider_options: provider_options
+                    .map(|signature| {
+                        [(
+                            PROVIDER_KEY.to_string(),
+                            json!({ THOUGHT_SIGNATURE_KEY: signature }),
+                        )]
+                        .into_iter()
+                        .collect()
+                    })
+                    .unwrap_or_default(),
+            }],
+            provider_options: HashMap::new(),
+        };
+        let request = |assistant: Message| ChatRequest {
+            model: "gemini-3-pro".to_string(),
+            messages: vec![text_message(Role::User, "hi"), assistant],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+
+        // 3 代 + 无签名 → 哨兵 + 告警。
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request(assistant(None)), &mut warnings);
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["thoughtSignature"],
+            json!(SKIP_THOUGHT_SIGNATURE_VALIDATOR)
+        );
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Compatibility { feature, details }]
+                if feature == warning_feature::THOUGHT_SIGNATURE && details.as_deref().is_some_and(|d| d.contains("get_weather"))
+        ));
+
+        // 已带签名 → 原样回写，零注入零告警。
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request(assistant(Some(json!("sig_1")))), &mut warnings);
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["thoughtSignature"],
+            json!("sig_1")
+        );
+        assert!(warnings.is_empty(), "已带签名不应告警: {warnings:?}");
+
+        // 非 3 代模型（2.5）→ 不注入不告警。
+        let mut request = request(assistant(None));
+        request.model = "gemini-2.5-pro".to_string();
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+        assert!(
+            wire["contents"][1]["parts"][0]
+                .get("thoughtSignature")
+                .is_none(),
+            "非 3 代不应注入哨兵"
+        );
+        assert!(warnings.is_empty());
+    }
+
+    /// 并行豁免：同一条 assistant 消息内已见带签名调用时，后续无签名调用是
+    /// Gemini 3 并行调用的合法形状，跳过哨兵注入；reasoning part 不参与注入。
+    #[test]
+    fn gemini3_sentinel_skips_after_signed_call_in_same_message() {
+        let signed_options: HashMap<String, Value> = [(
+            PROVIDER_KEY.to_string(),
+            json!({ THOUGHT_SIGNATURE_KEY: "sig_1" }),
+        )]
+        .into_iter()
+        .collect();
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentPart::Reasoning {
+                    text: "先想".to_string(),
+                    provider_options: HashMap::new(),
+                },
+                ContentPart::ToolCall {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "signed_tool".to_string(),
+                    input: json!({}),
+                    provider_options: signed_options,
+                },
+                ContentPart::ToolCall {
+                    tool_call_id: "call_2".to_string(),
+                    tool_name: "unsigned_tool".to_string(),
+                    input: json!({}),
+                    provider_options: HashMap::new(),
+                },
+            ],
+            provider_options: HashMap::new(),
+        };
+        let request = ChatRequest {
+            model: "gemini-3-pro".to_string(),
+            messages: vec![text_message(Role::User, "hi"), message],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+        let parts = &wire["contents"][1]["parts"];
+        // reasoning part 无签名不注入；带签名调用原样；后续无签名调用豁免。
+        assert!(
+            parts[0].get("thoughtSignature").is_none(),
+            "reasoning 不注入"
+        );
+        assert_eq!(parts[1]["thoughtSignature"], json!("sig_1"));
+        assert!(
+            parts[2].get("thoughtSignature").is_none(),
+            "并行豁免：同消息已见签名调用，后续无签名调用跳过注入"
+        );
+        assert!(warnings.is_empty(), "豁免路径零告警: {warnings:?}");
     }
 }

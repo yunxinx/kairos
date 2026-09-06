@@ -20,7 +20,7 @@ test.describe('settings page', () => {
     const token = await seedToken(page, { name: 'e2e-settings-body-limit' });
     const oversized = 'x'.repeat(20_000);
     const resp = await request.post(`http://127.0.0.1:${E2E_PROTOCOL_PORT}/v1/chat/completions`, {
-      headers: { Authorization: `Bearer ${token.token_key}` },
+      headers: { Authorization: `Bearer ${token.plaintext_key}` },
       data: {
         model: 'gpt-4o',
         messages: [{ role: 'user', content: oversized }],

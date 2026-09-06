@@ -553,6 +553,8 @@ export interface LogEntry {
   cost_usd_micros: number;
   /** 费用是否已完成所属用户钱包结算。 */
   settled: boolean;
+  /** 请求是否实际发往上游；false 表示未出站即终局（余额拒绝、无可用渠道等）。旧数据无此字段。 */
+  dispatched?: boolean;
   /** 上游响应是否明确携带 usage；显式零用量也属于已报告。 */
   usage_reported: boolean;
   /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
@@ -661,6 +663,8 @@ export interface CleanupResultView {
 export interface StatsSummary {
   request_count: number;
   success_count: number;
+  /** 未出站即终局（余额拒绝、无可用渠道等）的请求数，与 request_count（仅已出站）分列。 */
+  not_dispatched: number;
   input_tokens: number;
   output_tokens: number;
   cost_usd_micros: number;
@@ -702,7 +706,9 @@ export interface StatsView {
 
 /** `/stats/lifetime` 全量累计，不受时间窗影响。
  *
- * `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 统计所有已结算尝试。
+ * 只统计已出站（dispatched = 1）的请求；未出站即终局的请求单列在 `/stats`
+ * 的 `summary.not_dispatched`。`request_count` 与 `total_tokens` 含未结算行；
+ * `cost_usd_micros` 统计所有已结算尝试。
  */
 export interface LifetimeStats {
   request_count: number;

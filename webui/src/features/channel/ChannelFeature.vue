@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onScopeDispose, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
@@ -81,9 +81,44 @@ const showTableSkeleton = computed(
 
 const { enabled: healthEnabled, cooldowns } = useChannelHealth();
 
-/** 冷却剩余量 → `分:秒` 计时形态；无轮询，取渲染时刻的快照。 */
-function formatCooldownRemaining(untilMillis: number): string {
-  const totalSeconds = Math.max(0, Math.ceil((untilMillis - Date.now()) / 1000));
+// 冷却剩余随本地时钟每秒走动：健康数据只在渠道缓存失效时刷新，徽标若只取
+// 渲染时刻快照会冻结在打开页面时的数值。到期条目按剩余归零本地清除——到期
+// 是时间事实而非投影缺失，待下次健康刷新自然收编。
+const cooldownNow = ref(Date.now());
+let cooldownTimer: ReturnType<typeof setInterval> | undefined;
+
+/** channel_id → 未到期的冷却剩余毫秒；到期条目剔除，徽标随之清除。 */
+const activeCooldowns = computed(() => {
+  const map = new Map<number, number>();
+  for (const [id, entry] of cooldowns.value) {
+    const remaining = entry.cooldown_until - cooldownNow.value;
+    if (remaining > 0) map.set(id, remaining);
+  }
+  return map;
+});
+
+watch(
+  () => activeCooldowns.value.size > 0,
+  (ticking) => {
+    if (ticking && cooldownTimer === undefined) {
+      cooldownTimer = setInterval(() => {
+        cooldownNow.value = Date.now();
+      }, 1_000);
+    } else if (!ticking && cooldownTimer !== undefined) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = undefined;
+    }
+  },
+  { immediate: true },
+);
+
+onScopeDispose(() => {
+  if (cooldownTimer !== undefined) clearInterval(cooldownTimer);
+});
+
+/** 冷却剩余毫秒 → `分:秒` 计时形态。 */
+function formatCooldownRemaining(remainingMillis: number): string {
+  const totalSeconds = Math.ceil(remainingMillis / 1000);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${String(seconds).padStart(2, '0')}`;
@@ -364,7 +399,7 @@ function openProbe(channel: ChannelView) {
               </TableCell>
               <TableCell v-if="healthEnabled" align="center" data-testid="channel-health">
                 <span
-                  v-if="cooldowns.get(channel.id)"
+                  v-if="activeCooldowns.has(channel.id)"
                   class="inline-flex items-center justify-center gap-1.5"
                   data-testid="channel-cooldown"
                 >
@@ -374,7 +409,7 @@ function openProbe(channel: ChannelView) {
                   <span class="text-fg-muted text-xs" data-testid="channel-cooldown-remaining">
                     {{
                       t('channel.cooldownRemaining', {
-                        time: formatCooldownRemaining(cooldowns.get(channel.id)!.cooldown_until),
+                        time: formatCooldownRemaining(activeCooldowns.get(channel.id)!),
                       })
                     }}
                   </span>

@@ -90,6 +90,48 @@ const OPENAI_MEMORY_KEYS: &[&str] = &[
     "prompt_cache_retention",
 ];
 
+/// Chat 出站面未知字段逃生舱的回写白名单：本协议服务端接受的顶层请求字段
+/// （已类型化字段 + 官方在册未类型化字段）。
+///
+/// chat 与 responses 共用 `openai` 逃生舱键，族内互回必须按目标协议过滤
+/// （OpenAI 对未知顶层参数 400），本清单即过滤依据；`service_tier`/`metadata`
+/// 两协议都接受，双侧登记保持互回往返。维护说明见 `ir::ExtraWriteback`。
+const CHAT_EXTRA_WRITEBACK_FIELDS: &[&str] = &[
+    // 类型化字段（KNOWN_REQUEST_FIELDS 同集）。
+    "model",
+    "messages",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "n",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "response_format",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning_effort",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    // 官方在册、网关未类型化的顶层字段。
+    "logit_bias",
+    "logprobs",
+    "top_logprobs",
+    "user",
+    "store",
+    "metadata",
+    "service_tier",
+    "stream_options",
+    "audio",
+    "modalities",
+    "prediction",
+    "web_search_options",
+];
+
 /// OpenAI Chat Completions 出站/入站请求体（wire）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,8 +152,10 @@ struct WireChatRequest {
     max_completion_tokens: Option<u32>,
     #[serde(default)]
     n: Option<u32>,
+    /// 官方 schema 允许 `string | string[]` 两种形态：单字符串归一为单元素
+    /// 列表（语义等价，无需告警），出站统一数组形状。
     #[serde(default)]
-    stop: Option<Vec<String>>,
+    stop: Option<WireStop>,
     #[serde(default)]
     presence_penalty: Option<f64>,
     #[serde(default)]
@@ -141,6 +185,23 @@ struct WireChatRequest {
 #[serde(rename_all = "snake_case")]
 struct WireTool {
     function: WireFunctionTool,
+}
+
+/// `stop` 字段的两种官方形态：单字符串或字符串数组。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum WireStop {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl WireStop {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(stop) => vec![stop],
+            Self::Many(stops) => stops,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -429,7 +490,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         top_k: None,
         max_tokens: wire.max_completion_tokens.or(wire.max_tokens),
         n: wire.n,
-        stop: wire.stop.unwrap_or_default(),
+        stop: wire.stop.map(WireStop::into_vec).unwrap_or_default(),
         presence_penalty: wire.presence_penalty,
         frequency_penalty: wire.frequency_penalty,
         seed: wire.seed,
@@ -1000,8 +1061,16 @@ pub fn encode_request_with(
     if let Some(retention) = openai_memory.and_then(|o| o.get("prompt_cache_retention")) {
         obj.insert("prompt_cache_retention".into(), retention.clone());
     }
-    // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
-    apply_provider_extra(&mut obj, request, "openai", warnings);
+    // 未知字段逃生舱最后应用：本族字段按目标协议白名单回写（不覆盖类型化
+    // 字段，chat-only 字段不会写进族内互回的 Responses 请求），跨族字段丢弃
+    // 告警。
+    apply_provider_extra(
+        &mut obj,
+        request,
+        "openai",
+        crate::core::ir::ExtraWriteback::TargetFields(CHAT_EXTRA_WRITEBACK_FIELDS),
+        warnings,
+    );
     Value::Object(obj)
 }
 
@@ -1120,12 +1189,24 @@ fn encode_message(
             Value::Object(wire)
         }
         Role::Tool => {
-            // tool 消息只携带 tool_result parts。
-            let part = message
+            // tool 消息只携带 tool_result parts；wire 形状一条消息只承载一个
+            // 结果（tool_call_id 单值），多于一个时取首个并告警，其余丢弃
+            // 可观测（跨族来源的合并 Tool 消息会走到这里）。
+            let results: Vec<&ContentPart> = message
                 .content
                 .iter()
-                .find(|p| matches!(p, ContentPart::ToolResult { .. }));
-            let (tool_call_id, output) = match part {
+                .filter(|part| matches!(part, ContentPart::ToolResult { .. }))
+                .collect();
+            if results.len() > 1 {
+                warnings.push(Warning::compatibility(
+                    warning_feature::TOOL_RESULT,
+                    format!(
+                        "tool 消息携带 {} 个工具结果，仅首个可随单条 tool 消息承载，其余已丢弃",
+                        results.len()
+                    ),
+                ));
+            }
+            let (tool_call_id, output) = match results.first() {
                 Some(ContentPart::ToolResult {
                     tool_call_id,
                     output,
@@ -1168,6 +1249,17 @@ fn encode_user_part(part: &ContentPart, warnings: &mut Vec<Warning>) -> Option<V
             }
             let url = match data {
                 MediaSource::Data { base64 } => {
+                    // data URL 需要完整 `type/subtype`：仅顶层段的类别标记
+                    // （如跨族来源回放的无类型 base64 图片）拼不出合法 data URL。
+                    if !crate::core::ir::is_full_media_type(media_type) {
+                        warnings.push(Warning::unsupported(
+                            warning_feature::MEDIA,
+                            format!(
+                                "OpenAI Chat Completions 的 data URL 需要完整媒体类型，{media_type:?} 无法承载，已丢弃"
+                            ),
+                        ));
+                        return None;
+                    }
                     format!("data:{media_type};base64,{base64}")
                 }
                 MediaSource::Url { url } => url.clone(),
@@ -1213,10 +1305,24 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
             provider_options: HashMap::new(),
         });
     }
+    let mut warnings = Vec::new();
     if let Some(tool_calls) = &message.tool_calls {
         for tc in tool_calls {
-            let input = serde_json::from_str::<Value>(&tc.function.arguments)
-                .map_err(|_| DecodeError::ToolCallArgumentsNotString { index: 0 })?;
+            let input = if tc.function.arguments.trim().is_empty() {
+                // 空串等价无参调用：与请求侧/流式侧兜底一致按 `{}` 处理并告警，
+                // 整体报错会让合法响应不可用。
+                warnings.push(Warning::compatibility(
+                    warning_feature::TOOL_ARGUMENTS,
+                    format!(
+                        "tool call {} 的 arguments 为空串，已按空对象处理",
+                        tc.function.name
+                    ),
+                ));
+                json!({})
+            } else {
+                serde_json::from_str::<Value>(&tc.function.arguments)
+                    .map_err(|_| DecodeError::ToolCallArgumentsNotString { index: 0 })?
+            };
             content.push(ContentPart::ToolCall {
                 tool_call_id: tc.id.clone(),
                 tool_name: tc.function.name.clone(),
@@ -1245,7 +1351,7 @@ pub fn decode_response(value: &Value) -> Result<ChatResponse, DecodeError> {
         },
         usage,
         provider_metadata: HashMap::new(),
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -1343,6 +1449,13 @@ pub fn encode_response(response: &ChatResponse) -> Value {
         warnings.push(Warning::unsupported(
             warning_feature::REASONING,
             "OpenAI Chat Completions 无 reasoning 内容块，响应中的推理内容已丢弃",
+        ));
+    }
+    if response.finish_reason.unified == FinishReasonUnified::Error {
+        // 上游失败终态：与流式 finish 帧同规，映射为 stop 的整形以告警保可观测。
+        warnings.push(Warning::compatibility(
+            warning_feature::FINISH,
+            "上游以失败状态结束，finish_reason 枚举无失败值，已映射为 stop",
         ));
     }
     let text = text_parts(&response.content).unwrap_or_default();
@@ -1472,6 +1585,9 @@ pub struct StreamDecoder {
     /// 文本块是否已产出 TextStart：首帧 role 被思维链占用时（reasoning 先行），
     /// 文本块延迟到首个 content 增量才开启。
     text_started: bool,
+    /// 流式解码中累积的 warnings（首帧字段缺席的兼容兜底等）：经 IR 流式
+    /// warnings 通道（StreamStart）上抛，与 gemini 解码器同机制。
+    warnings: Vec<Warning>,
 }
 
 impl StreamDecoder {
@@ -1593,23 +1709,44 @@ impl StreamDecoder {
                         Some(id) => {
                             // 首帧携带 id：记录 index→id 并产出工具起始。
                             self.tool_ids_by_index.insert(index, id.clone());
+                            let tool_name = tc
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.clone())
+                                .unwrap_or_default();
+                            if tool_name.is_empty() {
+                                // 官方流契约首帧必带 function.name；缺席按空名
+                                // 兜底而非硬错误，兼容处理可观测。
+                                self.warnings.push(Warning::compatibility(
+                                    warning_feature::TOOL_CALL,
+                                    format!(
+                                        "流式 tool call {id} 的首帧缺少 function.name，已按空名处理"
+                                    ),
+                                ));
+                            }
                             events.push(StreamEvent::ToolInputStart {
                                 id: id.clone(),
-                                tool_name: tc
-                                    .function
-                                    .as_ref()
-                                    .and_then(|f| f.name.clone())
-                                    .unwrap_or_default(),
+                                tool_name,
                                 provider_options: HashMap::new(),
                             });
                             id.clone()
                         }
-                        // 后续帧只带 index：回查首帧记录的 id。
-                        None => self
-                            .tool_ids_by_index
-                            .get(&index)
-                            .cloned()
-                            .unwrap_or_else(|| format!("{index}")),
+                        // 后续帧只带 index：回查首帧记录的 id；首帧即缺 id 时按
+                        // 序号合成兜底 id（登记复用，后续帧不再重复告警）。
+                        None => {
+                            self.tool_ids_by_index
+                                .get(&index)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    self.warnings.push(Warning::compatibility(
+                                warning_feature::TOOL_CALL,
+                                format!("流式 tool call 首帧缺少 id，已按序号 {index} 合成兜底 id"),
+                            ));
+                                    let synthesized = format!("{index}");
+                                    self.tool_ids_by_index.insert(index, synthesized.clone());
+                                    synthesized
+                                })
+                        }
                     };
                     if let Some(function) = &tc.function
                         && let Some(arguments) = &function.arguments
@@ -1623,6 +1760,9 @@ impl StreamDecoder {
                     }
                     is_output = true;
                 }
+                // 本帧累积的兼容兜底 warnings 以 StreamStart 上抛（累积器按
+                // 追加处理，各入站编码器转为独立 warnings 帧下发）。
+                self.flush_warnings(&mut events);
             }
         }
 
@@ -1663,6 +1803,16 @@ impl StreamDecoder {
         }
 
         DecodeStreamChunk { events, is_output }
+    }
+
+    /// 把累积的流式解码 warnings 以 StreamStart 事件上抛（IR 流式 warnings
+    /// 通道）：各协议入站编码器将其转为 warnings 帧下发，流式累积路径并入
+    /// 响应 warnings。流中 warnings 发现晚于首帧时允许 StreamStart 再次出现。
+    fn flush_warnings(&mut self, events: &mut Vec<StreamEvent>) {
+        if !self.warnings.is_empty() {
+            let warnings = std::mem::take(&mut self.warnings);
+            events.push(StreamEvent::StreamStart { warnings });
+        }
     }
 }
 
@@ -1883,15 +2033,25 @@ impl StreamEncoder {
                 );
                 let mut obj = self.build_chunk(choice);
                 obj.insert("usage".into(), encode_usage(usage));
-                // 流中丢弃过 reasoning：finish 帧显式 warning，供下游感知信息损失。
+                // finish 帧显式 warning，供下游感知信息损失与失败终态整形。
+                let mut finish_warnings = Vec::new();
                 if self.saw_reasoning {
-                    let warning = Warning::unsupported(
+                    // 流中丢弃过 reasoning。
+                    finish_warnings.push(Warning::unsupported(
                         warning_feature::REASONING,
                         "OpenAI Chat Completions 无 reasoning 内容块，推理内容已丢弃",
-                    );
-                    if let Some(gateway) = encode_warnings(&[warning]) {
-                        obj.insert("gateway".into(), gateway);
-                    }
+                    ));
+                }
+                if finish_reason.unified == FinishReasonUnified::Error {
+                    // 上游失败终态（如 Gemini 畸形工具调用）：finish_reason 枚举
+                    // 无失败值，映射为 stop 会让下游误判自然完成，以告警保可观测。
+                    finish_warnings.push(Warning::compatibility(
+                        warning_feature::FINISH,
+                        "上游以失败状态结束，finish_reason 枚举无失败值，已映射为 stop",
+                    ));
+                }
+                if let Some(gateway) = encode_warnings(&finish_warnings) {
+                    obj.insert("gateway".into(), gateway);
                 }
                 vec![Value::Object(obj)]
             }
@@ -3112,6 +3272,49 @@ mod tests {
         insta::assert_json_snapshot!(frames_to_snapshot(&frames));
     }
 
+    /// 上游失败终态（IR Error）经流式编码：finish_reason 枚举无失败值，映射为
+    /// stop 的整形以 finish 帧 gateway.warnings 保可观测。
+    #[test]
+    fn stream_error_finish_warns_via_gateway() {
+        let mut encoder = StreamEncoder::default();
+        let frames = encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Error,
+                raw: Some("MALFORMED_FUNCTION_CALL".to_string()),
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        });
+        assert_eq!(frames.len(), 1);
+        let chunk: Value = serde_json::from_str(&frames[0].data).expect("应为 JSON");
+        assert_eq!(chunk["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(
+            chunk["gateway"]["warnings"][0]["feature"], "finish",
+            "失败终态整形应可观测: {chunk:?}"
+        );
+    }
+
+    /// 上游失败终态经非流式编码：与流式 finish 帧同规，顶层 gateway.warnings
+    /// 保可观测。
+    #[test]
+    fn non_stream_error_finish_reports_gateway_warning() {
+        let response = ChatResponse {
+            id: "chatcmpl_1".to_string(),
+            model: "gpt-4o".to_string(),
+            content: Vec::new(),
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Error,
+                raw: Some("MALFORMED_FUNCTION_CALL".to_string()),
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let encoded = encode_response(&response);
+        assert_eq!(encoded["choices"][0]["finish_reason"], json!("stop"));
+        assert_eq!(encoded["gateway"]["warnings"][0]["feature"], "finish");
+    }
+
     /// 目标协议不支持的媒体类型（非图片）出站时丢弃并记 warning。
     #[test]
     fn non_image_media_is_dropped_with_warning() {
@@ -3286,5 +3489,198 @@ mod tests {
         let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
         let encoded = encode_model_list(&["fast".to_string(), "gpt-4o".to_string()]);
         assert_eq!(encoded, wire, "列表编码应与黄金样例一致");
+    }
+
+    // ---- 以下为本批协议兼容性修复的用例 ----
+
+    /// 非流式响应的空串 arguments：按 `{}` 处理并告警（与请求侧/流式侧兜底
+    /// 一致），不再让整个响应解码失败。
+    #[test]
+    fn empty_response_tool_arguments_fall_back_to_empty_object() {
+        let response = decode_response(&json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-4o",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("空串 arguments 应兜底解码而非报错");
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentPart::ToolCall { input, .. }] if *input == json!({})
+        ));
+        assert!(matches!(
+            response.warnings.as_slice(),
+            [Warning::Compatibility { feature, .. }] if feature == warning_feature::TOOL_ARGUMENTS
+        ));
+
+        // 合法 arguments 照常透传，零告警。
+        let response = decode_response(&json!({
+            "id": "chatcmpl-1",
+            "model": "gpt-4o",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "{\"city\":\"上海\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("合法 arguments 应可解码");
+        assert!(matches!(
+            response.content.as_slice(),
+            [ContentPart::ToolCall { input, .. }] if input == &json!({ "city": "上海" })
+        ));
+        assert!(response.warnings.is_empty());
+    }
+
+    /// 官方 schema 允许 `stop` 为单字符串或数组：单字符串归一为单元素列表，
+    /// 语义等价无需告警；出站统一数组形状。
+    #[test]
+    fn single_string_stop_decodes_to_single_element_list() {
+        let wire = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stop": "END"
+        });
+        let ir = decode_request(&wire).expect("单字符串 stop 应可解码");
+        assert_eq!(ir.stop, vec!["END".to_string()]);
+        assert!(ir.warnings.is_empty());
+        let mut warnings = Vec::new();
+        let reencoded = encode_request(&ir, &mut warnings);
+        assert_eq!(reencoded["stop"], json!(["END"]), "出站统一数组形状");
+        assert!(warnings.is_empty());
+
+        let array = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stop": ["END", "DONE"]
+        });
+        let ir = decode_request(&array).expect("数组 stop 应可解码");
+        assert_eq!(ir.stop, vec!["END".to_string(), "DONE".to_string()]);
+    }
+
+    /// 流式首帧字段缺席的兼容兜底可观测：缺 function.name 按空名、缺 id 按
+    /// 序号合成，各记一条 TOOL_CALL warning（经 StreamStart 上抛）；迟到
+    /// name 的忽略行为与 AI SDK 一致，保持不动。
+    #[test]
+    fn stream_first_frame_missing_name_or_id_warns_via_stream_start() {
+        // 首帧缺 name：id 在场、function.name 缺席。
+        let chunk = json!({
+            "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": { "arguments": "{}" }
+            }] } }]
+        });
+        let decoded = StreamDecoder::default().process(&chunk);
+        let warning_events: Vec<&Vec<Warning>> = decoded
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::StreamStart { warnings } => Some(warnings),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warning_events.len(), 1, "应产出一条 StreamStart 告警");
+        assert!(matches!(
+            warning_events[0].as_slice(),
+            [Warning::Compatibility { feature, .. }] if feature == warning_feature::TOOL_CALL
+        ));
+
+        // 首帧缺 id：按序号合成兜底 id（该路径不产出 ToolInputStart，参数以
+        // 首个增量开流），后续帧复用合成 id 不再重复告警。
+        let first = json!({
+            "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                "index": 0, "type": "function",
+                "function": { "name": "get_weather", "arguments": "" }
+            }] } }]
+        });
+        let second = json!({
+            "choices": [{ "index": 0, "delta": { "tool_calls": [{
+                "index": 0, "function": { "arguments": "{\"city\":\"上海\"}" }
+            }] } }]
+        });
+        let mut decoder = StreamDecoder::default();
+        let first_events = decoder.process(&first).events;
+        assert!(matches!(
+            first_events.as_slice(),
+            [StreamEvent::StreamStart { warnings }]
+                if matches!(warnings.as_slice(), [Warning::Compatibility { feature, .. }]
+                    if feature == warning_feature::TOOL_CALL)
+        ));
+        let second_events = decoder.process(&second).events;
+        assert!(
+            matches!(
+                second_events.as_slice(),
+                [StreamEvent::ToolInputDelta { id, delta, .. }]
+                    if id == "0" && delta == "{\"city\":\"上海\"}"
+            ),
+            "后续帧应复用合成 id 且零新告警: {second_events:?}"
+        );
+    }
+
+    /// Tool 消息携带多个 ToolResult part：wire 一条消息只承载单结果（
+    /// tool_call_id 单值），取首个并告警，其余丢弃可观测。
+    #[test]
+    fn tool_message_with_multiple_results_keeps_first_with_warning() {
+        let request = ChatRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![Message {
+                role: Role::Tool,
+                content: vec![
+                    ContentPart::ToolResult {
+                        tool_call_id: "call_1".to_string(),
+                        tool_name: String::new(),
+                        output: json!("first"),
+                        provider_options: HashMap::new(),
+                    },
+                    ContentPart::ToolResult {
+                        tool_call_id: "call_2".to_string(),
+                        tool_name: String::new(),
+                        output: json!("second"),
+                        provider_options: HashMap::new(),
+                    },
+                ],
+                provider_options: HashMap::new(),
+            }],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert_eq!(encoded["messages"][0]["tool_call_id"], json!("call_1"));
+        assert_eq!(encoded["messages"][0]["content"], json!("first"));
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Compatibility { feature, .. }] if feature == warning_feature::TOOL_RESULT
+        ));
     }
 }

@@ -502,7 +502,7 @@ function openBulkDelete() {
         :topmost="win.id === topmostId"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty, confirmKey) => setDirty(win.id, dirty, true, confirmKey)"
       />
       <ConfirmWindow
         v-else-if="win.payload.kind === 'delete'"

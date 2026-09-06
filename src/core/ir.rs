@@ -114,6 +114,18 @@ pub mod warning_feature {
     /// 缓存断点超过目标协议预算（Anthropic 上限 4 个），按 render order
     /// 保留靠后者、牺牲最早者。
     pub const CACHE_BREAKPOINT: &str = "cache_breakpoint";
+    /// 流式工具调用首帧字段缺席（name/id），已按兼容形状兜底（空名/序号 id）。
+    pub const TOOL_CALL: &str = "tool_call";
+    /// 上游安全拦截（如 Gemini `promptFeedback.blockReason`），内容被拒发。
+    pub const SAFETY: &str = "safety";
+    /// 回放的工具调用缺少思考签名，已注入占位哨兵规避上游校验拒绝。
+    pub const THOUGHT_SIGNATURE: &str = "thought_signature";
+    /// 目标协议必填的输出上限缺席，已补网关默认值（如 Anthropic max_tokens
+    /// 补 4096），语义从「不限」变为默认值封顶。
+    pub const MAX_TOKENS: &str = "max_tokens";
+    /// 上游失败终态（如 Gemini 畸形工具调用）在目标协议的 finish 枚举无
+    /// 承载值，已映射为自然完成（stop / end_turn）。
+    pub const FINISH: &str = "finish";
 }
 
 /// 未知字段逃生舱在 provider 逃生舱内的键：`provider_options[<provider>]["extra"]`。
@@ -237,6 +249,22 @@ pub fn top_level_media_type(media_type: &str) -> &str {
     media_type.split('/').next().unwrap_or(media_type)
 }
 
+/// 媒体类型是否为完整 `type/subtype` 形态（子类型非空且非通配 `*`）。
+///
+/// IR 的 `media_type` 允许仅顶层段的类别标记（如 `image`、`document`）——
+/// wire 的 part 类型（chat `image_url`、Anthropic image/document 块）只表达
+/// 类别时，标记承载「目标协议应映射为图片还是文档」的判别信息，往返必需。
+/// 但 wire 上要求完整 IANA 类型的位置（Anthropic base64 source 的
+/// `media_type`、data URL、Gemini `mimeType`）不得写出标记值——完整类型
+/// 未知时要么省略字段（可省的位置，如 Gemini `fileData.mimeType`），要么
+/// 丢弃并告警（必填的位置），由各出站面按本判定选择。
+pub fn is_full_media_type(media_type: &str) -> bool {
+    match media_type.split_once('/') {
+        Some((_, subtype)) => !subtype.is_empty() && subtype != "*",
+        None => false,
+    }
+}
+
 /// 消息内容 part 枚举。`type` 为 serde tag，序列化为 `snake_case`。
 ///
 /// 跨协议族转换有损时记 warning 而非静默吞掉。
@@ -255,9 +283,12 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 媒体内容（多模态）。`media_type` 为 IANA 媒体类型（如 `image/png`），
-    /// 携带数据源（base64 字节或 URL）+ provider_options 逃生舱；wire 类型不出
-    /// 适配器边界。
+    /// 媒体内容（多模态）。`media_type` 为 IANA 媒体类型（如 `image/png`）；
+    /// wire part 类型只表达类别时（chat `image_url`、Anthropic image/document
+    /// 块的 URL source）允许仅顶层段的类别标记（`image`/`document` 等）——
+    /// 标记承载出站面的图片/文档判别，是否可写上 wire 由
+    /// [`is_full_media_type`] 在各出站面判定。携带数据源（base64 字节或 URL）
+    /// + provider_options 逃生舱；wire 类型不出适配器边界。
     Media {
         media_type: String,
         data: MediaSource,
@@ -590,20 +621,71 @@ pub(crate) fn capture_unknown_fields(
     extra
 }
 
-/// 出站编码的未知字段逃生舱处理：本族字段回写、跨族字段丢弃并告警。
+/// 出站面未知字段逃生舱的回写策略：本族 `extra` 内字段如何落到出站对象。
 ///
-/// `family` 为本适配器的 provider 键：本族 `extra` 内的字段原样写回出站
-/// 对象（不覆盖类型化字段已写的键）；其他 provider 的字段丢弃并记
+/// 策略张力：chat 与 responses 共用一个 `openai` 逃生舱键（族内互回不区分
+/// 来源协议），但两个适配器各自只认识本方 wire 的顶层字段——OpenAI 服务端
+/// 对未知顶层请求参数直接 400，族内互回若不按目标协议过滤，chat 入站的
+/// `logprobs`/`logit_bias`/`user` 等 chat-only 字段会被原样写进 Responses
+/// 请求，请求在到达模型前就被拒绝（反向同理）。anthropic/google 两个键与
+/// 协议一一对应，同族即同协议，extra 内字段全部来自本协议 wire，保持原样
+/// 回写以维持同族往返 byte-shape 一致。
+///
+/// 白名单维护（[`ExtraWriteback::TargetFields`] 的列表）：内容是「目标协议
+/// 服务端接受的顶层请求字段」，包含已类型化字段与官方在册但网关未类型化
+/// 的字段（如 `service_tier`/`metadata` 两协议都接受，必须双侧登记以保持
+/// 族内互回往返）。协议演进时（厂商新增顶层参数）同步登记；字段提升为 IR
+/// 类型化字段后仍保留在列表——列表语义是「目标协议认识这个键」，与「网关
+/// 是否类型化」正交。遗漏真实字段会让同族互回丢弃合法字段，多列不存在的
+/// 字段只影响恰好同名的未知字段，宁可从宽。
+pub(crate) enum ExtraWriteback<'a> {
+    /// 本族逃生舱与协议一一对应（anthropic/google）：原样回写，不按字段
+    /// 过滤。
+    WholeFamily,
+    /// 本族逃生舱由多个协议共享（openai = chat + responses）：仅回写目标
+    /// 协议认识的顶层字段，其余丢弃并记 [`warning_feature::UNKNOWN_FIELDS`]
+    /// 告警。
+    TargetFields(&'a [&'static str]),
+}
+
+/// 出站编码的未知字段逃生舱处理：本族字段按策略回写、跨族字段丢弃并告警。
+///
+/// `family` 为本适配器的 provider 键；`writeback` 决定本族 `extra` 内字段
+/// 的回写方式（见 [`ExtraWriteback`]）。其他 provider 的字段一律丢弃并记
 /// [`warning_feature::UNKNOWN_FIELDS`] warning，details 携带字段名。
 pub(crate) fn apply_provider_extra(
     obj: &mut serde_json::Map<String, Value>,
     request: &ChatRequest,
     family: &str,
+    writeback: ExtraWriteback<'_>,
     warnings: &mut Vec<Warning>,
 ) {
     if let Some(extra) = request.provider_extra(family) {
-        for (key, field) in extra {
-            obj.entry(key.clone()).or_insert(field.clone());
+        match writeback {
+            ExtraWriteback::WholeFamily => {
+                for (key, field) in extra {
+                    obj.entry(key.clone()).or_insert(field.clone());
+                }
+            }
+            ExtraWriteback::TargetFields(known) => {
+                let mut dropped: Vec<&str> = Vec::new();
+                for (key, field) in extra {
+                    if known.contains(&key.as_str()) {
+                        obj.entry(key.clone()).or_insert(field.clone());
+                    } else {
+                        dropped.push(key.as_str());
+                    }
+                }
+                if !dropped.is_empty() {
+                    warnings.push(Warning::unsupported(
+                        warning_feature::UNKNOWN_FIELDS,
+                        format!(
+                            "{family} 的未知字段 {} 不被目标协议接受，已丢弃",
+                            dropped.join("、")
+                        ),
+                    ));
+                }
+            }
         }
     }
     for provider in request.provider_options.keys() {
@@ -641,7 +723,11 @@ pub(crate) fn prefix_hash(request: &ChatRequest) -> u64 {
         write_message_prefix(&mut hasher, message);
     }
     for message in request.messages.iter().take(2) {
-        write_message_prefix(&mut hasher, message);
+        // system 消息已在前一轮全量计入：前两条里再哈希会让首条 system
+        // 重复进入摘要，去重后语义仍是「system 全文 + 前两条消息」。
+        if message.role != Role::System {
+            write_message_prefix(&mut hasher, message);
+        }
     }
     hasher.finish()
 }
@@ -808,7 +894,13 @@ mod tests {
             (warning_feature::TOOL_CHOICE, "tool_choice"),
             (warning_feature::PARALLEL_TOOL_CALLS, "parallel_tool_calls"),
             (warning_feature::UNKNOWN_FIELDS, "unknown_fields"),
+            (warning_feature::PAUSE_TURN, "pause_turn"),
             (warning_feature::CACHE_BREAKPOINT, "cache_breakpoint"),
+            (warning_feature::TOOL_CALL, "tool_call"),
+            (warning_feature::SAFETY, "safety"),
+            (warning_feature::THOUGHT_SIGNATURE, "thought_signature"),
+            (warning_feature::MAX_TOKENS, "max_tokens"),
+            (warning_feature::FINISH, "finish"),
         ];
         for (constant, value) in expected {
             assert_eq!(constant, value);

@@ -32,6 +32,9 @@ struct StatsQueryParams {
 struct StatsSummaryView {
     request_count: u64,
     success_count: u64,
+    /// 未出站即终局的请求数（dispatched=0 单列统计，不并入 request_count
+    /// 等出站口径指标）。
+    not_dispatched: u64,
     input_tokens: u64,
     output_tokens: u64,
     /// 实收（折后）合计。
@@ -106,6 +109,7 @@ async fn get_stats(
         summary: StatsSummaryView {
             request_count: stats.summary.request_count,
             success_count: stats.summary.success_count,
+            not_dispatched: stats.summary.not_dispatched,
             input_tokens: stats.summary.input_tokens,
             output_tokens: stats.summary.output_tokens,
             cost_usd_micros: stats.summary.cost_usd_micros,

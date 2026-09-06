@@ -35,7 +35,7 @@ use super::{anthropic_messages, gemini, openai_chat, openai_responses};
 use crate::config::Protocol;
 use crate::core::ir::{
     ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message,
-    ReasoningEffort, Role, Tool, ToolChoice, Usage, Warning,
+    ReasoningEffort, Role, Tool, ToolChoice, Usage, Warning, warning_feature,
 };
 use gemini::stable_tool_call_id;
 
@@ -955,7 +955,11 @@ fn developer_role_treats_as_system_across_protocols() {
     ));
 
     let (anthropic_wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
-    assert!(warnings.is_empty());
+    // chat 入站未带 max_tokens：Anthropic 必填补默认（唯一告警）。
+    assert!(matches!(
+        warnings.as_slice(),
+        [Warning::Compatibility { feature, .. }] if feature == warning_feature::MAX_TOKENS
+    ));
     assert_eq!(anthropic_wire["system"], json!("输出须为 JSON"));
 
     let (responses_wire, warnings) = encode_request_wire(Protocol::OpenAiResponses, &ir);
@@ -1012,8 +1016,15 @@ fn chat_reasoning_content_survives_via_anthropic_thinking_block() {
     ));
 
     // anthropic 出站：无 signature 的 reasoning 预置为无 signature 的 thinking 块。
+    // chat 入站未带 max_tokens，Anthropic 必填补默认 4096（兼容告警，见 P8）。
     let (anthropic_wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
-    assert!(warnings.is_empty());
+    assert_eq!(
+        warnings,
+        vec![Warning::compatibility(
+            warning_feature::MAX_TOKENS,
+            "Anthropic 必填 max_tokens 缺席或非法，已补默认 4096（原语义为不限，现为 4096 封顶）",
+        )]
+    );
     let assistant = anthropic_wire["messages"]
         .as_array()
         .expect("应有消息数组")
@@ -1084,7 +1095,11 @@ fn chat_effort_maps_to_anthropic_by_model_form() {
 
     let ir = decode_request_wire(Protocol::OpenAiChat, &chat_wire("claude-opus-4-6", "high"));
     let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
-    assert!(warnings.is_empty());
+    // chat 入站未带 max_tokens：Anthropic 必填补默认（唯一告警）。
+    assert!(matches!(
+        warnings.as_slice(),
+        [Warning::Compatibility { feature, .. }] if feature == warning_feature::MAX_TOKENS
+    ));
     assert_eq!(wire["thinking"], json!({ "type": "adaptive" }));
     assert_eq!(wire["output_config"], json!({ "effort": "high" }));
 
@@ -1283,11 +1298,15 @@ fn illegal_tool_arguments_fallback_declared_lossy() {
         )]
     );
 
-    // 兜底后的 tool_call 跨族出站为空 input，编码零告警。
+    // 兜底后的 tool_call 跨族出站为空 input，编码告警仅 max_tokens 补默认
+    // （chat 入站未带输出上限，Anthropic 必填）。
     let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &request);
     assert_eq!(wire["messages"][0]["content"][0]["type"], "tool_use");
     assert_eq!(wire["messages"][0]["content"][0]["input"], json!({}));
-    assert!(warnings.is_empty());
+    assert!(matches!(
+        warnings.as_slice(),
+        [Warning::Compatibility { feature, .. }] if feature == warning_feature::MAX_TOKENS
+    ));
 }
 
 /// tool 的根级 union schema 只在 anthropic 出站面归一化：摊平合并并记
@@ -1408,10 +1427,16 @@ fn unknown_fields_warn_and_drop_on_cross_family_outbound() {
     let ir = decode_request_wire(Protocol::OpenAiChat, &chat);
     let (wire, warnings) = encode_request_wire(Protocol::AnthropicMessages, &ir);
     assert!(wire.get("logprobs").is_none(), "跨族出站不应携带未知字段");
+    // chat 入站未带 max_tokens：Anthropic 补默认（compatibility）+ 跨族未知
+    // 字段丢弃（unsupported），各一条。
     assert!(matches!(
         warnings.as_slice(),
-        [Warning::Unsupported { feature, details }]
-            if feature == "unknown_fields" && details.as_deref().is_some_and(|d| d.contains("logprobs"))
+        [
+            Warning::Compatibility { feature: filled, .. },
+            Warning::Unsupported { feature, details }
+        ] if filled == warning_feature::MAX_TOKENS
+            && feature == warning_feature::UNKNOWN_FIELDS
+            && details.as_deref().is_some_and(|d| d.contains("logprobs"))
     ));
 
     let anthropic = json!({
@@ -1642,7 +1667,9 @@ fn cross_family_escape_hatches_warn_and_same_family_stays_silent() {
         temperature: None,
         top_p: None,
         top_k: None,
-        max_tokens: None,
+        // 显式携带输出上限：本格聚焦缓存断点告警，避免 Anthropic 必填
+        // max_tokens 的补默认告警混入断言。
+        max_tokens: Some(1024),
         reasoning: None,
         n: None,
         stop: Vec::new(),
@@ -1692,4 +1719,91 @@ fn cross_family_escape_hatches_warn_and_same_family_stays_silent() {
         warnings.is_empty(),
         "anthropic 同族断点出站不应告警: {warnings:?}"
     );
+}
+
+/// 工具结果居中的工具轮（user → assistant(tool_call) → tool → assistant(text)
+/// → user）：全部有向对无损——Gemini 面要求 functionResponse 紧随 functionCall
+/// 的 model 轮（居中结果先落独立 user content），顺序在投影面不漂移。
+#[test]
+fn mid_sequence_tool_result_survives_all_directed_pairs() {
+    let mut request = base_request();
+    // 在工具结果之后、末尾之前插入 assistant 回答与新的 user 追问。
+    request.messages.insert(
+        4,
+        Message {
+            role: Role::Assistant,
+            content: vec![text_part("上海晴，26 度。")],
+            provider_options: HashMap::new(),
+        },
+    );
+    request.messages.insert(
+        5,
+        Message {
+            role: Role::User,
+            content: vec![text_part("明天呢？")],
+            provider_options: HashMap::new(),
+        },
+    );
+    for (a, b) in directed_pairs() {
+        request_survives(a, b, &request);
+    }
+}
+
+/// anthropic thinking 签名经 chat 中转：思维链文本以 `reasoning_content`
+/// 保留，`anthropic.signature` 逃生舱在 chat 出站丢弃并记 provider_options
+/// 告警（签名与 Anthropic 上游绑定，chat 面本就无承载）——独立于既有跨族
+/// 用例（彼处只锁 cache_control）断言签名面。
+#[test]
+fn anthropic_signature_transits_chat_with_text_kept_and_signature_dropped() {
+    let anthropic_wire = json!({
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 1024,
+        "messages": [
+            { "role": "user", "content": "925 ÷ 5 等于多少？" },
+            { "role": "assistant", "content": [
+                { "type": "thinking", "thinking": "先算 925 ÷ 5。", "signature": "sig_1" },
+                { "type": "text", "text": "185" }
+            ] }
+        ]
+    });
+    let ir = decode_request_wire(Protocol::AnthropicMessages, &anthropic_wire);
+    assert!(matches!(
+        &ir.messages[1].content[0],
+        ContentPart::Reasoning { provider_options, .. }
+            if provider_options["anthropic"]["signature"] == json!("sig_1")
+    ));
+
+    // chat 出站：文本保留为 reasoning_content，签名丢弃并告警（内容级逃生舱）。
+    let (chat_wire, warnings) = encode_request_wire(Protocol::OpenAiChat, &ir);
+    assert_eq!(
+        chat_wire["messages"][1]["reasoning_content"],
+        json!("先算 925 ÷ 5。")
+    );
+    assert_eq!(chat_wire["messages"][1]["content"], json!("185"));
+    assert!(matches!(
+        warnings.as_slice(),
+        [Warning::Unsupported { feature, details: Some(details) }]
+            if feature == warning_feature::PROVIDER_OPTIONS
+                && details.contains("anthropic") && details.contains("内容级")
+    ));
+    // chat wire 无任何签名字段（签名在 chat 面无承载）。
+    let chat_text = chat_wire.to_string();
+    assert!(!chat_text.contains("sig_1"), "签名不应泄漏进 chat wire");
+
+    // 回到 anthropic 面：文本语义保留，签名已不可恢复（经 chat 的既有有损面）。
+    let via_chat = decode_request_wire(Protocol::OpenAiChat, &chat_wire);
+    let (back, warnings) = encode_request_wire(Protocol::AnthropicMessages, &via_chat);
+    let assistant = back["messages"]
+        .as_array()
+        .expect("应有消息数组")
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("应有 assistant 消息");
+    assert_eq!(assistant["content"][0]["type"], json!("thinking"));
+    assert_eq!(assistant["content"][0]["thinking"], json!("先算 925 ÷ 5。"));
+    assert!(
+        assistant["content"][0].get("signature").is_none(),
+        "经 chat 中转后签名不可恢复"
+    );
+    assert!(warnings.is_empty());
 }

@@ -46,14 +46,19 @@ pub(crate) fn normalize_object_root(schema: Option<&Value>) -> (Value, Option<St
     };
     let mut required = required_schema_names(root.get("required")).unwrap_or_default();
     let mut flattened = false;
+    // 键值非数组的畸形 union：摊平无从谈起，但直接丢弃会让约束悄悄消失，
+    // 记入动作说明（随 INPUT_SCHEMA 告警面可观测）。不能保留原值——根级
+    // union 本身就是上游拒绝的形态，保留等于把已知的 400 原样送回。
+    let mut dropped_malformed: Vec<&str> = Vec::new();
     for union_name in ["anyOf", "oneOf", "allOf"] {
         let Some(branches) = root.remove(union_name) else {
             continue;
         };
-        flattened = true;
         let Value::Array(branches) = branches else {
+            dropped_malformed.push(union_name);
             continue;
         };
+        flattened = true;
         for branch in branches {
             let Value::Object(branch) = branch else {
                 continue;
@@ -86,12 +91,24 @@ pub(crate) fn normalize_object_root(schema: Option<&Value>) -> (Value, Option<St
     if !flattened && schema == Some(&normalized) {
         return (normalized, None);
     }
-    let action = if flattened {
-        "根级 anyOf/oneOf/allOf 已摊平合并".to_string()
+    if flattened || !dropped_malformed.is_empty() {
+        let mut actions = Vec::new();
+        if flattened {
+            actions.push("根级 anyOf/oneOf/allOf 已摊平合并".to_string());
+        }
+        if !dropped_malformed.is_empty() {
+            actions.push(format!(
+                "根级 {} 值非数组无法摊平，已丢弃",
+                dropped_malformed.join("/")
+            ));
+        }
+        (normalized, Some(actions.join("；")))
     } else {
-        "根级已归一化为显式 object 形态".to_string()
-    };
-    (normalized, Some(action))
+        (
+            normalized,
+            Some("根级已归一化为显式 object 形态".to_string()),
+        )
+    }
 }
 
 /// schema `type` 声明能否承载 object：缺席视为可能，`"object"` 或含
@@ -219,6 +236,44 @@ mod tests {
         assert_eq!(
             action,
             Some("非 object 根已兜底为空 object schema".to_string())
+        );
+    }
+
+    /// union 键值非数组（畸形 schema）：摊平无从谈起，丢弃动作如实记入
+    /// action（随 INPUT_SCHEMA 告警可观测），不再谎报「已摊平合并」；合法
+    /// union 与畸形 union 并存时两个动作都记录。
+    #[test]
+    fn malformed_union_value_drop_is_recorded_in_action() {
+        let (normalized, action) = normalize_object_root(Some(&json!({
+            "anyOf": { "type": "object" }
+        })));
+        assert_eq!(
+            normalized,
+            json!({ "type": "object", "properties": {} }),
+            "畸形 union 丢弃后仍归一为合法 object 根"
+        );
+        assert_eq!(
+            action,
+            Some("根级 anyOf 值非数组无法摊平，已丢弃".to_string())
+        );
+
+        // 合法 union 与畸形 union 并存：摊平与丢弃两个动作都记录。
+        let (normalized, action) = normalize_object_root(Some(&json!({
+            "anyOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+            ],
+            "oneOf": "oops"
+        })));
+        assert_eq!(
+            normalized,
+            json!({ "type": "object", "properties": { "a": { "type": "string" } } })
+        );
+        assert_eq!(
+            action,
+            Some(
+                "根级 anyOf/oneOf/allOf 已摊平合并；根级 oneOf 值非数组无法摊平，已丢弃"
+                    .to_string()
+            )
         );
     }
 }

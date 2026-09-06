@@ -70,6 +70,10 @@ pub(super) struct LogEntry {
     settled: bool,
     /// 上游响应是否明确携带 usage 字段；显式的全零 usage 仍为已报告。
     usage_reported: bool,
+    /// 该行是否对应已实际派发上游的尝试；`false` 表示未出站即终局
+    ///（全部渠道冷却 / 无可用密钥、本地计费拒绝、出站安全策略拒绝等），
+    /// 行上无渠道与费用。
+    dispatched: bool,
     request_body: Option<String>,
     response_body: Option<String>,
 }
@@ -108,6 +112,7 @@ impl LogEntry {
             cost_usd_micros: log.cost_usd_micros,
             settled: log.settled,
             usage_reported: log.usage_reported,
+            dispatched: log.dispatched,
             request_body: log.request_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
             response_body: log.response_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
         }

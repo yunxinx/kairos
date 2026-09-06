@@ -483,11 +483,19 @@ pub const DEFAULT_RATE_LIMIT_RPM: u64 = 0;
 pub const DEFAULT_REQUEST_RECTIFY: bool = true;
 /// 默认拒绝私网目标；需要内网渠道时由 root 在设置中显式放行。
 pub const DEFAULT_ALLOW_PRIVATE_NETWORKS: bool = false;
+/// 单次渠道调用的服务端超时下限（毫秒）：更小的值连常规握手都来不及完成，
+/// 每次调用都会退化为确定性超时。校验只拦新增写入；存量库中的更小旧值由
+/// 运行时钳制继续兼容。
+pub const MIN_CHANNEL_TIMEOUT_MS: u64 = 1_000;
 /// 单次渠道调用的服务端超时硬上限。管理面拒绝更大值，请求路径仍再次钳制，
 /// 使直接写库或旧快照也不能突破请求资源预算。
 pub const MAX_CHANNEL_TIMEOUT_MS: u64 = 120_000;
 /// 渠道级预首字节总时限缺省值（毫秒）：与原网关全局硬编码一致。
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
+/// 渠道级预首字节总时限下限（毫秒）：连接、响应头与流首 peek 共享该预算，
+/// 短于一次常规握手加首字节的时长没有运营意义。校验只拦新增写入；存量库
+/// 中的更小旧值由运行时钳制继续兼容。
+pub const MIN_REQUEST_TIMEOUT_MS: u64 = 1_000;
 /// 渠道级预首字节总时限上限（毫秒）：深度推理/大 prompt 的合法长首字节
 /// 允许到 10 分钟，再长的应走异步化而非占用活动请求容量。
 pub const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;

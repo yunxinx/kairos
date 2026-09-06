@@ -720,10 +720,14 @@ fn decode_message(wire: &WireMessage, index: usize) -> Result<Vec<Message>, Deco
     }
 }
 
-/// user 消息：文本块进 User 消息，tool_result 块各自拆为 Tool 消息。
+/// user 消息：按块遇到顺序拆分为独立 IR 消息。
 ///
-/// Anthropic 把 tool_result 放在 user 消息里，而 IR 的 tool 结果独立成 Tool 角色
-/// （与 OpenAI 约定一致）。混含时文本与各 tool_result 分拆，保持 content 顺序。
+/// Anthropic 把 tool_result 放在 user 消息里，而 IR 的 tool 结果独立成 Tool
+/// 角色（与 OpenAI 约定一致）。混排块（如 `[tool_result, text]`）按遇到顺序
+/// 拆分——工具结果前的文本先落 User 消息、结果落 Tool 消息、其后的文本再落
+/// User 消息——不做 IR 块级交错；连续同类块归并进同一条消息保持原形状
+/// （连续 tool_result 各自一条 Tool 消息，与既有拆分粒度一致，出站侧再由
+/// 连续 Tool 消息合并回单条 user 的多 tool_result 块还原 wire）。
 fn decode_user(content: &WireContent, index: usize) -> Result<Vec<Message>, DecodeError> {
     // 纯字符串 user 消息 → 单个 text part。
     let blocks = match content {
@@ -741,8 +745,7 @@ fn decode_user(content: &WireContent, index: usize) -> Result<Vec<Message>, Deco
     };
 
     let mut messages = Vec::new();
-    let mut text_parts = Vec::new();
-    let mut tool_results = Vec::new();
+    let mut text_parts: Vec<ContentPart> = Vec::new();
 
     for block in blocks {
         match block {
@@ -761,6 +764,15 @@ fn decode_user(content: &WireContent, index: usize) -> Result<Vec<Message>, Deco
                 is_error,
                 cache_control,
             } => {
+                // 遇到工具结果：先把累积的文本落为 User 消息（保持 wire 块序，
+                // 文本不被推迟到结果之后），再落本条 Tool 消息。
+                if !text_parts.is_empty() {
+                    messages.push(Message {
+                        role: Role::User,
+                        content: std::mem::take(&mut text_parts),
+                        provider_options: HashMap::new(),
+                    });
+                }
                 let output = match content {
                     Some(Value::String(s)) => Value::String(s.clone()),
                     Some(other) => other.clone(),
@@ -779,11 +791,15 @@ fn decode_user(content: &WireContent, index: usize) -> Result<Vec<Message>, Deco
                         anthropic.insert("cache_control".into(), cc.clone());
                     }
                 }
-                tool_results.push(ContentPart::ToolResult {
-                    tool_call_id: tool_use_id.clone(),
-                    tool_name: String::new(),
-                    output,
-                    provider_options,
+                messages.push(Message {
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        tool_call_id: tool_use_id.clone(),
+                        tool_name: String::new(),
+                        output,
+                        provider_options,
+                    }],
+                    provider_options: HashMap::new(),
                 });
             }
             WireBlock::Image {
@@ -808,13 +824,6 @@ fn decode_user(content: &WireContent, index: usize) -> Result<Vec<Message>, Deco
         messages.push(Message {
             role: Role::User,
             content: text_parts,
-            provider_options: HashMap::new(),
-        });
-    }
-    for part in tool_results {
-        messages.push(Message {
-            role: Role::Tool,
-            content: vec![part],
             provider_options: HashMap::new(),
         });
     }
@@ -929,9 +938,19 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
         obj.insert("system".into(), system);
     }
     obj.insert("messages".into(), Value::Array(messages));
-    // Anthropic 强制要求 max_tokens：缺省时补 4096，
-    // 否则跨协议请求（如 OpenAI 入站未带 max_tokens）会被上游 400 拒绝。
-    let max_tokens = request.max_tokens.filter(|&v| v > 0).unwrap_or(4096);
+    // Anthropic 的 max_tokens 是必填项，而 OpenAI 语义里缺席等于「不设上限」：
+    // 跨协议请求（如 chat 入站未带 max_tokens）不补默认会被上游 400 拒绝。
+    // 取 4096 是网关规范值——足够容纳常规回复，又不至于放大按量计费敞口；
+    // 需要更大输出的下游应显式携带 max_tokens/max_completion_tokens。补默认
+    // 是兼容整形（下游语义从「不限」变为「4096 封顶」），记 compatibility
+    // warning 保持可观测；取值可随运营经验调整。
+    let max_tokens = request.max_tokens.filter(|&v| v > 0).unwrap_or_else(|| {
+        warnings.push(Warning::compatibility(
+            warning_feature::MAX_TOKENS,
+            "Anthropic 必填 max_tokens 缺席或非法，已补默认 4096（原语义为不限，现为 4096 封顶）",
+        ));
+        4096
+    });
     obj.insert("max_tokens".into(), json!(max_tokens));
 
     let anthropic_options = request.provider_options.get("anthropic");
@@ -1156,7 +1175,14 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
         obj.insert("output_config".into(), output_config);
     }
     // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
-    apply_provider_extra(&mut obj, request, "anthropic", warnings);
+    // anthropic 键与协议一一对应，同族即同协议，原样回写保持 byte-shape 一致。
+    apply_provider_extra(
+        &mut obj,
+        request,
+        "anthropic",
+        crate::core::ir::ExtraWriteback::WholeFamily,
+        warnings,
+    );
     if !tools_enabled {
         // `ToolChoice::None` 的协议承载是完全不发送工具面；逃生舱不能重新
         // 注入 Anthropic 不接受的 `tools`/`tool_choice` 字段。
@@ -1513,18 +1539,31 @@ fn encode_messages(
             Role::Tool => {
                 let blocks = encode_tool_result_blocks(&message.content, &mut alignment);
                 // 连续 tool 消息合并为一条 user 的多个 tool_result 块。
-                if let Some(last) = wire_messages.last_mut()
-                    && last.get("role").and_then(Value::as_str) == Some("user")
-                    && last
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .is_some_and(|c| {
-                            c.iter().all(|b| {
-                                b.get("type").and_then(Value::as_str) == Some("tool_result")
-                            })
-                        })
+                if is_tool_result_message(wire_messages.last().expect("分支条件已确认末条在场"))
                 {
-                    append_blocks(last, blocks);
+                    append_blocks(wire_messages.last_mut().expect("已确认末条存在"), blocks);
+                } else if let Some(mut merged) = take_last_pure_text_user_blocks(&mut wire_messages)
+                {
+                    // 夹层文本归并：decode_user 把混排的 user 消息按遇到顺序拆成
+                    // User(text)→Tool 序列；若不归并，文本消息会插在
+                    // assistant(tool_use) 与 tool_result 之间，Anthropic 会以
+                    // tool_result 未紧随 tool_use 轮拒绝整个请求。把紧邻的纯文本
+                    // user 消息折为 tool 消息的前导文本块，保持原遇顺序。
+                    merged.extend(blocks);
+                    if is_tool_result_message(
+                        wire_messages
+                            .last()
+                            .expect("折叠分支末条可能为 tool_result 消息"),
+                    ) {
+                        // 前一条已是 tool_result 消息（如 [tool_result, text,
+                        // tool_result] 的拆分）：追加保持原块序。
+                        append_blocks(wire_messages.last_mut().expect("已确认末条存在"), merged);
+                    } else {
+                        let mut m = serde_json::Map::new();
+                        m.insert("role".into(), json!("user"));
+                        m.insert("content".into(), Value::Array(merged));
+                        wire_messages.push(Value::Object(m));
+                    }
                 } else {
                     let mut m = serde_json::Map::new();
                     m.insert("role".into(), json!("user"));
@@ -1666,6 +1705,56 @@ fn push_user_blocks(wire_messages: &mut Vec<Value>, blocks: Vec<Value>) {
     wire_messages.push(json!({ "role": "user", "content": Value::Array(blocks) }));
 }
 
+/// 判定一条 wire 消息是否为 tool_result 承载消息（user 角色、内容为非空且
+/// 全部由 tool_result 块组成的数组）。
+///
+/// 连续 tool 消息合并与 [`align_tool_results`] 的消息识别共用同一谓词，
+/// 语义漂移会让两处对「tool_result 消息」的认定不一致。
+fn is_tool_result_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                !blocks.is_empty()
+                    && blocks
+                        .iter()
+                        .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            })
+}
+
+/// 取出末尾的纯文本 user 消息并转为文本块列表；末条不是 user 消息、内容
+/// 为空或含非文本块（媒体、tool_result）时不动作，返回 `None`。
+///
+/// 供 [`encode_messages`] 的 Role::Tool 分支做夹层文本归并：Anthropic 要求
+/// tool_result 紧随 tool_use 轮，decode_user 拆分保序产生的 User(text)→Tool
+/// 序列需要折回同一条 user 消息。纯文本限定是保守口径——含媒体的 user 消息
+/// 语义上不是工具轮的附属文本，保持独立消息。
+fn take_last_pure_text_user_blocks(wire_messages: &mut Vec<Value>) -> Option<Vec<Value>> {
+    let last = wire_messages.last()?;
+    if last.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    match last.get("content")? {
+        Value::String(text) if !text.is_empty() => {
+            let text = text.clone();
+            wire_messages.pop();
+            Some(vec![json!({ "type": "text", "text": text })])
+        }
+        Value::Array(blocks)
+            if !blocks.is_empty()
+                && blocks
+                    .iter()
+                    .all(|b| b.get("type").and_then(Value::as_str) == Some("text")) =>
+        {
+            let blocks = blocks.clone();
+            wire_messages.pop();
+            Some(blocks)
+        }
+        _ => None,
+    }
+}
+
 /// 把 part 级缓存断点写入 wire 内容块（约定键 anthropic.cache_control）。
 fn attach_cache_control(block: &mut Value, provider_options: &crate::core::ir::ProviderOptions) {
     if let Some(cache_control) = provider_options
@@ -1771,18 +1860,41 @@ fn encode_media_block(
             .and_then(|a| a.get("data"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // text source 的 media_type 同样要求完整类型（官方为 text/plain 等），
+        // 仅顶层段标记拼不出合法值，丢弃并告警。
+        if !crate::core::ir::is_full_media_type(media_type) {
+            warnings.push(Warning::unsupported(
+                warning_feature::MEDIA,
+                format!("Anthropic text source 需要完整媒体类型，{media_type:?} 无法承载，已丢弃"),
+            ));
+            return None;
+        }
         return Some(json!({
             "type": block_type,
             "source": { "type": "text", "media_type": media_type, "data": text_data },
         }));
     }
 
+    // base64 source 的 media_type 必填且须为完整 IANA 类型：IR 里仅顶层段的
+    // 类别标记（跨族来源回放的无类型 base64）拼不出合法值，丢弃并告警。
+    // url source 无 media_type 字段，类别由块类型承载，不受此限。
     let source = match data {
-        crate::core::ir::MediaSource::Data { base64 } => json!({
-            "type": "base64",
-            "media_type": media_type,
-            "data": base64,
-        }),
+        crate::core::ir::MediaSource::Data { base64 } => {
+            if !crate::core::ir::is_full_media_type(media_type) {
+                warnings.push(Warning::unsupported(
+                    warning_feature::MEDIA,
+                    format!(
+                        "Anthropic base64 source 需要完整媒体类型，{media_type:?} 无法承载，已丢弃"
+                    ),
+                ));
+                return None;
+            }
+            json!({
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64,
+            })
+        }
         crate::core::ir::MediaSource::Url { url } => json!({
             "type": "url",
             "url": url,
@@ -1958,18 +2070,7 @@ fn part_output(part: &ContentPart) -> Value {
 /// 上游判定）。合法已对齐的序列重排为恒等，同族往返逐字节稳定。
 fn align_tool_results(wire_messages: &mut [Value]) {
     for index in 1..wire_messages.len() {
-        let is_tool_result_message = wire_messages[index].get("role").and_then(Value::as_str)
-            == Some("user")
-            && wire_messages[index]
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    !blocks.is_empty()
-                        && blocks
-                            .iter()
-                            .all(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                });
-        if !is_tool_result_message {
+        if !is_tool_result_message(&wire_messages[index]) {
             continue;
         }
         let Some(tool_use_ids) = wire_messages[..index]
@@ -2273,6 +2374,16 @@ pub fn encode_response(response: &ChatResponse) -> Value {
 
     let stop_reason = encode_stop_reason(&response.finish_reason);
 
+    // 上游失败终态：与流式 message_delta 前的 ping 告警同规，映射为 end_turn
+    // 的整形以顶层 gateway.warnings 保可观测。
+    let mut warnings = response.warnings.clone();
+    if response.finish_reason.unified == FinishReasonUnified::Error {
+        warnings.push(Warning::compatibility(
+            warning_feature::FINISH,
+            "上游以失败状态结束，stop_reason 枚举无失败值，已映射为 end_turn",
+        ));
+    }
+
     let mut obj = serde_json::Map::new();
     obj.insert("id".into(), json!(response.id));
     obj.insert("type".into(), json!("message"));
@@ -2282,7 +2393,7 @@ pub fn encode_response(response: &ChatResponse) -> Value {
     obj.insert("stop_reason".into(), json!(stop_reason));
     obj.insert("stop_sequence".into(), Value::Null);
     obj.insert("usage".into(), encode_usage(&response.usage));
-    if let Some(gateway) = crate::core::openai_chat::encode_warnings(&response.warnings) {
+    if let Some(gateway) = crate::core::openai_chat::encode_warnings(&warnings) {
         obj.insert("gateway".into(), gateway);
     }
     Value::Object(obj)
@@ -2736,10 +2847,22 @@ impl StreamEncoder {
                     "usage": encode_usage(usage),
                 });
                 let message_stop = json!({ "type": "message_stop" });
-                vec![
-                    SseFrame::named("message_delta", delta.to_string()),
-                    SseFrame::named("message_stop", message_stop.to_string()),
-                ]
+                let mut frames = Vec::new();
+                if finish_reason.unified == FinishReasonUnified::Error {
+                    // 上游失败终态（如 Gemini 畸形工具调用）：stop_reason 枚举无
+                    // 失败值，映射为 end_turn 会让下游误判自然完成；Anthropic 无
+                    // 标准 warnings 通道，以 `ping` 事件携带告警（SDK 忽略）。
+                    let warning = Warning::compatibility(
+                        warning_feature::FINISH,
+                        "上游以失败状态结束，stop_reason 枚举无失败值，已映射为 end_turn",
+                    );
+                    let gateway = crate::core::openai_chat::encode_warnings(&[warning])
+                        .unwrap_or_else(|| json!({ "warnings": [] }));
+                    frames.push(SseFrame::named("ping", gateway.to_string()));
+                }
+                frames.push(SseFrame::named("message_delta", delta.to_string()));
+                frames.push(SseFrame::named("message_stop", message_stop.to_string()));
+                frames
             }
             // 流内错误以 `event: error` 下发（与网关兜底错误帧同形状），
             // 由调用方感知并终止流。
@@ -3687,7 +3810,14 @@ mod tests {
         let request = crate::core::openai_chat::decode_request(&wire).expect("应可解码");
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);
-        assert!(warnings.is_empty());
+        // chat 入站未带 max_tokens：Anthropic 必填，补默认 4096 并记兼容告警。
+        assert_eq!(
+            warnings,
+            vec![Warning::compatibility(
+                warning_feature::MAX_TOKENS,
+                "Anthropic 必填 max_tokens 缺席或非法，已补默认 4096（原语义为不限，现为 4096 封顶）",
+            )]
+        );
 
         let assistant = encoded["messages"]
             .as_array()
@@ -3756,7 +3886,14 @@ mod tests {
         let request = crate::core::openai_chat::decode_request(&wire).expect("应可解码");
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);
-        assert!(warnings.is_empty());
+        // chat 入站未带 max_tokens：补默认并记兼容告警（唯一告警，其余整形静默）。
+        assert_eq!(
+            warnings,
+            vec![Warning::compatibility(
+                warning_feature::MAX_TOKENS,
+                "Anthropic 必填 max_tokens 缺席或非法，已补默认 4096（原语义为不限，现为 4096 封顶）",
+            )]
+        );
 
         let results = encoded["messages"]
             .as_array()
@@ -3985,6 +4122,97 @@ mod tests {
         let encoded = encode_request(&request, &mut Vec::new());
         assert!(encoded.get("tools").is_none());
         assert!(encoded.get("tool_choice").is_none());
+    }
+
+    /// 混排 user 消息（text 与 tool_result 交错）同族往返：拆分保序后编码时
+    /// 把夹层文本折回 tool_result 所在的 user 消息——tool_result 必须紧随
+    /// tool_use 轮，且 [text, tool_result, text] 的原遇顺序不漂移。
+    #[test]
+    fn mixed_user_message_refolds_text_with_tool_result() {
+        let wire = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [
+                { "role": "user", "content": "天气如何" },
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_1", "name": "get_weather",
+                      "input": { "city": "SF" } }
+                ]},
+                { "role": "user", "content": [
+                    { "type": "text", "text": "先看结果" },
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny, 72F" },
+                    { "type": "text", "text": "再补充一句" }
+                ]}
+            ]
+        });
+        let request = decode_request(&wire).expect("应可解码");
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        let messages = encoded["messages"].as_array().expect("应有消息数组");
+        // [user(问), assistant(tool_use), user([text, tool_result]), user(补充)]。
+        assert_eq!(messages.len(), 4, "夹层文本应折回 tool 消息: {messages:?}");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(
+            messages[2]["role"], "user",
+            "tool_result 消息应紧随 assistant(tool_use) 轮"
+        );
+        let blocks = messages[2]["content"].as_array().expect("应为块数组");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "先看结果");
+        assert_eq!(blocks[1]["type"], "tool_result");
+        assert_eq!(blocks[1]["tool_use_id"], "toolu_1");
+        assert_eq!(
+            messages[3]["content"], "再补充一句",
+            "tool_result 之后的文本应保持独立 user 消息"
+        );
+    }
+
+    /// 上游失败终态（IR Error）经流式编码：stop_reason 映射 end_turn 的整形
+    /// 以 `ping` 告警帧保可观测，时序在 message_delta 之前。
+    #[test]
+    fn stream_error_finish_emits_ping_warning() {
+        let mut encoder = StreamEncoder::default();
+        let frames = encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Error,
+                raw: Some("MALFORMED_FUNCTION_CALL".to_string()),
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        });
+        assert_eq!(frames.len(), 3, "ping + message_delta + message_stop");
+        assert_eq!(frames[0].event.as_deref(), Some("ping"));
+        let gateway: Value = serde_json::from_str(&frames[0].data).expect("ping 帧应为 JSON");
+        assert_eq!(
+            gateway["warnings"][0]["feature"], "finish",
+            "应携带 finish 告警: {gateway:?}"
+        );
+        assert_eq!(frames[1].event.as_deref(), Some("message_delta"));
+        assert_eq!(frames[2].event.as_deref(), Some("message_stop"));
+    }
+
+    /// 上游失败终态经非流式编码：end_turn 整形以顶层 gateway.warnings 保可观测。
+    #[test]
+    fn non_stream_error_finish_reports_gateway_warning() {
+        let response = ChatResponse {
+            id: "msg_1".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            content: Vec::new(),
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Error,
+                raw: Some("MALFORMED_FUNCTION_CALL".to_string()),
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let encoded = encode_response(&response);
+        assert_eq!(encoded["stop_reason"], "end_turn");
+        let warnings = encoded["gateway"]["warnings"]
+            .as_array()
+            .expect("应有 gateway.warnings");
+        assert_eq!(warnings[0]["feature"], "finish");
     }
 
     /// `event: error`（200 后流内错误，如 overloaded_error）解码为 IR Error
@@ -4324,6 +4552,15 @@ mod tests {
             encoded["max_tokens"], 4096,
             "缺 max_tokens 应补 Anthropic 默认"
         );
+        // 补默认改变下游语义（不限 → 4096 封顶），兼容告警可观测；显式携带
+        // 时不补不告警（其余 anthropic 编码用例已覆盖零告警路径）。
+        assert_eq!(
+            warnings,
+            vec![Warning::compatibility(
+                warning_feature::MAX_TOKENS,
+                "Anthropic 必填 max_tokens 缺席或非法，已补默认 4096（原语义为不限，现为 4096 封顶）",
+            )]
+        );
     }
 
     /// 错误编码为 Anthropic 格式；内层 type 按状态码：客户端错误为
@@ -4465,5 +4702,145 @@ mod tests {
         let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
         let encoded = encode_model_list(&["fast".to_string(), "gpt-4o".to_string()]);
         assert_eq!(encoded, wire, "列表编码应与黄金样例一致");
+    }
+
+    // ---- 以下为本批协议兼容性修复的用例 ----
+
+    /// user 消息混排块的拆分保持遇到顺序：`[tool_result, text]` 落为
+    /// Tool 在前、User 在后；`[text, tool_result, text]` 三段按块序拆分，
+    /// 不再把文本统一提前（跨轮对话的因果序不被打乱）。
+    #[test]
+    fn mixed_user_blocks_split_in_encounter_order() {
+        let wire = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {} }
+                ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "晴" },
+                    { "type": "text", "text": "那明天呢？" }
+                ] },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "明天多云。" }
+                ] }
+            ]
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        let roles: Vec<Role> = ir.messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![Role::Assistant, Role::Tool, Role::User, Role::Assistant],
+            "工具结果应先于其后文本落位"
+        );
+        assert!(matches!(
+            &ir.messages[1].content[0],
+            ContentPart::ToolResult { tool_call_id, .. } if tool_call_id == "toolu_1"
+        ));
+        assert!(matches!(
+            &ir.messages[2].content[0],
+            ContentPart::Text { text, .. } if text == "那明天呢？"
+        ));
+
+        // 中缀文本 + 结果 + 后缀文本：三段按块序。
+        let wire = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 100,
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": "前缀" },
+                    { "type": "tool_result", "tool_use_id": "toolu_1", "content": "结果" },
+                    { "type": "text", "text": "后缀" }
+                ] }
+            ]
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        let roles: Vec<Role> = ir.messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![Role::User, Role::Tool, Role::User]);
+        assert!(matches!(
+            &ir.messages[0].content[0],
+            ContentPart::Text { text, .. } if text == "前缀"
+        ));
+        assert!(matches!(
+            &ir.messages[2].content[0],
+            ContentPart::Text { text, .. } if text == "后缀"
+        ));
+    }
+
+    /// base64 source 的 media_type 必须是完整 IANA 类型：仅顶层段的类别标记
+    /// （跨族来源回放的无类型 base64 图片）拼不出合法值，丢弃并告警；url
+    /// source 无 media_type 字段，不受此限。
+    #[test]
+    fn base64_source_requires_full_media_type() {
+        let request = ChatRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Media {
+                        media_type: "image".to_string(),
+                        data: crate::core::ir::MediaSource::Data {
+                            base64: "aGVsbG8=".to_string(),
+                        },
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Media {
+                        media_type: "image".to_string(),
+                        data: crate::core::ir::MediaSource::Url {
+                            url: "https://example.com/a.png".to_string(),
+                        },
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Media {
+                        media_type: "image/png".to_string(),
+                        data: crate::core::ir::MediaSource::Data {
+                            base64: "aGVsbG8=".to_string(),
+                        },
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: Some(100),
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        let messages = encoded["messages"].as_array().expect("应有消息数组");
+        // 标记类型的 base64 丢弃；URL 与完整类型保留。
+        assert_eq!(messages.len(), 2, "标记类型 base64 应被丢弃");
+        assert_eq!(messages[0]["content"][0]["source"]["type"], json!("url"));
+        assert_eq!(
+            messages[1]["content"][0]["source"]["media_type"],
+            json!("image/png")
+        );
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Unsupported { feature, .. }] if feature == warning_feature::MEDIA
+        ));
     }
 }

@@ -896,6 +896,67 @@ async fn stream_fails_over_on_429() {
     assert_eq!(ups[1].received().len(), 1);
 }
 
+/// 首渠道（Gemini 协议）流在产出任何内容前以失败终态收尾（MALFORMED_
+/// FUNCTION_CALL）：peek 在响应头前判为上游错误换渠道——与直通路径对
+/// 失败终态同判，同一上游失败不因下游走 IR 路径而变成 200 建流后中途
+/// 错误帧。
+#[tokio::test]
+async fn pre_content_error_finish_fails_over_before_response_headers() {
+    let (gw, mut ups) = TestGateway::start_with_multi(2, |bases| {
+        let mut seed = two_channel_seed(bases);
+        seed.channels[0].protocol = config::Protocol::Gemini;
+        seed.channels[0].max_retries = 0;
+        seed.channels[1].max_retries = 0;
+        seed
+    })
+    .await;
+    // Gemini 流首即失败终态：无候选内容、无 usage，仅 finishReason。
+    ups[0].set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "candidates": [
+                { "content": { "role": "model", "parts": [] },
+                  "finishReason": "MALFORMED_FUNCTION_CALL" }
+            ]
+        }))
+        .unwrap(),
+    ]));
+    ups[1].set_behavior(UpstreamBehavior::Sse(vec![
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-s", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "Hi" } }]
+        }))
+        .unwrap(),
+        serde_json::to_string(&json!({
+            "id": "chatcmpl-s", "object": "chat.completion.chunk", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+        }))
+        .unwrap(),
+    ]));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "失败终态应在响应头前换渠道"
+    );
+    let body = resp.text().await.expect("应能读取流");
+    assert!(body.contains("Hi"), "次渠道内容应到达下游: {body}");
+    assert_eq!(ups[0].received().len(), 1);
+    assert_eq!(ups[1].received().len(), 1);
+}
+
 /// 流式首渠道中途断连（已发首字节）：不 failover（failover 只保证首字节前的
 /// 请求完整性，首字节后重试会让下游收到重复内容），下游收到已累积的部分流后结束。
 #[tokio::test]

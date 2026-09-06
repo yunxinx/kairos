@@ -1172,7 +1172,7 @@ pub struct UserStatsRecord {
 ///
 /// 用量按 `request_log.user_id` 聚合而非 JOIN `tokens`：令牌删除后历史用量仍归属该
 /// 用户。`last_used_at` 仍取自现存令牌——它是「当前凭证的活跃度」，删掉的令牌不该
-/// 继续把用户显示为活跃。
+/// 继续把用户显示为活跃。请求数与 `/stats` 同口径：只统计已派发出站的行。
 pub async fn list_users_stats(
     pool: &SqlitePool,
 ) -> Result<std::collections::HashMap<i64, UserStatsRecord>, StoreError> {
@@ -1181,7 +1181,7 @@ pub async fn list_users_stats(
                 COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
                 COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                 COALESCE(SUM(output_tokens), 0) AS output_tokens \
-         FROM request_log \
+         FROM request_log WHERE dispatched = 1 \
          GROUP BY user_id",
     )
     .fetch_all(pool)
@@ -1229,7 +1229,7 @@ pub async fn get_user_stats(
         "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
                 COALESCE(SUM(input_tokens), 0) AS input_tokens, \
                 COALESCE(SUM(output_tokens), 0) AS output_tokens \
-         FROM request_log WHERE user_id = ?",
+         FROM request_log WHERE dispatched = 1 AND user_id = ?",
     )
     .bind(user_id)
     .fetch_one(pool)

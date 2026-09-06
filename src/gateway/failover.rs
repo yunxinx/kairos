@@ -97,20 +97,34 @@ fn jitter_delay(base: Duration) -> Duration {
     base.mul_f64(factor)
 }
 
+/// 一跳出站的结果：终局失败时附带返回下游的响应面。
+///
+/// 请求级路径（`handle_request`）用 `failure` 区分「未出站即终局」——任一
+/// 物理尝试都没真正发出时补一条 `dispatched = 0` 的请求日志；已派发失败的
+/// 请求已有逐尝试日志，不再重复落行。
+pub(super) struct FailoverOutcome {
+    pub(super) response: Response,
+    /// 终局失败的响应面；成功响应为 `None`。
+    pub(super) failure: Option<FailureWire>,
+}
+
+/// 终局失败返回下游的响应面。
+pub(super) struct FailureWire {
+    pub(super) status: u16,
+    /// 错误响应体 JSON 字节：full_body 开启时按实际返回下游的内容记日志。
+    pub(super) wire: Vec<u8>,
+}
+
 /// 按渠道路由顺序发起出站调用，遇可重试错误自动 failover；渠道内密钥按
 /// 请求级轮换状态在 key 粒度上恢复失败（[`KeyRotation`]）。
 ///
-/// `attempt` 每次收到渠道记录与本次要用的密钥；`log_failure` 接收（渠道名、
-/// 状态码、是否已 failover、返回下游的错误响应体 wire 字节、失败尝试的密钥
-/// 名）：wire 字节先于日志构造，保证 full_body 开启时失败日志也能记录实际
-/// 返回下游的入站响应。
-/// 全部候选渠道耗尽后返回下游的最后一次失败归因。
+/// `attempt` 每次收到渠道记录与本次要用的密钥。全部候选渠道耗尽后返回
+/// 下游的最后一次失败归因；终局失败（直接返回或候选耗尽）携带响应 wire
+/// 字节，供请求级路径在未出站时落 dispatched=0 的失败日志。
 struct FinalFailure {
     channel: String,
     status: Option<u16>,
     message: String,
-    /// 最后一次失败尝试所用的密钥名；无密钥上下文（无候选渠道）时为空。
-    key_name: String,
 }
 
 /// 只有 401 能稳定归因到单把凭证失效。402 属于账号计费域，403 还可能表示
@@ -320,7 +334,9 @@ pub(super) struct FailoverPolicy<'a> {
 /// 渠道级预首字节预算：`request_timeout_ms` 夹到合法区间，至少 1ms。
 ///
 /// 预算在渠道入口重锚（连接、响应头、流首 peek、同渠道重试退避共享该渠道
-/// 的预算），换渠道 / 统一模型换成员时按新渠道重新起算。
+/// 的预算），换渠道 / 统一模型换成员时按新渠道重新起算。下限保持 1 而非
+/// 管理面校验的 1000ms：校验只拦新增写入，存量库中可能仍有更小的旧值，
+/// 运行时行为不因校验收紧而回溯改变。
 pub(super) fn channel_request_budget(channel: &crate::store::resources::Channel) -> Duration {
     Duration::from_millis(channel.request_timeout_ms.clamp(1, MAX_REQUEST_TIMEOUT_MS))
 }
@@ -333,21 +349,19 @@ async fn wait_for_retry(delay: Duration, deadline: tokio::time::Instant) -> bool
         .is_ok()
 }
 
-pub(super) async fn run_failover<'a, A, L>(
+pub(super) async fn run_failover<'a, A>(
     route: &'a routing::Route,
     channels: &'a [ChannelRecord],
     model: &str,
     mut attempt: A,
-    log_failure: L,
     policy: FailoverPolicy<'_>,
-) -> Response
+) -> FailoverOutcome
 where
     A: FnMut(
         &'a ChannelRecord,
         &'a StoredChannelKey,
         tokio::time::Instant,
     ) -> BoxFuture<'a, Outbound>,
-    L: Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()>,
 {
     let mut last_failure: Option<FinalFailure> = None;
     let now = Instant::now();
@@ -395,7 +409,6 @@ where
                     channel: record.channel.name.clone(),
                     status: Some(504),
                     message: "渠道请求时限已耗尽".to_string(),
-                    key_name: rotation.current().name.clone(),
                 });
                 break 'channels;
             }
@@ -405,7 +418,10 @@ where
                 Outbound::Success(response) => {
                     policy.key_cooldowns.clear(key.id);
                     policy.channel_cooldowns.clear(record.id);
-                    return response;
+                    return FailoverOutcome {
+                        response,
+                        failure: None,
+                    };
                 }
                 Outbound::Fatal {
                     channel,
@@ -423,7 +439,6 @@ where
                             channel: channel.clone(),
                             status: Some(status),
                             message,
-                            key_name: key.name.clone(),
                         });
                         break;
                     }
@@ -435,7 +450,6 @@ where
                         channel,
                         status: Some(402),
                         message,
-                        key_name: key.name.clone(),
                     });
                     break;
                 }
@@ -453,7 +467,6 @@ where
                         channel: channel.clone(),
                         status: Some(status),
                         message,
-                        key_name: key.name.clone(),
                     });
                     break;
                 }
@@ -470,12 +483,14 @@ where
                         policy.inbound_protocol,
                     );
                     let wire = serde_json::to_vec(&body).unwrap_or_default();
-                    log_failure(&channel, status, false, &wire, &key.name).await;
-                    return (
-                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                        Json(body),
-                    )
-                        .into_response();
+                    return FailoverOutcome {
+                        response: (
+                            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                            Json(body),
+                        )
+                            .into_response(),
+                        failure: Some(FailureWire { status, wire }),
+                    };
                 }
                 Outbound::Retryable {
                     channel,
@@ -507,7 +522,6 @@ where
                                 channel,
                                 status: Some(504),
                                 message: "渠道请求时限已耗尽".to_string(),
-                                key_name: key.name.clone(),
                             });
                             break 'channels;
                         }
@@ -517,7 +531,6 @@ where
                         channel: channel.clone(),
                         status,
                         message,
-                        key_name: key.name.clone(),
                     });
                     if retries_used
                         >= record
@@ -537,7 +550,6 @@ where
                             channel,
                             status: Some(504),
                             message: "渠道请求时限已耗尽".to_string(),
-                            key_name: key.name.clone(),
                         });
                         break 'channels;
                     }
@@ -551,12 +563,10 @@ where
         channel,
         status,
         message,
-        key_name,
     } = last_failure.unwrap_or_else(|| FinalFailure {
         channel: "unknown".to_string(),
         status: None,
         message: "所有渠道均不可用".to_string(),
-        key_name: String::new(),
     });
     let auth_exhausted = status.is_some_and(is_credential_failure);
     let status_code = if auth_exhausted {
@@ -576,12 +586,17 @@ where
         )
     };
     let wire = serde_json::to_vec(&body).unwrap_or_default();
-    log_failure(&channel, status_code, true, &wire, &key_name).await;
-    (
-        StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
-        Json(body),
-    )
-        .into_response()
+    FailoverOutcome {
+        response: (
+            StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(body),
+        )
+            .into_response(),
+        failure: Some(FailureWire {
+            status: status_code,
+            wire,
+        }),
+    }
 }
 
 /// 渠道内密钥轮换的去向。
@@ -909,7 +924,6 @@ mod tests {
     use crate::store::resources::{ChannelRecord, StoredChannelKey};
     use axum::http::StatusCode;
     use axum::response::{IntoResponse, Response};
-    use futures_util::future::BoxFuture;
 
     fn key(id: i64, name: &str) -> StoredChannelKey {
         StoredChannelKey::new(
@@ -1026,13 +1040,6 @@ mod tests {
         (StatusCode::OK, Body::empty()).into_response()
     }
 
-    /// 无侧害的失败日志闭包。
-    async fn no_log() {}
-
-    fn no_failure_log<'a>() -> impl Fn(&str, u16, bool, &[u8], &str) -> BoxFuture<'a, ()> {
-        |_channel, _status, _failover, _wire, _key| Box::pin(no_log())
-    }
-
     #[tokio::test]
     async fn rate_limit_rotation_is_free_until_pool_exhausted() {
         let keys = vec![key(1, "a"), key(2, "b")];
@@ -1042,7 +1049,7 @@ mod tests {
         let seen_for_attempt = seen.clone();
 
         // max_retries=0：a 的 429 轮换到未试过的 b 恢复，不消耗重试预算。
-        let response = run_failover(
+        let outcome = run_failover(
             &route,
             &records,
             "m",
@@ -1062,7 +1069,6 @@ mod tests {
                     }
                 })
             },
-            no_failure_log(),
             FailoverPolicy {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
@@ -1071,7 +1077,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(outcome.response.status(), StatusCode::OK);
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["a".to_string(), "b".to_string()]
@@ -1087,7 +1093,7 @@ mod tests {
 
         // 5xx 与 key 无关：同 key 退避重试（b 不出场），预算耗尽返回错误。
         let seen_for_attempt = seen.clone();
-        let response = run_failover(
+        let outcome = run_failover(
             &route,
             &records,
             "m",
@@ -1102,7 +1108,6 @@ mod tests {
                     }
                 })
             },
-            no_failure_log(),
             FailoverPolicy {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
@@ -1111,7 +1116,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(outcome.response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["a".to_string(), "a".to_string()],
@@ -1132,7 +1137,7 @@ mod tests {
 
         // 渠道内全部 key 认证失效才切下一渠道；结算/日志归接手渠道。
         let seen_for_attempt = seen.clone();
-        let response = run_failover(
+        let outcome = run_failover(
             &route,
             &records,
             "m",
@@ -1151,7 +1156,6 @@ mod tests {
                     }
                 })
             },
-            no_failure_log(),
             FailoverPolicy {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(10_000, 10_000, 10),
@@ -1160,7 +1164,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(outcome.response.status(), StatusCode::OK);
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
@@ -1183,7 +1187,7 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let seen_for_attempt = seen.clone();
 
-        let response = run_failover(
+        let outcome = run_failover(
             &route,
             &records,
             "m",
@@ -1191,7 +1195,6 @@ mod tests {
                 seen_for_attempt.lock().unwrap().push(record.id);
                 Box::pin(async { Outbound::Success(ok_response()) })
             },
-            no_failure_log(),
             FailoverPolicy {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
@@ -1200,7 +1203,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(outcome.response.status(), StatusCode::OK);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![2],
@@ -1219,7 +1222,7 @@ mod tests {
         let route = route_of(&records, &[(1, first[0].id), (2, second[0].id)]);
         let cooldowns = ChannelCooldowns::new();
 
-        let response = run_failover(
+        let outcome = run_failover(
             &route,
             &records,
             "m",
@@ -1237,7 +1240,6 @@ mod tests {
                     }
                 })
             },
-            no_failure_log(),
             FailoverPolicy {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
@@ -1246,7 +1248,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(outcome.response.status(), StatusCode::OK);
         assert!(
             !cooldowns.is_available(1, Instant::now()),
             "上游 402 应立即冷却该渠道"
@@ -1262,7 +1264,7 @@ mod tests {
         let cooldowns = ChannelCooldowns::new();
 
         // 唯一渠道计费拒绝：候选耗尽后以 402 返回下游，渠道不进冷却。
-        let response = run_failover(
+        let outcome = run_failover(
             &route,
             &records,
             "m",
@@ -1274,7 +1276,6 @@ mod tests {
                     }
                 })
             },
-            no_failure_log(),
             FailoverPolicy {
                 inbound_protocol: Protocol::OpenAiChat,
                 retry_backoff: RetryBackoff::from_ms(1, 1, 1),
@@ -1284,7 +1285,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            response.status(),
+            outcome.response.status(),
             StatusCode::PAYMENT_REQUIRED,
             "计费拒绝耗尽候选后仍以 402 返回下游"
         );

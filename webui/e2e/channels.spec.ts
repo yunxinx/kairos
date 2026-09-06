@@ -376,7 +376,8 @@ test.describe('channel manual model add', () => {
         data: { name: 'manual-add-token', balance_usd_micros: null, enabled: true },
       });
       expect(tokenResp.ok()).toBeTruthy();
-      const token = (await tokenResp.json()) as { token_key: string };
+      // 协议面凭证是创建响应一次性返回的明文 key；token_key 列只承载指纹。
+      const token = (await tokenResp.json()) as { plaintext_key: string };
 
       await page.goto('/channels');
       await page.getByTestId('create-channel').click();
@@ -422,7 +423,7 @@ test.describe('channel manual model add', () => {
       expect(await savedChannelModels(page, channelName)).not.toContain('mini');
       expect(await savedChannelModels(page, channelName)).not.toContain(manualId);
 
-      const beforeSave = await chatCompletionsStatus(page, token.token_key, manualId);
+      const beforeSave = await chatCompletionsStatus(page, token.plaintext_key, manualId);
       expect(beforeSave.status).toBe(503);
       expect(beforeSave.message).toContain('渠道');
 
@@ -465,7 +466,7 @@ test.describe('channel manual model add', () => {
       await expect(page.getByTestId('channel-add-model-input')).toHaveValue('');
 
       expect(await savedChannelModels(page, channelName)).not.toContain(manualId);
-      const stillDraft = await chatCompletionsStatus(page, token.token_key, manualId);
+      const stillDraft = await chatCompletionsStatus(page, token.plaintext_key, manualId);
       expect(stillDraft.status).toBe(503);
       expect(stillDraft.message).toContain('渠道');
 
@@ -481,7 +482,7 @@ test.describe('channel manual model add', () => {
           .locator('[data-testid="channel-models-chip"][data-model="mini"][data-canonical="true"]'),
       ).toBeVisible();
       await page.keyboard.press('Escape');
-      const afterSave = await chatCompletionsStatus(page, token.token_key, manualId);
+      const afterSave = await chatCompletionsStatus(page, token.plaintext_key, manualId);
       expect(afterSave.status).toBe(503);
       expect(afterSave.message).toContain('价格');
 

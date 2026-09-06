@@ -42,12 +42,14 @@ function findSessionSetCookie(response: APIResponse): string {
 }
 
 /**
- * 钉住服务端会话 Cookie 的安全属性：HttpOnly、SameSite=Strict、Secure。
- * 属性改写只发生在下方的测试 jar 副本上，服务器行为由本断言锁定。
+ * 钉住服务端会话 Cookie 的恒定安全属性：HttpOnly、SameSite=Strict。
+ * `Secure` 按请求协议条件附加（环回 HTTP 部署按设计签发非 Secure 会话），
+ * 环回 HTTP 的 e2e 环境不携带该属性；属性改写只发生在下方的测试 jar 副本上，
+ * 服务器行为由本断言锁定。
  */
 function assertSessionCookieAttributes(response: APIResponse): void {
   const setCookie = findSessionSetCookie(response);
-  for (const attribute of ['HttpOnly', 'SameSite=Strict', 'Secure']) {
+  for (const attribute of ['HttpOnly', 'SameSite=Strict']) {
     expect(setCookie).toContain(attribute);
   }
 }
@@ -77,6 +79,8 @@ async function injectSessionCookie(page: Page, response: APIResponse): Promise<v
 /** 通过 API 以给定账号登录，并建立 page.request 可回发的会话。 */
 export async function loginViaApi(page: Page, email: string, password: string): Promise<void> {
   const response = await page.request.post('/api/login', {
+    // 写请求同源守卫要求携带与 Host 匹配的 Origin；与种子助手的请求头约定一致。
+    headers: { Origin: E2E_ADMIN_ORIGIN },
     data: { email, password },
   });
   expect(response.ok(), await response.text()).toBeTruthy();

@@ -104,9 +104,15 @@ async fn openai_inbound_drops_anthropic_reasoning_with_warning() {
     let body: Value = resp.json().await.expect("响应应可解析");
     // reasoning 被丢弃，仅 text 保留。
     assert_eq!(body["choices"][0]["message"]["content"], "结果是 185");
-    // 显式 warning：reasoning 丢弃。
-    assert_eq!(body["gateway"]["warnings"][0]["type"], "unsupported");
-    assert_eq!(body["gateway"]["warnings"][0]["feature"], "reasoning");
+    // 显式 warning：reasoning 丢弃（按 feature 定位——告警序列里还有
+    // max_tokens 补默认的 compatibility 告警，位置不保证）。
+    let reasoning_warning = body["gateway"]["warnings"]
+        .as_array()
+        .expect("应有 warnings")
+        .iter()
+        .find(|warning| warning["feature"] == "reasoning")
+        .expect("应有 reasoning 告警");
+    assert_eq!(reasoning_warning["type"], "unsupported");
 }
 
 /// Anthropic 入站 → OpenAI 渠道：非流式。

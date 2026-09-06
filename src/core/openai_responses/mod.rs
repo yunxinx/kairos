@@ -89,6 +89,41 @@ const KNOWN_REQUEST_FIELDS: &[&str] = &[
     "conversation",
 ];
 
+/// Responses 出站面未知字段逃生舱的回写白名单：本协议服务端接受的顶层请求
+/// 字段（已类型化字段 + 官方在册未类型化字段）。
+///
+/// chat 与 responses 共用 `openai` 逃生舱键，族内互回必须按目标协议过滤
+/// （OpenAI 对未知顶层参数 400），本清单即过滤依据；`service_tier`/`metadata`
+/// 两协议都接受，双侧登记保持互回往返。维护说明见 `ir::ExtraWriteback`。
+const RESPONSES_EXTRA_WRITEBACK_FIELDS: &[&str] = &[
+    // 类型化字段（KNOWN_REQUEST_FIELDS 同集）。
+    "model",
+    "input",
+    "instructions",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "text",
+    "reasoning",
+    "store",
+    "previous_response_id",
+    "conversation",
+    // 官方在册、网关未类型化（或仅作逃生舱留存）的顶层字段。
+    "metadata",
+    "service_tier",
+    "truncation",
+    "include",
+    "background",
+    "prompt",
+    "prompt_cache_key",
+    "preferences",
+    "safety_identifier",
+];
+
 /// OpenAI Responses 出站/入站请求体（wire）。
 ///
 /// `input` 可为字符串或数组（`Vec<Value>` 手动分派）；`store`/`previous_response_id`/
@@ -914,8 +949,16 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     if !reasoning_emitted && let Some(effort) = request.reasoning {
         obj.insert("reasoning".into(), json!({ "effort": effort.as_str() }));
     }
-    // 未知字段逃生舱最后应用：本族字段回写不覆盖类型化字段，跨族字段丢弃告警。
-    apply_provider_extra(&mut obj, request, OPENAI_PROVIDER, warnings);
+    // 未知字段逃生舱最后应用：本族字段按目标协议白名单回写（不覆盖类型化
+    // 字段，Responses-only 字段不会写进族内互回的 chat 请求），跨族字段丢弃
+    // 告警。
+    apply_provider_extra(
+        &mut obj,
+        request,
+        OPENAI_PROVIDER,
+        crate::core::ir::ExtraWriteback::TargetFields(RESPONSES_EXTRA_WRITEBACK_FIELDS),
+        warnings,
+    );
     Value::Object(obj)
 }
 
@@ -1042,7 +1085,8 @@ fn encode_user_item(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Value
                 data,
                 provider_options,
             } => {
-                if let Some(part) = encode_media_part(media_type, data, provider_options) {
+                if let Some(part) = encode_media_part(media_type, data, provider_options, warnings)
+                {
                     parts.push(part);
                 }
             }
@@ -1071,6 +1115,7 @@ fn encode_media_part(
     media_type: &str,
     data: &crate::core::ir::MediaSource,
     provider_options: &crate::core::ir::ProviderOptions,
+    warnings: &mut Vec<Warning>,
 ) -> Option<Value> {
     let openai = provider_options.get(OPENAI_PROVIDER);
     // provider 托管引用（file_id）经逃生舱回传（同协议族无损）。
@@ -1088,6 +1133,21 @@ fn encode_media_part(
         part.insert("type".into(), json!(part_type));
         part.insert("file_id".into(), json!(file_id));
         return Some(Value::Object(part));
+    }
+
+    // base64 数据源拼 data URL 需要完整 `type/subtype`：IR 里仅顶层段的类别
+    // 标记拼不出合法 data URL，丢弃并告警。远程 URL 无需媒体类型（part 类型
+    // 承载类别），不受此限。
+    if matches!(data, crate::core::ir::MediaSource::Data { .. })
+        && !crate::core::ir::is_full_media_type(media_type)
+    {
+        warnings.push(Warning::unsupported(
+            warning_feature::MEDIA,
+            format!(
+                "OpenAI Responses 的 data URL 需要完整媒体类型，{media_type:?} 无法承载，已丢弃"
+            ),
+        ));
+        return None;
     }
 
     let is_image = crate::core::ir::top_level_media_type(media_type) == "image";
@@ -1221,6 +1281,14 @@ fn encode_tool_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Valu
                 output,
                 ..
             } => {
+                // 官方类型 `output: string | 内容数组`：非字符串载荷（Gemini
+                // functionResponse.response 对象、Anthropic 块数组等跨族来源）
+                // 序列化为 JSON 字符串——值经序列化保留，与 chat 出站整形
+                // 同规（同为无损形状归一，不告警）。
+                let output = match output {
+                    Value::String(text) => json!(text),
+                    other => json!(other.to_string()),
+                };
                 items.push(json!({
                     "type": "function_call_output",
                     "call_id": tool_call_id,
@@ -2017,6 +2085,10 @@ pub struct StreamEncoder {
     inbound_model: Option<String>,
     /// `StreamStart` 转换的 warnings，随首个 `response.created` 的 `gateway` 字段下发。
     pending_warnings: Vec<Warning>,
+    /// `response.created` 已下发后才到达的 warnings（如 chat 上游流中段才
+    /// 开启的 tool call 缺 name/id）：Responses 无独立告警事件，改随终端
+    /// `response.completed` 的 `response.gateway` 下发，不静默滞留。
+    late_warnings: Vec<Warning>,
     /// output_index 分配：每个 output item 一个递增的唯一索引。下游 SDK 按
     /// output_index 索引进行中的工具调用与活跃项，多 item 共用 0 会互相覆盖。
     next_item_index: usize,
@@ -2036,6 +2108,10 @@ pub struct StreamEncoder {
     /// 已收尾 output 项的最终形状（按 output_index 归序后进 `response.completed`
     /// 的 `response.output`，官方契约要求终端帧承载完整条目数组）。
     final_items: Vec<(usize, Value)>,
+    /// `response.created` 是否已下发：官方契约要求它是首帧，上游流缺元数据
+    /// （如 chat 上游 chunk 缺 id/model、Gemini 上游缺 responseId/modelVersion）
+    /// 时由首个内容/终端事件前合成补发，见 [`StreamEncoder::ensure_created`]。
+    created_emitted: bool,
 }
 
 /// 进行中的工具调用（出站侧）。
@@ -2188,35 +2264,32 @@ impl StreamEncoder {
         match event {
             StreamEvent::StreamStart { warnings } => {
                 // warnings 留存，待首个 `response.created`（含真实 id）下发出。
-                self.pending_warnings.extend(warnings.clone());
+                if self.created_emitted {
+                    // 首帧已过（如 chat 上游流中段补发的告警）：created 只发一次，
+                    // 改随终端 response.completed 的 gateway 字段下发。
+                    self.late_warnings.extend(warnings.clone());
+                } else {
+                    self.pending_warnings.extend(warnings.clone());
+                }
                 Vec::new()
             }
             StreamEvent::ResponseMetadata { id, model } => {
                 self.id = id.clone();
                 self.model = model.clone();
                 // 首个 `response.created` 在拿到真实 id/model 后下发，避免占位 id
-                // 与 `response.completed` 的真实 id 不一致。
-                let mut response = serde_json::Map::new();
-                response.insert("id".into(), json!(id));
-                response.insert("object".into(), json!("response"));
-                response.insert("status".into(), json!("in_progress"));
-                let model = self.inbound_model.as_deref().unwrap_or(model);
-                response.insert("model".into(), json!(model));
-                if let Some(gateway) =
-                    crate::core::openai_chat::encode_warnings(&self.pending_warnings)
-                {
-                    response.insert("gateway".into(), gateway);
+                // 与 `response.completed` 的真实 id 不一致。已合成过首帧（上游
+                // 流从未产出元数据）时只更新 id/model 供后续帧使用，不重复宣告。
+                if self.created_emitted {
+                    return Vec::new();
                 }
-                self.pending_warnings.clear();
-                vec![SseFrame::named(
-                    "response.created",
-                    json!({ "type": "response.created", "response": response }).to_string(),
-                )]
+                self.created_emitted = true;
+                vec![self.created_frame()]
             }
             StreamEvent::TextStart {
                 id,
                 provider_options,
             } => {
+                let mut frames = self.ensure_created();
                 self.text_id = Some(id.clone());
                 let output_index = self.next_output_index();
                 self.text_index = Some(output_index);
@@ -2226,7 +2299,7 @@ impl StreamEncoder {
                     .and_then(|o| o.get(ITEM_ID))
                     .and_then(Value::as_str)
                     .unwrap_or(id);
-                vec![
+                frames.extend(vec![
                     SseFrame::named(
                         "response.output_item.added",
                         json!({
@@ -2252,13 +2325,15 @@ impl StreamEncoder {
                         })
                         .to_string(),
                     ),
-                ]
+                ]);
+                frames
             }
             StreamEvent::TextDelta { id, delta, .. } => {
+                let mut frames = self.ensure_created();
                 let item_id = self.text_id.as_deref().unwrap_or(id);
                 let output_index = self.text_index.unwrap_or(0);
                 self.text_accumulated.push_str(delta);
-                vec![SseFrame::named(
+                frames.push(SseFrame::named(
                     "response.output_text.delta",
                     json!({
                         "type": "response.output_text.delta",
@@ -2268,13 +2343,19 @@ impl StreamEncoder {
                         "delta": delta,
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
-            StreamEvent::TextEnd { .. } => self.close_text_block(),
+            StreamEvent::TextEnd { .. } => {
+                let mut frames = self.ensure_created();
+                frames.extend(self.close_text_block());
+                frames
+            }
             StreamEvent::ReasoningStart {
                 id,
                 provider_options,
             } => {
+                let mut frames = self.ensure_created();
                 let item_id = provider_options
                     .get(OPENAI_PROVIDER)
                     .and_then(|o| o.get(ITEM_ID))
@@ -2296,7 +2377,7 @@ impl StreamEncoder {
                     Some(enc) => item.insert("encrypted_content".into(), enc.clone()),
                     None => item.insert("encrypted_content".into(), Value::Null),
                 };
-                vec![SseFrame::named(
+                frames.push(SseFrame::named(
                     "response.output_item.added",
                     json!({
                         "type": "response.output_item.added",
@@ -2304,13 +2385,15 @@ impl StreamEncoder {
                         "item": Value::Object(item),
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
             StreamEvent::ReasoningDelta { id, delta, .. } => {
+                let mut frames = self.ensure_created();
                 let base_id = strip_summary_suffix(id).to_string();
                 // 无 start 事件的增量：惰性补齐 output_index 并补发 added 事件，
                 // 使下游看到的流序与官方契约一致（added 先于任何 delta）。
-                let (output_index, mut frames) = match self.reasoning_indexes.get(&base_id) {
+                let (output_index, added_frames) = match self.reasoning_indexes.get(&base_id) {
                     Some(index) => (*index, Vec::new()),
                     None => {
                         let index = self.next_output_index();
@@ -2333,6 +2416,7 @@ impl StreamEncoder {
                     .entry(base_id.clone())
                     .or_default()
                     .push_str(delta);
+                frames.extend(added_frames);
                 frames.push(SseFrame::named(
                     "response.reasoning_summary_text.delta",
                     json!({
@@ -2346,8 +2430,13 @@ impl StreamEncoder {
                 ));
                 frames
             }
-            StreamEvent::ReasoningEnd { id, .. } => self.close_reasoning_item(id),
+            StreamEvent::ReasoningEnd { id, .. } => {
+                let mut frames = self.ensure_created();
+                frames.extend(self.close_reasoning_item(id));
+                frames
+            }
             StreamEvent::ToolInputStart { id, tool_name, .. } => {
+                let mut frames = self.ensure_created();
                 let output_index = self.next_output_index();
                 self.tool_indexes.insert(id.clone(), output_index);
                 self.tools.insert(
@@ -2357,7 +2446,7 @@ impl StreamEncoder {
                         arguments: String::new(),
                     },
                 );
-                vec![SseFrame::named(
+                frames.push(SseFrame::named(
                     "response.output_item.added",
                     json!({
                         "type": "response.output_item.added",
@@ -2371,14 +2460,16 @@ impl StreamEncoder {
                         },
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
             StreamEvent::ToolInputDelta { id, delta, .. } => {
                 if let Some(tool) = self.tools.get_mut(id) {
                     tool.arguments.push_str(delta);
                 }
                 let output_index = self.tool_indexes.get(id).copied().unwrap_or(0);
-                vec![SseFrame::named(
+                let mut frames = self.ensure_created();
+                frames.push(SseFrame::named(
                     "response.function_call_arguments.delta",
                     json!({
                         "type": "response.function_call_arguments.delta",
@@ -2387,7 +2478,8 @@ impl StreamEncoder {
                         "delta": delta,
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
             StreamEvent::ToolInputEnd { id, .. } => {
                 // 终端事件：以累积的完整 arguments 下发 `output_item.done`，关闭
@@ -2395,7 +2487,9 @@ impl StreamEncoder {
                 let Some(tool) = self.tools.remove(id) else {
                     return Vec::new();
                 };
-                vec![self.close_function_call(id, &tool.tool_name, &tool.arguments)]
+                let mut frames = self.ensure_created();
+                frames.push(self.close_function_call(id, &tool.tool_name, &tool.arguments));
+                frames
             }
             StreamEvent::ToolCall {
                 tool_call_id,
@@ -2405,7 +2499,9 @@ impl StreamEncoder {
             } => {
                 // 兜底：非增量路径（如直接以完整工具调用编码）同样关闭 function_call 项。
                 self.tools.remove(tool_call_id);
-                vec![self.close_function_call(tool_call_id, tool_name, &input.to_string())]
+                let mut frames = self.ensure_created();
+                frames.push(self.close_function_call(tool_call_id, tool_name, &input.to_string()));
+                frames
             }
             StreamEvent::Finish {
                 finish_reason,
@@ -2415,7 +2511,8 @@ impl StreamEncoder {
                 // 流结束前把未收尾的项逐个关闭：上游解码器（如 openai_chat）可能
                 // 不发 TextEnd/ToolInputEnd，靠此处 flush 收尾，避免下游收到未闭合
                 // 条目或残缺的终端 output 数组。
-                let mut frames = self.close_text_block();
+                let mut frames = self.ensure_created();
+                frames.extend(self.close_text_block());
                 let mut open_reasoning: Vec<(usize, String)> = self
                     .reasoning_indexes
                     .iter()
@@ -2457,6 +2554,12 @@ impl StreamEncoder {
                     response.insert("incomplete_details".into(), json!({ "reason": reason }));
                 }
                 response.insert("usage".into(), encode_usage(usage));
+                // created 帧之后才到达的 warnings 随终端帧补发：Responses 无独立
+                // 告警事件，挂在 response.gateway（SDK 容忍未知键）。
+                let late_warnings = std::mem::take(&mut self.late_warnings);
+                if let Some(gateway) = crate::core::openai_chat::encode_warnings(&late_warnings) {
+                    response.insert("gateway".into(), gateway);
+                }
                 frames.push(SseFrame::named(
                     "response.completed",
                     json!({ "type": "response.completed", "response": response }).to_string(),
@@ -2465,8 +2568,53 @@ impl StreamEncoder {
             }
             // 流内错误以 `event: error` 下发（与网关兜底错误帧同形状），
             // 由调用方感知并终止流。
-            StreamEvent::Error { message } => vec![stream_error_frame(message)],
+            StreamEvent::Error { message } => {
+                let mut frames = self.ensure_created();
+                frames.push(stream_error_frame(message));
+                frames
+            }
         }
+    }
+
+    /// 上游流从未产出 `ResponseMetadata` 时（chat 上游 chunk 缺 id/model、
+    /// Gemini 上游缺 responseId/modelVersion 等实际存在的形状），首个内容或
+    /// 终端事件前合成最小元数据补发 `response.created`：下游 SDK 按官方契约
+    /// 期待 created 为首帧，缺失即协议破坏；`pending_warnings` 也只随该帧
+    /// 下发，不补发会整条滞留。占位 id 与终端帧的真实 id 可能不一致——
+    /// 元数据迟到时以 [`Self::id`] 的更新值为准，该折衷仅发生在上游完全不发
+    /// 元数据的畸形流上。
+    fn ensure_created(&mut self) -> Vec<SseFrame> {
+        if self.created_emitted {
+            return Vec::new();
+        }
+        self.created_emitted = true;
+        vec![self.created_frame()]
+    }
+
+    /// 构造 `response.created` 帧：以当前已知 id/model 填充（合成路径下为
+    /// 占位值），携带留存的 warnings。
+    fn created_frame(&mut self) -> SseFrame {
+        let mut response = serde_json::Map::new();
+        response.insert(
+            "id".into(),
+            json!(if self.id.is_empty() {
+                "resp_stream"
+            } else {
+                self.id.as_str()
+            }),
+        );
+        response.insert("object".into(), json!("response"));
+        response.insert("status".into(), json!("in_progress"));
+        let model = self.inbound_model.as_deref().unwrap_or(&self.model);
+        response.insert("model".into(), json!(model));
+        if let Some(gateway) = crate::core::openai_chat::encode_warnings(&self.pending_warnings) {
+            response.insert("gateway".into(), gateway);
+        }
+        self.pending_warnings.clear();
+        SseFrame::named(
+            "response.created",
+            json!({ "type": "response.created", "response": response }).to_string(),
+        )
     }
 }
 
@@ -2620,9 +2768,13 @@ mod tests {
         let frames = encoder.encode(&StreamEvent::Error {
             message: "Overloaded".to_string(),
         });
-        assert_eq!(frames, vec![stream_error_frame("Overloaded")]);
-        assert_eq!(frames[0].event.as_deref(), Some("error"));
-        let body: Value = serde_json::from_str(&frames[0].data).expect("错误帧载荷应为 JSON");
+        // 上游流从未产出元数据：错误帧前先合成 `response.created`（官方契约
+        // 的首帧），再下发错误帧。
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].event.as_deref(), Some("response.created"));
+        assert_eq!(frames[1], stream_error_frame("Overloaded"));
+        assert_eq!(frames[1].event.as_deref(), Some("error"));
+        let body: Value = serde_json::from_str(&frames[1].data).expect("错误帧载荷应为 JSON");
         assert_eq!(
             body,
             json!({ "error": { "message": "Overloaded", "type": "api_error", "code": null } })
@@ -3456,5 +3608,235 @@ mod tests {
         let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
         let encoded = encode_model_list(&["fast".to_string(), "gpt-4o".to_string()]);
         assert_eq!(encoded, wire, "列表编码应与黄金样例一致");
+    }
+
+    // ---- 以下为本批协议兼容性修复的用例 ----
+
+    /// function_call_output.output 的非字符串载荷（Gemini functionResponse
+    /// 对象、Anthropic 块数组等跨族来源）序列化为 JSON 字符串——官方类型为
+    /// `string | 内容数组`，对象原样写上会被 OpenAI 拒绝；字符串载荷透传。
+    #[test]
+    fn function_call_output_shapes_non_string_payloads_to_json_string() {
+        let request = ChatRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentPart::ToolCall {
+                        tool_call_id: "call_1".to_string(),
+                        tool_name: "get_weather".to_string(),
+                        input: json!({}),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        tool_call_id: "call_1".to_string(),
+                        tool_name: String::new(),
+                        output: json!({ "result": "晴，26 度" }),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+        assert_eq!(
+            wire["input"][1]["output"],
+            json!(r#"{"result":"晴，26 度"}"#),
+            "对象载荷应序列化为 JSON 字符串"
+        );
+        assert!(warnings.is_empty(), "无损形状归一不告警: {warnings:?}");
+
+        // 字符串载荷透传，不双重引号。
+        let mut request = request;
+        request.messages[1].content[0] = ContentPart::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            tool_name: String::new(),
+            output: json!("纯文本结果"),
+            provider_options: HashMap::new(),
+        };
+        let wire = encode_request(&request, &mut warnings);
+        assert_eq!(wire["input"][1]["output"], json!("纯文本结果"));
+    }
+
+    /// 上游流从未产出 ResponseMetadata（如 chat 上游 chunk 缺 id/model）：
+    /// 首个内容事件前合成最小元数据补发 `response.created`，官方首帧契约
+    /// 不破坏、pending_warnings 随该帧下发；元数据迟到时更新 id 不重复宣告。
+    #[test]
+    fn stream_without_metadata_synthesizes_created_first_frame() {
+        let mut encoder = StreamEncoder::new(None);
+        // warnings 先到（StreamStart）：只入队不产帧。
+        assert!(
+            encoder
+                .encode(&StreamEvent::StreamStart {
+                    warnings: vec![Warning::unsupported("top_k", "已丢弃")]
+                })
+                .is_empty()
+        );
+        let frames = encoder.encode(&StreamEvent::TextStart {
+            id: "msg_1".to_string(),
+            provider_options: HashMap::new(),
+        });
+        // 首帧必须是合成 response.created：占位 id + 携带留存的 warnings。
+        assert_eq!(frames[0].event.as_deref(), Some("response.created"));
+        let created: Value = serde_json::from_str(&frames[0].data).expect("应为 JSON");
+        assert_eq!(created["response"]["id"], json!("resp_stream"));
+        assert_eq!(created["response"]["status"], json!("in_progress"));
+        assert_eq!(
+            created["response"]["gateway"]["warnings"][0]["feature"],
+            json!("top_k"),
+            "pending_warnings 应随合成首帧下发"
+        );
+        // 后续 added 帧照常。
+        assert_eq!(
+            frames[1].event.as_deref(),
+            Some("response.output_item.added")
+        );
+
+        // 元数据迟到：更新 id/model 供终端帧使用，不重复宣告 created。
+        let frames = encoder.encode(&StreamEvent::ResponseMetadata {
+            id: "resp_real".to_string(),
+            model: "gpt-5".to_string(),
+        });
+        assert!(frames.is_empty(), "已宣告过 created 不应重复: {frames:?}");
+        let frames = encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: None,
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        });
+        let completed = frames
+            .iter()
+            .find(|frame| frame.event.as_deref() == Some("response.completed"))
+            .expect("应有终端帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("应为 JSON");
+        assert_eq!(
+            payload["response"]["id"],
+            json!("resp_real"),
+            "终端帧应使用迟到的真实 id"
+        );
+    }
+
+    /// created 帧已下发后才到达的流式告警（如 chat 上游流中段补发的
+    /// tool call 告警）：Responses 无独立告警事件，改随终端
+    /// `response.completed` 的 `response.gateway` 下发，不静默滞留。
+    #[test]
+    fn late_stream_warnings_ride_terminal_completed() {
+        let mut encoder = StreamEncoder::new(None);
+        let frames = encoder.encode(&StreamEvent::ResponseMetadata {
+            id: "resp_1".to_string(),
+            model: "gpt-5".to_string(),
+        });
+        let created: Value = serde_json::from_str(&frames[0].data).expect("created 帧应为 JSON");
+        assert!(
+            created["response"]["gateway"].is_null(),
+            "无告警时 created 不带 gateway: {created:?}"
+        );
+        // created 之后的流式告警：created 只发一次，不能滞留丢弃。
+        assert!(
+            encoder
+                .encode(&StreamEvent::StreamStart {
+                    warnings: vec![Warning::compatibility(
+                        warning_feature::TOOL_CALL,
+                        "流式 tool call 首帧缺 name，已兜底空名"
+                    )]
+                })
+                .is_empty()
+        );
+        let frames = encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: None,
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        });
+        let completed = frames
+            .iter()
+            .find(|frame| frame.event.as_deref() == Some("response.completed"))
+            .expect("应有终端帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("应为 JSON");
+        assert_eq!(
+            payload["response"]["gateway"]["warnings"][0]["feature"],
+            json!("tool_call"),
+            "迟到告警应随终端帧下发: {payload:?}"
+        );
+    }
+
+    /// 族内互回按目标协议过滤：chat 入站的 chat-only 字段（logprobs 等）在
+    /// Responses 出站被丢弃并告警；双合法字段（service_tier）双向保留。
+    #[test]
+    fn openai_family_extra_writeback_filters_by_target_protocol() {
+        let chat = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "logprobs": true,
+            "logit_bias": { "1": 1 },
+            "service_tier": "flex",
+        });
+        let ir = decode_request_wire_chat(&chat);
+        let mut warnings = Vec::new();
+        let wire = encode_request(&ir, &mut warnings);
+        assert!(
+            wire.get("logprobs").is_none() && wire.get("logit_bias").is_none(),
+            "chat-only 字段不应写进 Responses 请求: {wire}"
+        );
+        assert_eq!(wire["service_tier"], json!("flex"), "双合法字段保留");
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Unsupported { feature, details }]
+                if feature == warning_feature::UNKNOWN_FIELDS
+                    && details.as_deref().is_some_and(|d| d.contains("logprobs")
+                        && d.contains("logit_bias"))
+        ));
+
+        // 反向：Responses-only 字段在 chat 出站同样过滤。
+        let responses = json!({
+            "model": "gpt-4o",
+            "input": [{ "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": "hi" }] }],
+            "truncation": "auto",
+            "service_tier": "flex",
+        });
+        let ir = decode_request(&responses).expect("应可解码");
+        let mut warnings = Vec::new();
+        let chat_wire = crate::core::openai_chat::encode_request(&ir, &mut warnings);
+        assert!(
+            chat_wire.get("truncation").is_none(),
+            "Responses-only 字段过滤"
+        );
+        assert_eq!(chat_wire["service_tier"], json!("flex"));
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Unsupported { feature, .. }] if feature == warning_feature::UNKNOWN_FIELDS
+        ));
+    }
+
+    /// 测试助手：以 chat 协议解码请求 wire。
+    fn decode_request_wire_chat(wire: &Value) -> ChatRequest {
+        crate::core::openai_chat::decode_request(wire).expect("chat 请求应可解码")
     }
 }

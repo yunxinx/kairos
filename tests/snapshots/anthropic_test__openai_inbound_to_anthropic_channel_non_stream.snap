@@ -25,6 +25,15 @@ expression: "json!({ \"downstream_response\": body, \"upstream_request\": receiv
         }
       }
     ],
+    "gateway": {
+      "warnings": [
+        {
+          "details": "Anthropic 必填 max_tokens 缺席或非法，已补默认 4096（原语义为不限，现为 4096 封顶）",
+          "feature": "max_tokens",
+          "type": "compatibility"
+        }
+      ]
+    },
     "id": "msg_01x",
     "model": "claude-sonnet",
     "object": "chat.completion",

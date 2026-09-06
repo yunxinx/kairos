@@ -46,7 +46,11 @@ const PROTOCOLS: Protocol[] = ['openai_chat', 'openai_responses', 'anthropic_mes
 type EditorTab = 'basic' | 'advanced';
 
 /** 高级设置页签内的字段：保存校验失败时需切回该页签才能看到错误。 */
-const ADVANCED_FIELDS: ReadonlySet<string> = new Set(['timeoutMs', 'requestTimeoutMs', 'maxRetries']);
+const ADVANCED_FIELDS: ReadonlySet<string> = new Set([
+  'timeoutMs',
+  'requestTimeoutMs',
+  'maxRetries',
+]);
 
 /** 两列网格末格留给 +N；露出奇数个 chip，避免把编辑器撑高。 */
 const EDITOR_MODEL_VISIBLE_COUNT = 9;
@@ -495,12 +499,13 @@ function handleSave(removalConfirmed = false) {
     {
       name: 'timeoutMs',
       value: editorTimeoutMs.value,
-      rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+      // 与后端契约一致：超时值不允许低于 1 秒。
+      rules: [{ kind: 'required' }, { kind: 'uint', min: 1000 }],
     },
     {
       name: 'requestTimeoutMs',
       value: editorRequestTimeoutMs.value,
-      rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+      rules: [{ kind: 'required' }, { kind: 'uint', min: 1000 }],
     },
     {
       name: 'maxRetries',
@@ -843,48 +848,6 @@ function handleSave(removalConfirmed = false) {
                 data-testid="channel-editor-group"
               />
             </FormField>
-            <FormField
-              field-name="reasoningOutput"
-              :label="t('channel.reasoningOutput.label')"
-              :input-id="reasoningOutputInputId"
-              :guide="t('channel.reasoningOutput.guide')"
-            >
-              <ListboxSelect
-                :id="reasoningOutputInputId"
-                v-model="editorReasoningOutput"
-                :options="reasoningOutputOptions"
-                :search-placeholder="t('channel.reasoningOutput.label')"
-                data-testid="channel-editor-reasoning-output"
-              />
-            </FormField>
-            <FormField
-              field-name="sessionCacheKey"
-              :label="t('channel.sessionCacheKey.label')"
-              :input-id="sessionCacheKeyInputId"
-              :guide="t('channel.sessionCacheKey.guide')"
-            >
-              <ListboxSelect
-                :id="sessionCacheKeyInputId"
-                v-model="editorSessionCacheKey"
-                :options="sessionCacheKeyOptions"
-                :search-placeholder="t('channel.sessionCacheKey.label')"
-                data-testid="channel-editor-session-cache-key"
-              />
-            </FormField>
-            <FormField
-              v-if="editorProtocol === 'anthropic_messages'"
-              field-name="injectsCacheBreakpoints"
-              layout="inline"
-              :label="t('channel.injectsCacheBreakpoints.label')"
-              :input-id="injectsCacheBreakpointsInputId"
-              :guide="t('channel.injectsCacheBreakpoints.guide')"
-            >
-              <FormSwitch
-                :id="injectsCacheBreakpointsInputId"
-                v-model="editorInjectsCacheBreakpoints"
-                data-testid="channel-editor-injects-cache-breakpoints"
-              />
-            </FormField>
             <fieldset class="border-seed rounded-md border p-3">
               <legend
                 class="text-fg-muted flex w-full items-center gap-1.5 px-1 text-xs font-medium"
@@ -1076,6 +1039,48 @@ function handleSave(removalConfirmed = false) {
                 </template>
               </FormField>
             </div>
+            <FormField
+              field-name="reasoningOutput"
+              :label="t('channel.reasoningOutput.label')"
+              :input-id="reasoningOutputInputId"
+              :guide="t('channel.reasoningOutput.guide')"
+            >
+              <ListboxSelect
+                :id="reasoningOutputInputId"
+                v-model="editorReasoningOutput"
+                :options="reasoningOutputOptions"
+                :search-placeholder="t('channel.reasoningOutput.label')"
+                data-testid="channel-editor-reasoning-output"
+              />
+            </FormField>
+            <FormField
+              field-name="sessionCacheKey"
+              :label="t('channel.sessionCacheKey.label')"
+              :input-id="sessionCacheKeyInputId"
+              :guide="t('channel.sessionCacheKey.guide')"
+            >
+              <ListboxSelect
+                :id="sessionCacheKeyInputId"
+                v-model="editorSessionCacheKey"
+                :options="sessionCacheKeyOptions"
+                :search-placeholder="t('channel.sessionCacheKey.label')"
+                data-testid="channel-editor-session-cache-key"
+              />
+            </FormField>
+            <FormField
+              v-if="editorProtocol === 'anthropic_messages'"
+              field-name="injectsCacheBreakpoints"
+              layout="inline"
+              :label="t('channel.injectsCacheBreakpoints.label')"
+              :input-id="injectsCacheBreakpointsInputId"
+              :guide="t('channel.injectsCacheBreakpoints.guide')"
+            >
+              <FormSwitch
+                :id="injectsCacheBreakpointsInputId"
+                v-model="editorInjectsCacheBreakpoints"
+                data-testid="channel-editor-injects-cache-breakpoints"
+              />
+            </FormField>
             <FormField
               field-name="abortOnDisconnect"
               layout="inline"

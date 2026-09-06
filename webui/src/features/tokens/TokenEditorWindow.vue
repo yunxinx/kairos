@@ -41,7 +41,8 @@ const props = withDefaults(
 const emit = defineEmits<{
   close: [];
   raise: [];
-  'dirty-change': [dirty: boolean];
+  /** confirmKey 为关闭脏窗口时的确认文案键；一次性明文面板与表单草稿不同。 */
+  'dirty-change': [dirty: boolean, confirmKey?: string];
 }>();
 
 const { t } = useI18n();
@@ -157,26 +158,35 @@ const balanceCommandReady = computed(() => {
   return initialMode === 'unlimited' || amountMicros.value !== 0;
 });
 
+// 创建成功后窗体切换为「明文只出现一次」面板；此后任何接口都不再提供明文。
+const createdKey = ref<string | null>(null);
+const copied = ref(false);
+
+// 一次性明文面板存续期间保持脏态：明文 key 只在创建响应出现一次，
+// 误触关闭即永久丢失，必须经关闭确认或「完成」才放行。
 const dirty = computed(
   () =>
+    createdKey.value !== null ||
     editorName.value !== initialName ||
     editorRpm.value !== initialRpm ||
     editorEnabled.value !== initialEnabled ||
     editorGroup.value !== initialGroup ||
     balanceDirty.value,
 );
-watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
+watch(
+  [dirty, createdKey],
+  ([value, key]) =>
+    emit('dirty-change', value, key !== null ? 'tokens.confirmCloseCreatedKey' : undefined),
+  { immediate: true },
+);
 
 /** 保存载荷：新建由系统发 key，更新按库生成 id 定位。 */
 type SavePayload =
   { kind: 'create'; body: TokenCreate } | { kind: 'update'; id: number; body: TokenUpdate };
 
-// 创建成功后窗体切换为「明文只出现一次」面板；此后任何接口都不再提供明文。
-const createdKey = ref<string | null>(null);
-const copied = ref(false);
-
 function finishCreate() {
   createdKey.value = null;
+  emit('dirty-change', false);
   emit('close');
 }
 
@@ -186,7 +196,8 @@ async function copyCreatedKey() {
     await navigator.clipboard.writeText(createdKey.value);
     copied.value = true;
   } catch {
-    error(t('common.copyFailedTokenKey'));
+    // HTTP 内网部署无安全上下文，剪贴板 API 不可用时引导手动复制。
+    error(t('tokens.createdKeyCopyFailed'));
   }
 }
 
@@ -198,13 +209,14 @@ const saveMutation = useMutation({
     return await apiClient.updateToken(payload.id, payload.body);
   },
   onSuccess: async (result) => {
-    emit('dirty-change', false);
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
     if ('plaintext_key' in result && typeof result.plaintext_key === 'string') {
+      // 创建成功进入一次性明文面板：脏态与关闭守卫保持，由上方 watch 上报。
       createdKey.value = result.plaintext_key;
       copied.value = false;
       return;
     }
+    emit('dirty-change', false);
     emit('close');
   },
   onError: (err) => {
@@ -309,7 +321,7 @@ function handleSave() {
     <div v-if="createdKey !== null" class="card-body space-y-3" data-testid="token-created-panel">
       <p class="text-sm">{{ t('tokens.createdKeyHint') }}</p>
       <code
-        class="bg-surface-alt block break-all rounded px-2 py-1.5 font-mono text-xs"
+        class="bg-surface-alt block rounded px-2 py-1.5 font-mono text-xs break-all"
         data-testid="token-created-key"
         >{{ createdKey }}</code
       >
@@ -317,7 +329,12 @@ function handleSave() {
         <button type="button" class="btn" data-testid="token-created-copy" @click="copyCreatedKey">
           {{ copied ? t('common.copied') : t('common.copy') }}
         </button>
-        <button type="button" class="btn btn-primary" data-testid="token-created-done" @click="finishCreate">
+        <button
+          type="button"
+          class="btn btn-primary"
+          data-testid="token-created-done"
+          @click="finishCreate"
+        >
           {{ t('common.done') }}
         </button>
       </div>

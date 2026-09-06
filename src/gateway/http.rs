@@ -13,9 +13,13 @@
 //! 的标准模型列表（`GET /v1/models`）按令牌分组与统一模型隐藏过滤。
 
 use std::{
+    future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -51,8 +55,8 @@ use crate::{
 };
 
 use super::failover::{
-    ChannelCooldowns, FailoverPolicy, KeyCooldowns, Outbound, RetryBackoff, channel_request_budget,
-    run_failover,
+    ChannelCooldowns, FailoverOutcome, FailoverPolicy, KeyCooldowns, Outbound, RetryBackoff,
+    channel_request_budget, run_failover,
 };
 use super::logging::{
     Billing, RequestLogDraft, RequestLogWriter, new_request_id, protocol_name, queue_request_log,
@@ -736,9 +740,14 @@ async fn handle_request(
     // 立即返回）。统一模型 hop 之间：400 视为请求本身有问题，不再打后续成员；
     // 429/5xx 及其余非 2xx 继续下一成员。hop 间不等待——成员钉在不同渠道，
     // 换成员不是同渠道退避。
-    let mut last_failure: Option<Response> = None;
+    //
+    // ever_dispatched 是请求级「曾出站」标记：任一物理尝试真正发送前置位。
+    // 终局失败时据此区分「未出站即终局」（落一条 dispatched=0 行，此前这类
+    // 请求在日志与统计中完全隐形）与已有逐尝试日志的已派发失败。
+    let ever_dispatched = AtomicBool::new(false);
+    let mut last_failure: Option<FailoverOutcome> = None;
     for hop in &hops {
-        let response = dispatch_hop(
+        let outcome = dispatch_hop(
             &deps,
             &snapshot,
             &request,
@@ -753,17 +762,39 @@ async fn handle_request(
             &request_id,
             &session_identity,
             active_permit.clone(),
+            &ever_dispatched,
         )
         .await;
-        if response.status().is_success() {
-            return response;
+        if outcome.response.status().is_success() {
+            return outcome.response;
         }
-        if !should_try_next_hop(response.status()) {
-            return response;
+        if !should_try_next_hop(outcome.response.status()) {
+            last_failure = Some(outcome);
+            break;
         }
-        last_failure = Some(response);
+        last_failure = Some(outcome);
     }
-    last_failure.expect("准入已保证至少一条可路由跳")
+    let terminal = last_failure.expect("准入已保证至少一条可路由跳");
+    // 单一终局收口：只有「从未出站的失败」补一条 dispatched=0 的零费用行，
+    // 状态码与响应体是实际返回下游的内容；已派发失败的逐尝试行早已入队。
+    if !ever_dispatched.load(Ordering::Acquire)
+        && let Some(failure) = terminal.failure
+    {
+        queue_undispatched_failure_log(
+            &deps,
+            token,
+            &request.model,
+            failure.status,
+            started,
+            inbound_protocol,
+            snapshot.discount_bp_for_token(token),
+            request_body_for_log,
+            snapshot.full_body.then_some(failure.wire),
+            &request_id,
+        )
+        .await;
+    }
+    terminal.response
 }
 
 /// 一次出站跳：已登记模型名 + 已定价渠道的 failover 顺序。
@@ -1075,6 +1106,8 @@ struct OutboundCall<'a> {
     session_identity: &'a str,
     /// 由请求入口持有的活动容量许可；流式路径会把所有权转交给后台流水任务。
     active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    /// 请求级「曾出站」标记；物理尝试真正发送前置位。
+    ever_dispatched: &'a AtomicBool,
     /// 本渠道入口重锚的预首字节截止时刻；同渠道重试退避与响应读取共享，
     /// 切换渠道时由新渠道的 request_timeout_ms 重新起算。
     deadline: tokio::time::Instant,
@@ -1094,6 +1127,8 @@ struct BillingAttemptStart<'a> {
     price: PriceSnapshot,
     inbound_protocol: Protocol,
     request_body: Option<Bytes>,
+    /// 请求级「曾出站」标记；物理尝试真正发送前置位。
+    ever_dispatched: &'a AtomicBool,
     /// 本渠道入口重锚的截止时刻；出站响应读取与结果持久化共享同一预算。
     deadline: tokio::time::Instant,
 }
@@ -1126,7 +1161,12 @@ impl BillingAttempt<'_> {
         )
         .await;
         let mark_error = match mark_result {
-            Ok(Ok(())) => return Ok(()),
+            Ok(Ok(())) => {
+                // 同一请求任务内顺序写后读，标记只是终局判定的输入；用
+                // Release/Acquire 做保守一致，不依赖跨任务可见性。
+                self.start.ever_dispatched.store(true, Ordering::Release);
+                return Ok(());
+            }
             Ok(Err(err)) => err.to_string(),
             Err(_) => "计费尝试标记出站状态超时".to_string(),
         };
@@ -1196,6 +1236,7 @@ impl BillingAttempt<'_> {
                 request_id: self.start.request_id,
                 billing_attempt_id: Some(&self.attempt_id),
                 upstream_reached,
+                dispatched: true,
                 deadline: Some(self.start.deadline),
             },
         )
@@ -1318,6 +1359,7 @@ async fn begin_attempt_for_call<'a>(
         price,
         inbound_protocol: ctx.inbound_protocol,
         request_body: ctx.request_body.clone(),
+        ever_dispatched: ctx.ever_dispatched,
         deadline: ctx.deadline,
     })
     .await
@@ -1340,7 +1382,8 @@ async fn dispatch_hop(
     request_id: &str,
     session_identity: &str,
     active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
-) -> Response {
+    ever_dispatched: &AtomicBool,
+) -> FailoverOutcome {
     let hop_dispatch = HopDispatch {
         deps,
         snapshot,
@@ -1356,6 +1399,7 @@ async fn dispatch_hop(
         request_id,
         session_identity,
         active_permit,
+        ever_dispatched,
     };
     hop_with_failover(&hop_dispatch, &hop.route).await
 }
@@ -1385,6 +1429,9 @@ struct HopDispatch<'a> {
     session_identity: &'a str,
     /// 活动请求 permit 的所有权容器；流式任务创建后从此处取走并持有到结算结束。
     active_permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    /// 请求级「曾出站」标记：物理尝试真正发送前由计费尝试的派发标记置位，
+    /// 供请求终局时区分「未出站即终局」与已派发失败。
+    ever_dispatched: &'a AtomicBool,
 }
 
 impl<'a> HopDispatch<'a> {
@@ -1404,8 +1451,10 @@ impl<'a> HopDispatch<'a> {
 ///
 /// 两路径共享同一套 failover/日志/结算设施：可重试错误（网络错误/429/5xx）
 /// 在首字节之前切换下一渠道（按接手渠道各自判定路径）；不可重试 4xx 直接
-/// 返回。快路径同样不免认证与计费（已在准入阶段完成）。
-async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Response {
+/// 返回。快路径同样不免认证与计费（已在准入阶段完成）。终局失败时由
+/// [`run_failover`] 携带返回下游的响应面，请求级路径据此在「从未出站」时
+/// 落一条 dispatched=0 的失败日志。
+async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> FailoverOutcome {
     run_failover(
         route,
         &ctx.snapshot.channels,
@@ -1433,6 +1482,7 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
                         request_id: ctx.request_id,
                         session_identity: ctx.session_identity,
                         active_permit: ctx.active_permit.clone(),
+                        ever_dispatched: ctx.ever_dispatched,
                         deadline: channel_deadline,
                     };
                     if ctx.request.stream {
@@ -1451,7 +1501,6 @@ async fn hop_with_failover(ctx: &HopDispatch<'_>, route: &routing::Route) -> Res
                 }
             })
         },
-        |_channel, _status, _failover, _body_wire, _key_name| Box::pin(async {}),
         FailoverPolicy {
             inbound_protocol: ctx.inbound_protocol,
             retry_backoff: retry_backoff(ctx.snapshot),
@@ -1511,6 +1560,7 @@ async fn passthrough_stream_completion(
         price,
         inbound_protocol: ctx.inbound_protocol,
         request_body: ctx.request_body.clone(),
+        ever_dispatched: ctx.ever_dispatched,
         deadline,
     })
     .await
@@ -1724,9 +1774,12 @@ async fn passthrough_stream_completion(
         log_deadline: tokio::time::Instant::now() + channel_request_budget(channel),
     };
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(64);
-    tokio::spawn(async move {
-        pipe_passthrough_stream(byte_stream, tx, task).await;
-    });
+    spawn_piped_stream_task(
+        task.request_id.clone(),
+        task.billing_attempt_id.clone(),
+        task.channel.name.clone(),
+        pipe_passthrough_stream(byte_stream, tx, task),
+    );
 
     let stream = receiver_stream(rx);
     let mut response = Response::new(Body::from_stream(stream));
@@ -1786,6 +1839,7 @@ async fn passthrough_non_stream_completion(
         price,
         inbound_protocol: ctx.inbound_protocol,
         request_body: ctx.request_body.clone(),
+        ever_dispatched: ctx.ever_dispatched,
         deadline,
     })
     .await
@@ -1930,6 +1984,7 @@ async fn passthrough_non_stream_completion(
                 request_id: ctx.request_id,
                 billing_attempt_id: Some(billing_attempt_id.id()),
                 upstream_reached: true,
+                dispatched: true,
                 deadline: Some(deadline),
             },
         )
@@ -1972,6 +2027,7 @@ async fn passthrough_non_stream_completion(
                 request_id: ctx.request_id,
                 billing_attempt_id: Some(billing_attempt_id.id()),
                 upstream_reached: true,
+                dispatched: true,
                 deadline: Some(deadline),
             },
         )
@@ -2122,10 +2178,6 @@ enum PassthroughPeek {
 /// 「已解出帧但无 IR 映射」的活性信号才算 Content；重装超限、读取失败、EOF
 /// 与首帧超时一律 Interrupted——此刻尚未向下游转发任何字节，failover 零痕迹，
 /// 不把 200 + 残缺流伪装成可交付响应。
-///
-/// 直通路径不重编码响应，因此不能复用 IR 路径只保存 JSON 帧的 peek 结果；
-/// 这里保留已消费的网络块，并在流水任务开头先发送它们。检查同时受 SSE 重装
-/// 上限约束，避免上游长时间只发无法组成完整帧的字节时无限增长。
 async fn peek_passthrough_stream_head_until(
     byte_stream: UpstreamByteStream,
     protocol: Protocol,
@@ -2401,6 +2453,7 @@ async fn pipe_passthrough_stream<S>(
             request_id: &ctx.request_id,
             billing_attempt_id: Some(&ctx.billing_attempt_id),
             upstream_reached: true,
+            dispatched: true,
             deadline: Some(ctx.log_deadline),
         },
     )
@@ -2668,6 +2721,7 @@ async fn non_stream_completion(
                         request_id: ctx.request_id,
                         billing_attempt_id: Some(billing_attempt_id.id()),
                         upstream_reached: true,
+                        dispatched: true,
                         deadline: Some(ctx.deadline),
                     },
                 )
@@ -3086,9 +3140,12 @@ async fn stream_completion(
         // 时限在流首重锚，长流结束时不受入站起算的旧时刻约束。
         log_deadline: tokio::time::Instant::now() + channel_request_budget(channel),
     };
-    tokio::spawn(async move {
-        pipe_stream(byte_stream, tx, ctx).await;
-    });
+    spawn_piped_stream_task(
+        ctx.request_id.clone(),
+        ctx.billing_attempt_id.clone(),
+        ctx.channel.name.clone(),
+        pipe_stream(byte_stream, tx, ctx),
+    );
 
     let stream = receiver_stream(rx);
     Outbound::Success(Sse::new(stream).into_response())
@@ -3222,6 +3279,18 @@ async fn peek_stream_head_until(
                     StreamEvent::Error { message } => {
                         return (PeekHead::UpstreamError(message.clone()), byte_stream);
                     }
+                    // 上游在产出任何内容前就以失败终态收尾（如 Gemini 的
+                    // MALFORMED_FUNCTION_CALL）：与直通 peek 同判为上游错误，
+                    // 在响应头前换渠道重试，避免 200 建流后中途错误帧——
+                    // 同一上游失败不应因下游协议（直通 vs IR）而产生不同结果。
+                    StreamEvent::Finish { finish_reason, .. }
+                        if finish_reason.unified == crate::core::ir::FinishReasonUnified::Error =>
+                    {
+                        return (
+                            PeekHead::UpstreamError("上游响应以失败状态结束".to_string()),
+                            byte_stream,
+                        );
+                    }
                     // 空应答的正常收尾：合法流，交由流任务照常转发。
                     StreamEvent::Finish { .. } => content = true,
                     StreamEvent::ResponseMetadata { .. } => saw_message_start = true,
@@ -3318,6 +3387,50 @@ fn spawn_reservation_heartbeat(deps: &Deps, attempt_id: &str) -> tokio::task::Jo
             }
         }
     })
+}
+
+/// spawn 流式结算流水任务并挂轻量监视。
+///
+/// 任务 panic 或异常终止时，下游流只会随 mpsc 通道关闭而静默截断、结算与
+/// 日志随之丢失——预留能由恢复任务按零费用释放，缺失的对账日志行无法重建。
+/// 监视任务 await 业务 JoinHandle，在 JoinError 时补一条带请求上下文的
+/// error 日志供人工对账。
+///
+/// 监视只观察终态：不调用 abort、不延长业务任务生命周期——业务任务始终是
+/// detached 运行，监视的存在不影响其执行与取消语义；监视自身也无人持有
+/// 句柄，随业务任务结束后自然退出。
+fn spawn_piped_stream_task<F>(
+    request_id: String,
+    billing_attempt_id: String,
+    channel: String,
+    task: F,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(task);
+    tokio::spawn(async move {
+        if let Err(join_error) = handle.await {
+            // panic 载荷尽量还原为文本；取消只可能来自显式 abort（本网关从不
+            // 调用），与 panic 一样意味着结算未完成，一律按 error 上报。
+            let reason = if join_error.is_panic() {
+                let panic = join_error.into_panic();
+                panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|value| value.to_string()))
+                    .unwrap_or_else(|| "无法识别的 panic 载荷".to_string())
+            } else {
+                "任务被外部 abort".to_string()
+            };
+            tracing::error!(
+                request_id = %request_id,
+                billing_attempt_id = %billing_attempt_id,
+                channel = %channel,
+                reason = %reason,
+                "流式结算任务异常终止：下游流已静默截断且结算日志丢失，请人工对账"
+            );
+        }
+    });
 }
 
 /// 把上游 SSE 字节流逐帧解码 → 提取 usage → 重编码，推送到下游通道。
@@ -3588,6 +3701,7 @@ async fn settle_and_log(ctx: &StreamTask, usage: Usage, usage_reported: bool) {
             request_id: &ctx.request_id,
             billing_attempt_id: Some(&ctx.billing_attempt_id),
             upstream_reached: true,
+            dispatched: true,
             deadline: Some(ctx.log_deadline),
         },
     )
@@ -3699,6 +3813,9 @@ fn retry_backoff(snapshot: &RuntimeSnapshot) -> RetryBackoff {
 }
 
 /// 流式空闲超时与非流式读体超时：渠道 `timeout_ms`，至少 1ms。
+///
+/// 下限保持 1 而非管理面校验的 1000ms：校验只拦新增写入，存量库中可能仍有
+/// 更小的旧值，运行时行为不因校验收紧而回溯改变。
 fn channel_idle(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms.clamp(1, crate::store::resources::MAX_CHANNEL_TIMEOUT_MS))
 }
@@ -3821,7 +3938,58 @@ pub(super) fn upstream_error_message(parsed: &Value, status: u16) -> String {
         .unwrap_or_else(|| format!("上游返回状态码 {status}"))
 }
 
-/// 构造入站协议错误格式的响应，并落一条请求日志（无计费数据）。
+/// 落一条「未出站即终局」的失败日志：零费用、无渠道与计费身份、dispatched=0。
+///
+/// 准入前置失败与出站阶段的终局失败（全部渠道冷却 / 无可用密钥、本地计费
+/// 拒绝、出站安全策略拒绝等从未建立上游连接的结局）共用本写法，让这类请求
+/// 在 request_log 与统计中不再隐形。状态码与响应体按实际（或即将）返回下游
+/// 的内容记录，归属用户与令牌照常定格，统计侧由 `not_dispatched` 单列呈现。
+#[allow(clippy::too_many_arguments)]
+async fn queue_undispatched_failure_log(
+    deps: &Deps,
+    token: &Token,
+    model: &str,
+    status: u16,
+    started: i64,
+    inbound_protocol: Protocol,
+    discount_bp: i64,
+    request_body: Option<Bytes>,
+    response_wire: Option<Vec<u8>>,
+    request_id: &str,
+) {
+    let billing = Billing {
+        discount_bp,
+        request_body,
+        response_body: response_wire,
+        ..Billing::default()
+    };
+    if let Err(err) = queue_request_log(
+        deps,
+        RequestLogDraft {
+            token,
+            model,
+            outbound_model: None,
+            channel: "",
+            channel_key: None,
+            status,
+            started,
+            billing,
+            inbound_protocol,
+            request_id,
+            billing_attempt_id: None,
+            upstream_reached: false,
+            dispatched: false,
+            deadline: None,
+        },
+    )
+    .await
+    {
+        tracing::error!(error = %err, request_id, "未出站即终局的失败日志无法持久化");
+    }
+}
+
+/// 构造入站协议错误格式的响应，并落一条「未出站即终局」的请求日志
+///（无计费数据）。
 ///
 /// full_body 开启时错误日志同样带全 body：入站请求字节与实际返回下游的错误
 /// JSON 字节，便于排障时重放失败请求。
@@ -3842,38 +4010,19 @@ async fn error_response(
     if let (Some(token), Some(model)) = (token, model) {
         let response_wire = full_body.then(|| serde_json::to_vec(&body).unwrap_or_default());
         let discount_bp = deps.snapshot.read().await.discount_bp_for_token(token);
-        if let Err(err) = queue_request_log(
+        queue_undispatched_failure_log(
             deps,
-            RequestLogDraft {
-                token,
-                model,
-                outbound_model: None,
-                channel: "",
-                channel_key: None,
-                status: status.as_u16(),
-                started,
-                billing: Billing {
-                    usage: Usage::default(),
-                    price: PriceSnapshot::default(),
-                    base_cost_usd_micros: 0,
-                    discount_bp,
-                    cost_usd_micros: 0,
-                    calculation_error: None,
-                    usage_reported: false,
-                    request_body,
-                    response_body: response_wire,
-                },
-                inbound_protocol,
-                request_id,
-                billing_attempt_id: None,
-                upstream_reached: false,
-                deadline: None,
-            },
+            token,
+            model,
+            status.as_u16(),
+            started,
+            inbound_protocol,
+            discount_bp,
+            request_body,
+            response_wire,
+            request_id,
         )
-        .await
-        {
-            tracing::error!(error = %err, request_id, "错误响应日志无法持久化");
-        }
+        .await;
     }
     (status, Json(body)).into_response()
 }

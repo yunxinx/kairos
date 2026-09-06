@@ -203,6 +203,9 @@ pub(super) struct RequestLogDraft<'a> {
     /// `true`；连接失败（TCP 未建立）为 `false`。仅对带计费身份且缺失
     /// usage 的日志参与告警分类，未出站的日志该值不产生作用。
     pub(super) upstream_reached: bool,
+    /// 该行是否对应已实际派发上游的尝试；`false` 表示未出站即终局的
+    /// 零费用失败行（无渠道、无计费身份）。
+    pub(super) dispatched: bool,
     /// 请求级绝对截止时刻；设置后队列持久化不得越过该时刻。
     pub(super) deadline: Option<tokio::time::Instant>,
 }
@@ -282,6 +285,7 @@ async fn queue_request_log_inner(
             && (draft.billing_attempt_id.is_none() || !draft.billing.usage_reported),
         request_id: Some(draft.request_id.to_string()),
         billing_attempt_id: draft.billing_attempt_id.map(str::to_string),
+        dispatched: draft.dispatched,
         request_body: clip_logged_body(
             draft.billing.request_body.map(|bytes| bytes.to_vec()),
             max_bytes,

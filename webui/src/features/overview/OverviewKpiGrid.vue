@@ -49,6 +49,15 @@ const tokenTotal = computed(() => {
                 }}</span>
                 {{ t('overview.channelCount') }}
               </template>
+              <!-- 未出站即终局（余额拒绝、无可用渠道等）的请求数：异常信号，
+                   为零时不占位。request_count 只统计已出站请求，两者口径分列。 -->
+              <template v-if="summary.not_dispatched > 0">
+                <span aria-hidden="true"> · </span>
+                <span data-testid="overview-not-dispatched">{{
+                  formatCount(summary.not_dispatched, locale)
+                }}</span>
+                {{ t('overview.notDispatched') }}
+              </template>
             </div>
             <SkeletonBlock v-else height="h-3" width="w-32" />
           </div>

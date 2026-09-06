@@ -48,7 +48,7 @@ expression: frames
     "data": {
       "candidates": [
         {
-          "finishReason": "STOP",
+          "finishReason": "OTHER",
           "index": 0
         }
       ],

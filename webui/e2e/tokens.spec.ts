@@ -1,3 +1,4 @@
+import type { Page } from '@playwright/test';
 import { authedTest as test, expect } from './fixtures';
 import { clickRowAction } from './helpers/table';
 
@@ -5,6 +6,20 @@ test.describe.configure({ mode: 'serial' });
 
 /** 系统生成 key 的形状：ks- 前缀 + 64 位大小写字母与数字。 */
 const GENERATED_KEY_PATTERN = /^ks-[A-Za-z0-9]{64}$/;
+
+/** 行内 key 单元格：SHA-256 指纹经掩码后是「前 8 位 + ****** + 后 8 位」。 */
+const MASKED_FINGERPRINT_PATTERN = /^[0-9a-f]{8}\*{6}[0-9a-f]{8}$/;
+
+/** 创建成功后收下一次明文面板：守卫期间面板保留，明文只在面板出现。 */
+async function acknowledgeCreatedPanel(page: Page): Promise<string> {
+  const panel = page.getByTestId('token-created-panel');
+  await expect(panel).toBeVisible();
+  const key = (await page.getByTestId('token-created-key').textContent()) ?? '';
+  expect(key).toMatch(GENERATED_KEY_PATTERN);
+  await page.getByTestId('token-created-done').click();
+  await expect(panel).toHaveCount(0);
+  return key;
+}
 
 test.describe('token resource page', () => {
   test('creates, edits definition fields, toggles status, and deletes a token', async ({
@@ -21,14 +36,33 @@ test.describe('token resource page', () => {
     await page.getByTestId('token-editor-initial-balance').fill('12');
     await page.getByTestId('token-save').click();
 
+    // 创建成功切换到一次性明文面板：明文 key 只在此处出现。
+    const createdPanel = page.getByTestId('token-created-panel');
+    await expect(createdPanel).toBeVisible();
+    const tokenKey = (await page.getByTestId('token-created-key').textContent()) ?? '';
+    expect(tokenKey).toMatch(GENERATED_KEY_PATTERN);
+
+    // 复制按钮把明文写入剪贴板并翻转为「已复制」。
+    await page.getByTestId('token-created-copy').click();
+    await expect(page.getByTestId('token-created-copy')).toHaveText('Copied');
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(tokenKey);
+
+    // 关闭守卫：Esc 触发的确认被拒绝时面板保留，明文不因误触丢失。
+    page.once('dialog', (dialog) => {
+      void dialog.dismiss();
+    });
+    await page.keyboard.press('Escape');
+    await expect(createdPanel).toBeVisible();
+
+    // 「完成」显式收下一次性面板；此后任何接口都不再提供明文。
+    await page.getByTestId('token-created-done').click();
+    await expect(createdPanel).toHaveCount(0);
+
     const createdRow = page.locator('[data-testid="token-row"]', { hasText: 'Alpha token' });
     await expect(createdRow).toBeVisible();
-    // 行内只展示掩码 key：完整 key 经复制按钮进剪贴板验证系统生成形状。
-    await createdRow.getByTestId('token-copy-key').click();
-    const tokenKey = await page.evaluate(() => navigator.clipboard.readText());
-    expect(tokenKey).toMatch(GENERATED_KEY_PATTERN);
-    // key 掩码展示：完整 key 不以明文出现在行内，且新建令牌未使用过。
+    // 行内只展示掩码指纹：完整明文不出现在行内。
     await expect(createdRow).not.toContainText(tokenKey);
+    await expect(createdRow.locator('code')).toHaveText(MASKED_FINGERPRINT_PATTERN);
     await expect(createdRow.getByTestId('token-toggle-enabled')).toHaveText('Enabled');
     await expect(createdRow.getByTestId('token-last-used')).toHaveText(/never used/i);
     await expect(createdRow.getByTestId('token-rpm')).toHaveText('60');
@@ -40,7 +74,6 @@ test.describe('token resource page', () => {
     await page.getByTestId('tokens-search').fill('');
     await expect(createdRow).toBeVisible();
 
-    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(tokenKey);
     await page.getByTestId('tokens-status-filter').click();
     await page
       .locator('[data-testid="tokens-status-filter-option"][data-value="disabled"]')
@@ -52,8 +85,9 @@ test.describe('token resource page', () => {
 
     await expect(createdRow.getByTestId('token-balance')).toHaveText('$12.00');
 
-    // 编辑器包含余额调整面板
+    // 编辑器包含余额调整面板；再次打开不重现一次性明文。
     await createdRow.getByTestId('token-edit').click();
+    await expect(page.getByTestId('token-created-panel')).toHaveCount(0);
     await expect(page.getByTestId('token-editor-rpm')).toHaveValue('60');
     await expect(page.getByTestId('token-editor-initial-balance')).toHaveCount(0);
     await expect(page.getByTestId('token-current-balance')).toHaveText('12');
@@ -97,20 +131,12 @@ test.describe('token resource page', () => {
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('First');
     await page.getByTestId('token-save').click();
-    const firstRow = page.locator('[data-testid="token-row"]', { hasText: 'First' });
-    await expect(firstRow).toBeVisible();
-    await firstRow.getByTestId('token-copy-key').click();
-    const firstKey = await page.evaluate(() => navigator.clipboard.readText());
-    expect(firstKey).toMatch(GENERATED_KEY_PATTERN);
+    const firstKey = await acknowledgeCreatedPanel(page);
 
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('Second');
     await page.getByTestId('token-save').click();
-    const secondRow = page.locator('[data-testid="token-row"]', { hasText: 'Second' });
-    await expect(secondRow).toBeVisible();
-    await secondRow.getByTestId('token-copy-key').click();
-    const secondKey = await page.evaluate(() => navigator.clipboard.readText());
-    expect(secondKey).toMatch(GENERATED_KEY_PATTERN);
+    const secondKey = await acknowledgeCreatedPanel(page);
     expect(secondKey).not.toBe(firstKey);
   });
 
@@ -125,6 +151,7 @@ test.describe('token resource page', () => {
         await page.getByTestId('token-editor-initial-balance').fill('10');
       }
       await page.getByTestId('token-save').click();
+      await acknowledgeCreatedPanel(page);
       await expect(page.locator('[data-testid="token-row"]', { hasText: name })).toBeVisible();
     }
 
@@ -159,6 +186,7 @@ test.describe('token resource page', () => {
     await page.locator('[id^="token-editor-name"]').fill('Retry balance');
     await page.getByTestId('token-editor-initial-balance').fill('10');
     await page.getByTestId('token-save').click();
+    await acknowledgeCreatedPanel(page);
     const row = page.locator('[data-testid="token-row"]', { hasText: 'Retry balance' });
     await expect(row).toBeVisible();
 
@@ -207,11 +235,13 @@ test.describe('token resource page', () => {
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('Bulk A');
     await page.getByTestId('token-save').click();
+    await acknowledgeCreatedPanel(page);
     await expect(page.locator('[data-testid="token-row"]', { hasText: 'Bulk A' })).toBeVisible();
 
     await page.getByTestId('create-token').click();
     await page.locator('[id^="token-editor-name"]').fill('Bulk B');
     await page.getByTestId('token-save').click();
+    await acknowledgeCreatedPanel(page);
     await expect(page.locator('[data-testid="token-row"]', { hasText: 'Bulk B' })).toBeVisible();
 
     // 搜索收敛到 Bulk 行，全选只作用于可见行。

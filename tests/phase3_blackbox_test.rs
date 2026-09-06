@@ -286,7 +286,9 @@ async fn stream_generate_content_inbound_emits_gemini_frames_without_sentinel() 
         json!("lo")
     );
     let last = frames.last().expect("应有收尾帧");
-    assert_eq!(last.data["candidates"][0]["finishReason"], json!("STOP"));
+    // 上游 usage-only 末帧无 finish_reason（unified 归 Other）：诚实映射为
+    // Gemini 合法值 OTHER，不再折为 STOP（谎报自然完成）。
+    assert_eq!(last.data["candidates"][0]["finishReason"], json!("OTHER"));
     assert_eq!(last.data["usageMetadata"]["promptTokenCount"], json!(10));
     assert_eq!(last.data["usageMetadata"]["candidatesTokenCount"], json!(2));
     // 整条帧序列以快照锁定：chunk 的形状与顺序是单帧抽查覆盖不到的契约。

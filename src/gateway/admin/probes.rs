@@ -262,9 +262,13 @@ async fn list_upstream_models(
     if draft.api_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
     }
-    if draft.timeout_ms < 1 || draft.timeout_ms > crate::store::resources::MAX_CHANNEL_TIMEOUT_MS {
+    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
+        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
+        .contains(&draft.timeout_ms)
+    {
         return Err(AdminError::InvalidBody(format!(
-            "timeout_ms 必须在 1..={} 之间",
+            "timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
             crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
         )));
     }

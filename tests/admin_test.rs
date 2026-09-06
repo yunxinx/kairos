@@ -1192,6 +1192,29 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
     .await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
+    // 超时低于下限 → 400：1000ms 以下的超时连常规握手都容不下，只会把每次
+    // 调用变成确定性失败。
+    let mut tiny_timeouts =
+        channel_body("tiny-timeouts", gw.upstream.base_url(), json!([TEST_MODEL]));
+    tiny_timeouts["timeout_ms"] = json!(999);
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", tiny_timeouts).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let mut tiny_request_timeout = channel_body(
+        "tiny-request-timeout",
+        gw.upstream.base_url(),
+        json!([TEST_MODEL]),
+    );
+    tiny_request_timeout["request_timeout_ms"] = json!(999);
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        tiny_request_timeout,
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
     // 旧的优先级/权重字段不再属于写契约，deny_unknown_fields 必须直接拒绝。
     let mut legacy_routing = channel_body(
         "legacy-routing",
@@ -1211,7 +1234,7 @@ async fn invalid_input_returns_structured_error_and_leaves_state() {
         .expect("渠道列表应可解析");
     let mut conflict = channel_body("test-channel", gw.upstream.base_url(), json!([TEST_MODEL]));
     conflict["keys"][0]["api_key"] = json!("sk-other");
-    conflict["timeout_ms"] = json!(1);
+    conflict["timeout_ms"] = json!(1000);
     conflict["max_retries"] = json!(4);
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", conflict).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
@@ -2490,6 +2513,7 @@ async fn logs_redact_long_token_keys() {
             settled: true,
             request_id: None,
             billing_attempt_id: None,
+            dispatched: true,
             request_body: None,
             response_body: None,
         },
@@ -2550,6 +2574,7 @@ async fn logs_redact_long_token_keys() {
             settled: true,
             request_id: None,
             billing_attempt_id: None,
+            dispatched: true,
             request_body: None,
             response_body: None,
         },
@@ -2603,6 +2628,7 @@ async fn logs_mask_multibyte_token_keys_without_panic() {
             settled: true,
             request_id: None,
             billing_attempt_id: None,
+            dispatched: true,
             request_body: None,
             response_body: None,
         },
@@ -2660,6 +2686,7 @@ async fn logs_filter_settled_and_report_unsettled_total() {
         settled: false,
         request_id: None,
         billing_attempt_id: None,
+        dispatched: true,
         request_body: None,
         response_body: None,
     };
@@ -2733,6 +2760,7 @@ async fn unsettled_log_can_be_settled_or_waived() {
         settled: false,
         request_id: None,
         billing_attempt_id: None,
+        dispatched: true,
         request_body: None,
         response_body: None,
     };
@@ -2883,6 +2911,7 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
         settled: false,
         request_id: None,
         billing_attempt_id: None,
+        dispatched: true,
         request_body: None,
         response_body: None,
     };
@@ -3184,6 +3213,7 @@ async fn seed_log(pool: &sqlx::SqlitePool, log: SeededLog) {
             settled: true,
             request_id: None,
             billing_attempt_id: None,
+            dispatched: true,
             request_body: None,
             response_body: None,
         },
@@ -3607,7 +3637,7 @@ async fn channel_probe_timeout_is_unreachable() {
         gw.upstream.base_url(),
         json!([TEST_MODEL]),
     );
-    timeout_body["timeout_ms"] = json!(200);
+    timeout_body["timeout_ms"] = json!(1000);
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels", timeout_body).await;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let created: Value = resp.json().await.expect("应返回新建渠道");
@@ -3638,8 +3668,8 @@ async fn channel_probe_timeout_is_unreachable() {
     );
     let latency = body["latency_ms"].as_u64().unwrap_or(0);
     assert!(
-        (100..3_000).contains(&latency),
-        "延迟应贴近渠道 timeout_ms=200，实际 {latency}"
+        (900..3_000).contains(&latency),
+        "延迟应贴近渠道 timeout_ms=1000，实际 {latency}"
     );
 }
 

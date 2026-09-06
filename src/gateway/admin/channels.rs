@@ -493,19 +493,23 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
     }
     reject_non_http_url(&channel.base_url)?;
-    if channel.timeout_ms == 0
-        || channel.timeout_ms > crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
+        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
+        .contains(&channel.timeout_ms)
     {
         return Err(AdminError::InvalidBody(format!(
-            "timeout_ms 必须在 1..={} 之间",
+            "timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
             crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
         )));
     }
-    if channel.request_timeout_ms == 0
-        || channel.request_timeout_ms > crate::store::resources::MAX_REQUEST_TIMEOUT_MS
+    if !(crate::store::resources::MIN_REQUEST_TIMEOUT_MS
+        ..=crate::store::resources::MAX_REQUEST_TIMEOUT_MS)
+        .contains(&channel.request_timeout_ms)
     {
         return Err(AdminError::InvalidBody(format!(
-            "request_timeout_ms 必须在 1..={} 之间",
+            "request_timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_REQUEST_TIMEOUT_MS,
             crate::store::resources::MAX_REQUEST_TIMEOUT_MS
         )));
     }

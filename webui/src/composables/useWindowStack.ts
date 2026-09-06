@@ -13,6 +13,8 @@ export interface WindowStackEntry<T> {
   dirty: boolean;
   /** 是否在用户关闭时要求确认；操作确认窗只需防止淘汰，不拦正常关闭。 */
   closeGuard: boolean;
+  /** 关闭脏窗口时的确认文案键；不同脏形态丢失的东西不同（表单草稿 / 一次性明文）。 */
+  confirmKey: string;
   /** 淘汰被阻止时的短暂提示动画。 */
   attention: boolean;
   anchor: FloatingWindowAnchor | null;
@@ -30,7 +32,7 @@ export function useWindowStack<T>(): {
   topmostId: ComputedRef<number | null>;
   open: (anchor: FloatingWindowAnchor | null, payload: T) => WindowStackEntry<T> | null;
   close: (id: number, force?: boolean) => boolean;
-  setDirty: (id: number, dirty: boolean, closeGuard?: boolean) => void;
+  setDirty: (id: number, dirty: boolean, closeGuard?: boolean, confirmKey?: string) => void;
   bringToFront: (id: number) => void;
 } {
   const windows = ref<WindowStackEntry<T>[]>([]) as Ref<WindowStackEntry<T>[]>;
@@ -69,12 +71,7 @@ export function useWindowStack<T>(): {
   function close(id: number, force = false): boolean {
     const entry = findEntry(id);
     if (!entry) return false;
-    if (
-      !force &&
-      entry.dirty &&
-      entry.closeGuard &&
-      !window.confirm(t('common.discardUnsavedChanges'))
-    ) {
+    if (!force && entry.dirty && entry.closeGuard && !window.confirm(t(entry.confirmKey))) {
       bringToFront(id);
       return false;
     }
@@ -84,11 +81,13 @@ export function useWindowStack<T>(): {
     return true;
   }
 
-  function setDirty(id: number, dirty: boolean, closeGuard = true): void {
+  /** 未携带文案键时回退默认「放弃未保存更改」，窗口脏形态切换即随之切换。 */
+  function setDirty(id: number, dirty: boolean, closeGuard = true, confirmKey?: string): void {
     const entry = findEntry(id);
     if (entry) {
       entry.dirty = dirty;
       entry.closeGuard = closeGuard;
+      entry.confirmKey = confirmKey ?? 'common.discardUnsavedChanges';
     }
   }
 
@@ -116,6 +115,7 @@ export function useWindowStack<T>(): {
       z: nextZ++,
       dirty: false,
       closeGuard: true,
+      confirmKey: 'common.discardUnsavedChanges',
       attention: false,
       anchor,
       payload,
