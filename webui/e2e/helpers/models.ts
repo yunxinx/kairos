@@ -104,7 +104,7 @@ export async function seedToken(
     },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
-  // token_key_fingerprint 是指纹（与列表读取面比对用），协议面凭证必须用一次性明文 plaintext_key。
+  // token_key_fingerprint 是掩码（与列表读取面比对用），协议面凭证用创建响应的明文 plaintext_key。
   return (await resp.json()) as { token_key_fingerprint: string; plaintext_key: string };
 }
 

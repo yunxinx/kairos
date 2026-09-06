@@ -28,6 +28,7 @@ pub(super) fn routes() -> Router<AdminDeps> {
         )
         .route("/tokens/{id}", put(update_token).delete(delete_token))
         .route("/tokens/{id}/enabled", put(set_token_enabled))
+        .route("/tokens/{id}/key", get(reveal_token_key))
         .route(
             "/tokens/{id}/balance-adjustments",
             post(super::token_balance::adjust_token_balance),
@@ -38,8 +39,7 @@ pub(super) fn routes() -> Router<AdminDeps> {
 #[derive(Debug, Serialize)]
 pub(super) struct TokenView {
     pub(super) id: i64,
-    /// 令牌 key 的 SHA-256 指纹（读取面一律掩码）；明文只在创建响应
-    /// [`TokenCreatedView::plaintext_key`] 出现一次。
+    /// 令牌 key 的掩码形态；明文只在创建响应与 [`reveal_token_key`] 出现。
     pub(super) token_key_fingerprint: String,
     pub(super) name: String,
     pub(super) limit_usd_micros: Option<i64>,
@@ -98,13 +98,8 @@ pub(super) fn available_balance(
         .transpose()
 }
 
-async fn token_view(pool: &SqlitePool, record: TokenRecord) -> Result<TokenView, AdminError> {
-    let settled = store::settlement::get_token_settled(pool, &record.token.token_key)
-        .await
-        .map_err(AdminError::Store)?;
-    TokenView::from_record(record, settled)
-}
-
+/// 掩码视图：所有读取面（含创建响应的 view 部分）一律掩码；明文由
+/// [`reveal_token_key`] 与创建响应的 `plaintext_key` 字段交付。
 async fn token_view_masked(
     pool: &SqlitePool,
     record: TokenRecord,
@@ -152,11 +147,13 @@ pub(super) async fn list_tokens(
     let settled = store::settlement::list_token_settled_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
+    // 列表一律掩码——所有者与跨归属视角一致；明文只在创建响应与取回端点
+    // （点击「复制」时）出现，在此之前不进前端内存。
     let views = records
         .into_iter()
         .map(|record| {
             let amount = settled.get(&record.token.token_key).copied().unwrap_or(0);
-            TokenView::from_record(record, amount)
+            TokenView::from_record_masked(record, amount)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(views))
@@ -409,10 +406,10 @@ fn generate_token_key() -> String {
     format!("{TOKEN_KEY_PREFIX}{random_part}")
 }
 
-/// 创建响应：TokenView 之上附带一次性的明文 key。
+/// 创建响应：TokenView 之上随创建交付明文 key（第一份拷贝）。
 ///
-/// 库内与后续所有读取面只存指纹；本字段是明文唯一的出现点，前端应即时展示
-/// 或复制，之后无法再从任何接口取回。
+/// 创建时用户还没有机会点「复制」，明文随响应先交付一次；之后的读取面全部
+/// 掩码，按需取回走 [`reveal_token_key`]。
 #[derive(Debug, Serialize)]
 pub(super) struct TokenCreatedView {
     #[serde(flatten)]
@@ -430,14 +427,13 @@ pub(super) async fn create_token(
         let snapshot = deps.snapshot.read().await;
         loop {
             let candidate = generate_token_key();
-            let fingerprint = store::token_key_fingerprint(&candidate);
-            if !snapshot.tokens.contains_key(&fingerprint) {
+            if !snapshot.tokens.contains_key(&candidate) {
                 break candidate;
             }
         }
     };
     let token = Token {
-        token_key: store::token_key_fingerprint(&plaintext_key),
+        token_key: plaintext_key.clone(),
         name: create.name,
         // 新令牌尚无累计结算，因此初始余额与累计上限数值相同。
         limit_usd_micros: create.balance_usd_micros,
@@ -459,7 +455,7 @@ pub(super) async fn create_token(
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_token_record_by_key(&deps, &token.token_key).await?;
-    let view = token_view(&deps.pool, created).await?;
+    let view = token_view_masked(&deps.pool, created).await?;
     Ok((
         axum::http::StatusCode::CREATED,
         Json(TokenCreatedView {
@@ -512,7 +508,7 @@ pub(super) async fn update_token(
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let updated = read_token_record(&deps, id).await?;
-    token_view(&deps.pool, updated).await.map(Json)
+    token_view_masked(&deps.pool, updated).await.map(Json)
 }
 
 /// 幂等地设置令牌启用状态。
@@ -533,7 +529,6 @@ pub(super) async fn set_token_enabled(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
     reject_token_toggle_on_conn(&mut tx, &identity, &existing).await?;
-    let cross_owner = existing.token.user_id != identity.user_id();
     if existing.token.enabled != enabled {
         store::resources::set_token_enabled(&mut tx, id, enabled)
             .await
@@ -545,11 +540,31 @@ pub(super) async fn set_token_enabled(
         reload_and_swap(&deps).await?;
     }
     let updated = read_token_record(&deps, id).await?;
-    if cross_owner {
-        token_view_masked(&deps.pool, updated).await.map(Json)
-    } else {
-        token_view(&deps.pool, updated).await.map(Json)
-    }
+    token_view_masked(&deps.pool, updated).await.map(Json)
+}
+
+/// 明文 key 取回响应：仅含 key 本体。
+#[derive(Debug, Serialize)]
+pub(super) struct TokenKeyView {
+    token_key: String,
+}
+
+/// 按需取回令牌的明文 key：仅令牌所有者可用。
+///
+/// 前端「复制」按钮触发本端点，点击之前明文不进前端内存。跨归属（admin/
+/// root 查他人令牌）在列表与启停面仍只有掩码，这里直接 403——运营视角没有
+/// 需要持有他人凭证的理由。
+pub(super) async fn reveal_token_key(
+    State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
+    Path(raw_id): Path<String>,
+) -> Result<Json<TokenKeyView>, AdminError> {
+    let id = parse_token_id(&raw_id)?;
+    let existing = read_token_record(&deps, id).await?;
+    reject_cross_owner_mutation(&identity, &existing)?;
+    Ok(Json(TokenKeyView {
+        token_key: existing.token.token_key,
+    }))
 }
 
 pub(super) async fn delete_token(
@@ -575,7 +590,10 @@ pub(super) async fn delete_token(
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
-    TokenView::from_record(deleted, settled).map(Json)
+    let masked = mask_token_key(&deleted.token.token_key);
+    let mut view = TokenView::from_record(deleted, settled)?;
+    view.token_key_fingerprint = masked;
+    Ok(Json(view))
 }
 
 async fn delete_tokens(

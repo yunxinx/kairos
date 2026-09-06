@@ -7,8 +7,8 @@ test.describe.configure({ mode: 'serial' });
 /** 系统生成 key 的形状：ks- 前缀 + 64 位大小写字母与数字。 */
 const GENERATED_KEY_PATTERN = /^ks-[A-Za-z0-9]{64}$/;
 
-/** 行内 key 单元格：SHA-256 指纹经掩码后是「前 8 位 + ****** + 后 8 位」。 */
-const MASKED_FINGERPRINT_PATTERN = /^[0-9a-f]{8}\*{6}[0-9a-f]{8}$/;
+/** 行内 key 单元格：明文 key 经掩码后是「前 8 位（含 ks- 前缀）+ ****** + 后 8 位」。 */
+const MASKED_KEY_PATTERN = /^ks-.{5}\*{6}.{8}$/;
 
 /** 创建成功后收下一次明文面板：守卫期间面板保留，明文只在面板出现。 */
 async function acknowledgeCreatedPanel(page: Page): Promise<string> {
@@ -36,7 +36,7 @@ test.describe('token resource page', () => {
     await page.getByTestId('token-editor-initial-balance').fill('12');
     await page.getByTestId('token-save').click();
 
-    // 创建成功切换到一次性明文面板：明文 key 只在此处出现。
+    // 创建成功切换到明文面板：明文 key 先在此处交付。
     const createdPanel = page.getByTestId('token-created-panel');
     await expect(createdPanel).toBeVisible();
     const tokenKey = (await page.getByTestId('token-created-key').textContent()) ?? '';
@@ -53,15 +53,19 @@ test.describe('token resource page', () => {
     await page.getByRole('button', { name: /cancel|取消/i }).click();
     await expect(createdPanel).toBeVisible();
 
-    // 「完成」显式收下一次性面板；此后任何接口都不再提供明文。
+    // 「完成」收下创建面板；明文之后仍可从行内「复制」按需取回。
     await page.getByTestId('token-created-done').click();
     await expect(createdPanel).toHaveCount(0);
 
     const createdRow = page.locator('[data-testid="token-row"]', { hasText: 'Alpha token' });
     await expect(createdRow).toBeVisible();
-    // 行内只展示掩码指纹：完整明文不出现在行内。
+    // 行内只展示掩码形态：完整明文不出现在行内，点「复制」才按需取回。
     await expect(createdRow).not.toContainText(tokenKey);
-    await expect(createdRow.locator('code')).toHaveText(MASKED_FINGERPRINT_PATTERN);
+    await expect(createdRow.locator('code')).toHaveText(MASKED_KEY_PATTERN);
+    // 行内「复制」按钮：请求取回端点把明文写入剪贴板，成功后翻对号。
+    await createdRow.getByTestId('token-copy-key').click();
+    await expect(createdRow.getByTestId('token-copy-key').locator('svg')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(tokenKey);
     await expect(createdRow.getByTestId('token-toggle-enabled')).toHaveText('Enabled');
     await expect(createdRow.getByTestId('token-last-used')).toHaveText(/never used/i);
     await expect(createdRow.getByTestId('token-rpm')).toHaveText('60');

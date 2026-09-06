@@ -40,7 +40,7 @@ pub(super) struct LogEntry {
     id: i64,
     created_at: i64,
     token_name: String,
-    /// 令牌 key 的 SHA-256 指纹（管理面读取一律掩码；指纹本身不可逆）。
+    /// 令牌 key 的掩码形态（前 8 位 + ****** + 后 8 位；日志归属展示用，非凭证）。
     token_key_fingerprint: String,
     inbound_protocol: String,
     model: String,

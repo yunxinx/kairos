@@ -487,10 +487,10 @@ fn raw_sse_response(body: Body) -> Response {
 /// 测试用下游令牌 key。
 pub const TEST_TOKEN_KEY: &str = "sk-test-token";
 
-/// 明文 key 的库内指纹形态：直连 SQL 断言绑定库列前统一经此换算。
-/// HTTP 认证头仍用明文，不经过本函数。
+/// 明文 key 的库内形态：库列直存明文，此处为直连 SQL 断言的绑定入口。
+/// HTTP 认证头同样用明文。
 pub fn fingerprint(key: &str) -> String {
-    kairos::store::token_key_fingerprint(key)
+    key.to_string()
 }
 
 /// 测试用可用模型。
@@ -614,8 +614,8 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         inserted.push((id, channel));
     }
     for token in &seed.tokens {
-        // 种子令牌的 key 以指纹形态入库：与生产库一致，认证以指纹查找。
-        let stored_key = store::token_key_fingerprint(&token.token_key);
+        // 种子令牌的 key 以明文入库：与生产库一致，认证按明文直查。
+        let stored_key = token.token_key.clone();
         resources::insert_token(
             &mut conn,
             &Token {
@@ -687,12 +687,11 @@ pub const TEST_ROOT_PASSWORD: &str = "sk-admin-test";
 
 /// 按 key 查出令牌的库生成 id。
 ///
-/// 管理 API 按 id 寻址（明文 key 只在创建响应返回一次），而多数测试手上只有
-/// 播种时的 key；库内以指纹存储，查找前先换算。
+/// 管理 API 按 id 寻址（明文 key 只在创建响应与所有者取回端点出现），而多数
+/// 测试手上只有播种时的 key；库内以明文存储，直接按 key 查找。
 pub async fn token_id(pool: &sqlx::SqlitePool, token_key: &str) -> i64 {
-    let fingerprint = store::token_key_fingerprint(token_key);
     sqlx::query_scalar("SELECT id FROM tokens WHERE token_key = ?")
-        .bind(fingerprint)
+        .bind(token_key)
         .fetch_one(pool)
         .await
         .expect("令牌应存在")

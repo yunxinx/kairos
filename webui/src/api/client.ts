@@ -33,6 +33,7 @@ import type {
   LifetimeStats,
   TokenBalanceCommand,
   TokenCreate,
+  TokenKeyView,
   TokenUpdate,
   TokenCreatedView,
   TokenView,
@@ -202,6 +203,16 @@ export const apiClient = {
 
   createToken(body: TokenCreate): Promise<TokenCreatedView> {
     return apiFetch('/tokens', { method: 'POST', body: JSON.stringify(body) });
+  },
+
+  /**
+   * 按需取回令牌的明文 key：仅令牌所有者可用。
+   *
+   * 列表等读取面一律掩码；「复制」按钮点击后才调用本端点，明文在请求之前
+   * 不进前端内存，复制完成后除剪贴板失败的就地展示外不驻留组件状态。
+   */
+  revealTokenKey(id: number): Promise<TokenKeyView> {
+    return apiFetch(`/tokens/${id}/key`);
   },
 
   updateToken(id: number, body: TokenUpdate): Promise<TokenView> {

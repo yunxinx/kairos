@@ -58,10 +58,15 @@ export interface TokenCreate extends TokenAttributes {
   balance_usd_micros: number | null;
 }
 
-/** 创建响应在 TokenView 之上额外返回一次性的明文 key；此后任何接口都不再提供。 */
+/** 创建响应在 TokenView 之上随创建交付明文 key；之后读取面掩码、取回走独立端点。 */
 export interface TokenCreatedView extends TokenView {
-  /** 明文 key，仅创建响应返回一次。 */
+  /** 明文 key，随创建交付的第一份拷贝。 */
   plaintext_key: string;
+}
+
+/** `GET /tokens/{id}/key` 响应：明文 key 本体，仅令牌所有者可取。 */
+export interface TokenKeyView {
+  token_key: string;
 }
 
 export interface BulkDeleteResult<T> {
@@ -77,7 +82,7 @@ export interface ChannelModelTarget {
 export interface TokenView extends TokenAttributes {
   /** 库生成的稳定身份；管理面按它定位令牌。 */
   id: number;
-  /** 令牌 key 的 SHA-256 指纹（读取面一律掩码）；明文只在创建响应出现一次。 */
+  /** 令牌 key 的掩码形态（前 8 位 + ****** + 后 8 位）；明文经取回端点按需获得。 */
   token_key_fingerprint: string;
   /** 累计消费上限；`null` 表示无限额。 */
   limit_usd_micros: number | null;

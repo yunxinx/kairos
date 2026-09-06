@@ -34,7 +34,7 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     );
     let new_id = created["id"].as_i64().expect("应返回库生成 id");
 
-    // 列表反映新令牌；明文 key 只在创建响应存在一次，列表读到的不是明文。
+    // 列表反映新令牌；列表一律掩码，明文经取回端点按需获得。
     let list: Value = admin_get(&gw, "/tokens")
         .await
         .json()
@@ -49,6 +49,15 @@ async fn token_crud_roundtrip_and_immediate_effect() {
     assert_ne!(
         listed["token_key_fingerprint"], new_key,
         "列表不得回显明文 key"
+    );
+    let revealed: Value = admin_get(&gw, &format!("/tokens/{new_id}/key"))
+        .await
+        .json()
+        .await
+        .expect("明文 key 取回应可解析");
+    assert_eq!(
+        revealed["token_key"], new_key,
+        "取回端点应返回与创建响应一致的明文 key"
     );
 
     // 新建令牌在请求路径即时可用：充值（余额调整属 04 票，测试内用相对量原语

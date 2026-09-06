@@ -333,7 +333,7 @@ async fn token_mode_changes_are_explicit_and_finite_balance_is_derived_from_sett
     assert_eq!(invalid_adjustment.status(), StatusCode::CONFLICT);
 
     sqlx::query("UPDATE token_balance SET settled_usd_micros = 3_000_000 WHERE token_key = ?")
-        .bind(kairos::store::token_key_fingerprint(key))
+        .bind(key)
         .execute(&gw.pool)
         .await
         .expect("应能模拟累计结算");
@@ -383,7 +383,7 @@ async fn delete_token_returns_the_balance_observed_before_settlement_cleanup() {
     let id = created["id"].as_i64().expect("应有令牌 id");
     let key = created["plaintext_key"].as_str().expect("应有 key");
     sqlx::query("UPDATE token_balance SET settled_usd_micros = 3_000_000 WHERE token_key = ?")
-        .bind(kairos::store::token_key_fingerprint(key))
+        .bind(key)
         .execute(&gw.pool)
         .await
         .expect("应能模拟累计结算");

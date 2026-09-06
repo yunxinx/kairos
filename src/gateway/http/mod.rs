@@ -1265,11 +1265,9 @@ fn authenticate<'a>(
     headers: &HeaderMap,
 ) -> Result<&'a Token, AuthenticationError> {
     let key = extract_key(headers).ok_or(AuthenticationError::MissingToken)?;
-    // 库内与快照只存 key 的 SHA-256 指纹；呈现的明文先换算再查找。
-    let fingerprint = store::token_key_fingerprint(&key);
     let token = snapshot
         .tokens
-        .get(&fingerprint)
+        .get(&key)
         .ok_or(AuthenticationError::InvalidToken)?;
     if !token.enabled {
         return Err(AuthenticationError::DisabledToken);

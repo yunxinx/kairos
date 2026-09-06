@@ -128,7 +128,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
     let mine: Value = created.json().await.expect("令牌应可解析");
-    // 创建响应携带一次性的明文 key；列表等读取面只有指纹。
+    // 创建响应交付明文 key；列表一律掩码，明文按需经取回端点获得。
     let mine_key = mine["plaintext_key"]
         .as_str()
         .expect("应有 key")
@@ -149,7 +149,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     assert_eq!(user_ids, vec![mine_id]);
     assert_ne!(
         user_list[0]["token_key_fingerprint"], mine_key,
-        "列表不得回显明文 key"
+        "所有者列表也不得回显明文 key"
     );
 
     // admin 档默认名单为空；令牌候选也必须先由套餐名单授予。
@@ -196,7 +196,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         .to_string();
     let admin_token_id = admin_created["id"].as_i64().expect("应有 id");
     let owner: (i64,) = sqlx::query_as("SELECT user_id FROM tokens WHERE token_key = ?")
-        .bind(kairos::store::token_key_fingerprint(&admin_token_key))
+        .bind(&admin_token_key)
         .fetch_one(&gw.pool)
         .await
         .expect("应有归属");
@@ -346,6 +346,19 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     )
     .await;
     assert_eq!(with_user_id.status(), StatusCode::BAD_REQUEST);
+
+    // 明文取回端点只对所有者开放：admin 不能借此拿到他人令牌的明文 key。
+    let reveal_others = get_req(&gw, &admin_token, &format!("/tokens/{mine_id}/key")).await;
+    assert_eq!(
+        reveal_others.status(),
+        StatusCode::FORBIDDEN,
+        "跨归属取回明文 key 必须 403"
+    );
+    // 所有者自己取回则拿到与创建响应一致的明文。
+    let reveal_own = get_req(&gw, &user_token, &format!("/tokens/{mine_id}/key")).await;
+    assert_eq!(reveal_own.status(), StatusCode::OK);
+    let revealed: Value = reveal_own.json().await.expect("取回响应应可解析");
+    assert_eq!(revealed["token_key"], mine_key, "应取回创建时的明文 key");
 
     let admin_list: Value = get_req(&gw, &admin_token, "/tokens")
         .await

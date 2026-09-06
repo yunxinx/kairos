@@ -92,7 +92,7 @@ async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
          FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id \
          WHERE t.token_key = ?",
     )
-    .bind(kairos::store::token_key_fingerprint(key))
+    .bind(key)
     .fetch_one(&gw.pool)
     .await
     .expect("用户余额应存在")

@@ -41,7 +41,7 @@ const props = withDefaults(
 const emit = defineEmits<{
   close: [];
   raise: [];
-  /** confirmKey 为关闭脏窗口时的确认文案键；一次性明文面板与表单草稿不同。 */
+  /** confirmKey 为关闭脏窗口时的确认文案键；明文面板与表单草稿不同。 */
   'dirty-change': [dirty: boolean, confirmKey?: string];
 }>();
 
@@ -158,12 +158,13 @@ const balanceCommandReady = computed(() => {
   return initialMode === 'unlimited' || amountMicros.value !== 0;
 });
 
-// 创建成功后窗体切换为「明文只出现一次」面板；此后任何接口都不再提供明文。
+// 创建成功后窗体切换为明文面板：随创建先交付一份明文，方便立即保存或复制；
+// 之后列表只回掩码，需要时从行内「复制」按钮经取回端点再拿一份。
 const createdKey = ref<string | null>(null);
 const copied = ref(false);
 
-// 一次性明文面板存续期间保持脏态：明文 key 只在创建响应出现一次，
-// 误触关闭即永久丢失，必须经关闭确认或「完成」才放行。
+// 明文面板存续期间保持脏态：key 面板是创建交付的一部分，误触关闭应经确认，
+// 而不是无声丢弃（虽可再取回，但交付动作应当显式完成）。
 const dirty = computed(
   () =>
     createdKey.value !== null ||
@@ -211,7 +212,7 @@ const saveMutation = useMutation({
   onSuccess: async (result) => {
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
     if ('plaintext_key' in result && typeof result.plaintext_key === 'string') {
-      // 创建成功进入一次性明文面板：脏态与关闭守卫保持，由上方 watch 上报。
+      // 创建成功进入明文面板：脏态与关闭守卫保持，由上方 watch 上报。
       createdKey.value = result.plaintext_key;
       copied.value = false;
       return;
@@ -317,7 +318,7 @@ function handleSave() {
     @close="emit('close')"
     @pointerdown="emit('raise')"
   >
-    <!-- 明文只出现一次的确认面板：关闭或复制后无法再取回。 -->
+    <!-- 创建明文面板：随创建先交付一份明文，之后可从列表「复制」按钮再取。 -->
     <div v-if="createdKey !== null" class="card-body space-y-3" data-testid="token-created-panel">
       <p class="text-sm">{{ t('tokens.createdKeyHint') }}</p>
       <code

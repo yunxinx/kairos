@@ -75,8 +75,13 @@ test.describe('users page', () => {
       data: { name: 'owned', balance_usd_micros: null, enabled: true },
     });
     expect(own.ok()).toBeTruthy();
-    // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态。
-    const owned = (await own.json()) as { id: number; token_key_fingerprint: string };
+    // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态；掩码与所有者
+    // 视图同款，明文从不出现。
+    const owned = (await own.json()) as {
+      id: number;
+      token_key_fingerprint: string;
+      plaintext_key: string;
+    };
     // 以第二用户身份建完令牌后切回 root：/users 是 admin-only 页面。
     await loginViaApi(page, E2E_ADMIN_EMAIL, E2E_ADMIN_PASSWORD);
 
@@ -86,7 +91,7 @@ test.describe('users page', () => {
     await page.getByTestId('user-tab-tokens').click();
     const tokenRow = page.locator(`[data-testid="user-token-row"][data-token-id="${owned.id}"]`);
     await expect(tokenRow).toBeVisible();
-    await expect(tokenRow).not.toContainText(owned.token_key_fingerprint);
+    await expect(tokenRow).not.toContainText(owned.plaintext_key);
     // 余额列与用户列表同款：纯 mono 数值，不再绘制额度进度条。
     await expect(tokenRow.getByTestId('token-balance')).toHaveText('Unlimited');
     await expect(tokenRow.locator('[data-testid="token-quota-track"]')).toHaveCount(0);

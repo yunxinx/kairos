@@ -50,11 +50,66 @@ const REMAINING_WARN_RATIO = 0.5;
 const REMAINING_DANGER_RATIO = 0.2;
 /** 相对时间展示的刷新间隔（毫秒）。 */
 const RELATIVE_TIME_TICK_MS = 30_000;
+/** 复制成功后对号停留时长，与日志 body 复制反馈对齐。 */
+const COPY_FEEDBACK_MS = 2_000;
+/** 剪贴板不可用时就地展开明文的时长：留给手动选中复制，需明显长于对号。 */
+const REVEAL_FALLBACK_MS = 30_000;
 
 const { t, locale } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
 
+// --- 明文 key 复制 ---
+// 列表接口只给掩码；点「复制」才请求取回端点，明文只在函数局部流转后交给
+// 剪贴板，不进组件状态。成功对号留在按钮上（2s 回落）。剪贴板不可用
+// （HTTP 内网部署无安全上下文）时就地展开该行明文供手动复制，数秒后回落。
+const copiedKeyId = ref<number | null>(null);
+/** 剪贴板失败后就地展开明文的行 id；与 copiedKeyId 互斥。 */
+const revealedKeyId = ref<number | null>(null);
+/** 就地展开期间的明文缓存；回落时清空，其余时刻明文不驻留组件状态。 */
+const revealedKeyText = ref('');
+let keyFeedbackTimer: ReturnType<typeof setTimeout> | undefined;
+
+onUnmounted(() => {
+  if (keyFeedbackTimer !== undefined) clearTimeout(keyFeedbackTimer);
+});
+
+async function copyTokenKey(token: TokenRow) {
+  if (copiedKeyId.value === token.id) return;
+  let plaintext: string;
+  try {
+    plaintext = (await apiClient.revealTokenKey(token.id)).token_key;
+  } catch (err) {
+    error(extractApiError(err).message);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(plaintext);
+  } catch {
+    // 剪贴板 API 不可用：明文就地展开，交给用户手动复制。
+    revealedKeyId.value = token.id;
+    revealedKeyText.value = plaintext;
+    scheduleKeyFeedbackReset(REVEAL_FALLBACK_MS);
+    return;
+  }
+  copiedKeyId.value = token.id;
+  scheduleKeyFeedbackReset(COPY_FEEDBACK_MS);
+}
+
+/** 就地展开行当前显示的明文；未展开时为空串（模板仅在展开分支调用）。 */
+function tokenPlaintext(token: TokenRow): string {
+  return revealedKeyId.value === token.id ? revealedKeyText.value : '';
+}
+
+function scheduleKeyFeedbackReset(durationMs: number) {
+  if (keyFeedbackTimer !== undefined) clearTimeout(keyFeedbackTimer);
+  keyFeedbackTimer = setTimeout(() => {
+    keyFeedbackTimer = undefined;
+    copiedKeyId.value = null;
+    revealedKeyId.value = null;
+    revealedKeyText.value = '';
+  }, durationMs);
+}
 const searchText = ref('');
 const statusFilter = ref<string[]>([]);
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
@@ -370,9 +425,32 @@ function openBulkDelete() {
                 </span>
               </TableCell>
               <TableCell>
-                <code class="code-chip rounded px-2 py-0.5 font-mono text-xs">
-                  {{ maskTokenKey(token.token_key_fingerprint) }}
-                </code>
+                <span class="inline-flex items-center gap-1">
+                  <!-- 剪贴板不可用时就地展开明文供手动复制（2s 后回落掩码）。 -->
+                  <code
+                    v-if="revealedKeyId === token.id"
+                    class="code-chip rounded px-2 py-0.5 font-mono text-xs"
+                    data-testid="token-key-plaintext"
+                  >
+                    {{ tokenPlaintext(token) }}
+                  </code>
+                  <code v-else class="code-chip rounded px-2 py-0.5 font-mono text-xs">
+                    {{ maskTokenKey(token.token_key_fingerprint) }}
+                  </code>
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-icon"
+                    data-testid="token-copy-key"
+                    :aria-label="t('common.copy')"
+                    :title="t('common.copy')"
+                    @click="copyTokenKey(token)"
+                  >
+                    <UiIcon
+                      :name="copiedKeyId === token.id ? 'check' : 'copy'"
+                      :size="14"
+                    />
+                  </button>
+                </span>
               </TableCell>
               <TableCell>
                 <div class="w-36" :title="quotaLabel(token)">

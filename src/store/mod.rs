@@ -4,8 +4,8 @@
 //! 查询与统计）、结算（[`settlement`]：计费预留、用户钱包与令牌累计结算）、
 //! 资源（[`resources`]）、用户（[`users`]）、套餐（[`plans`]）、价格目录
 //! （[`catalog`]）与系统日志（`system_log`）。本文件保留打开库与迁移、
-//! 库文件权限收敛、存量明文 key 指纹换算、WAL checkpoint，以及分页与
-//! WHERE 拼接等共享查询辅助。金额一律整数 micro-USD。
+//! 库文件权限收敛、WAL checkpoint，以及分页与 WHERE 拼接等共享查询辅助。
+//! 金额一律整数 micro-USD。
 
 pub mod balance_operations;
 pub mod catalog;
@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Connection, Row, SqliteConnection, SqlitePool,
+    Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 use thiserror::Error;
@@ -126,204 +126,8 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
         .map_err(StoreError::Migrate)?;
 
     ids::initialize(&pool).await?;
-    hash_legacy_token_key_plaintext(path).await?;
 
     Ok(pool)
-}
-
-/// 令牌 key 的库内存储形态：SHA-256 的十六进制指纹。
-///
-/// 明文只出现在两处边界——签发时的创建响应，与入站认证头。库内
-/// （tokens、token_balance、request_log、request_log_outbox、
-/// billing_reservations）一律只存指纹，WAL/备份/任何 DB 读取都还原不出
-/// 可用凭证。换算确定性且无盐：认证侧对呈现的明文做同一换算后查快照。
-pub fn token_key_fingerprint(token_key: &str) -> String {
-    use sha2::{Digest, Sha256};
-
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest: [u8; 32] = Sha256::digest(token_key.as_bytes()).into();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-/// 存量令牌 key 明文换算的完成标记（settings 表）；写入即代表库内已全量指纹化。
-const SETTING_TOKEN_KEYS_HASHED: &str = "token_keys_hashed";
-
-/// 把存量库中的令牌 key 明文原地换算为指纹。
-///
-/// 覆盖五张表：tokens、token_balance、request_log、request_log_outbox 与
-/// billing_reservations，其中 outbox 元数据与预留恢复元数据里的 JSON 载荷
-/// 同步重写。换算不可逆（明文从此只存在于创建响应与调用方），全部动作与
-/// 完成标记在同一写事务中提交，中断即整体回滚、重启重跑；已有标记时直接
-/// 返回。新库空表扫描为无操作。逐行 JSON 解析失败时保留原行并告警——那本
-/// 就是损坏数据，不能借换算之手伪造。
-///
-/// 子表 `token_balance` 外键引用 `tokens(token_key)` 且未声明 DEFERRABLE：
-/// 立即外键下「父行改键前子表先改、父行改键时子表仍指旧值」都会被拒。换算
-/// 走关闭外键的专用连接（启动路径独占，无并发写入者），提交前以
-/// `pragma_foreign_key_check` 复核引用一致性，不一致即回滚报错；应用连接池
-/// 的外键强制不受影响。
-pub(crate) async fn hash_legacy_token_key_plaintext(path: &Path) -> Result<(), StoreError> {
-    // 换算要原位改写两类 JSON 载荷：outbox 队列元数据与预留恢复元数据。
-    use request_log::PendingRequestLog;
-    use settlement::BillingAttemptRecovery;
-
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .foreign_keys(false);
-    let mut conn = SqliteConnection::connect_with(&options)
-        .await
-        .map_err(StoreError::Connect)?;
-    let mut tx = conn
-        .begin_with("BEGIN IMMEDIATE")
-        .await
-        .map_err(StoreError::Query)?;
-
-    // 完成标记与换算同事务读写：标记在场即代表此前已完成，直接返回。
-    let flagged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM settings WHERE setting_key = ?")
-        .bind(SETTING_TOKEN_KEYS_HASHED)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(StoreError::Query)?;
-    if flagged.is_some() {
-        tx.rollback().await.map_err(StoreError::Query)?;
-        return Ok(());
-    }
-
-    // 先读后写：JSON 重写需要行上的明文 token_key 作为换算来源，与列更新
-    // 之前完成读取。
-    let outbox_rows: Vec<(i64, String, Vec<u8>)> =
-        sqlx::query("SELECT id, token_key, metadata FROM request_log_outbox")
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(StoreError::Query)?
-            .into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get::<i64, _>("id").map_err(StoreError::Query)?,
-                    row.try_get::<String, _>("token_key")
-                        .map_err(StoreError::Query)?,
-                    row.try_get::<Vec<u8>, _>("metadata")
-                        .map_err(StoreError::Query)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
-    for (outbox_id, token_key, metadata) in outbox_rows {
-        let Ok(mut pending) = serde_json::from_slice::<PendingRequestLog>(&metadata) else {
-            tracing::warn!(outbox_id, "存量 outbox 元数据无法解析，指纹换算跳过该行");
-            continue;
-        };
-        pending.log.token_key = token_key_fingerprint(&token_key);
-        let encoded = serde_json::to_vec(&pending).map_err(|err| {
-            StoreError::InvalidResource(format!("outbox 元数据重编码失败: {err}"))
-        })?;
-        sqlx::query("UPDATE request_log_outbox SET metadata = ? WHERE id = ?")
-            .bind(encoded)
-            .bind(outbox_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(StoreError::Query)?;
-    }
-
-    let reservation_rows: Vec<(String, Vec<u8>)> =
-        sqlx::query("SELECT token_key, recovery_metadata FROM billing_reservations")
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(StoreError::Query)?
-            .into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get::<String, _>("token_key")
-                        .map_err(StoreError::Query)?,
-                    row.try_get::<Vec<u8>, _>("recovery_metadata")
-                        .map_err(StoreError::Query)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
-    for (token_key, metadata) in reservation_rows {
-        let Ok(mut recovery) = serde_json::from_slice::<BillingAttemptRecovery>(&metadata) else {
-            // 告警只打指纹：此处 token_key 还是库中明文遗留 key，直接输出会把
-            // 可用凭证写进进程日志。
-            tracing::warn!(
-                token_key = %token_key_fingerprint(&token_key),
-                "存量预留恢复元数据无法解析，指纹换算跳过该行"
-            );
-            continue;
-        };
-        if let Some(result) = recovery.result.as_deref_mut() {
-            result.token_key = token_key_fingerprint(&token_key);
-        }
-        let encoded = serde_json::to_vec(&recovery)
-            .map_err(|err| StoreError::InvalidResource(format!("恢复元数据重编码失败: {err}")))?;
-        sqlx::query("UPDATE billing_reservations SET recovery_metadata = ? WHERE token_key = ?")
-            .bind(encoded)
-            .bind(&token_key)
-            .execute(&mut *tx)
-            .await
-            .map_err(StoreError::Query)?;
-    }
-
-    let plain_keys: Vec<String> = sqlx::query("SELECT token_key FROM tokens")
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(StoreError::Query)?
-        .into_iter()
-        .map(|row| {
-            row.try_get::<String, _>("token_key")
-                .map_err(StoreError::Query)
-        })
-        .collect::<Result<Vec<_>, StoreError>>()?;
-
-    // 子表先改、父表后改：关闭外键后顺序不再是正确性依据，保留既有次序
-    // 仅利于阅读（对账表在凭证表之前）。
-    for plain in &plain_keys {
-        let fingerprint = token_key_fingerprint(plain);
-        for table in [
-            "UPDATE token_balance SET token_key = ? WHERE token_key = ?",
-            "UPDATE request_log SET token_key = ? WHERE token_key = ?",
-            "UPDATE request_log_outbox SET token_key = ? WHERE token_key = ?",
-            "UPDATE billing_reservations SET token_key = ? WHERE token_key = ?",
-        ] {
-            sqlx::query(table)
-                .bind(&fingerprint)
-                .bind(plain)
-                .execute(&mut *tx)
-                .await
-                .map_err(StoreError::Query)?;
-        }
-        sqlx::query("UPDATE tokens SET token_key = ? WHERE token_key = ?")
-            .bind(&fingerprint)
-            .bind(plain)
-            .execute(&mut *tx)
-            .await
-            .map_err(StoreError::Query)?;
-    }
-
-    resources::set_setting(
-        &mut tx,
-        SETTING_TOKEN_KEYS_HASHED,
-        &serde_json::Value::Bool(true),
-    )
-    .await?;
-
-    // 提交前复核引用一致性：关外键写入不触发约束，损坏必须在此拦下而不是
-    // 落库后由运行期外键错误暴露。
-    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(StoreError::Query)?;
-    if violations > 0 {
-        tx.rollback().await.map_err(StoreError::Query)?;
-        return Err(StoreError::InvalidResource(format!(
-            "令牌 key 指纹换算后仍有 {violations} 处悬挂引用，已回滚"
-        )));
-    }
-    tx.commit().await.map_err(StoreError::Query)?;
-    Ok(())
 }
 
 /// 把数据库文件与既有边车（WAL/SHM）的权限收紧为 owner-only（0o600）。
@@ -574,13 +378,9 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::billing::PriceSnapshot;
-    use crate::store::request_log::RequestLog;
-    use crate::store::settlement::{
-        BillingAttemptRecovery, get_admission_snapshot, initialize_token_settlement,
-    };
+    use crate::store::settlement::{get_admission_snapshot, initialize_token_settlement};
     use crate::store::test_support::{seed_token, test_pool};
-    use sqlx::Connection;
+    use sqlx::{Connection, SqliteConnection};
 
     /// 空库迁移后即有内置 root（id=1）与零额钱包；尚未设密码。
     #[tokio::test]
@@ -1085,8 +885,8 @@ mod tests {
             .await
             .expect("应能查余额");
         assert!(balance.is_none(), "孤儿余额行应被迁移清理");
-        // 明文 key 在 open() 的指纹换算中转为 SHA-256，按指纹读取存量令牌。
-        let balance = get_admission_snapshot(&mut conn, &token_key_fingerprint("sk-live"))
+        // 令牌 key 以明文形态留存：按明文直查存量令牌。
+        let balance = get_admission_snapshot(&mut conn, "sk-live")
             .await
             .expect("应能查余额")
             .expect("存量令牌应能读到用户钱包");
@@ -1103,7 +903,7 @@ mod tests {
         .expect("应有 root 钱包");
         assert_eq!(wallet, (1_500_000, 200));
         let owner: i64 = sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = ?")
-            .bind(token_key_fingerprint("sk-live"))
+            .bind("sk-live")
             .fetch_one(&mut *conn)
             .await
             .expect("令牌应有归属");
@@ -1113,162 +913,6 @@ mod tests {
             .await
             .expect("升级后应能写入");
         assert!(id >= 1, "AUTOINCREMENT 计数应延续");
-    }
-
-    /// 存量明文 key 换算遇到损坏的恢复元数据：该行跳过不 panic、原样保留
-    /// （不半写），其余行照常完成换算；完成标记仍然落盘——坏行交给人工
-    /// 处置，不阻塞库的打开与使用。
-    #[tokio::test]
-    async fn legacy_plaintext_hash_skips_corrupted_recovery_metadata() {
-        // 先建一个全新库（迁移全部应用），再手工摘掉完成标记、把一行预留的
-        // recovery_metadata 换成损坏字节与明文 key——模拟「指纹化迁移前崩溃
-        // 损坏」的存量形态。
-        let dir = tempfile::tempdir().expect("应能创建临时目录");
-        let path = dir.path().join("legacy-hash.db");
-        let pool = open(&path).await.expect("应能建库");
-        // 换算在首次 open 已完成（标记已落）；清掉标记、注入明文时代的
-        // token 与预留行，模拟「指纹化迁移前崩溃 + 元数据损坏」的存量库。
-        sqlx::query("DELETE FROM settings WHERE setting_key = 'token_keys_hashed'")
-            .execute(&pool)
-            .await
-            .expect("应能清完成标记");
-        // 明文时代的 tokens 行（列主换算以 tokens 表为驱动，行必须在场）。
-        for (name, key) in [("good", "sk-legacy-good"), ("bad", "sk-legacy-bad")] {
-            sqlx::query("INSERT INTO tokens (token_key, name, user_id) VALUES (?, ?, 1)")
-                .bind(key)
-                .bind(name)
-                .execute(&pool)
-                .await
-                .expect("应能注入明文令牌行");
-        }
-
-        let price = PriceSnapshot {
-            input_micros: 1,
-            output_micros: 1,
-            cache_read_micros: 0,
-            cache_write_micros: 0,
-            cache_write_1h_micros: 0,
-        };
-        let good_recovery = serde_json::to_vec(&BillingAttemptRecovery {
-            token_name: "t".to_string(),
-            model: "gpt-4o".to_string(),
-            outbound_model: None,
-            channel: "c1".to_string(),
-            channel_key: None,
-            inbound_protocol: "openai_chat".to_string(),
-            started: 1,
-            price,
-            discount_bp: 10_000,
-            request_body: None,
-            // 带上已完成的结果载荷：JSON 内 token_key 的换算发生在 result 里，
-            // 缺席则无 JSON 内换算面可断言。
-            result: Some(Box::new(RequestLog {
-                id: 0,
-                created_at: 1,
-                token_name: "t".to_string(),
-                token_key: "sk-legacy-good".to_string(),
-                user_id: resources::ROOT_USER_ID,
-                inbound_protocol: "openai_chat".to_string(),
-                model: "gpt-4o".to_string(),
-                outbound_model: None,
-                channel_key: None,
-                channel: "c1".to_string(),
-                status_code: 200,
-                latency_ms: 1,
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                cache_write_1h_tokens: 0,
-                usage_reported: false,
-                price,
-                cost_usd_micros: 0,
-                base_cost_usd_micros: 0,
-                discount_bp: 10_000,
-                settled: false,
-                request_id: None,
-                billing_attempt_id: None,
-                dispatched: true,
-                request_body: None,
-                response_body: None,
-            })),
-            result_settlement_error: None,
-            upstream_reached: true,
-        })
-        .expect("合法恢复元数据应可编码");
-        for (attempt, key, metadata) in [
-            ("attempt-good", "sk-legacy-good", good_recovery),
-            ("attempt-bad", "sk-legacy-bad", b"not-json".to_vec()),
-        ] {
-            sqlx::query(
-                "INSERT INTO billing_reservations \
-                 (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
-                  recovery_metadata, status, dispatched, result_persisted, created_at, updated_at) \
-                 VALUES (?, ?, ?, 1, 0, ?, 'reserved', 1, 0, 1, 1)",
-            )
-            .bind(attempt)
-            .bind(format!("req-{attempt}"))
-            .bind(key)
-            .bind(&metadata)
-            .execute(&pool)
-            .await
-            .expect("应能注入预留行");
-        }
-        pool.close().await;
-
-        // 重新 open：换算对坏行跳过、好行完成，库正常可用。
-        let pool = open(&path).await.expect("坏行不应阻塞库打开");
-        let mut conn = pool.acquire().await.expect("应能获取连接");
-
-        let flagged: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM settings WHERE setting_key = 'token_keys_hashed'",
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .expect("应能查标记");
-        assert_eq!(flagged, 1, "完成标记仍应落盘（坏行交人工处置）");
-
-        let (bad_key, bad_meta): (String, Vec<u8>) =
-            sqlx::query_as("SELECT token_key, recovery_metadata FROM billing_reservations WHERE attempt_id = 'attempt-bad'")
-                .fetch_one(&mut *conn)
-                .await
-                .expect("坏行应保留");
-        assert_eq!(
-            bad_key,
-            token_key_fingerprint("sk-legacy-bad"),
-            "表列换算以 tokens 表为驱动对所有表统一生效，坏行不例外（列换算不依赖 JSON 可解析）"
-        );
-        assert_eq!(bad_meta, b"not-json", "损坏元数据应原样保留");
-
-        let good_key: String = sqlx::query_scalar(
-            "SELECT token_key FROM billing_reservations WHERE attempt_id = 'attempt-good'",
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .expect("好行应在场");
-        assert_eq!(
-            good_key,
-            token_key_fingerprint("sk-legacy-good"),
-            "合法行应完成明文→指纹换算"
-        );
-        // 合法行的 JSON 内 token_key 同步换算：恢复任务按指纹定位行，
-        // JSON 内仍是明文会让恢复路径找不到行。
-        let good_meta: Vec<u8> = sqlx::query_scalar(
-            "SELECT recovery_metadata FROM billing_reservations WHERE attempt_id = 'attempt-good'",
-        )
-        .fetch_one(&mut *conn)
-        .await
-        .expect("好行元数据应在场");
-        let recovery: BillingAttemptRecovery =
-            serde_json::from_slice(&good_meta).expect("好行元数据应可解析");
-        assert_eq!(
-            recovery
-                .result
-                .map(|result| result.token_key.clone())
-                .unwrap_or_default(),
-            token_key_fingerprint("sk-legacy-good"),
-            "结果载荷内的 token_key 应同步换算为指纹"
-        );
     }
 
     /// 活动读事务会令 SQLite 返回 busy=1；checkpoint 辅助必须检查结果行，不能只
