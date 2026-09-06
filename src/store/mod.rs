@@ -4751,6 +4751,162 @@ mod tests {
         assert!(id >= 1, "AUTOINCREMENT 计数应延续");
     }
 
+    /// 存量明文 key 换算遇到损坏的恢复元数据：该行跳过不 panic、原样保留
+    /// （不半写），其余行照常完成换算；完成标记仍然落盘——坏行交给人工
+    /// 处置，不阻塞库的打开与使用。
+    #[tokio::test]
+    async fn legacy_plaintext_hash_skips_corrupted_recovery_metadata() {
+        // 先建一个全新库（迁移全部应用），再手工摘掉完成标记、把一行预留的
+        // recovery_metadata 换成损坏字节与明文 key——模拟「指纹化迁移前崩溃
+        // 损坏」的存量形态。
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let path = dir.path().join("legacy-hash.db");
+        let pool = open(&path).await.expect("应能建库");
+        // 换算在首次 open 已完成（标记已落）；清掉标记、注入明文时代的
+        // token 与预留行，模拟「指纹化迁移前崩溃 + 元数据损坏」的存量库。
+        sqlx::query("DELETE FROM settings WHERE setting_key = 'token_keys_hashed'")
+            .execute(&pool)
+            .await
+            .expect("应能清完成标记");
+        // 明文时代的 tokens 行（列主换算以 tokens 表为驱动，行必须在场）。
+        for (name, key) in [("good", "sk-legacy-good"), ("bad", "sk-legacy-bad")] {
+            sqlx::query("INSERT INTO tokens (token_key, name, user_id) VALUES (?, ?, 1)")
+                .bind(key)
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("应能注入明文令牌行");
+        }
+
+        let price = PriceSnapshot {
+            input_micros: 1,
+            output_micros: 1,
+            cache_read_micros: 0,
+            cache_write_micros: 0,
+            cache_write_1h_micros: 0,
+        };
+        let good_recovery = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "t".to_string(),
+            model: "gpt-4o".to_string(),
+            outbound_model: None,
+            channel: "c1".to_string(),
+            channel_key: None,
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price,
+            discount_bp: 10_000,
+            request_body: None,
+            // 带上已完成的结果载荷：JSON 内 token_key 的换算发生在 result 里，
+            // 缺席则无 JSON 内换算面可断言。
+            result: Some(Box::new(RequestLog {
+                id: 0,
+                created_at: 1,
+                token_name: "t".to_string(),
+                token_key: "sk-legacy-good".to_string(),
+                user_id: resources::ROOT_USER_ID,
+                inbound_protocol: "openai_chat".to_string(),
+                model: "gpt-4o".to_string(),
+                outbound_model: None,
+                channel_key: None,
+                channel: "c1".to_string(),
+                status_code: 200,
+                latency_ms: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
+                usage_reported: false,
+                price,
+                cost_usd_micros: 0,
+                base_cost_usd_micros: 0,
+                discount_bp: 10_000,
+                settled: false,
+                request_id: None,
+                billing_attempt_id: None,
+                dispatched: true,
+                request_body: None,
+                response_body: None,
+            })),
+            result_settlement_error: None,
+            upstream_reached: true,
+        })
+        .expect("合法恢复元数据应可编码");
+        for (attempt, key, metadata) in [
+            ("attempt-good", "sk-legacy-good", good_recovery),
+            ("attempt-bad", "sk-legacy-bad", b"not-json".to_vec()),
+        ] {
+            sqlx::query(
+                "INSERT INTO billing_reservations \
+                 (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+                  recovery_metadata, status, dispatched, result_persisted, created_at, updated_at) \
+                 VALUES (?, ?, ?, 1, 0, ?, 'reserved', 1, 0, 1, 1)",
+            )
+            .bind(attempt)
+            .bind(format!("req-{attempt}"))
+            .bind(key)
+            .bind(&metadata)
+            .execute(&pool)
+            .await
+            .expect("应能注入预留行");
+        }
+        pool.close().await;
+
+        // 重新 open：换算对坏行跳过、好行完成，库正常可用。
+        let pool = open(&path).await.expect("坏行不应阻塞库打开");
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+
+        let flagged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM settings WHERE setting_key = 'token_keys_hashed'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("应能查标记");
+        assert_eq!(flagged, 1, "完成标记仍应落盘（坏行交人工处置）");
+
+        let (bad_key, bad_meta): (String, Vec<u8>) =
+            sqlx::query_as("SELECT token_key, recovery_metadata FROM billing_reservations WHERE attempt_id = 'attempt-bad'")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("坏行应保留");
+        assert_eq!(
+            bad_key,
+            token_key_fingerprint("sk-legacy-bad"),
+            "表列换算以 tokens 表为驱动对所有表统一生效，坏行不例外（列换算不依赖 JSON 可解析）"
+        );
+        assert_eq!(bad_meta, b"not-json", "损坏元数据应原样保留");
+
+        let good_key: String = sqlx::query_scalar(
+            "SELECT token_key FROM billing_reservations WHERE attempt_id = 'attempt-good'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("好行应在场");
+        assert_eq!(
+            good_key,
+            token_key_fingerprint("sk-legacy-good"),
+            "合法行应完成明文→指纹换算"
+        );
+        // 合法行的 JSON 内 token_key 同步换算：恢复任务按指纹定位行，
+        // JSON 内仍是明文会让恢复路径找不到行。
+        let good_meta: Vec<u8> = sqlx::query_scalar(
+            "SELECT recovery_metadata FROM billing_reservations WHERE attempt_id = 'attempt-good'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("好行元数据应在场");
+        let recovery: BillingAttemptRecovery =
+            serde_json::from_slice(&good_meta).expect("好行元数据应可解析");
+        assert_eq!(
+            recovery
+                .result
+                .map(|result| result.token_key.clone())
+                .unwrap_or_default(),
+            token_key_fingerprint("sk-legacy-good"),
+            "结果载荷内的 token_key 应同步换算为指纹"
+        );
+    }
+
     /// 请求日志分页查询：时间倒序、LIMIT/OFFSET 生效、过滤维度生效。
     #[tokio::test]
     async fn request_log_query_paginates_and_filters() {

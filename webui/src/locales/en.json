@@ -12,6 +12,9 @@
     "lead": "Transparent same-protocol relay. Governance, metering, and observability on the gateway side.",
     "startCta": "Get started"
   },
+  "session": {
+    "expiredWithUnsaved": "Your session has expired. This page still has unsaved changes, so automatic redirect is paused. Save or discard them, then sign in again."
+  },
   "nav": {
     "overview": "Overview",
     "tokens": "Tokens",
@@ -76,6 +79,9 @@
     "retry": "Try again",
     "close": "Close",
     "discardUnsavedChanges": "You have unsaved changes. Discard them?",
+    "unsavedChangesTitle": "Discard unsaved changes",
+    "confirmDiscard": "Discard changes",
+    "confirmDiscardAnyway": "Close anyway",
     "cancel": "Cancel",
     "done": "Done",
     "save": "Save",
@@ -133,6 +139,7 @@
     "search": "Search by name",
     "editorCreate": "New token",
     "createdKeyHint": "Save this key now: it is shown only once and cannot be retrieved later.",
+    "createdKeyTitle": "Close one-time key panel",
     "confirmCloseCreatedKey": "This key is shown only once and cannot be retrieved after closing. Close anyway?",
     "createdKeyCopyFailed": "Could not copy the token key: select the text above and copy it manually.",
     "editorEdit": "Edit token",

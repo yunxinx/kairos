@@ -30,6 +30,7 @@ import { useWindowStack } from '@/composables/useWindowStack';
 import { formatUnixMillis } from '@/lib/format';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type SystemLogWindowPayload = {
   entry: SystemLogEntry;
@@ -84,6 +85,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   bringToFront,
 } = useWindowStack<SystemLogWindowPayload>();
 
@@ -492,5 +494,12 @@ function levelLabel(level: string): string {
         @filter-level="onQuickFilterLevel"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

@@ -420,22 +420,26 @@ pub(crate) enum ErrorMessageShape {
 /// [`StreamEvent::Error`] 交由网关终止流，其余失败帧跳过，帧内未知字段的
 /// 容忍策略不变。返回事件序列而非各适配器的 delivery 包装——
 /// `DecodeStreamChunk` 是适配器私有类型，由调用方自行包一层。
+///
+/// 帧以原始字节传入而非 `Value`：解码器热路径 `from_str` 直达 wire 类型
+/// 零中间 `Value`，本函数仅在失败时才重新解析一次（错误提取）。
 pub(crate) fn decode_failed_frame(
     err: &serde_json::Error,
-    frame: &Value,
+    frame: &str,
     message_shape: ErrorMessageShape,
 ) -> Vec<StreamEvent> {
     tracing::warn!(error = %err, payload = %frame, "上游流式帧无法解码");
-    let nested = frame
+    let parsed = serde_json::from_str::<Value>(frame).unwrap_or(Value::Null);
+    let nested = parsed
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str);
     let message = match (nested, message_shape) {
         (Some(message), _) => Some(message),
         (None, ErrorMessageShape::TopLevelOnErrorType)
-            if frame.get("type").and_then(Value::as_str) == Some("error") =>
+            if parsed.get("type").and_then(Value::as_str) == Some("error") =>
         {
-            frame.get("message").and_then(Value::as_str)
+            parsed.get("message").and_then(Value::as_str)
         }
         (None, _) => None,
     };

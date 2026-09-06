@@ -37,6 +37,7 @@ import UserManageWindow from '@/features/users/UserManageWindow.vue';
 import { formatCount, formatTokensCount, formatUnixMillis, formatUsdMicros } from '@/lib/format';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type UserManageTab = 'profile' | 'recharge' | 'tokens';
 
@@ -156,6 +157,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<UserWindowPayload>();
@@ -744,5 +746,12 @@ watch(users, (rows) => {
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

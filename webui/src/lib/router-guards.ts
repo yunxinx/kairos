@@ -5,6 +5,7 @@ import { hasCapability, type ManagementCapability } from '@/lib/capabilities';
 import {
   captureSessionGeneration,
   getMe,
+  hasKnownLoggedOut,
   markSessionActive,
   setMeForSession,
 } from '@/lib/session';
@@ -27,8 +28,9 @@ export async function requireAuth(): Promise<void> {
   }
 }
 
-/** 登录页：已持有凭证则进入控制台。 */
+/** 登录页：已持有凭证则进入控制台；已知无会话（上一轮 401）则跳过探测。 */
 export async function requireGuest(): Promise<void> {
+  if (hasKnownLoggedOut()) return;
   try {
     await ensureMe();
   } catch {

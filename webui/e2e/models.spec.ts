@@ -845,7 +845,9 @@ test.describe('models page', () => {
     const listed = await page.request.get('/api/tokens', {
       headers: await e2eRootHeaders(page),
     });
-    const tokens = (await listed.json()) as Array<{ token_key: string; model_group: string }>;
-    expect(tokens.find((item) => item.token_key === token.token_key)?.model_group).toBe('');
+    const tokens = (await listed.json()) as Array<{ token_key_fingerprint: string; model_group: string }>;
+    expect(
+      tokens.find((item) => item.token_key_fingerprint === token.token_key_fingerprint)?.model_group,
+    ).toBe('');
   });
 });

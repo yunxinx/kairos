@@ -35,6 +35,7 @@ import { unifiedUsesChannel } from '@/lib/unified-sources';
 import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type UnifiedWindowPayload =
   | { kind: 'editor'; model: UnifiedModel | null }
@@ -70,6 +71,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<UnifiedWindowPayload>();
@@ -432,5 +434,12 @@ function openBulkDelete() {
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

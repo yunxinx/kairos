@@ -91,7 +91,7 @@ const toggleMutation = useMutation({
               <!-- 接口只返回掩码指纹：同用户多把令牌靠前后缀区分，运营按 id 操作。 -->
               <TableCell>
                 <span class="text-fg-muted font-mono text-xs" data-testid="user-token-key">
-                  {{ maskTokenKey(token.token_key) }}
+                  {{ maskTokenKey(token.token_key_fingerprint) }}
                 </span>
               </TableCell>
               <TableCell class="font-mono text-xs" data-testid="user-token-model-group">

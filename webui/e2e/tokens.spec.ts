@@ -47,11 +47,10 @@ test.describe('token resource page', () => {
     await expect(page.getByTestId('token-created-copy')).toHaveText('Copied');
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(tokenKey);
 
-    // 关闭守卫：Esc 触发的确认被拒绝时面板保留，明文不因误触丢失。
-    page.once('dialog', (dialog) => {
-      void dialog.dismiss();
-    });
+    // 关闭守卫：Esc 触发的栈内确认窗被取消时面板保留，明文不因误触丢失。
     await page.keyboard.press('Escape');
+    await page.getByTestId('close-guard-confirm').waitFor({ state: 'visible' });
+    await page.getByRole('button', { name: /cancel|取消/i }).click();
     await expect(createdPanel).toBeVisible();
 
     // 「完成」显式收下一次性面板；此后任何接口都不再提供明文。

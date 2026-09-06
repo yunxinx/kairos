@@ -35,6 +35,7 @@ import { useToast } from '@/composables/useToast';
 import PlanEditorWindow from '@/features/plans/PlanEditorWindow.vue';
 import { formatDiscountBp, formatUnixMillis, formatUsdMicros } from '@/lib/format';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type PlanWindowPayload =
   /** 新建时 `plan` 为 null，受众由点的是哪个按钮决定；编辑时受众取自 `plan`。 */
@@ -90,6 +91,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<PlanWindowPayload>();
@@ -595,5 +597,12 @@ watch(plans, (rows) => {
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

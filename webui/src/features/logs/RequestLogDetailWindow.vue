@@ -260,11 +260,11 @@ const calculationSteps = computed(() => {
               </dt>
               <dd
                 class="mt-1 flex flex-col font-mono text-xs"
-                :title="`${entry.token_name} (${entry.token_key})`"
+                :title="`${entry.token_name} (${entry.token_key_fingerprint})`"
               >
                 <span class="font-medium text-[var(--seed-fg)]">{{ entry.token_name }}</span>
                 <span class="text-fg-muted text-[10px] opacity-75"
-                  >({{ maskTokenKey(entry.token_key) }})</span
+                  >({{ maskTokenKey(entry.token_key_fingerprint) }})</span
                 >
               </dd>
             </div>

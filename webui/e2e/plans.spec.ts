@@ -106,9 +106,10 @@ test.describe('plans page', () => {
     // 管理员档才有能力开关，且受众建后不可改——编辑用户档时同样看不到开关。
     await page.getByTestId('create-plan-admin').click();
     await expect(page.getByTestId('plan-capability-manage_users')).toBeVisible();
-    // 管理员档默认预开能力开关，开窗即视为有草稿：Esc 关窗先弹放弃确认，需接受。
-    page.on('dialog', (dialog) => dialog.accept());
+    // 管理员档默认预开能力开关，开窗即视为有草稿：Esc 关窗先弹栈内放弃
+    // 确认窗，需确认放弃。
     await page.keyboard.press('Escape');
+    await page.getByTestId('close-guard-confirm').click();
 
     await clickRowAction(standard, page, 'plan-set-default');
     await expect(standard.getByTestId('plan-default-badge')).toBeVisible();

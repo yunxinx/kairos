@@ -46,6 +46,7 @@ import {
 } from '@/lib/inventory';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type InventoryDeleteTarget = { name: string; channelId: number; channelName: string };
 type InventorySectionRow = InventoryRow & { aliasChipItems: AliasChip[] };
@@ -86,6 +87,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<InventoryWindowPayload>();
@@ -719,5 +721,12 @@ function loadErrorMessage(): string {
         @confirm="deleteMutation.mutate(visibleDeleteTargets())"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

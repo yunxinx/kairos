@@ -956,7 +956,7 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
     let anthropic_options = request.provider_options.get("anthropic");
     let hatch_thinking = anthropic_options.and_then(|options| options.get("thinking"));
     let hatch_output_config = anthropic_options.and_then(|options| options.get("output_config"));
-    let adaptive_model = supports_adaptive_thinking(&request.model);
+    let adaptive_model = crate::core::model_family::anthropic_adaptive_thinking(&request.model);
 
     // 类型化 effort 兜底出站：本族逃生舱缺席时把旋钮展开为请求模型形态的
     // 原生形状——adaptive/native-effort 模型出 `thinking: adaptive` + 原生
@@ -1387,27 +1387,6 @@ pub fn inject_cache_breakpoints(obj: &mut serde_json::Map<String, Value>) -> usi
 /// 请求模型是否支持 adaptive thinking 与原生 effort（`output_config.effort`）。
 ///
 /// 网关暂无模型能力表，按模型名模式判定：opus 4.6/4.7/4.8/5+、sonnet 4.6/5+、
-/// fable/mythos 家族，日期后缀与点分变体（bedrock/vertex/azure 接入形态）
-/// 一并覆盖。判否时按 legacy budget 阶梯兜底——该形状对所有 budget 模型合法，
-/// 误判只损失 effort 档位粒度，不产生非法请求。
-fn supports_adaptive_thinking(model: &str) -> bool {
-    let model = model.to_lowercase();
-    let opus = model.contains("opus");
-    let version_46 = model.contains("4-6") || model.contains("4.6");
-    let opus_47_plus = opus
-        && (model.contains("4-7")
-            || model.contains("4.7")
-            || model.contains("4-8")
-            || model.contains("4.8")
-            || model.contains("opus-5"));
-    let sonnet_5_plus = model.contains("sonnet-5");
-    let fable_family = model.contains("fable") || model.contains("mythos");
-    opus_47_plus
-        || sonnet_5_plus
-        || fable_family
-        || (version_46 && (opus || model.contains("sonnet")))
-}
-
 /// 编码 IR tool_choice 为 Anthropic wire 值；请求级逃生舱
 /// `tool_choice_extra` 的附加键并回对象，类型化 `parallel_tool_calls` 以
 /// 反语义 `disable_parallel_tool_use`（取反）最终定值。
@@ -1603,12 +1582,51 @@ struct ToolAlignment {
     generated: u64,
     /// 已产出 tool_result 的原始 id：重复出现只发一次。
     emitted: HashSet<String>,
-    /// 原始 tool_call_id → 最后一条 tool 消息中的 ToolResult part。
-    last_result: HashMap<String, ContentPart>,
+    /// 原始 tool_call_id → 最后一条 tool 消息中 ToolResult 的输出派生物。
+    /// 扫描期预提取编码所需的三个标量（output / is_error / cache_control），
+    /// 避免把整个 ContentPart（含 output Value）克隆进表——请求内 O(结果数)
+    /// 的内容克隆，最终编码未必用到。
+    last_result: HashMap<String, ToolResultProjection>,
+}
+
+/// ToolResult part 的编码投影：`is_error` 与 `cache_control` 自 provider
+/// 逃生舱提取，`output` 保留原值（编码时按需序列化）。
+#[derive(Clone)]
+struct ToolResultProjection {
+    output: Value,
+    is_error: bool,
+    cache_control: Option<Value>,
+}
+
+impl ToolResultProjection {
+    fn from_part(part: &ContentPart) -> Self {
+        match part {
+            ContentPart::ToolResult {
+                output,
+                provider_options,
+                ..
+            } => {
+                let anthropic = provider_options.get("anthropic");
+                Self {
+                    output: output.clone(),
+                    is_error: anthropic
+                        .and_then(|a| a.get("is_error"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    cache_control: anthropic.and_then(|a| a.get("cache_control")).cloned(),
+                }
+            }
+            _ => Self {
+                output: Value::String(String::new()),
+                is_error: false,
+                cache_control: None,
+            },
+        }
+    }
 }
 
 impl ToolAlignment {
-    /// 前置扫描：记录每个原始 tool_call_id 最后一次出现的 ToolResult part。
+    /// 前置扫描：记录每个原始 tool_call_id 最后一次出现的 ToolResult 投影。
     fn scan(ir_messages: &[Message]) -> Self {
         let mut last_result = HashMap::new();
         for message in ir_messages {
@@ -1617,7 +1635,7 @@ impl ToolAlignment {
             }
             for part in &message.content {
                 if let ContentPart::ToolResult { tool_call_id, .. } = part {
-                    last_result.insert(tool_call_id.clone(), part.clone());
+                    last_result.insert(tool_call_id.clone(), ToolResultProjection::from_part(part));
                 }
             }
         }
@@ -2012,25 +2030,14 @@ fn encode_tool_result_blocks(parts: &[ContentPart], alignment: &mut ToolAlignmen
             if !alignment.emitted.insert(tool_call_id.clone()) {
                 return None;
             }
-            // 内容与 is_error 取该 id 的最后一条 tool 消息。
+            // 内容与 is_error 取该 id 的最后一条 tool 消息（扫描期已预提取投影）。
             let (output, is_error, cache_control) = match alignment.last_result.get(&tool_call_id) {
-                Some(ContentPart::ToolResult {
-                    output,
-                    provider_options,
-                    ..
-                }) => {
-                    let is_error = provider_options
-                        .get("anthropic")
-                        .and_then(|a| a.get("is_error"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let cache_control = provider_options
-                        .get("anthropic")
-                        .and_then(|a| a.get("cache_control"))
-                        .cloned();
-                    (output.clone(), is_error, cache_control)
-                }
-                _ => (part_output(part), false, None),
+                Some(projection) => (
+                    projection.output.clone(),
+                    projection.is_error,
+                    projection.cache_control.clone(),
+                ),
+                None => (part_output(part), false, None),
             };
             // 输出为字符串时直接用；否则 JSON 序列化（tool_result content 是文本）。
             let content_value = match output {
@@ -2491,8 +2498,8 @@ pub struct DecodeStreamChunk {
 
 impl StreamDecoder {
     /// 解码单个上游 SSE 事件为若干 IR 流事件。
-    pub fn process(&mut self, value: &Value) -> DecodeStreamChunk {
-        let wire = match serde_json::from_value::<WireStreamEvent>(value.clone()) {
+    pub fn process(&mut self, value: &str) -> DecodeStreamChunk {
+        let wire = match serde_json::from_str::<WireStreamEvent>(value) {
             Ok(wire) => wire,
             Err(err) => {
                 return DecodeStreamChunk::delivery(decode_failed_frame(
@@ -3012,43 +3019,6 @@ mod tests {
     use crate::core::stream::StreamAccumulator;
     use crate::core::testing::frames_to_snapshot;
     use similar_asserts::assert_eq;
-
-    /// 模型形态判定：adaptive/native-effort 家族覆盖官方名、日期后缀与
-    /// bedrock/vertex 变体；legacy 模型与异族模型名判否。
-    #[test]
-    fn supports_adaptive_thinking_matches_model_forms() {
-        for model in [
-            "claude-opus-4-6",
-            "claude-opus-4-6-20260201",
-            "claude-opus-4.6",
-            "claude-sonnet-4-6",
-            "claude-opus-4-7",
-            "claude-opus-4-8",
-            "claude-opus-5",
-            "claude-sonnet-5",
-            "claude-fable-5",
-            "claude-mythos-5",
-            "us.anthropic.claude-opus-4-6-v1:0",
-        ] {
-            assert!(
-                supports_adaptive_thinking(model),
-                "{model} 应判为 adaptive 形态"
-            );
-        }
-        for model in [
-            "claude-sonnet-4-5",
-            "claude-opus-4-5",
-            "claude-opus-4-1",
-            "claude-haiku-4-5",
-            "claude-3-7-sonnet",
-            "gpt-4o",
-        ] {
-            assert!(
-                !supports_adaptive_thinking(model),
-                "{model} 应判为 legacy 形态"
-            );
-        }
-    }
 
     /// wire 形状错误指明出错字段的 JSON 路径，而非笼统的「不是合法 JSON 对象」。
     #[test]
@@ -4166,6 +4136,19 @@ mod tests {
             messages[3]["content"], "再补充一句",
             "tool_result 之后的文本应保持独立 user 消息"
         );
+        // 同族往返幂等：对已折回形状再次 decode→encode，形状不变（折叠不重入、
+        // 顺序不漂移）。
+        let redecoded = decode_request(&encoded).expect("重编码应可解码");
+        let mut second_warnings = Vec::new();
+        let reencoded = encode_request(&redecoded, &mut second_warnings);
+        assert_eq!(
+            reencoded["messages"], encoded["messages"],
+            "同族往返应保持稳定形状"
+        );
+        assert!(
+            second_warnings.is_empty(),
+            "已折回的合法形状不应再产出 warning: {second_warnings:?}"
+        );
     }
 
     /// 上游失败终态（IR Error）经流式编码：stop_reason 映射 end_turn 的整形
@@ -4222,7 +4205,7 @@ mod tests {
         let raw = include_str!("__fixtures__/stream_error.json");
         let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
         let mut decoder = StreamDecoder::default();
-        let chunk = decoder.process(&wire);
+        let chunk = decoder.process(&wire.to_string());
         assert!(matches!(
             chunk.events.as_slice(),
             [StreamEvent::Error { message }] if message == "Overloaded"
@@ -4238,7 +4221,7 @@ mod tests {
         let event = json!({
             "error": { "type": "overloaded_error", "message": "Overloaded" },
         });
-        let decoded = StreamDecoder::default().process(&event);
+        let decoded = StreamDecoder::default().process(&event.to_string());
         assert!(matches!(
             decoded.events.as_slice(),
             [StreamEvent::Error { message }] if message == "Overloaded"
@@ -4253,7 +4236,7 @@ mod tests {
             "index": "not-a-number",
             "delta": { "type": "text_delta", "text": "hi" },
         });
-        let decoded = StreamDecoder::default().process(&event);
+        let decoded = StreamDecoder::default().process(&event.to_string());
         assert_eq!(decoded.events, Vec::new());
 
         // error 对象在场但 message 类型不符：无字符串可提取，同样跳过。
@@ -4261,7 +4244,7 @@ mod tests {
             "type": "error",
             "error": { "type": "overloaded_error", "message": 42 },
         });
-        let decoded = StreamDecoder::default().process(&event);
+        let decoded = StreamDecoder::default().process(&event.to_string());
         assert_eq!(decoded.events, Vec::new());
     }
 
@@ -4300,7 +4283,7 @@ mod tests {
             include_str!("__fixtures__/stream_message_delta.json"),
         ] {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }
@@ -4337,13 +4320,13 @@ mod tests {
             "usage": { "output_tokens": 45 }
         });
 
-        let start_chunk = decoder.process(&start);
+        let start_chunk = decoder.process(&start.to_string());
         assert!(start_chunk.events.iter().any(|event| matches!(
             event,
             StreamEvent::ResponseMetadata { id, model }
                 if id == "msg_1" && model == "claude-sonnet"
         )));
-        let finish = decoder.process(&delta).events;
+        let finish = decoder.process(&delta.to_string()).events;
         assert!(matches!(
             finish.as_slice(),
             [StreamEvent::Finish { usage, .. }]
@@ -4367,7 +4350,7 @@ mod tests {
             include_str!("__fixtures__/stream_finish.json"),
         ] {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }
@@ -4400,7 +4383,7 @@ mod tests {
             include_str!("__fixtures__/stream_tool_stop.json"),
         ] {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }

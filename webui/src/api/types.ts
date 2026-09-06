@@ -77,7 +77,8 @@ export interface ChannelModelTarget {
 export interface TokenView extends TokenAttributes {
   /** 库生成的稳定身份；管理面按它定位令牌。 */
   id: number;
-  token_key: string;
+  /** 令牌 key 的 SHA-256 指纹（读取面一律掩码）；明文只在创建响应出现一次。 */
+  token_key_fingerprint: string;
   /** 累计消费上限；`null` 表示无限额。 */
   limit_usd_micros: number | null;
   /** 派生可用余额 = 累计消费上限 - 累计已结算；`null` 表示无限额。 */
@@ -525,7 +526,8 @@ export interface LogEntry {
   id: number;
   created_at: number;
   token_name: string;
-  token_key: string;
+  /** 令牌 key 的掩码指纹（不可逆，非凭证）。 */
+  token_key_fingerprint: string;
   inbound_protocol: string;
   model: string;
   /** 实际出站模型名；旧行可能为 null。 */
@@ -587,7 +589,7 @@ export type SystemLogSortBy = 'created';
 
 /** 日志列表查询。 */
 export interface LogQuery {
-  /** 按令牌展示名精确过滤；列表里的 `token_key` 已脱敏，行内筛选用这个。 */
+  /** 按令牌展示名精确过滤；列表里的 `token_key_fingerprint` 已脱敏，行内筛选用这个。 */
   token_name?: string;
   model?: string;
   /** 按渠道名精确过滤。 */

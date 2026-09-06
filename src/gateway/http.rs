@@ -2199,8 +2199,10 @@ async fn peek_passthrough_stream_head_until(
             if frame.is_empty() {
                 continue;
             }
-            let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
-            let decoded = decoder.process(&chunk);
+            // 帧以 UTF-8 文本交给解码器直解 wire 类型（丢失字节的坏帧按
+            // 解码失败留痕跳过，与原 Null 行为一致：不因个别坏帧中断 peek）。
+            let frame_text = String::from_utf8_lossy(&frame);
+            let decoded = decoder.process(&frame_text);
             let mut content = false;
             if matches!(protocol, Protocol::AnthropicMessages)
                 && event_name.as_deref() == Some("message_start")
@@ -2360,12 +2362,14 @@ async fn pipe_passthrough_stream<S>(
             if frame.is_empty() {
                 continue;
             }
-            if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+            // 帧以 UTF-8 文本交给解码器直解 wire 类型；usage 嗅探按需自行解析。
+            let frame_text = String::from_utf8_lossy(&frame);
+            if let Ok(value) = serde_json::from_str::<Value>(&frame_text) {
                 if let Some(sniffed) = protocol::sniff_usage(&value, ctx.protocol) {
                     usage_reported = true;
                     usage.union_max(sniffed);
                 }
-                let decoded = decoder.process(&value);
+                let decoded = decoder.process(&frame_text);
                 if decoded.events.iter().any(|event| match event {
                     StreamEvent::Error { .. } => true,
                     StreamEvent::Finish { finish_reason, .. } => {
@@ -3265,8 +3269,13 @@ async fn peek_stream_head_until(
                     byte_stream,
                 );
             }
-            let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
-            let decoded = decoder.process(&chunk);
+            // 帧以 UTF-8 文本交给解码器直解 wire 类型（丢失字节的坏帧按
+            // 解码失败留痕跳过，与原 Null 行为一致：不因个别坏帧中断 peek）。
+            let frame_text = String::from_utf8_lossy(&frame);
+            // 重放缓冲需要 Value 形态（PeekHead::Content），peek 只触及首块前的
+            // 少量帧，此处解析不在整流热路径上。
+            let chunk: Value = serde_json::from_str(&frame_text).unwrap_or(Value::Null);
+            let decoded = decoder.process(&frame_text);
             let mut content = false;
             if matches!(protocol, Protocol::AnthropicMessages)
                 && event_name.as_deref() == Some("message_start")
@@ -3521,12 +3530,15 @@ async fn pipe_stream<S>(
             if frame.is_empty() {
                 continue;
             }
-            let chunk: Value = serde_json::from_slice(&frame).unwrap_or(Value::Null);
-            if let Some(sniffed) = protocol::sniff_usage(&chunk, ctx.channel.protocol) {
+            // 帧以 UTF-8 文本交给解码器直解 wire 类型；usage 嗅探按需自行解析。
+            let frame_text = String::from_utf8_lossy(&frame);
+            if let Ok(value) = serde_json::from_str::<Value>(&frame_text)
+                && let Some(sniffed) = protocol::sniff_usage(&value, ctx.channel.protocol)
+            {
                 usage_reported = true;
                 usage.union_max(sniffed);
             }
-            let decoded = decoder.process(&chunk);
+            let decoded = decoder.process(&frame_text);
             for event in &decoded.events {
                 let mut suppress_event = false;
                 if let StreamEvent::Finish {

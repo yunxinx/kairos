@@ -40,7 +40,8 @@ pub(super) struct LogEntry {
     id: i64,
     created_at: i64,
     token_name: String,
-    token_key: String,
+    /// 令牌 key 的 SHA-256 指纹（管理面读取一律掩码；指纹本身不可逆）。
+    token_key_fingerprint: String,
     inbound_protocol: String,
     model: String,
     outbound_model: Option<String>,
@@ -85,7 +86,7 @@ impl LogEntry {
             id: log.id,
             created_at: log.created_at,
             token_name: log.token_name,
-            token_key: mask_token_key(&log.token_key),
+            token_key_fingerprint: mask_token_key(&log.token_key),
             inbound_protocol: log.inbound_protocol,
             model: log.model,
             outbound_model: reveal_topology.then_some(log.outbound_model).flatten(),

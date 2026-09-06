@@ -38,7 +38,9 @@ pub(super) fn routes() -> Router<AdminDeps> {
 #[derive(Debug, Serialize)]
 pub(super) struct TokenView {
     pub(super) id: i64,
-    pub(super) token_key: String,
+    /// 令牌 key 的 SHA-256 指纹（读取面一律掩码）；明文只在创建响应
+    /// [`TokenCreatedView::plaintext_key`] 出现一次。
+    pub(super) token_key_fingerprint: String,
     pub(super) name: String,
     pub(super) limit_usd_micros: Option<i64>,
     pub(super) rate_limit_rpm: Option<u64>,
@@ -57,7 +59,7 @@ impl TokenView {
             available_balance(record.token.limit_usd_micros, settled_usd_micros)?;
         Ok(Self {
             id: record.id,
-            token_key: record.token.token_key,
+            token_key_fingerprint: record.token.token_key,
             name: record.token.name,
             limit_usd_micros: record.token.limit_usd_micros,
             rate_limit_rpm: record.token.rate_limit_rpm,
@@ -76,7 +78,7 @@ impl TokenView {
     ) -> Result<Self, AdminError> {
         let masked = mask_token_key(&record.token.token_key);
         let mut view = Self::from_record(record, settled_usd_micros)?;
-        view.token_key = masked;
+        view.token_key_fingerprint = masked;
         Ok(view)
     }
 }

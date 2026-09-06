@@ -12,6 +12,9 @@
     "lead": "同协议透明转发。网关侧统一治理、计量与观测。",
     "startCta": "开始使用"
   },
+  "session": {
+    "expiredWithUnsaved": "登录已过期。当前页面仍有未保存的更改，已暂停自动跳转；保存或放弃后请重新登录。"
+  },
   "nav": {
     "overview": "概览",
     "tokens": "令牌",
@@ -76,6 +79,9 @@
     "retry": "重试",
     "close": "关闭",
     "discardUnsavedChanges": "有未保存的更改，确定要放弃吗？",
+    "unsavedChangesTitle": "放弃未保存的更改",
+    "confirmDiscard": "放弃更改",
+    "confirmDiscardAnyway": "仍然关闭",
     "cancel": "取消",
     "done": "完成",
     "save": "保存",
@@ -133,6 +139,7 @@
     "search": "按名称搜索",
     "editorCreate": "新建令牌",
     "createdKeyHint": "请立即保存这把 key：它只显示这一次，关闭后无法再从系统取回。",
+    "createdKeyTitle": "关闭一次性 key 面板",
     "confirmCloseCreatedKey": "明文 key 仅展示这一次，关闭后无法再取回。确定要关闭吗？",
     "createdKeyCopyFailed": "无法复制令牌 key：请手动选中上方文本复制。",
     "editorEdit": "编辑令牌",

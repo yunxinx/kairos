@@ -902,14 +902,7 @@ fn typed_thinking_config(
         ReasoningEffort::None => 0,
         effort => effort.budget_tokens()?,
     };
-    let normalized = model.to_ascii_lowercase();
-    let cap = if normalized.contains("2.5-pro") || normalized.contains("2.5-pro-preview") {
-        32_768
-    } else if normalized.contains("2.5") {
-        24_576
-    } else {
-        budget
-    };
+    let cap = crate::core::model_family::gemini_2_5_budget_cap(model).unwrap_or(u32::MAX);
     let budget = budget.min(cap);
     if budget != effort.budget_tokens().unwrap_or(0) {
         warnings.push(Warning::compatibility(
@@ -1539,8 +1532,8 @@ impl StreamDecoder {
     /// 形状不符的 chunk 留痕后跳过（错误语义可安全提取时映射 IR Error）：
     /// 流式面对的是已建立连接的上游，单个坏块不值得整条流报废，异常流由
     /// 网关的流完整性校验归类。流内错误帧产出 IR Error，交由网关终止流。
-    pub fn process(&mut self, chunk: &Value) -> DecodeStreamChunk {
-        let wire = match serde_json::from_value::<WireResponse>(chunk.clone()) {
+    pub fn process(&mut self, chunk: &str) -> DecodeStreamChunk {
+        let wire = match serde_json::from_str::<WireResponse>(chunk) {
             Ok(wire) => wire,
             Err(err) => {
                 return DecodeStreamChunk::delivery(decode_failed_frame(
@@ -2751,7 +2744,7 @@ mod tests {
                 "status": "RESOURCE_EXHAUSTED",
             }
         });
-        let decoded = StreamDecoder::default().process(&error_chunk);
+        let decoded = StreamDecoder::default().process(&error_chunk.to_string());
         assert!(!decoded.is_output);
         assert_eq!(
             decoded.events,
@@ -2769,7 +2762,7 @@ mod tests {
             "error": { "code": 500, "message": "boom", "status": "INTERNAL" },
             "candidates": "not-an-array",
         });
-        let decoded = StreamDecoder::default().process(&chunk);
+        let decoded = StreamDecoder::default().process(&chunk.to_string());
         assert_eq!(
             decoded.events,
             vec![StreamEvent::Error {
@@ -2782,7 +2775,7 @@ mod tests {
     #[test]
     fn malformed_frame_without_error_semantics_is_skipped() {
         let chunk = json!({ "candidates": "not-an-array" });
-        let decoded = StreamDecoder::default().process(&chunk);
+        let decoded = StreamDecoder::default().process(&chunk.to_string());
         assert_eq!(decoded.events, Vec::new());
     }
 
@@ -2795,7 +2788,7 @@ mod tests {
                 { "inlineData": { "mimeType": "image/png", "data": "aGVsbG8=" } }
             ] }, "index": 0 }],
         });
-        let decoded = StreamDecoder::default().process(&chunk);
+        let decoded = StreamDecoder::default().process(&chunk.to_string());
         assert!(!decoded.is_output);
         assert_eq!(
             decoded.events,
@@ -2840,7 +2833,7 @@ mod tests {
         let mut decoder = StreamDecoder::default();
         let events: Vec<StreamEvent> = chunks
             .iter()
-            .flat_map(|chunk| decoder.process(chunk).events)
+            .flat_map(|chunk| decoder.process(&chunk.to_string()).events)
             .collect();
 
         assert_eq!(
@@ -2922,10 +2915,13 @@ mod tests {
     #[test]
     fn cumulative_usage_finishes_only_on_finish_reason() {
         let mut decoder = StreamDecoder::default();
-        let mid_stream = decoder.process(&json!({
-            "candidates": [{ "content": { "role": "model", "parts": [{ "text": "a" }] } }],
-            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 1 }
-        }));
+        let mid_stream = decoder.process(
+            &json!({
+                "candidates": [{ "content": { "role": "model", "parts": [{ "text": "a" }] } }],
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 1 }
+            })
+            .to_string(),
+        );
         assert!(
             !mid_stream
                 .events
@@ -2934,10 +2930,13 @@ mod tests {
             "中途 usage 不应触发 Finish"
         );
 
-        let finish = decoder.process(&json!({
-            "candidates": [{ "finishReason": "STOP" }],
-            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 3 }
-        }));
+        let finish = decoder.process(
+            &json!({
+                "candidates": [{ "finishReason": "STOP" }],
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 3 }
+            })
+            .to_string(),
+        );
         let finish_event = finish
             .events
             .iter()
@@ -2948,9 +2947,12 @@ mod tests {
             .expect("finishReason chunk 应触发 Finish");
         assert_eq!(finish_event.output_tokens, 3);
 
-        let trailing = decoder.process(&json!({
-            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5 }
-        }));
+        let trailing = decoder.process(
+            &json!({
+                "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 5 }
+            })
+            .to_string(),
+        );
         let final_usage = trailing
             .events
             .iter()
@@ -2967,13 +2969,16 @@ mod tests {
     #[test]
     fn stop_after_function_call_finishes_as_tool_calls() {
         let mut decoder = StreamDecoder::default();
-        decoder.process(&json!({
-            "candidates": [{ "content": { "role": "model", "parts": [
-                { "functionCall": { "name": "get_weather", "args": {} } }
-            ] } }]
-        }));
+        decoder.process(
+            &json!({
+                "candidates": [{ "content": { "role": "model", "parts": [
+                    { "functionCall": { "name": "get_weather", "args": {} } }
+                ] } }]
+            })
+            .to_string(),
+        );
         let events = decoder
-            .process(&json!({ "candidates": [{ "finishReason": "STOP" }] }))
+            .process(&json!({ "candidates": [{ "finishReason": "STOP" }] }).to_string())
             .events;
         assert!(matches!(
             events.as_slice(),
@@ -3217,7 +3222,7 @@ mod tests {
             for frame in encoder.encode(event) {
                 let payload: Value =
                     serde_json::from_str(&frame.data).expect("帧载荷应为合法 JSON");
-                decoded.extend(decoder.process(&payload).events);
+                decoded.extend(decoder.process(&payload.to_string()).events);
             }
         }
         // usage.raw 保留解码侧的原 wire 值（加法回写后的 usageMetadata），
@@ -3336,7 +3341,7 @@ mod tests {
             "promptFeedback": { "blockReason": "SAFETY" },
             "usageMetadata": { "promptTokenCount": 5 }
         });
-        let decoded = StreamDecoder::default().process(&chunk);
+        let decoded = StreamDecoder::default().process(&chunk.to_string());
         assert!(!decoded.is_output);
         match decoded.events.as_slice() {
             [
@@ -3587,7 +3592,7 @@ mod tests {
                 { "content": { "role": "model", "parts": [{ "text": "b" }] }, "index": 1 }
             ]
         });
-        let first = decoder.process(&multi);
+        let first = decoder.process(&multi.to_string());
         assert!(first.events.iter().any(|event| matches!(
             event,
             StreamEvent::StreamStart { warnings }
@@ -3595,7 +3600,7 @@ mod tests {
                     if feature == warning_feature::N)
         )));
         // 候选数在整条流内恒定：第二个多候选 chunk 不重复告警。
-        let second = decoder.process(&multi);
+        let second = decoder.process(&multi.to_string());
         assert!(
             second.events.iter().all(|event| !matches!(
                 event,

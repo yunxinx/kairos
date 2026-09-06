@@ -37,6 +37,7 @@ import ChannelProbeWindow from '@/features/channel/ChannelProbeWindow.vue';
 import OverflowChips from '@/components/ui/OverflowChips.vue';
 import { listedModelChips } from '@/lib/model-list';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type ChannelWindowPayload =
   | { kind: 'editor'; channel: ChannelView | null }
@@ -61,6 +62,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<ChannelWindowPayload>();
@@ -538,5 +540,12 @@ function openProbe(channel: ChannelView) {
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

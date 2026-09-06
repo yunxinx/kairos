@@ -139,9 +139,9 @@ function handleRowClick(event: MouseEvent) {
         </div>
         <div
           class="text-fg-muted truncate font-mono text-[10px] opacity-80"
-          :title="entry.token_key"
+          :title="entry.token_key_fingerprint"
         >
-          {{ maskTokenKey(entry.token_key) }}
+          {{ maskTokenKey(entry.token_key_fingerprint) }}
         </div>
       </div>
     </TableCell>

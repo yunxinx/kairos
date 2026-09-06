@@ -1,9 +1,21 @@
 import { authedTest as test, expect } from './fixtures';
 import { E2E_PROTOCOL_PORT } from './helpers/gateway';
 import { e2eRootHeaders } from './helpers/session';
-import { seedChannel } from './helpers/models';
+import { seedChannel, seedPrice, seedToken } from './helpers/models';
 import { clickRowAction } from './helpers/table';
 import { startProbeUpstream } from './helpers/upstream';
+
+/** 按名称取已保存渠道的库生成 id；渠道不存在时返回 undefined。 */
+async function savedChannelId(
+  page: import('@playwright/test').Page,
+  name: string,
+): Promise<number | undefined> {
+  const resp = await page.request.get('/api/channels', {
+    headers: await e2eRootHeaders(page),
+  });
+  const channels = (await resp.json()) as Array<{ id: number; name: string }>;
+  return channels.find((item) => item.name === name)?.id;
+}
 
 /** 读已保存渠道的模型清单；渠道不存在时返回 undefined。 */
 async function savedChannelModels(
@@ -279,9 +291,9 @@ test.describe('channel resource page', () => {
       await page.mouse.move(0, 0);
       await expect(syncError).toBeHidden({ timeout: 5_000 });
       await page.getByTestId('channel-sync-back').click();
-      // 表单已有改动：取消触发脏关闭确认，接受后窗口才真正关闭。
-      page.once('dialog', (dialog) => dialog.accept());
+      // 表单已有改动：取消触发栈内脏关闭确认窗，确认后窗口才真正关闭。
       await page.getByRole('button', { name: 'Cancel' }).click();
+      await page.getByTestId('close-guard-confirm').click();
       await expect(page.getByTestId('channel-editor-name')).toHaveCount(0);
 
       await page.getByTestId('create-channel').click();
@@ -778,9 +790,10 @@ test.describe('channel editor model overflow', () => {
     await expect(createKeyInput).toHaveAttribute('type', 'password');
     await createKeyInput.fill('sk-brand-new');
     await expect(createKeyInput).toHaveValue('sk-brand-new');
-    // 表单已有改动：取消触发脏关闭确认，接受后窗口才真正关闭。
-    page.once('dialog', (dialog) => dialog.accept());
+    // 表单已有改动：取消触发栈内脏关闭确认窗，确认后窗口才真正关闭。
     await page.getByRole('button', { name: /cancel|取消/i }).click();
+    await page.getByTestId('close-guard-confirm').click();
+    await expect(page.getByTestId('channel-editor-name')).toHaveCount(0);
 
     await page.getByTestId('channels-search').fill('mask-key-channel');
     await page.getByTestId('channel-edit').click();
@@ -802,5 +815,56 @@ test.describe('channel editor model overflow', () => {
     const saved = channels.find((item) => item.name === 'mask-key-channel');
     expect(saved?.keys[0].api_key).toBe(`${longKey.slice(0, 8)}******${longKey.slice(-8)}`);
     expect(await page.content()).not.toContain(longKey);
+  });
+});
+
+/** 冷却徽标与倒计时：上游 402（账号域故障，立即冷却）后徽标出现、剩余时间随秒走动。 */
+test.describe('channel cooldown countdown', () => {
+  test('cooldown badge ticks down and clears on expiry', async ({ page }) => {
+    // 独立上游：恒 402（上游账号/计费域故障，单次即触发渠道冷却——
+    // 可重试失败（429/5xx）需连续 3 次才达阈值，不适合短用例）。
+    const upstream = await startProbeUpstream(402);
+    const channelName = 'cooldown-tick-channel';
+    const modelName = 'gpt-4o-cooldown';
+    try {
+      await seedChannel(page, {
+        name: channelName,
+        models: [modelName],
+        base_url: upstream.baseUrl,
+        timeout_ms: 5000,
+      });
+      await seedPrice(page, {
+        channel_id: (await savedChannelId(page, channelName))!,
+        model: modelName,
+        input_micros: 1,
+        output_micros: 1,
+        cache_read_micros: null,
+        cache_write_micros: null,
+        cache_write_1h_micros: null,
+      });
+      const token = await seedToken(page, { name: 'cooldown-probe' });
+
+      // 协议面打一次 402：上游账号域故障，渠道立即进入冷却。
+      const result = await chatCompletionsStatus(page, token.plaintext_key, modelName);
+      expect(result.status).toBe(402);
+
+      await page.goto('/channels');
+      const remaining = page.getByTestId('channel-cooldown-remaining');
+      await expect(remaining).toBeVisible();
+      // 剩余时间格式 `分:秒`，且随秒走动（间隔 1 秒的两次读取不相等——
+      // 同秒内轮询可能取到相同值，放宽为 3 秒窗口内数值下降）。
+      const parseRemaining = async (): Promise<number> => {
+        const text = (await remaining.textContent()) ?? '';
+        const match = /(\d+):(\d{2})/.exec(text);
+        expect(match, `倒计时格式应为 分:秒: ${text}`).toBeTruthy();
+        return Number(match![1]) * 60 + Number(match![2]);
+      };
+      const first = await parseRemaining();
+      await page.waitForTimeout(2_500);
+      const second = await parseRemaining();
+      expect(second).toBeLessThan(first);
+    } finally {
+      await upstream.close();
+    }
   });
 });

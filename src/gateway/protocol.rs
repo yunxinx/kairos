@@ -231,7 +231,9 @@ pub struct DecodeChunk {
 
 /// 流式解码器抽象：把上游 SSE 帧解码为 IR 流事件。
 pub trait ChatStreamDecoder {
-    fn process(&mut self, value: &Value) -> DecodeChunk;
+    /// 解析单个 SSE 帧负载（UTF-8 JSON 文本）。解码器 `from_str` 直达
+    /// wire 类型，热路径不构造中间 `Value`、不做整树克隆。
+    fn process(&mut self, value: &str) -> DecodeChunk;
 }
 
 /// 流式编码器抽象：把 IR 流事件还原为入站 SSE 帧。
@@ -289,7 +291,7 @@ pub fn make_encoder(
 
 struct OpenAiStreamDecoder(crate::core::openai_chat::StreamDecoder);
 impl ChatStreamDecoder for OpenAiStreamDecoder {
-    fn process(&mut self, value: &Value) -> DecodeChunk {
+    fn process(&mut self, value: &str) -> DecodeChunk {
         DecodeChunk {
             events: self.0.process(value).events,
         }
@@ -298,7 +300,7 @@ impl ChatStreamDecoder for OpenAiStreamDecoder {
 
 struct AnthropicStreamDecoder(crate::core::anthropic_messages::StreamDecoder);
 impl ChatStreamDecoder for AnthropicStreamDecoder {
-    fn process(&mut self, value: &Value) -> DecodeChunk {
+    fn process(&mut self, value: &str) -> DecodeChunk {
         DecodeChunk {
             events: self.0.process(value).events,
         }
@@ -307,7 +309,7 @@ impl ChatStreamDecoder for AnthropicStreamDecoder {
 
 struct ResponsesStreamDecoder(crate::core::openai_responses::StreamDecoder);
 impl ChatStreamDecoder for ResponsesStreamDecoder {
-    fn process(&mut self, value: &Value) -> DecodeChunk {
+    fn process(&mut self, value: &str) -> DecodeChunk {
         DecodeChunk {
             events: self.0.process(value).events,
         }
@@ -316,7 +318,7 @@ impl ChatStreamDecoder for ResponsesStreamDecoder {
 
 struct GeminiStreamDecoder(crate::core::gemini::StreamDecoder);
 impl ChatStreamDecoder for GeminiStreamDecoder {
-    fn process(&mut self, value: &Value) -> DecodeChunk {
+    fn process(&mut self, value: &str) -> DecodeChunk {
         DecodeChunk {
             events: self.0.process(value).events,
         }

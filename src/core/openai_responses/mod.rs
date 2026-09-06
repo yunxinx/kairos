@@ -1813,8 +1813,8 @@ pub struct DecodeStreamChunk {
 
 impl StreamDecoder {
     /// 解码单个上游 SSE 事件为若干 IR 流事件。
-    pub fn process(&mut self, value: &Value) -> DecodeStreamChunk {
-        let wire = match serde_json::from_value::<WireStreamEvent>(value.clone()) {
+    pub fn process(&mut self, value: &str) -> DecodeStreamChunk {
+        let wire = match serde_json::from_str::<WireStreamEvent>(value) {
             Ok(wire) => wire,
             Err(err) => {
                 return DecodeStreamChunk::delivery(decode_failed_frame(
@@ -2791,7 +2791,7 @@ mod tests {
             "code": "insufficient_quota",
             "message": "quota exceeded",
         });
-        let decoded = StreamDecoder::default().process(&top_level);
+        let decoded = StreamDecoder::default().process(&top_level.to_string());
         assert!(!decoded.is_output);
         assert_eq!(
             decoded.events,
@@ -2808,7 +2808,7 @@ mod tests {
                 "message": "You exceeded your current quota",
             },
         });
-        let decoded = StreamDecoder::default().process(&nested);
+        let decoded = StreamDecoder::default().process(&nested.to_string());
         assert_eq!(
             decoded.events,
             vec![StreamEvent::Error {
@@ -2826,7 +2826,7 @@ mod tests {
             "message": 42,
             "error": { "message": "boom" },
         });
-        let decoded = StreamDecoder::default().process(&malformed);
+        let decoded = StreamDecoder::default().process(&malformed.to_string());
         assert_eq!(
             decoded.events,
             vec![StreamEvent::Error {
@@ -2839,7 +2839,7 @@ mod tests {
             "item_id": "msg_1",
             "text": "done",
         });
-        let decoded = StreamDecoder::default().process(&unmodeled);
+        let decoded = StreamDecoder::default().process(&unmodeled.to_string());
         assert_eq!(decoded.events, Vec::new());
     }
 
@@ -3042,7 +3042,7 @@ mod tests {
         ];
         for raw in frames {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }
@@ -3068,7 +3068,7 @@ mod tests {
             include_str!("__fixtures__/stream_reasoning_done.json"),
         ] {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }

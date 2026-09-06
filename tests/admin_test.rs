@@ -285,7 +285,10 @@ async fn token_crud_roundtrip_and_immediate_effect() {
         .iter()
         .find(|t| t["id"] == new_id)
         .expect("新建令牌应出现在列表");
-    assert_ne!(listed["token_key"], new_key, "列表不得回显明文 key");
+    assert_ne!(
+        listed["token_key_fingerprint"], new_key,
+        "列表不得回显明文 key"
+    );
 
     // 新建令牌在请求路径即时可用：充值（余额调整属 04 票，测试内用相对量原语
     // 绕过）后请求成功。新建令牌已有零额余额行，故可被 `adjust_balance` 充值。
@@ -2531,7 +2534,7 @@ async fn logs_redact_long_token_keys() {
         .iter()
         .find(|item| item["token_name"] == "long")
         .expect("应有长 key 行");
-    let masked = long_entry["token_key"]
+    let masked = long_entry["token_key_fingerprint"]
         .as_str()
         .expect("token_key 应为字符串");
     assert_eq!(
@@ -2592,7 +2595,7 @@ async fn logs_redact_long_token_keys() {
         .iter()
         .find(|item| item["token_name"] == "short")
         .expect("应有短 key 行");
-    assert_eq!(short_entry["token_key"], "******");
+    assert_eq!(short_entry["token_key_fingerprint"], "******");
 }
 
 /// GET `/logs` 按 Unicode 标量掩码多字节 token_key，不会按字节切片 panic。
@@ -2652,7 +2655,7 @@ async fn logs_mask_multibyte_token_keys_without_panic() {
         .chain(['*', '*', '*', '*', '*', '*'].iter())
         .chain(chars[chars.len() - 8..].iter())
         .collect();
-    assert_eq!(entry["token_key"], expected);
+    assert_eq!(entry["token_key_fingerprint"], expected);
 }
 
 /// GET `/logs?settled=` 过滤，且 `unsettled_total` 忽略 settled 维。
@@ -2882,7 +2885,9 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
     assert_eq!(token.status(), reqwest::StatusCode::CREATED);
     let token: Value = token.json().await.expect("令牌应可解析");
     let token_id = token["id"].as_i64().expect("应有令牌 id");
-    let token_key = token["token_key"].as_str().expect("应有令牌 key");
+    let token_key = token["token_key_fingerprint"]
+        .as_str()
+        .expect("应有令牌 key");
 
     let mut log = store::RequestLog {
         id: 0,

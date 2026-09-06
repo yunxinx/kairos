@@ -7,6 +7,7 @@ pub mod anthropic_messages;
 pub mod billing;
 pub mod gemini;
 pub mod ir;
+pub mod model_family;
 pub mod openai_chat;
 pub mod openai_responses;
 pub(crate) mod schema;

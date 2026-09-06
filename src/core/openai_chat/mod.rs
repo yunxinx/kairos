@@ -1592,8 +1592,8 @@ pub struct StreamDecoder {
 
 impl StreamDecoder {
     /// 解码单个上游 chunk 为若干 IR 流事件。
-    pub fn process(&mut self, chunk: &Value) -> DecodeStreamChunk {
-        let wire = match serde_json::from_value::<WireStreamChunk>(chunk.clone()) {
+    pub fn process(&mut self, chunk: &str) -> DecodeStreamChunk {
+        let wire = match serde_json::from_str::<WireStreamChunk>(chunk) {
             Ok(wire) => wire,
             Err(err) => {
                 return DecodeStreamChunk::delivery(decode_failed_frame(
@@ -2842,7 +2842,7 @@ mod tests {
         ];
         for raw in frames {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }
@@ -2864,7 +2864,7 @@ mod tests {
             "id": "chatcmpl-9", "object": "chat.completion.chunk", "model": "gpt-4o",
             "choices": [{ "index": 0, "delta": { "role": "assistant", "content": "Hel" } }]
         });
-        let decoded = StreamDecoder::default().process(&text_chunk);
+        let decoded = StreamDecoder::default().process(&text_chunk.to_string());
         assert!(decoded.is_output);
         assert_eq!(
             decoded.events,
@@ -2890,7 +2890,7 @@ mod tests {
             "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
             "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
         });
-        let decoded = StreamDecoder::default().process(&finish_chunk);
+        let decoded = StreamDecoder::default().process(&finish_chunk.to_string());
         assert!(!decoded.is_output);
         assert_eq!(decoded.events.len(), 1);
         match &decoded.events[0] {
@@ -2920,7 +2920,7 @@ mod tests {
                 "code": "429",
             }
         });
-        let decoded = StreamDecoder::default().process(&error_chunk);
+        let decoded = StreamDecoder::default().process(&error_chunk.to_string());
         assert!(!decoded.is_output);
         assert_eq!(
             decoded.events,
@@ -2938,7 +2938,7 @@ mod tests {
             "error": { "message": "boom", "code": "internal" },
             "choices": "not-an-array",
         });
-        let decoded = StreamDecoder::default().process(&chunk);
+        let decoded = StreamDecoder::default().process(&chunk.to_string());
         assert_eq!(
             decoded.events,
             vec![StreamEvent::Error {
@@ -2951,7 +2951,7 @@ mod tests {
     #[test]
     fn malformed_frame_without_error_semantics_is_skipped() {
         let chunk = json!({ "choices": "not-an-array" });
-        let decoded = StreamDecoder::default().process(&chunk);
+        let decoded = StreamDecoder::default().process(&chunk.to_string());
         assert_eq!(decoded.events, Vec::new());
     }
 
@@ -2966,6 +2966,7 @@ mod tests {
                 "id": "chatcmpl-r", "object": "chat.completion.chunk", "model": "deepseek-chat",
                 "choices": [{ "index": 0, "delta": delta }]
             })
+            .to_string()
         };
         let mut decoder = StreamDecoder::default();
 
@@ -3038,9 +3039,12 @@ mod tests {
         );
 
         // 流收尾：推理块已收，Finish 前不再重复 ReasoningEnd。
-        let decoded = decoder.process(&json!({
-            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
-        }));
+        let decoded = decoder.process(
+            &json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+            })
+            .to_string(),
+        );
         assert_eq!(decoded.events.len(), 1);
         assert!(matches!(decoded.events[0], StreamEvent::Finish { .. }));
     }
@@ -3049,15 +3053,21 @@ mod tests {
     #[test]
     fn reasoning_only_stream_closes_block_before_finish() {
         let mut decoder = StreamDecoder::default();
-        decoder.process(&json!({
-            "id": "chatcmpl-r", "object": "chat.completion.chunk", "model": "deepseek-chat",
-            "choices": [{ "index": 0, "delta": {
-                "role": "assistant", "reasoning_content": "只想不答。"
-            } }]
-        }));
-        let decoded = decoder.process(&json!({
-            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
-        }));
+        decoder.process(
+            &json!({
+                "id": "chatcmpl-r", "object": "chat.completion.chunk", "model": "deepseek-chat",
+                "choices": [{ "index": 0, "delta": {
+                    "role": "assistant", "reasoning_content": "只想不答。"
+                } }]
+            })
+            .to_string(),
+        );
+        let decoded = decoder.process(
+            &json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+            })
+            .to_string(),
+        );
         assert_eq!(
             decoded.events,
             vec![
@@ -3089,12 +3099,15 @@ mod tests {
             .into_iter()
             .flat_map(|delta| {
                 decoder
-                    .process(&json!({
-                        "id": "chatcmpl-9",
-                        "object": "chat.completion.chunk",
-                        "model": "gpt-4o",
-                        "choices": [{ "index": 0, "delta": { "content": delta } }]
-                    }))
+                    .process(
+                        &json!({
+                            "id": "chatcmpl-9",
+                            "object": "chat.completion.chunk",
+                            "model": "gpt-4o",
+                            "choices": [{ "index": 0, "delta": { "content": delta } }]
+                        })
+                        .to_string(),
+                    )
                     .events
             })
             .filter(|event| matches!(event, StreamEvent::ResponseMetadata { .. }))
@@ -3115,7 +3128,7 @@ mod tests {
             "choices": [],
             "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
         });
-        let decoded = StreamDecoder::default().process(&usage_chunk);
+        let decoded = StreamDecoder::default().process(&usage_chunk.to_string());
         // 帧含 id/model，先产出 ResponseMetadata，再产出 Finish。
         assert_eq!(
             decoded.events.len(),
@@ -3142,8 +3155,8 @@ mod tests {
             "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
         });
         let mut decoder = StreamDecoder::default();
-        decoder.process(&finish_chunk);
-        let decoded = decoder.process(&usage_chunk);
+        decoder.process(&finish_chunk.to_string());
+        let decoded = decoder.process(&usage_chunk.to_string());
         match decoded.events.last().expect("应产出 Finish") {
             StreamEvent::Finish { finish_reason, .. } => {
                 assert_eq!(finish_reason.unified, FinishReasonUnified::ToolCalls);
@@ -3169,8 +3182,8 @@ mod tests {
         });
 
         let mut decoder = StreamDecoder::default();
-        let first_events = decoder.process(&first).events;
-        let second_events = decoder.process(&second).events;
+        let first_events = decoder.process(&first.to_string()).events;
+        let second_events = decoder.process(&second.to_string()).events;
         assert!(matches!(
             &first_events[0],
             StreamEvent::ToolInputStart { id, tool_name, .. }
@@ -3585,7 +3598,7 @@ mod tests {
                 "function": { "arguments": "{}" }
             }] } }]
         });
-        let decoded = StreamDecoder::default().process(&chunk);
+        let decoded = StreamDecoder::default().process(&chunk.to_string());
         let warning_events: Vec<&Vec<Warning>> = decoded
             .events
             .iter()
@@ -3614,14 +3627,14 @@ mod tests {
             }] } }]
         });
         let mut decoder = StreamDecoder::default();
-        let first_events = decoder.process(&first).events;
+        let first_events = decoder.process(&first.to_string()).events;
         assert!(matches!(
             first_events.as_slice(),
             [StreamEvent::StreamStart { warnings }]
                 if matches!(warnings.as_slice(), [Warning::Compatibility { feature, .. }]
                     if feature == warning_feature::TOOL_CALL)
         ));
-        let second_events = decoder.process(&second).events;
+        let second_events = decoder.process(&second.to_string()).events;
         assert!(
             matches!(
                 second_events.as_slice(),

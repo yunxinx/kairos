@@ -7,6 +7,7 @@ import { loadTokenRows, type TokenRow } from '@/api/token-rows';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import Checkbox from '@/components/ui/Checkbox.vue';
 import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
@@ -67,6 +68,7 @@ function takePendingAnchor(): FloatingWindowAnchor | null {
 const {
   windows,
   topmostId,
+  pendingConfirmation,
   open: openWindow,
   close: closeWindow,
   setDirty,
@@ -369,7 +371,7 @@ function openBulkDelete() {
               </TableCell>
               <TableCell>
                 <code class="code-chip rounded px-2 py-0.5 font-mono text-xs">
-                  {{ maskTokenKey(token.token_key) }}
+                  {{ maskTokenKey(token.token_key_fingerprint) }}
                 </code>
               </TableCell>
               <TableCell>
@@ -539,5 +541,12 @@ function openBulkDelete() {
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>
