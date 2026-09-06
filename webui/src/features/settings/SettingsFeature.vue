@@ -8,6 +8,7 @@ import type { CatalogMeta, Settings } from '@/api/types';
 import PageHeader from '@/app/layout/PageHeader.vue';
 import FormField from '@/components/ui/FormField.vue';
 import FormSwitch from '@/components/ui/FormSwitch.vue';
+import FormTextarea from '@/components/ui/FormTextarea.vue';
 import FormTextInput from '@/components/ui/FormTextInput.vue';
 import InlineError from '@/components/ui/InlineError.vue';
 import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
@@ -736,11 +737,11 @@ const tabsAria = computed(() => t('settings.sections'));
                 :guide="t('settings.privateNetworkAllowlistGuide')"
               >
                 <template #default>
-                  <textarea
+                  <FormTextarea
                     id="settings-private-network-allowlist"
                     v-model="privateNetworkAllowlist"
                     rows="3"
-                    class="input-base min-h-20 w-full resize-y font-mono text-xs"
+                    class="min-h-20 w-full font-mono text-xs"
                     data-testid="settings-private-network-allowlist"
                   />
                 </template>

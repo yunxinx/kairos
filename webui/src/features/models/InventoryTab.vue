@@ -72,8 +72,10 @@ const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 const canRewriteChannels = computed(() => me.value?.role === 'root');
 const canSelectRows = computed(() => canEditCatalog.value || canRewriteChannels.value);
 const hasActions = computed(() => canEditPrices.value || canRewriteChannels.value);
+// 选择 + 模型/别名 + 四档单价（cache 写入另含 1h 档）+ 操作。分组行与空态行
+// 的 colspan 都从这里取：改列结构只动这一处，不再让分组行漏盖尾部列。
 const tableColumnCount = computed(
-  () => 6 + (canSelectRows.value ? 1 : 0) + (hasActions.value ? 1 : 0),
+  () => 7 + (canSelectRows.value ? 1 : 0) + (hasActions.value ? 1 : 0),
 );
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
@@ -429,6 +431,7 @@ function loadErrorMessage(): string {
           <col v-if="canSelectRows" class="w-10" />
           <col />
           <col />
+          <col class="w-28" />
           <col class="w-28" />
           <col class="w-28" />
           <col class="w-28" />
