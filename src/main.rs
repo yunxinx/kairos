@@ -68,12 +68,20 @@ async fn main() -> anyhow::Result<()> {
     // 可选的管理面：配置了 `admin_listen` 才启动独立管理监听；未配置即管理面
     // 整体关闭，协议监听不注册任何管理路由。管理面与协议面物理隔离。
     if let Some(admin_listen) = &cfg.admin_listen {
+        if !cfg.admin_trusted_origins.is_empty() {
+            // 受信来源直接扩大写请求的放行面，启动时显式留痕便于运营核查。
+            tracing::info!(
+                origins = ?cfg.admin_trusted_origins,
+                "管理面同源守卫放行配置的受信来源"
+            );
+        }
         let admin_app = gateway::admin_router_with_writer(
             pool.clone(),
             snapshot.clone(),
             cfg.database.path.clone(),
             request_log_writer.clone(),
             channel_cooldowns.clone(),
+            cfg.admin_trusted_origins.clone(),
         );
         let admin_addr = format!("{}:{}", admin_listen.host, admin_listen.port);
         let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;

@@ -266,6 +266,82 @@ async fn login_requires_same_origin() {
     assert_eq!(same.status(), StatusCode::OK);
 }
 
+/// `admin_trusted_origins` 拓扑：管理 SPA 与管理 API 不同源、经服务端转发
+/// （如前端开发服务器把 `/api` 代理到管理监听）时，配置的来源对登录与登录后
+/// 的写请求放行；未列入的跨站来源仍被同源守卫拒绝，Cookie 会话认证不变。
+#[tokio::test]
+async fn trusted_origins_allow_forwarded_dev_server_writes() {
+    let dev_origin = "http://127.0.0.1:5173";
+    let gw = TestGateway::start_with_admin_trusted_origins(
+        common::test_seed,
+        vec!["http://127.0.0.1:5173"],
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // 受信来源上的登录：放行（开发服务器代理场景的入口请求）。
+    let login = client
+        .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, dev_origin)
+        .json(&json!({
+            "email": common::TEST_ROOT_EMAIL,
+            "password": common::TEST_ROOT_PASSWORD
+        }))
+        .send()
+        .await
+        .expect("登录请求应可达");
+    assert_eq!(login.status(), StatusCode::OK);
+    let session = common::session_cookie(&login);
+
+    // 受信来源上的管理写请求：放行。
+    let created = client
+        .post(admin_url(&gw, "/users"))
+        .header(reqwest::header::COOKIE, &session)
+        .header(reqwest::header::ORIGIN, dev_origin)
+        .json(&json!({
+            "email": "dev-server@example.com",
+            "display_name": "dev-server",
+            "password": "password1",
+            "role": "user"
+        }))
+        .send()
+        .await
+        .expect("创建用户应可达");
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    // 未列入的跨站来源：仍按跨站拒绝，白名单不是通配。
+    let denied = client
+        .post(admin_url(&gw, "/users"))
+        .header(reqwest::header::COOKIE, &session)
+        .header(reqwest::header::ORIGIN, "https://evil.example")
+        .json(&json!({
+            "email": "evil@example.com",
+            "display_name": "evil",
+            "password": "password1",
+            "role": "user"
+        }))
+        .send()
+        .await
+        .expect("创建用户应可达");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    // 端口不同也不放行：精确匹配 host+port，同主机其他端口不属于同一来源。
+    let wrong_port = client
+        .post(admin_url(&gw, "/users"))
+        .header(reqwest::header::COOKIE, &session)
+        .header(reqwest::header::ORIGIN, "http://127.0.0.1:9999")
+        .json(&json!({
+            "email": "other-port@example.com",
+            "display_name": "other-port",
+            "password": "password1",
+            "role": "user"
+        }))
+        .send()
+        .await
+        .expect("创建用户应可达");
+    assert_eq!(wrong_port.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn unsafe_management_requests_require_same_origin() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;

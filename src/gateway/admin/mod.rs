@@ -154,33 +154,18 @@ pub(super) async fn begin_write(
         .map_err(db_err)
 }
 
-/// 组装管理面路由：资源 CRUD 挂在认证中间件之后；`/login` 与静态 UI 免认证。
-///
-/// 路由以领域词直出（`/tokens`、`/channels`、`/prices`），集合端点 GET 列出、
-/// POST 新建；单资源端点 PUT 整体替换、DELETE 删除。UI 静态资源与未匹配的 GET
-/// 深链不经认证中间件。
-pub fn router(
-    pool: SqlitePool,
-    snapshot: crate::runtime::SnapshotHandle,
-    db_path: std::path::PathBuf,
-    channel_cooldowns: ChannelCooldowns,
-) -> Router {
-    router_with_writer(
-        pool.clone(),
-        snapshot,
-        db_path,
-        RequestLogWriter::start(pool),
-        channel_cooldowns,
-    )
-}
-
 /// 组装管理面路由并注入共享的请求日志写入器。
+///
+/// 资源 CRUD 挂在认证中间件之后；`/login` 与静态 UI 免认证。路由以领域词直出
+/// （`/tokens`、`/channels`、`/prices`），集合端点 GET 列出、POST 新建；单资源
+/// 端点 PUT 整体替换、DELETE 删除。UI 静态资源与未匹配的 GET 深链不经认证中间件。
 pub fn router_with_writer(
     pool: SqlitePool,
     snapshot: crate::runtime::SnapshotHandle,
     db_path: std::path::PathBuf,
     request_log_writer: RequestLogWriter,
     channel_cooldowns: ChannelCooldowns,
+    trusted_origins: Vec<reqwest::Url>,
 ) -> Router {
     // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
     // builder 事先记下错误时失败；本路径未设置会失败的选项。
@@ -201,6 +186,9 @@ pub fn router_with_writer(
         request_log_writer,
         channel_cooldowns,
     };
+    // 受信来源只被同源守卫中间件消费，不进路由状态：受保护层克隆一份，登录
+    // 端点单独挂同一守卫、按值拿走。共享句柄让每请求的中间件状态克隆保持廉价。
+    let trusted_origins = Arc::new(trusted_origins);
     let root_only = Router::new()
         .merge(channels::routes())
         .merge(channels::model_routes())
@@ -234,7 +222,10 @@ pub fn router_with_writer(
         .merge(root_only)
         .merge(admin_plus)
         .merge(signed_in)
-        .route_layer(middleware::from_fn(auth::same_origin_guard))
+        .route_layer(middleware::from_fn_with_state(
+            trusted_origins.clone(),
+            auth::same_origin_guard,
+        ))
         .route_layer(middleware::from_fn_with_state(
             AdminAuth { pool },
             auth::admin_auth,
@@ -246,7 +237,7 @@ pub fn router_with_writer(
     // 深链刷新才能正常命中页面路由。
     let api = Router::new()
         .merge(protected)
-        .merge(users::public_routes())
+        .merge(users::public_routes(trusted_origins))
         // `/api` 子路由必须有自己的 fallback：否则未匹配的 `/api/typo` 会落到顶层
         // fallback 上，把 index.html 当成 API 响应回给调用方。
         .fallback(api_not_found);

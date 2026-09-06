@@ -41,6 +41,15 @@ pub struct Config {
     /// 可选的管理监听地址；配置了才启动管理面，否则管理 API 整体关闭。
     #[serde(default)]
     pub admin_listen: Option<Listen>,
+    /// 管理面写请求同源守卫的追加受信来源（`scheme://host[:port]`，逐项精确匹配）。
+    ///
+    /// 供管理 SPA 与管理 API 不同源、但由服务端转发的拓扑放行浏览器写请求，典型是
+    /// 本地前端开发服务器（`npm run dev` 起在 5173，把 `/api` 代理到 `admin_listen`）：
+    /// 代理改写 Host 头却保留浏览器 Origin，同源比对必然失败。只放宽来源比对，
+    /// 不放宽 Cookie 会话认证；空表（缺省）= 仅同源。这不是完整 CORS——没有
+    /// 预检与跨源响应头，不经转发的跨源直连仍不可用。
+    #[serde(default, deserialize_with = "deserialize_trusted_origins")]
+    pub admin_trusted_origins: Vec<reqwest::Url>,
 }
 
 /// HTTP 监听地址。
@@ -159,6 +168,48 @@ fn blank_to_none(value: Option<String>) -> Option<String> {
     value.filter(|raw| !raw.trim().is_empty())
 }
 
+/// 解析单个受信来源：必须是 `http(s)://host[:port]` 形态的纯源。
+///
+/// 逐项严卡（无路径/查询/片段/用户信息、仅 http/https、主机名不以点结尾）是
+/// 刻意的：这个白名单直接决定哪些来源能携带 Cookie 发起写请求，宁可配置时
+/// 多打几个字，也不留子串或通配匹配带来的误放行。配置加载与测试播种共用
+/// 本函数，两条路径对「合法来源」只有一种定义。
+pub fn parse_trusted_origin(raw: &str) -> Result<reqwest::Url, String> {
+    let trimmed = raw.trim();
+    let url = reqwest::Url::parse(trimmed)
+        .map_err(|err| format!("受信来源 {raw:?} 不是合法 URL: {err}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("受信来源 {raw:?} 必须是 http/https 源"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("受信来源 {raw:?} 不应携带用户信息"));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "受信来源 {raw:?} 只能是 scheme://host[:port]，不应带路径/查询/片段"
+        ));
+    }
+    // 结尾点主机名（DNS 全称形态）能通过上面的全部检查，但浏览器 Origin 不发
+    // 送结尾点，按 host_str 精确比对永不命中——按坏值拒绝，不给静默失效留口。
+    if url.host_str().is_some_and(|host| host.ends_with('.')) {
+        return Err(format!(
+            "受信来源 {raw:?} 的主机名不应以点结尾（浏览器 Origin 不带结尾点，该配置永不匹配）"
+        ));
+    }
+    Ok(url)
+}
+
+/// 反序列化时即校验每个受信来源：坏值让启动直接失败，而不是运行期静默失效。
+fn deserialize_trusted_origins<'de, D>(deserializer: D) -> Result<Vec<reqwest::Url>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|origin| parse_trusted_origin(&origin).map_err(serde::de::Error::custom))
+        .collect()
+}
+
 impl Config {
     /// 从 `path` 加载配置，并把相对路径解析为相对配置文件目录的绝对路径。
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -173,6 +224,14 @@ impl Config {
         // 空串与缺省同义，避免 JSON 里写了 `"admin_password": ""` 却被当成「已配置的空口令」。
         config.admin_email = blank_to_none(config.admin_email);
         config.admin_password = blank_to_none(config.admin_password);
+        // 受信来源只服务管理面写请求守卫；管理面未启动时它是永远不生效的孤儿
+        // 配置，按「避免静默漏配」直接报错，而不是启动后无声忽略。
+        if config.admin_listen.is_none() && !config.admin_trusted_origins.is_empty() {
+            return Err(ConfigError::Invalid {
+                path: path.display().to_string(),
+                message: "admin_trusted_origins 仅管理面生效，需同时配置 admin_listen".to_string(),
+            });
+        }
         config.resolve_paths(path);
         Ok(config)
     }
@@ -216,7 +275,7 @@ mod tests {
         );
     }
 
-    /// 全字段（含可选管理监听与种子邮箱/密码）配置可解析，相对路径相对配置文件目录解析。
+    /// 全字段（含可选管理监听、种子邮箱/密码与受信来源）配置可解析，相对路径相对配置文件目录解析。
     #[test]
     fn load_full_config_and_resolve_relative_path() {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
@@ -229,7 +288,8 @@ mod tests {
                 "database": {{ "path": "./kairos.db" }},
                 "admin_email": "root@example.com",
                 "admin_password": "sk-admin",
-                "admin_listen": {{ "host": "127.0.0.1", "port": 8788 }}
+                "admin_listen": {{ "host": "127.0.0.1", "port": 8788 }},
+                "admin_trusted_origins": ["http://127.0.0.1:5173"]
             }}"#
         )
         .expect("应能写入配置");
@@ -243,11 +303,15 @@ mod tests {
         assert_eq!(cfg.admin_password.as_deref(), Some("sk-admin"));
         let admin = cfg.admin_listen.expect("管理监听应可解析");
         assert_eq!(admin.port, 8788);
+        assert_eq!(cfg.admin_trusted_origins.len(), 1);
+        assert_eq!(cfg.admin_trusted_origins[0].scheme(), "http");
+        assert_eq!(cfg.admin_trusted_origins[0].host_str(), Some("127.0.0.1"));
+        assert_eq!(cfg.admin_trusted_origins[0].port(), Some(5173));
         // 相对路径已相对配置文件目录解析。
         assert_eq!(cfg.database.path, dir.path().join("kairos.db"));
     }
 
-    /// 缺省的管理监听地址：未配置即管理面关闭（`None`）。
+    /// 缺省的管理监听地址：未配置即管理面关闭（`None`），受信来源为空表。
     #[test]
     fn admin_listen_omitted_is_off() {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
@@ -261,6 +325,81 @@ mod tests {
         assert!(cfg.admin_listen.is_none(), "缺管理监听应为关闭");
         assert!(cfg.admin_email.is_none());
         assert!(cfg.admin_password.is_none());
+        assert!(cfg.admin_trusted_origins.is_empty(), "缺省受信来源应为空表");
+    }
+
+    /// 受信来源逐项严卡：非 http(s) 协议、带路径/查询、带用户信息、结尾点
+    /// 主机名、非 URL 都让启动失败。
+    #[test]
+    fn trusted_origins_reject_non_origin_shapes() {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let base = r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_listen":{"host":"127.0.0.1","port":8788},"admin_trusted_origins":"#;
+        for raw in [
+            r#"["ftp://127.0.0.1:5173"]"#,
+            r#"["http://127.0.0.1:5173/dev"]"#,
+            r#"["http://user:pw@127.0.0.1:5173"]"#,
+            r#"["https://ops.example.com."]"#,
+            r#"["http://localhost.:5173"]"#,
+            r#"["not-a-url"]"#,
+            r#""http://127.0.0.1:5173""#,
+        ] {
+            let cfg_path = dir.path().join("config.json");
+            std::fs::write(&cfg_path, format!("{base}{raw}}}")).expect("应能写配置");
+            assert!(
+                Config::load(&cfg_path).is_err(),
+                "受信来源 {raw} 应在启动时报错"
+            );
+        }
+        // 合法形态：显式端口、缺省端口、结尾斜杠（规范化后仍是纯源）都接受。
+        let cfg_path = dir.path().join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_listen":{"host":"127.0.0.1","port":8788},"admin_trusted_origins":["http://127.0.0.1:5173","https://ops.example.com","http://localhost:5173/"]}"#,
+        )
+        .expect("应能写配置");
+        let cfg = Config::load(&cfg_path).expect("合法受信来源应可解析");
+        assert_eq!(cfg.admin_trusted_origins.len(), 3);
+        assert_eq!(cfg.admin_trusted_origins[0].port(), Some(5173));
+        assert_eq!(
+            cfg.admin_trusted_origins[1].port_or_known_default(),
+            Some(443)
+        );
+    }
+
+    /// 受信来源是管理面专属配置：未配置 admin_listen 时按孤儿配置报错，
+    /// 与未知字段同一「避免静默漏配」口径。
+    #[test]
+    fn trusted_origins_without_admin_listen_are_rejected() {
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let cfg_path = dir.path().join("config.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"listen":{"host":"0.0.0.0","port":1},"database":{"path":"d.db"},"admin_trusted_origins":["http://127.0.0.1:5173"]}"#,
+        )
+        .expect("应能写配置");
+        let err = Config::load(&cfg_path).expect_err("孤儿受信来源应报错");
+        match err {
+            ConfigError::Invalid { message, .. } => {
+                assert!(
+                    message.contains("admin_listen"),
+                    "错误应点明缺 admin_listen，实际 {message}"
+                );
+            }
+            other => panic!("应报 Invalid 错误，实际 {other:?}"),
+        }
+    }
+
+    /// 仓库示例配置必须始终可加载：它列全字段、是字段形态的活参考——新增
+    /// 必填字段而示例未跟上时，这里立即失败。
+    #[test]
+    fn example_config_loads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
+        let cfg = Config::load(&path).expect("示例配置应可加载");
+        assert!(cfg.admin_listen.is_some(), "示例应展示管理监听字段");
+        assert!(
+            cfg.admin_trusted_origins.is_empty(),
+            "示例的受信来源保持空表（安全缺省）"
+        );
     }
 
     /// 未知字段报错，避免静默漏配。旧的 `admin_key` 也走这条路，迫使改名而不是继续当 Bearer。

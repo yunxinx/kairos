@@ -1,5 +1,8 @@
 {
   "listen": { "host": "127.0.0.1", "port": 8787 },
   "database": { "path": "./kairos.db" },
-  "admin_listen": { "host": "127.0.0.1", "port": 8788 }
+  "admin_listen": { "host": "127.0.0.1", "port": 8788 },
+  "admin_email": "root@example.com",
+  "admin_password": "change-me",
+  "admin_trusted_origins": []
 }

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::{
     Extension, Json, Router,
@@ -62,12 +63,16 @@ pub(super) fn signed_in_routes() -> Router<AdminDeps> {
         .route("/logout", post(logout))
 }
 
-pub(super) fn public_routes() -> Router<AdminDeps> {
+pub(super) fn public_routes(trusted_origins: Arc<Vec<reqwest::Url>>) -> Router<AdminDeps> {
     // 登录虽免认证，但写语义同权暴露 login-CSRF 面：与受保护端点一样要求
     // 同源浏览器信号（SPA 登录请求自带 Origin；非浏览器脚本需显式携带）。
+    // 守卫状态与受保护层同源：`admin_trusted_origins` 的放行口径两边一致。
     Router::new().route(
         "/login",
-        post(login).route_layer(middleware::from_fn(super::auth::same_origin_guard)),
+        post(login).route_layer(middleware::from_fn_with_state(
+            trusted_origins,
+            super::auth::same_origin_guard,
+        )),
     )
 }
 

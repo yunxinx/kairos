@@ -728,17 +728,35 @@ impl TestGateway {
     /// 用自定义 seed 启动完整测试环境。`make_seed` 接收 mock 上游 base URL，
     /// 返回要播种进数据库的资源（计费/渠道可在其中定制）。
     pub async fn start_with(make_seed: impl Fn(&str) -> Seed) -> Self {
-        Self::start_with_opts(make_seed, false).await
+        Self::start_with_opts(make_seed, false, Vec::new()).await
     }
 
     /// 带独立管理监听启动：协议面与 `start_with` 相同，另起管理监听。
     /// 内置 root 用 `TEST_ROOT_EMAIL` / `TEST_ROOT_PASSWORD` 播种后登录。
     pub async fn start_with_admin(make_seed: impl Fn(&str) -> Seed) -> Self {
-        Self::start_with_opts(make_seed, true).await
+        Self::start_with_opts(make_seed, true, Vec::new()).await
+    }
+
+    /// 带独立管理监听与同源守卫受信来源启动：验证 `admin_trusted_origins` 拓扑
+    /// （管理 SPA 与管理 API 不同源、经服务端转发的开发/反代场景）。来源经
+    /// 配置同款严卡解析，测试与生产对「合法来源」只有一种定义。
+    pub async fn start_with_admin_trusted_origins(
+        make_seed: impl Fn(&str) -> Seed,
+        trusted_origins: Vec<&str>,
+    ) -> Self {
+        let origins = trusted_origins
+            .iter()
+            .map(|raw| kairos::config::parse_trusted_origin(raw).expect("测试受信来源应合法"))
+            .collect();
+        Self::start_with_opts(make_seed, true, origins).await
     }
 
     /// 内部统一启动逻辑：建库 → 播种 → 加载快照 →（可选）起管理监听 → 起网关。
-    async fn start_with_opts(make_seed: impl Fn(&str) -> Seed, with_admin: bool) -> Self {
+    async fn start_with_opts(
+        make_seed: impl Fn(&str) -> Seed,
+        with_admin: bool,
+        trusted_origins: Vec<reqwest::Url>,
+    ) -> Self {
         let upstream = MockUpstream::start().await;
 
         let db_dir = tempfile::tempdir().expect("应能创建临时库目录");
@@ -769,11 +787,13 @@ impl TestGateway {
             )
             .await
             .expect("测试 root 应能播种登录凭证");
-            let admin_app = gateway::admin_router(
+            let admin_app = gateway::admin_router_with_writer(
                 pool.clone(),
                 snapshot.clone(),
                 db_path.clone(),
+                gateway::RequestLogWriter::start(pool.clone()),
                 channel_cooldowns.clone(),
+                trusted_origins.clone(),
             );
             let admin_listener = TcpListener::bind("127.0.0.1:0")
                 .await

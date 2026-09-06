@@ -3,6 +3,8 @@
 //! 这个模块把 Cookie 会话解析、会话查验和角色中间件集中在一个窄接口后面；资源
 //! 处理器只接收已经解析好的 [`ManagementIdentity`]，不再重复理解凭证或限流细节。
 
+use std::sync::Arc;
+
 use axum::{
     Json,
     extract::{Request, State},
@@ -249,7 +251,7 @@ pub(super) fn request_is_secure(headers: &axum::http::HeaderMap) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
 }
 
-fn has_same_origin(headers: &axum::http::HeaderMap) -> bool {
+fn has_same_origin(headers: &axum::http::HeaderMap, trusted_origins: &[reqwest::Url]) -> bool {
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -274,18 +276,38 @@ fn has_same_origin(headers: &axum::http::HeaderMap) -> bool {
     let Ok(source) = reqwest::Url::parse(source) else {
         return false;
     };
+    origin_matches(&source, &expected)
+        || trusted_origins
+            .iter()
+            .any(|trusted| origin_matches(&source, trusted))
+}
+
+/// 源等价：scheme/host/port 三元组一致，缺省端口按协议已知默认折算。
+fn origin_matches(source: &reqwest::Url, expected: &reqwest::Url) -> bool {
     source.scheme() == expected.scheme()
         && source.host_str() == expected.host_str()
         && source.port_or_known_default() == expected.port_or_known_default()
 }
 
 /// 管理面的写请求必须带同源浏览器信号，避免 Cookie 被跨站请求自动携带。
-pub(super) async fn same_origin_guard(request: Request, next: Next) -> Response {
+///
+/// 同源之外，`admin_trusted_origins` 配置的来源同样放行：面向管理 SPA 与管理
+/// API 不同源、但由服务端转发的拓扑（如前端开发服务器把 `/api` 代理到管理
+/// 监听）。只放宽来源比对，Cookie 会话认证与角色能力校验不变。
+///
+/// 中间件状态即受信来源表的共享句柄（空表 = 仅同源），经 `from_fn_with_state`
+/// 注入，与路由状态分离——登录等免认证端点单独挂同一守卫，每请求克隆的只是
+/// 一次 Arc 递增。
+pub(super) async fn same_origin_guard(
+    State(trusted_origins): State<Arc<Vec<reqwest::Url>>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let requires_check = matches!(
         request.method(),
         &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
     );
-    if requires_check && !has_same_origin(request.headers()) {
+    if requires_check && !has_same_origin(request.headers(), &trusted_origins) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": { "code": "forbidden", "message": "请求来源不受信任" } })),
