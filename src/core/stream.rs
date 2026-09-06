@@ -1,4 +1,4 @@
-//! 流式累积器：把 IR 流事件无损归约为非流式响应（ADR-0001 同构）。
+//! 流式累积器：把 IR 流事件无损归约为非流式响应（流式与非流式同构）。
 //!
 //! 流式与非流式同构：一条流的 `start/delta/end` 与生命周期事件经
 //! [`StreamAccumulator`] 累积后得到与直接解码非流式响应一致的 [`ChatResponse`]。
@@ -71,8 +71,9 @@ struct PendingTool {
 ///
 /// Anthropic thinking 的 signature 在 `signature_delta` 才到达（内容增量之后），
 /// 因此逃生舱必须逐事件累加而非只取首个事件的值，否则 signature 丢失、多轮
-/// thinking 被上游拒绝。
-fn merge_provider_options(
+/// thinking 被上游拒绝。适配器的流式路径（解码器累积、编码器下发）共用同一
+/// 合并语义。
+pub(crate) fn merge_provider_options(
     target: &mut crate::core::ir::ProviderOptions,
     incoming: crate::core::ir::ProviderOptions,
 ) {
@@ -273,12 +274,13 @@ impl StreamAccumulator {
                 self.response.usage = usage;
                 self.response.provider_metadata = provider_metadata;
             }
+            // 错误不贡献内容：网关消费到即终止流，已累积的 usage 照常结算。
+            StreamEvent::Error { .. } => {}
         }
     }
 
     fn push_tool_call(&mut self, tool: PendingTool) {
-        // 空/非法累积参数收尾为 `{}`（Anthropic 要求 tool_use 必有对象 input，
-        // AI SDK 同款默认），避免 `null` 被上游拒绝。
+        // 空/非法累积参数收尾为 `{}`（Anthropic 要求 tool_use 必有对象 input），避免 `null` 被上游拒绝。
         let input = serde_json::from_str(&tool.arguments).unwrap_or_else(|_| serde_json::json!({}));
         self.response.content.push(ContentPart::ToolCall {
             tool_call_id: tool.tool_call_id,
@@ -290,7 +292,7 @@ impl StreamAccumulator {
 
     /// 取出累积的完整响应；未收到 `tool-input-end` 的进行中工具调用在此收尾。
     ///
-    /// 对齐 AI SDK 流 flush 时 `StreamingToolCallTracker::flush()`：未完成的工具
+    /// 流 flush：未完成的工具
     /// 调用在流结束时以已累积的参数收尾为 `tool-call`。
     pub fn finish(mut self) -> ChatResponse {
         let pending: Vec<PendingTool> = self.pending_tools.drain().map(|(_, t)| t).collect();
@@ -399,6 +401,57 @@ pub fn chat_response_to_stream_events(response: &ChatResponse) -> Vec<StreamEven
     events
 }
 
+/// 流式失败帧的错误 message 提取口径：错误帧形状随协议而异。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorMessageShape {
+    /// 仅认嵌套 `error.message`：错误帧 message 一律嵌套的协议
+    /// （Chat Completions / Gemini / Anthropic）。
+    NestedOnly,
+    /// 兼认顶层 `message`，但仅当事件声明 `type == "error"`（Responses 官方
+    /// 错误事件的 message 在顶层；type 门控避免把带 `message` 字段的普通
+    /// 事件误判为错误）。
+    TopLevelOnErrorType,
+}
+
+/// 反序列化失败的流式帧：留痕后尽量提取错误语义，四个协议解码器共用。
+///
+/// 流式面对的是已建立连接的上游，单个坏帧不值得整条流报废：先
+/// `tracing::warn` 留痕；能安全提取字符串错误 message 时映射为单个
+/// [`StreamEvent::Error`] 交由网关终止流，其余失败帧跳过，帧内未知字段的
+/// 容忍策略不变。返回事件序列而非各适配器的 delivery 包装——
+/// `DecodeStreamChunk` 是适配器私有类型，由调用方自行包一层。
+///
+/// 帧以原始字节传入而非 `Value`：解码器热路径 `from_str` 直达 wire 类型
+/// 零中间 `Value`，本函数仅在失败时才重新解析一次（错误提取）。
+pub(crate) fn decode_failed_frame(
+    err: &serde_json::Error,
+    frame: &str,
+    message_shape: ErrorMessageShape,
+) -> Vec<StreamEvent> {
+    tracing::warn!(error = %err, payload = %frame, "上游流式帧无法解码");
+    let parsed = serde_json::from_str::<Value>(frame).unwrap_or(Value::Null);
+    let nested = parsed
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str);
+    let message = match (nested, message_shape) {
+        (Some(message), _) => Some(message),
+        (None, ErrorMessageShape::TopLevelOnErrorType)
+            if parsed.get("type").and_then(Value::as_str) == Some("error") =>
+        {
+            parsed.get("message").and_then(Value::as_str)
+        }
+        (None, _) => None,
+    };
+    message
+        .map(|message| {
+            vec![StreamEvent::Error {
+                message: message.to_string(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +498,7 @@ mod tests {
                 output_tokens: 5,
                 cache_read_tokens: 2,
                 cache_write_tokens: 1,
+                cache_write_1h_tokens: 0,
                 raw: None,
             },
             provider_metadata: HashMap::new(),
@@ -514,6 +568,7 @@ mod tests {
                     output_tokens: 2,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    cache_write_1h_tokens: 0,
                     raw: None,
                 },
                 provider_metadata: HashMap::new(),

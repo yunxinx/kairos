@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 工具栏分面筛选：触发器对齐渠道「状态筛选」，浮层内搜索对齐 shadcn-admin CommandInput。
+// 工具栏分面筛选：触发器与浮层搜索保持统一交互。
 import { computed, ref, useId } from 'vue';
 import { PopoverContent, PopoverPortal, PopoverRoot, PopoverTrigger } from 'reka-ui';
 import { useI18n } from 'vue-i18n';

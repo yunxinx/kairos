@@ -16,7 +16,8 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -30,7 +31,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -216,7 +218,8 @@ async fn default_plan_can_only_be_transferred_within_its_audience() {
     // 对当前默认档重复执行仍保持默认，不存在反向“关闭”语义。
     let repeated = reqwest::Client::new()
         .put(admin_url(&gw, &format!("/plans/{candidate}/default")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("设默认命令应可达");
@@ -240,7 +243,8 @@ async fn force_deleting_the_default_plan_moves_users_to_a_live_plan() {
 
     let deleted = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/plans/{temp_default}?force=true")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删档应可达");

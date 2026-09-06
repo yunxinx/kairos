@@ -17,6 +17,10 @@ import {
   type ChannelKey,
   type ChannelView,
   type Protocol,
+  REASONING_OUTPUT_MODES,
+  type ReasoningOutputMode,
+  SESSION_CACHE_KEY_MODES,
+  type SessionCacheKeyMode,
 } from '@/api/types';
 import FloatingWindow from '@/components/ui/FloatingWindow.vue';
 import FormField from '@/components/ui/FormField.vue';
@@ -37,12 +41,16 @@ import { DEFAULT_MODEL_GROUP, groupSelectOptions } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
-const PROTOCOLS: Protocol[] = ['openai_chat', 'openai_responses', 'anthropic_messages'];
+const PROTOCOLS: Protocol[] = ['openai_chat', 'openai_responses', 'anthropic_messages', 'gemini'];
 
 type EditorTab = 'basic' | 'advanced';
 
 /** 高级设置页签内的字段：保存校验失败时需切回该页签才能看到错误。 */
-const ADVANCED_FIELDS: ReadonlySet<string> = new Set(['timeoutMs', 'maxRetries']);
+const ADVANCED_FIELDS: ReadonlySet<string> = new Set([
+  'timeoutMs',
+  'requestTimeoutMs',
+  'maxRetries',
+]);
 
 /** 两列网格末格留给 +N；露出奇数个 chip，避免把编辑器撑高。 */
 const EDITOR_MODEL_VISIBLE_COUNT = 9;
@@ -88,6 +96,7 @@ const nameInputId = `channel-editor-name-${uid}`;
 const protocolInputId = `channel-editor-protocol-${uid}`;
 const baseUrlInputId = `channel-editor-base-url-${uid}`;
 const timeoutMsInputId = `channel-editor-timeout-ms-${uid}`;
+const requestTimeoutMsInputId = `channel-editor-request-timeout-ms-${uid}`;
 const maxRetriesInputId = `channel-editor-max-retries-${uid}`;
 const enabledInputId = `channel-editor-enabled-${uid}`;
 const groupInputId = `channel-editor-group-${uid}`;
@@ -108,6 +117,7 @@ interface EditorKey {
   /** 编辑会话内稳定身份；不能用数组下标作为 Vue key。 */
   editorId: string;
   name: string;
+  /** 明文不回显：编辑既有渠道时始终以空串起步，留空提交即由后端按名称保留原值。 */
   api_key: string;
   /** 权重输入草稿；保存时按无符号整数解析，空值按 1 处理。 */
   weight: string;
@@ -136,7 +146,7 @@ function keyToEditor(key: ChannelKey): EditorKey {
   return {
     editorId: newEditorKeyId(),
     name: key.name,
-    api_key: key.api_key,
+    api_key: '',
     weight: String(key.weight),
     enabled: key.enabled,
     models: (key.models ?? []).join(', '),
@@ -193,9 +203,14 @@ const initialValues = {
   models: props.initial ? [...props.initial.models] : ([] as string[]),
   aliases: props.initial ? { ...props.initial.model_aliases } : ({} as Record<string, string>),
   timeoutMs: String(props.initial?.timeout_ms ?? '30000'),
+  requestTimeoutMs: String(props.initial?.request_timeout_ms ?? '120000'),
   maxRetries: String(props.initial?.max_retries ?? '0'),
   enabled: props.initial?.enabled ?? true,
   modelGroup: props.initial?.model_group ?? DEFAULT_MODEL_GROUP,
+  reasoningOutput: props.initial?.reasoning_output ?? 'auto',
+  sessionCacheKey: props.initial?.session_cache_key ?? 'off',
+  injectsCacheBreakpoints: props.initial?.injects_cache_breakpoints ?? false,
+  abortOnDisconnect: props.initial?.abort_on_disconnect ?? true,
 };
 
 const editorName = ref(initialValues.name);
@@ -208,9 +223,14 @@ const editorModels = ref<string[]>(initialValues.models);
 /** 别名映射草稿（别名 → 主模型名）：仅在同步表格中编辑。 */
 const editorAliasesMap = ref<Record<string, string>>(initialValues.aliases);
 const editorTimeoutMs = ref(initialValues.timeoutMs);
+const editorRequestTimeoutMs = ref(initialValues.requestTimeoutMs);
 const editorMaxRetries = ref(initialValues.maxRetries);
 const editorEnabled = ref(initialValues.enabled);
 const editorGroup = ref(initialValues.modelGroup);
+const editorReasoningOutput = ref<ReasoningOutputMode>(initialValues.reasoningOutput);
+const editorSessionCacheKey = ref<SessionCacheKeyMode>(initialValues.sessionCacheKey);
+const editorInjectsCacheBreakpoints = ref(initialValues.injectsCacheBreakpoints);
+const editorAbortOnDisconnect = ref(initialValues.abortOnDisconnect);
 /** 手动添加模型 ID 的输入草稿；点添加后 trim 写入 `editorModels`。 */
 const addModelDraft = ref('');
 
@@ -226,9 +246,14 @@ const dirty = computed(
     !sameModelSet(editorModels.value, initialValues.models) ||
     !sameAliasMap(editorAliasesMap.value, initialValues.aliases) ||
     editorTimeoutMs.value !== initialValues.timeoutMs ||
+    editorRequestTimeoutMs.value !== initialValues.requestTimeoutMs ||
     editorMaxRetries.value !== initialValues.maxRetries ||
     editorEnabled.value !== initialValues.enabled ||
-    editorGroup.value !== initialValues.modelGroup,
+    editorGroup.value !== initialValues.modelGroup ||
+    editorReasoningOutput.value !== initialValues.reasoningOutput ||
+    editorSessionCacheKey.value !== initialValues.sessionCacheKey ||
+    editorInjectsCacheBreakpoints.value !== initialValues.injectsCacheBreakpoints ||
+    editorAbortOnDisconnect.value !== initialValues.abortOnDisconnect,
 );
 watch(dirty, (value) => emit('dirty-change', value), { immediate: true });
 
@@ -241,12 +266,31 @@ const groupOptions = computed(() =>
   groupSelectOptions(groupsQuery.data.value ?? [], editorGroup.value, t('models.ungrouped')),
 );
 
+const reasoningOutputInputId = `channel-editor-reasoning-output-${uid}`;
+const reasoningOutputOptions = computed(() =>
+  REASONING_OUTPUT_MODES.map((value) => ({
+    value,
+    label: t(`channel.reasoningOutput.${value}`),
+  })),
+);
+
+const sessionCacheKeyInputId = `channel-editor-session-cache-key-${uid}`;
+const injectsCacheBreakpointsInputId = `channel-editor-injects-cache-breakpoints-${uid}`;
+const abortOnDisconnectInputId = `channel-editor-abort-on-disconnect-${uid}`;
+const sessionCacheKeyOptions = computed(() =>
+  SESSION_CACHE_KEY_MODES.map((value) => ({
+    value,
+    label: t(`channel.sessionCacheKey.${value}`),
+  })),
+);
+
 const saveMutation = useMutation({
   mutationFn: (body: Channel) =>
     props.initial === null
       ? apiClient.createChannel(body)
       : apiClient.updateChannel(props.initial.id, body),
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await invalidateChannelCaches(queryClient);
     await queryClient.invalidateQueries({ queryKey: ['model-groups'] });
@@ -429,14 +473,39 @@ function handleWindowClose() {
 
 // --- 保存 ---
 
-function handleSave() {
+const pendingRemovalCount = ref(0);
+
+watch(
+  [editorModels, editorAliasesMap],
+  () => {
+    pendingRemovalCount.value = 0;
+  },
+  { deep: true },
+);
+
+function callableNames(channel: Pick<Channel, 'models' | 'model_aliases'>): Set<string> {
+  return new Set([...channel.models, ...Object.keys(channel.model_aliases)]);
+}
+
+function removedCallableCount(previous: Channel, next: Channel): number {
+  const nextNames = callableNames(next);
+  return [...callableNames(previous)].filter((name) => !nextNames.has(name)).length;
+}
+
+function handleSave(removalConfirmed = false) {
   const specs: FieldValidationSpec[] = [
     { name: 'name', value: editorName.value, rules: [{ kind: 'required' }] },
     { name: 'baseUrl', value: editorBaseUrl.value, rules: [{ kind: 'required' }] },
     {
       name: 'timeoutMs',
       value: editorTimeoutMs.value,
-      rules: [{ kind: 'required' }, { kind: 'uint', min: 1 }],
+      // 与后端契约一致：超时值不允许低于 1 秒。
+      rules: [{ kind: 'required' }, { kind: 'uint', min: 1000 }],
+    },
+    {
+      name: 'requestTimeoutMs',
+      value: editorRequestTimeoutMs.value,
+      rules: [{ kind: 'required' }, { kind: 'uint', min: 1000 }],
     },
     {
       name: 'maxRetries',
@@ -444,9 +513,14 @@ function handleSave() {
       rules: [{ kind: 'required' }, { kind: 'uint' }],
     },
   ];
+  // 名称与既有密钥一致的行留空即由后端按名称保留原值；其余行（含新建渠道）仍必填。
+  const preservedKeyNames = new Set((props.initial?.keys ?? []).map((key) => key.name.trim()));
   editorKeys.value.forEach((key, index) => {
     specs.push({ name: `keyName${index}`, value: key.name, rules: [{ kind: 'required' }] });
-    specs.push({ name: `keyApi${index}`, value: key.api_key, rules: [{ kind: 'required' }] });
+    const keepsStoredKey = props.initial !== null && preservedKeyNames.has(key.name.trim());
+    if (!keepsStoredKey) {
+      specs.push({ name: `keyApi${index}`, value: key.api_key, rules: [{ kind: 'required' }] });
+    }
     if (key.weight.trim() !== '' && parseOptionalUint(key.weight) === null) {
       specs.push({ name: `keyWeight${index}`, value: key.weight, rules: [{ kind: 'uint' }] });
     }
@@ -468,26 +542,33 @@ function handleSave() {
     seenKeyNames.add(name);
   }
   const timeoutMs = parseOptionalUint(editorTimeoutMs.value);
+  const requestTimeoutMs = parseOptionalUint(editorRequestTimeoutMs.value);
   const maxRetries = parseOptionalUint(editorMaxRetries.value);
-  if (timeoutMs === null || maxRetries === null) {
+  if (timeoutMs === null || requestTimeoutMs === null || maxRetries === null) {
     return;
   }
   const keys = editorKeys.value.map(editorToKey);
   const models = [...editorModels.value].sort(compareModels);
   const modelAliases = { ...editorAliasesMap.value };
+  const edited: Channel = {
+    name: editorName.value.trim(),
+    protocol: editorProtocol.value,
+    base_url: editorBaseUrl.value.trim(),
+    keys,
+    models,
+    model_aliases: modelAliases,
+    timeout_ms: timeoutMs,
+    request_timeout_ms: requestTimeoutMs,
+    max_retries: maxRetries,
+    enabled: editorEnabled.value,
+    model_group: editorGroup.value,
+    reasoning_output: editorReasoningOutput.value,
+    session_cache_key: editorSessionCacheKey.value,
+    injects_cache_breakpoints: editorInjectsCacheBreakpoints.value,
+    abort_on_disconnect: editorAbortOnDisconnect.value,
+  };
   if (props.initial === null) {
-    saveMutation.mutate({
-      name: editorName.value.trim(),
-      protocol: editorProtocol.value,
-      base_url: editorBaseUrl.value.trim(),
-      keys,
-      models,
-      model_aliases: modelAliases,
-      timeout_ms: timeoutMs,
-      max_retries: maxRetries,
-      enabled: editorEnabled.value,
-      model_group: editorGroup.value,
-    });
+    saveMutation.mutate(edited);
     return;
   }
   // 编辑以列表中最新定义为基底整体替换写：开窗期间行内改过的字段
@@ -499,19 +580,14 @@ function handleSave() {
     error(t('channel.goneOnSave'));
     return;
   }
-  saveMutation.mutate({
-    ...channelWriteBody(latest),
-    name: editorName.value.trim(),
-    protocol: editorProtocol.value,
-    base_url: editorBaseUrl.value.trim(),
-    keys,
-    models,
-    model_aliases: modelAliases,
-    timeout_ms: timeoutMs,
-    max_retries: maxRetries,
-    enabled: editorEnabled.value,
-    model_group: editorGroup.value,
-  });
+  const next = { ...channelWriteBody(latest), ...edited };
+  const removed = removedCallableCount(channelWriteBody(latest), next);
+  if (removed > 0 && !removalConfirmed) {
+    pendingRemovalCount.value = removed;
+    return;
+  }
+  pendingRemovalCount.value = 0;
+  saveMutation.mutate(next);
 }
 </script>
 
@@ -542,7 +618,7 @@ function handleSave() {
       v-if="editorView === 'form'"
       novalidate
       data-testid="channel-form"
-      @submit.prevent="handleSave"
+      @submit.prevent="() => handleSave()"
     >
       <div class="card-body space-y-3">
         <!-- 两个页签叠放在同一网格单元：窗口高度取两者最大值，切换页签尺寸不变。
@@ -672,23 +748,24 @@ function handleSave() {
                     :error="fieldError(`keyApi${index}`)"
                   >
                     <template #default="{ hintId, invalid }">
-                      <FormTextInput
+                      <!-- 创建要求明文；编辑不回填不提供查看，留空即保留原值。 -->
+                      <FormPasswordInput
                         v-if="initial === null"
                         :id="`${uid}-channel-editor-key-apikey-${index}`"
                         v-model="key.api_key"
-                        type="text"
                         autocomplete="off"
                         :invalid="invalid"
                         :hint-id="hintId"
                         data-testid="channel-key-api"
                         v-on="fieldInputHandlers(`keyApi${index}`)"
                       />
-                      <FormPasswordInput
+                      <FormTextInput
                         v-else
                         :id="`${uid}-channel-editor-key-apikey-${index}`"
                         v-model="key.api_key"
+                        type="password"
                         autocomplete="off"
-                        mask-while-hidden
+                        :placeholder="t('channel.apiKeyKeepPlaceholder')"
                         :invalid="invalid"
                         :hint-id="hintId"
                         data-testid="channel-key-api"
@@ -926,6 +1003,24 @@ function handleSave() {
                 </template>
               </FormField>
               <FormField
+                field-name="requestTimeoutMs"
+                :label="t('channel.requestTimeoutMs')"
+                :input-id="requestTimeoutMsInputId"
+                :error="fieldError('requestTimeoutMs')"
+              >
+                <template #default="{ hintId, invalid }">
+                  <FormTextInput
+                    :id="requestTimeoutMsInputId"
+                    v-model="editorRequestTimeoutMs"
+                    type="text"
+                    inputmode="numeric"
+                    :invalid="invalid"
+                    :hint-id="hintId"
+                    v-on="fieldInputHandlers('requestTimeoutMs')"
+                  />
+                </template>
+              </FormField>
+              <FormField
                 field-name="maxRetries"
                 :label="t('channel.maxRetries')"
                 :input-id="maxRetriesInputId"
@@ -944,10 +1039,88 @@ function handleSave() {
                 </template>
               </FormField>
             </div>
+            <FormField
+              field-name="reasoningOutput"
+              :label="t('channel.reasoningOutput.label')"
+              :input-id="reasoningOutputInputId"
+              :guide="t('channel.reasoningOutput.guide')"
+            >
+              <ListboxSelect
+                :id="reasoningOutputInputId"
+                v-model="editorReasoningOutput"
+                :options="reasoningOutputOptions"
+                :search-placeholder="t('channel.reasoningOutput.label')"
+                data-testid="channel-editor-reasoning-output"
+              />
+            </FormField>
+            <FormField
+              field-name="sessionCacheKey"
+              :label="t('channel.sessionCacheKey.label')"
+              :input-id="sessionCacheKeyInputId"
+              :guide="t('channel.sessionCacheKey.guide')"
+            >
+              <ListboxSelect
+                :id="sessionCacheKeyInputId"
+                v-model="editorSessionCacheKey"
+                :options="sessionCacheKeyOptions"
+                :search-placeholder="t('channel.sessionCacheKey.label')"
+                data-testid="channel-editor-session-cache-key"
+              />
+            </FormField>
+            <FormField
+              v-if="editorProtocol === 'anthropic_messages'"
+              field-name="injectsCacheBreakpoints"
+              layout="inline"
+              :label="t('channel.injectsCacheBreakpoints.label')"
+              :input-id="injectsCacheBreakpointsInputId"
+              :guide="t('channel.injectsCacheBreakpoints.guide')"
+            >
+              <FormSwitch
+                :id="injectsCacheBreakpointsInputId"
+                v-model="editorInjectsCacheBreakpoints"
+                data-testid="channel-editor-injects-cache-breakpoints"
+              />
+            </FormField>
+            <FormField
+              field-name="abortOnDisconnect"
+              layout="inline"
+              :label="t('channel.abortOnDisconnect.label')"
+              :input-id="abortOnDisconnectInputId"
+              :guide="t('channel.abortOnDisconnect.guide')"
+            >
+              <FormSwitch
+                :id="abortOnDisconnectInputId"
+                v-model="editorAbortOnDisconnect"
+                data-testid="channel-editor-abort-on-disconnect"
+              />
+            </FormField>
           </div>
         </div>
       </div>
-      <div class="card-footer card-body flex justify-between gap-2">
+      <div
+        v-if="pendingRemovalCount > 0"
+        class="card-footer card-body flex items-center justify-between gap-3"
+        data-testid="channel-removal-confirmation"
+      >
+        <p class="text-danger text-sm">
+          {{ t('channel.removalConfirm', { count: pendingRemovalCount }) }}
+        </p>
+        <span class="flex shrink-0 gap-2">
+          <button type="button" class="btn" @click="pendingRemovalCount = 0">
+            {{ t('common.cancel') }}
+          </button>
+          <button
+            type="button"
+            class="btn btn-danger-filled"
+            data-testid="channel-removal-confirm"
+            :disabled="saveMutation.isPending.value"
+            @click="handleSave(true)"
+          >
+            {{ t('common.confirm') }}
+          </button>
+        </span>
+      </div>
+      <div v-else class="card-footer card-body flex justify-between gap-2">
         <button type="button" class="btn" @click="emit('close')">
           {{ t('common.cancel') }}
         </button>

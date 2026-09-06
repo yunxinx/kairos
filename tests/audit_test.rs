@@ -1,7 +1,7 @@
 //! 审计日志：写入与认证事件带操作者落入 system_log，读取操作不落。
 //!
-//! 此前用户增删改、余额调整、结算/豁免完全无记录——谁在什么时候给谁加了多少钱，
-//! 事后查不出来。参考 one-api 的 LogTypeTopup / LogTypeManage 补上。
+//! 用户增删改、余额调整、结算/豁免等事件必须带操作者可追溯，充值与运营操作
+//! 两类事件由此补入。
 
 mod common;
 
@@ -13,10 +13,11 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
     format!("{}{path}", gw.admin_base_url())
 }
 
-async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -24,14 +25,15 @@ async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Respon
 
 async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -92,6 +94,35 @@ async fn user_and_balance_mutations_are_audited() {
     .await;
     assert_eq!(disabled.status(), StatusCode::OK);
 
+    let token = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/tokens",
+        json!({
+            "name": "audited-token",
+            "balance_usd_micros": null,
+            "enabled": true
+        }),
+    )
+    .await;
+    assert_eq!(token.status(), StatusCode::CREATED);
+    let token_id = token.json::<Value>().await.expect("令牌应可解析")["id"]
+        .as_i64()
+        .expect("令牌应有 id");
+    let token_disabled = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/tokens/{token_id}"),
+        json!({
+            "name": "audited-token",
+            "enabled": false
+        }),
+    )
+    .await;
+    assert_eq!(token_disabled.status(), StatusCode::OK);
+
     // 重复提交已经生效的值不应制造伪变更或新的审计行。
     let before_noop = audit_rows(&gw).await.len();
     let noop = admin_json(
@@ -141,6 +172,10 @@ async fn user_and_balance_mutations_are_audited() {
     assert!(
         joined.contains("users|修改用户") && joined.contains("enabled true → false"),
         "改动审计应记字段前后值，实际:\n{joined}"
+    );
+    assert!(
+        joined.contains("tokens|修改用户") && joined.contains("状态 启用 → 停用"),
+        "通用令牌更新的启停变更也应留痕，实际:\n{joined}"
     );
 }
 
@@ -192,7 +227,8 @@ async fn archive_groups_and_settings_are_audited() {
 
     let archived = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/users/{user_id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("归档应可达");
@@ -226,6 +262,7 @@ async fn login_success_and_failure_are_audited() {
 
     let failed = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": common::TEST_ROOT_EMAIL, "password": "wrong-password" }))
         .send()
         .await
@@ -308,5 +345,78 @@ async fn settling_unsettled_log_is_audited() {
     assert!(
         joined.contains("billing|补扣未结算日志") && joined.contains("2.50 USD"),
         "补扣应记费用，实际:\n{joined}"
+    );
+}
+
+/// 价格、模型组和统一模型的变更也应进入同一套操作者审计流。
+#[tokio::test]
+async fn model_resource_mutations_are_audited() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channels: Value = admin_get(&gw, &gw.session, "/channels")
+        .await
+        .json()
+        .await
+        .expect("渠道列表应可解析");
+    let channel_id = channels[0]["id"].as_i64().expect("应有渠道 id");
+
+    let price = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::PUT,
+        &format!("/prices/{channel_id}/{}", common::TEST_MODEL),
+        json!({
+            "channel_id": channel_id,
+            "model": common::TEST_MODEL,
+            "input_micros": 2_500_000,
+            "output_micros": 10_000_000,
+            "cache_read_micros": null,
+            "cache_write_micros": null,
+            "cache_write_1h_micros": null
+        }),
+    )
+    .await;
+    assert_eq!(price.status(), StatusCode::OK);
+
+    let group = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({
+            "name": "audited-models",
+            "models": [{ "kind": "source", "channel_id": channel_id, "model": common::TEST_MODEL }]
+        }),
+    )
+    .await;
+    assert_eq!(group.status(), StatusCode::CREATED);
+
+    let unified = admin_json(
+        &gw,
+        &gw.session,
+        reqwest::Method::POST,
+        "/unified-models",
+        json!({
+            "id": "audited-unified",
+            "models": [{ "channel_id": channel_id, "model": common::TEST_MODEL }],
+            "hide": false
+        }),
+    )
+    .await;
+    assert_eq!(unified.status(), StatusCode::CREATED);
+
+    let joined: String = audit_rows(&gw)
+        .await
+        .iter()
+        .map(|(target, message, _)| format!("{target}|{message}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("prices|修改价格"), "改价应留痕：{joined}");
+    assert!(
+        joined.contains("model_groups|创建模型组"),
+        "建组应留痕：{joined}"
+    );
+    assert!(
+        joined.contains("unified_models|创建统一模型"),
+        "建统一模型应留痕：{joined}"
     );
 }

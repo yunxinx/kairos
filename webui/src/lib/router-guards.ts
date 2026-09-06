@@ -2,21 +2,25 @@ import { redirect } from '@tanstack/vue-router';
 import { apiClient } from '@/api/client';
 import { roleAtLeast, type ManagementRole } from '@/api/types';
 import { hasCapability, type ManagementCapability } from '@/lib/capabilities';
-import { captureSessionGeneration, getAdminKey, getMe, setMeForSession } from '@/lib/session';
+import {
+  captureSessionGeneration,
+  getMe,
+  hasKnownLoggedOut,
+  markSessionActive,
+  setMeForSession,
+} from '@/lib/session';
 
 /** 拉一次 `/me` 填进会话；已有则跳过。 */
 export async function ensureMe(): Promise<void> {
-  if (!getAdminKey()) return;
   if (getMe()) return;
+  const user = await apiClient.getMe();
+  markSessionActive();
   const generation = captureSessionGeneration();
-  setMeForSession(await apiClient.getMe(), generation);
+  setMeForSession(user, generation);
 }
 
 /** 受保护页面：无管理凭证则去登录。 */
 export async function requireAuth(): Promise<void> {
-  if (!getAdminKey()) {
-    throw redirect({ to: '/login' });
-  }
   try {
     await ensureMe();
   } catch {
@@ -24,11 +28,15 @@ export async function requireAuth(): Promise<void> {
   }
 }
 
-/** 登录页：已持有凭证则进入控制台。 */
-export function requireGuest(): void {
-  if (getAdminKey()) {
-    throw redirect({ to: '/overview' });
+/** 登录页：已持有凭证则进入控制台；已知无会话（上一轮 401）则跳过探测。 */
+export async function requireGuest(): Promise<void> {
+  if (hasKnownLoggedOut()) return;
+  try {
+    await ensureMe();
+  } catch {
+    return;
   }
+  if (getMe()) throw redirect({ to: '/overview' });
 }
 
 /** 角色不足则回概览。 */

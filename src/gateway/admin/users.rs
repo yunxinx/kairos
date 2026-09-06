@@ -6,7 +6,9 @@ use std::net::SocketAddr;
 use axum::{
     Extension, Json, Router,
     extract::{ConnectInfo, Path, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware,
+    response::IntoResponse,
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -18,14 +20,16 @@ use crate::store::StoreError;
 use crate::store::plans;
 use crate::store::users::{self, ManagementRole, NewUser, UserRecord};
 
-use super::auth::{ManagementCapability, ManagementIdentity};
+use super::auth::{
+    ManagementCapability, ManagementIdentity, SESSION_COOKIE, session_from_headers,
+    session_from_request,
+};
 use super::tokens;
 use super::{
-    AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, bearer_from_headers, begin_write,
-    db_err, format_usd_micros, map_user_store_err, reject_user_management, reload_and_swap,
+    AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, begin_write, db_err,
+    format_usd_micros, map_user_store_err, reject_user_management, reload_and_swap,
     validate_bulk_targets,
 };
-use crate::gateway::http::extract_bearer;
 
 pub(super) fn admin_routes() -> Router<AdminDeps> {
     Router::new()
@@ -59,7 +63,12 @@ pub(super) fn signed_in_routes() -> Router<AdminDeps> {
 }
 
 pub(super) fn public_routes() -> Router<AdminDeps> {
-    Router::new().route("/login", post(login))
+    // 登录虽免认证，但写语义同权暴露 login-CSRF 面：与受保护端点一样要求
+    // 同源浏览器信号（SPA 登录请求自带 Origin；非浏览器脚本需显式携带）。
+    Router::new().route(
+        "/login",
+        post(login).route_layer(middleware::from_fn(super::auth::same_origin_guard)),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,34 +107,43 @@ impl UserView {
 
 #[derive(Debug, Serialize)]
 struct LoginView {
-    token: String,
     expires_at: i64,
     user: UserView,
 }
 
-/// 邮箱密码换会话。成功后的 Bearer 是会话令牌，不是登录口令本身。
+/// 邮箱密码换会话；令牌通过 HttpOnly Cookie 交给浏览器。
 async fn login(
     State(deps): State<AdminDeps>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     body: Result<Json<LoginBody>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<LoginView>, AdminError> {
+) -> Result<impl IntoResponse, AdminError> {
     let snapshot = deps.snapshot.read().await;
     let max_failures = snapshot.auth_throttle_max_failures;
     let window = snapshot.auth_throttle_window();
     drop(snapshot);
     let ip = addr.ip();
-    if deps.throttle.is_blocked(ip, max_failures, window) {
-        return Err(AdminError::RateLimited);
-    }
     let body = body.map_err(AdminError::bad_body)?.0;
     // 形状封顶先于限流记账、Argon2 与审计写入：超长字段只会白白消耗 CPU，
     // email 还会原样进审计行（放大 system_log）；控制字符可伪造多行日志。
     validate_login_shape(&body.email, &body.password)?;
+    if deps
+        .throttle
+        .is_blocked(ip, Some(&body.email), max_failures, window)
+    {
+        return Err(AdminError::RateLimited);
+    }
+    let _verification_permit = deps
+        .password_verifiers
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AdminError::RateLimited)?;
     let Some(user) = users::authenticate_password(&deps.pool, &body.email, &body.password)
         .await
         .map_err(AdminError::Store)?
     else {
-        deps.throttle.record_failure(ip, max_failures, window);
+        deps.throttle
+            .record_failure(ip, Some(&body.email), max_failures, window);
         // 失败登录记 warn 且不带 actor：此刻还没认出是谁，邮箱只是对方声称的。
         store::record_audit_detached(
             &deps.pool,
@@ -162,11 +180,32 @@ async fn login(
         ),
     )
     .await;
-    Ok(Json(LoginView {
-        token,
-        expires_at,
-        user: UserView::from_record(user),
-    }))
+    // Secure 按请求协议条件附加：HTTPS 反代部署照常加固；纯 HTTP 内网部署
+    // 可用，但会话明文可被同网段观测，签发时告警一次（登录频率天然限频）。
+    let secure = if super::auth::request_is_secure(&headers) {
+        "; Secure"
+    } else {
+        ""
+    };
+    if secure.is_empty() {
+        tracing::warn!("管理会话 Cookie 未加 Secure（请求非 HTTPS）：明文传输下会话可被同网段窃听");
+    }
+    let cookie = format!(
+        "{SESSION_COOKIE}={token}; Path=/api; HttpOnly; SameSite=Strict{secure}; Max-Age={}",
+        (expires_at - now).max(0) / 1000
+    );
+    let cookie = HeaderValue::from_str(&cookie).map_err(|_| {
+        AdminError::Store(StoreError::InvalidResource(
+            "会话 Cookie 生成失败".to_string(),
+        ))
+    })?;
+    Ok((
+        [(header::SET_COOKIE, cookie)],
+        Json(LoginView {
+            expires_at,
+            user: UserView::from_record(user),
+        }),
+    ))
 }
 
 /// 登录入口的输入形状封顶：与写入路径共用 [`users::validate_email_shape`] /
@@ -180,17 +219,28 @@ fn validate_login_shape(email: &str, password: &str) -> Result<(), AdminError> {
 }
 
 /// 吊销当前会话；非 `ksess_` 前缀视为无操作，仍 204。
-async fn logout(State(deps): State<AdminDeps>, request: Request) -> Result<StatusCode, AdminError> {
-    let provided = request
-        .headers()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(extract_bearer)
-        .unwrap_or("");
+async fn logout(
+    State(deps): State<AdminDeps>,
+    request: Request,
+) -> Result<impl IntoResponse, AdminError> {
+    let provided = session_from_request(&request).unwrap_or("");
     users::revoke_session(&deps.pool, provided)
         .await
         .map_err(AdminError::Store)?;
-    Ok(StatusCode::NO_CONTENT)
+    let secure = if super::auth::request_is_secure(request.headers()) {
+        "; Secure"
+    } else {
+        ""
+    };
+    let clear = HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE}=; Path=/api; HttpOnly; SameSite=Strict{secure}; Max-Age=0"
+    ))
+    .map_err(|_| {
+        AdminError::Store(StoreError::InvalidResource(
+            "会话 Cookie 生成失败".to_string(),
+        ))
+    })?;
+    Ok(([(header::SET_COOKIE, clear)], StatusCode::NO_CONTENT))
 }
 
 /// 当前用户：身份 + 可用组 + 钱包。
@@ -234,7 +284,7 @@ async fn get_me(
         .as_ref()
         .map(|plan| plan.groups.clone())
         .unwrap_or_default();
-    let wallet = store::get_user_wallet(&deps.pool, user.id)
+    let wallet = store::settlement::get_user_wallet(&deps.pool, user.id)
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(MeView {
@@ -349,7 +399,7 @@ async fn update_me(
         }
     }
     if email_changed || password_changed {
-        users::revoke_user_sessions(&mut tx, user_id, bearer_from_headers(&headers))
+        users::revoke_user_sessions(&mut tx, user_id, session_from_headers(&headers))
             .await
             .map_err(map_user_store_err)?;
         changes.push("吊销其他会话".to_string());
@@ -694,7 +744,7 @@ async fn update_user(
             .map_err(map_user_store_err)?;
         // 登录标识变了，旧会话不能继续用；与改密同规则，操作者本人的当前会话保留。
         let keep = (identity.user_id() == id)
-            .then(|| bearer_from_headers(&headers))
+            .then(|| session_from_headers(&headers))
             .flatten();
         users::revoke_user_sessions(&mut tx, id, keep)
             .await
@@ -725,7 +775,7 @@ async fn update_user(
         // 改密后吊销该用户的其他会话（留下当前这条）：否则已被窃取的会话在改密后
         // 仍有效整整 8 小时。
         let keep = (identity.user_id() == id)
-            .then(|| bearer_from_headers(&headers))
+            .then(|| session_from_headers(&headers))
             .flatten();
         users::revoke_user_sessions(&mut tx, id, keep)
             .await
@@ -930,7 +980,7 @@ async fn user_admin_view(
         None => None,
     };
     let groups = visible_plan_groups(pool, identity, record.plan_id).await?;
-    let wallet = store::get_user_wallet(pool, record.id)
+    let wallet = store::settlement::get_user_wallet(pool, record.id)
         .await
         .map_err(AdminError::Store)?;
     let stats = match stats {
@@ -977,7 +1027,7 @@ async fn list_management_users(
     let stats_map = users::list_users_stats(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
-    let wallets = store::list_user_wallets(&deps.pool)
+    let wallets = store::settlement::list_user_wallets(&deps.pool)
         .await
         .map_err(AdminError::Store)?;
     let mut groups_by_plan: HashMap<i64, Vec<String>> = HashMap::new();

@@ -47,8 +47,8 @@ const props = withDefaults(
 const emit = defineEmits<{
   close: [];
   raise: [];
-  settle: [id: number];
-  waive: [id: number];
+  settle: [event: MouseEvent, entry: LogEntry];
+  waive: [event: MouseEvent, entry: LogEntry];
   filterModel: [model: string];
   filterChannel: [channel: string];
   filterToken: [token: string];
@@ -122,16 +122,46 @@ const calculationSteps = computed(() => {
     });
   }
   if (props.entry.cache_write_tokens > 0) {
-    steps.push({
-      name: t('logs.cacheWriteTokens'),
-      tokens: props.entry.cache_write_tokens,
-      price: props.entry.cache_write_price_usd_micros,
-      subtotalMicros: componentCostMicros(
-        props.entry.cache_write_tokens,
-        props.entry.cache_write_price_usd_micros,
-      ),
-      isCache: true,
-    });
+    // 与网关计费同一口径：配置 1h 档时写入拆两行（1h 明细钳制在写入总数内），
+    // 未配置则整行按缓存写单一费率。
+    const oneHourTokens = Math.min(
+      props.entry.cache_write_1h_tokens,
+      props.entry.cache_write_tokens,
+    );
+    const oneHourPriced = props.entry.cache_write_1h_price_usd_micros > 0 && oneHourTokens > 0;
+    if (oneHourPriced) {
+      const restTokens = props.entry.cache_write_tokens - oneHourTokens;
+      steps.push({
+        name: t('logs.cacheWrite1hTokens'),
+        tokens: oneHourTokens,
+        price: props.entry.cache_write_1h_price_usd_micros,
+        subtotalMicros: componentCostMicros(
+          oneHourTokens,
+          props.entry.cache_write_1h_price_usd_micros,
+        ),
+        isCache: true,
+      });
+      if (restTokens > 0) {
+        steps.push({
+          name: t('logs.cacheWriteTokens'),
+          tokens: restTokens,
+          price: props.entry.cache_write_price_usd_micros,
+          subtotalMicros: componentCostMicros(restTokens, props.entry.cache_write_price_usd_micros),
+          isCache: true,
+        });
+      }
+    } else {
+      steps.push({
+        name: t('logs.cacheWriteTokens'),
+        tokens: props.entry.cache_write_tokens,
+        price: props.entry.cache_write_price_usd_micros,
+        subtotalMicros: componentCostMicros(
+          props.entry.cache_write_tokens,
+          props.entry.cache_write_price_usd_micros,
+        ),
+        isCache: true,
+      });
+    }
   }
   return steps;
 });
@@ -230,11 +260,11 @@ const calculationSteps = computed(() => {
               </dt>
               <dd
                 class="mt-1 flex flex-col font-mono text-xs"
-                :title="`${entry.token_name} (${entry.token_key})`"
+                :title="`${entry.token_name} (${entry.token_key_fingerprint})`"
               >
                 <span class="font-medium text-[var(--seed-fg)]">{{ entry.token_name }}</span>
                 <span class="text-fg-muted text-[10px] opacity-75"
-                  >({{ maskTokenKey(entry.token_key) }})</span
+                  >({{ maskTokenKey(entry.token_key_fingerprint) }})</span
                 >
               </dd>
             </div>
@@ -440,7 +470,7 @@ const calculationSteps = computed(() => {
           data-testid="log-settle"
           :disabled="closing"
           :title="t('logs.settleGuide')"
-          @click="emit('settle', entry.id)"
+          @click="emit('settle', $event, entry)"
         >
           {{ t('logs.settleCharge') }}
         </button>
@@ -450,7 +480,7 @@ const calculationSteps = computed(() => {
           data-testid="log-waive"
           :disabled="closing"
           :title="t('logs.waiveGuide')"
-          @click="emit('waive', entry.id)"
+          @click="emit('waive', $event, entry)"
         >
           {{ t('logs.waiveCharge') }}
         </button>

@@ -1,10 +1,9 @@
 //! OpenAI Responses 协议适配器：wire ↔ IR 双向编解码。
 //!
 //! wire 结构体全部私有，透过 `decode_*`/`encode_*` 公共函数暴露 IR 边界，
-//! wire 类型不出本模块边界（ADR-0001 hub-and-spoke）。
+//! wire 类型不出本模块边界。
 //!
-//! 映射对齐 Vercel AI SDK `convert-to-openai-responses-input.ts` 与
-//! `openai-responses-language-model.ts`：
+//! 映射要点：
 //! - 请求侧：`input` 数组的 message/function_call/function_call_output/reasoning
 //!   项映射为对应 IR 消息；顶层 `instructions` 提升为首条 System 消息；`text`/
 //!   `reasoning` 面板经请求级逃生舱 `provider_options["openai"]` 无损往返。
@@ -14,7 +13,8 @@
 //!   reasoning 的 encrypted_content 经 part 逃生舱无损回传；finish_reason 由
 //!   `status`/`incomplete_details.reason` 双轨映射。
 //! - 流式：事件名驱动的 SSE（`response.created`/`response.output_text.delta`/
-//!   `response.completed` 等），`response.completed` 携带最终 usage。
+//!   `response.completed` 等），`response.completed` 携带最终 usage；流内
+//!   失败以 `error` 事件承载（`response.failed` 归 finish Error 语义）。
 //! - Responses 有状态特性（`store`/`previous_response_id`/`conversation`）Out of
 //!   Scope：入站留存到逃生舱，出站时显式 warning 并丢弃（不静默吞掉）。
 
@@ -25,10 +25,12 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::core::ir::{
-    ChatRequest, ChatResponse, ContentPart, FinishReason, FinishReasonUnified, Message, Role,
-    StreamEvent, Tool, Usage, Warning,
+    ChatRequest, ChatResponse, ContentPart, FILE_ID_KEY, FILE_NAME_KEY, FinishReason,
+    FinishReasonUnified, Message, PROVIDER_EXTRA_KEY, ReasoningEffort, Role, StreamEvent, Tool,
+    ToolChoice, Usage, Warning, apply_provider_extra, capture_unknown_fields,
+    part_provider_options, warn_dropped_provider_options, warning_feature,
 };
-use crate::core::stream::SseFrame;
+use crate::core::stream::{ErrorMessageShape, SseFrame, decode_failed_frame};
 
 // ---- 错误 ----
 
@@ -57,11 +59,70 @@ pub enum DecodeError {
     MissingText { index: usize },
     #[error("function_call 项 {index} 的 arguments 不是字符串")]
     ArgumentsNotString { index: usize },
+    #[error("tool_choice 形状无法识别: {detail}")]
+    InvalidToolChoice { detail: String },
+    #[error("reasoning.effort 取值无法识别: {detail}")]
+    InvalidReasoningEffort { detail: String },
     #[error("响应缺少 output")]
     MissingOutput,
 }
 
 // ---- wire 请求类型 ----
+
+/// 本协议已知顶层请求字段白名单；白名单外的顶层字段由入站解码收进
+/// 未知字段逃生舱（`provider_options["openai"]["extra"]`）。
+const KNOWN_REQUEST_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "text",
+    "reasoning",
+    "store",
+    "previous_response_id",
+    "conversation",
+];
+
+/// Responses 出站面未知字段逃生舱的回写白名单：本协议服务端接受的顶层请求
+/// 字段（已类型化字段 + 官方在册未类型化字段）。
+///
+/// chat 与 responses 共用 `openai` 逃生舱键，族内互回必须按目标协议过滤
+/// （OpenAI 对未知顶层参数 400），本清单即过滤依据；`service_tier`/`metadata`
+/// 两协议都接受，双侧登记保持互回往返。维护说明见 `ir::ExtraWriteback`。
+const RESPONSES_EXTRA_WRITEBACK_FIELDS: &[&str] = &[
+    // 类型化字段（KNOWN_REQUEST_FIELDS 同集）。
+    "model",
+    "input",
+    "instructions",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "text",
+    "reasoning",
+    "store",
+    "previous_response_id",
+    "conversation",
+    // 官方在册、网关未类型化（或仅作逃生舱留存）的顶层字段。
+    "metadata",
+    "service_tier",
+    "truncation",
+    "include",
+    "background",
+    "prompt",
+    "prompt_cache_key",
+    "preferences",
+    "safety_identifier",
+];
 
 /// OpenAI Responses 出站/入站请求体（wire）。
 ///
@@ -86,6 +147,8 @@ struct WireRequest {
     tools: Option<Vec<WireTool>>,
     #[serde(default)]
     tool_choice: Option<Value>,
+    #[serde(default)]
+    parallel_tool_calls: Option<bool>,
     #[serde(default)]
     text: Option<Value>,
     #[serde(default)]
@@ -228,6 +291,22 @@ enum WireStreamEvent {
         #[serde(default)]
         response: Option<Value>,
     },
+    /// 流内错误事件：官方文档为顶层 `message`，部分上游为嵌套
+    /// `error.message`（配额类错误帧的实测形状），两者都认。
+    #[serde(rename = "error")]
+    Error {
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        error: Option<WireStreamErrorBody>,
+    },
+}
+
+/// `error` 事件嵌套形状的载荷。
+#[derive(Debug, Clone, Deserialize)]
+struct WireStreamErrorBody {
+    #[serde(default)]
+    message: Option<String>,
 }
 
 /// `response.created` 的 response 首部：id/model。
@@ -246,7 +325,6 @@ const OPENAI_PROVIDER: &str = "openai";
 const REASONING_ENCRYPTED: &str = "reasoning_encrypted_content";
 const ITEM_ID: &str = "item_id";
 const IMAGE_DETAIL: &str = "image_detail";
-const FILE_NAME: &str = "filename";
 /// 有状态特性（Out of Scope）的留存键，出站时显式警告并丢弃。
 const STATEFUL_STORE: &str = "store";
 const STATEFUL_PREVIOUS_RESPONSE_ID: &str = "previous_response_id";
@@ -281,10 +359,16 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     }
 
     // 请求级逃生舱：`text`/`reasoning` 面板与有状态特性（留存，出站丢弃）。
+    // text.format 的可识别档位同时提升进类型化 response_format（chat 形状），
+    // 供跨族出站映射；面板原文照常留存，同族回写不受影响。
     let mut provider_options = HashMap::new();
     let mut openai = serde_json::Map::new();
+    let mut response_format: Option<Value> = None;
     if let Some(text) = &wire.text {
         openai.insert("text".into(), text.clone());
+        if let Some(format) = text.get("format") {
+            response_format = response_format_from_text_format(format);
+        }
     }
     if let Some(reasoning) = &wire.reasoning {
         openai.insert("reasoning".into(), reasoning.clone());
@@ -297,6 +381,11 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
     }
     if let Some(conv) = &wire.conversation {
         openai.insert(STATEFUL_CONVERSATION.into(), conv.clone());
+    }
+    // 白名单外的顶层字段收进未知字段逃生舱，同族出站原样回写。
+    let extra = capture_unknown_fields(value, KNOWN_REQUEST_FIELDS);
+    if !extra.is_empty() {
+        openai.insert(PROVIDER_EXTRA_KEY.to_string(), Value::Object(extra));
     }
     if !openai.is_empty() {
         provider_options.insert(OPENAI_PROVIDER.into(), Value::Object(openai));
@@ -316,7 +405,7 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
         presence_penalty: None,
         frequency_penalty: None,
         seed: None,
-        response_format: None,
+        response_format,
         tools: wire
             .tools
             .unwrap_or_default()
@@ -330,11 +419,31 @@ pub fn decode_request(value: &Value) -> Result<ChatRequest, DecodeError> {
                     name: t.name.unwrap_or_default(),
                     description: t.description,
                     parameters: t.parameters,
+                    provider_options: HashMap::new(),
                 })
             })
             .collect(),
-        tool_choice: wire.tool_choice,
+        tool_choice: wire
+            .tool_choice
+            .as_ref()
+            .map(decode_tool_choice)
+            .transpose()?,
+        parallel_tool_calls: wire.parallel_tool_calls,
+        reasoning: wire
+            .reasoning
+            .as_ref()
+            .and_then(|panel| panel.get("effort"))
+            .and_then(Value::as_str)
+            .map(|value| {
+                ReasoningEffort::parse_effort(value).ok_or_else(|| {
+                    DecodeError::InvalidReasoningEffort {
+                        detail: format!("未知档位 {value:?}"),
+                    }
+                })
+            })
+            .transpose()?,
         provider_options,
+        warnings: Vec::new(),
     })
 }
 
@@ -460,7 +569,7 @@ fn decode_media_part(part: &Value, index: usize) -> Result<ContentPart, DecodeEr
         openai.insert(IMAGE_DETAIL.into(), json!(detail));
     }
     if let Some(filename) = part.get("filename").and_then(Value::as_str) {
-        openai.insert(FILE_NAME.into(), json!(filename));
+        openai.insert(FILE_NAME_KEY.into(), json!(filename));
     }
 
     let (media_type, data) = if let Some(url) = part.get("image_url").and_then(Value::as_str) {
@@ -500,7 +609,7 @@ fn decode_media_part(part: &Value, index: usize) -> Result<ContentPart, DecodeEr
         }
     } else if let Some(file_id) = part.get("file_id").and_then(Value::as_str) {
         // provider 托管引用：以空 Data 占位，逃生舱保留 file_id。
-        openai.insert("file_id".into(), json!(file_id));
+        openai.insert(FILE_ID_KEY.into(), json!(file_id));
         (
             if image {
                 "image".to_string()
@@ -649,63 +758,85 @@ fn decode_reasoning_item(item: &Value) -> Result<Message, DecodeError> {
 /// previous_response_id/conversation）显式警告并丢弃。目标协议无法表达的内容
 /// 追加到 `warnings`。
 pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Value {
+    // 消息级与 part 级逃生舱统一在此检查：本族键（text/reasoning 面板、
+    // item_id、detail/filename/file_id 等）由各编码位按形状读写；非本族
+    // 条目（如跨族缓存断点、thinking 签名）无法表达，逐处告警。
+    for message in &request.messages {
+        warn_dropped_provider_options(
+            &message.provider_options,
+            OPENAI_PROVIDER,
+            "消息级",
+            warnings,
+        );
+        for provider_options in part_provider_options(&message.content) {
+            warn_dropped_provider_options(provider_options, OPENAI_PROVIDER, "内容级", warnings);
+        }
+    }
     // Responses 无以下采样与输出控制参数：显式丢弃并记 warning（不静默吞掉）。
     if request.top_k.is_some() {
         warnings.push(Warning::unsupported(
-            "top_k",
+            warning_feature::TOP_K,
             "OpenAI Responses 无 top_k 参数，已丢弃",
         ));
     }
     if request.n.is_some() {
         warnings.push(Warning::unsupported(
-            "n",
+            warning_feature::N,
             "OpenAI Responses 无 n 参数，已丢弃",
         ));
     }
     if request.seed.is_some() {
         warnings.push(Warning::unsupported(
-            "seed",
+            warning_feature::SEED,
             "OpenAI Responses 无 seed 参数，已丢弃",
         ));
     }
     if !request.stop.is_empty() {
         warnings.push(Warning::unsupported(
-            "stop",
+            warning_feature::STOP,
             "OpenAI Responses 无 stop 序列参数，已丢弃",
         ));
     }
     if request.presence_penalty.is_some() {
         warnings.push(Warning::unsupported(
-            "presence_penalty",
+            warning_feature::PRESENCE_PENALTY,
             "OpenAI Responses 无 presence_penalty 参数，已丢弃",
         ));
     }
     if request.frequency_penalty.is_some() {
         warnings.push(Warning::unsupported(
-            "frequency_penalty",
+            warning_feature::FREQUENCY_PENALTY,
             "OpenAI Responses 无 frequency_penalty 参数，已丢弃",
         ));
     }
-    if request.response_format.is_some() {
-        warnings.push(Warning::unsupported(
-            "response_format",
-            "OpenAI Responses 无 response_format 字段（JSON 输出需以 text.format 表达），已丢弃",
-        ));
-    }
+    // JSON 结构化输出等价映射：text 面板逃生舱在场时面板原文回写（同族保真
+    // 优先），缺席时类型化 response_format 以 text.format 出站；无法表达的
+    // 形状在换算处记 warning。
+    let text_panel_present = request
+        .provider_options
+        .get(OPENAI_PROVIDER)
+        .and_then(|openai| openai.get("text"))
+        .is_some();
+    let text_format = if text_panel_present {
+        None
+    } else {
+        text_format_from_response_format(request.response_format.as_ref(), warnings)
+    };
 
-    // System 消息聚合为 instructions；非文本 part 丢弃并记 warning。
+    // System 消息聚合为 instructions（空文本跳过，`\n\n` 连接，与 anthropic
+    // / chat 出站归并语义一致）；非文本 part 丢弃并记 warning。
     for message in request.messages.iter().filter(|m| m.role == Role::System) {
         for part in &message.content {
             match part {
                 ContentPart::Media { media_type, .. } => {
                     warnings.push(Warning::unsupported(
-                        "media",
+                        warning_feature::MEDIA,
                         format!("OpenAI Responses 系统消息不支持媒体内容（{media_type}），已丢弃"),
                     ));
                 }
                 ContentPart::Custom { kind, .. } => {
                     warnings.push(Warning::unsupported(
-                        "custom",
+                        warning_feature::CUSTOM,
                         format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                     ));
                 }
@@ -718,8 +849,9 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
         .iter()
         .filter(|m| m.role == Role::System)
         .filter_map(|m| text_parts(&m.content))
+        .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
 
     let mut input = Vec::new();
     for message in request.messages.iter().filter(|m| m.role != Role::System) {
@@ -757,6 +889,13 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
                     .tools
                     .iter()
                     .map(|t| {
+                        // 工具级逃生舱（如缓存断点）仅本族键有承载形态，跨族丢弃告警。
+                        warn_dropped_provider_options(
+                            &t.provider_options,
+                            OPENAI_PROVIDER,
+                            "工具级",
+                            warnings,
+                        );
                         let mut tool = serde_json::Map::new();
                         tool.insert("type".into(), json!("function"));
                         tool.insert("name".into(), json!(t.name));
@@ -772,17 +911,22 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             ),
         );
     }
-    if let Some(tc) = &request.tool_choice {
-        obj.insert("tool_choice".into(), tc.clone());
+    if let Some(choice) = &request.tool_choice {
+        obj.insert("tool_choice".into(), encode_tool_choice(choice));
+    }
+    if let Some(v) = request.parallel_tool_calls {
+        obj.insert("parallel_tool_calls".into(), json!(v));
     }
 
     // 请求级逃生舱回传；有状态特性出站丢弃并显式 warning。
+    let mut reasoning_emitted = false;
     if let Some(openai) = request.provider_options.get(OPENAI_PROVIDER) {
         if let Some(text) = openai.get("text") {
             obj.insert("text".into(), text.clone());
         }
         if let Some(reasoning) = openai.get("reasoning") {
             obj.insert("reasoning".into(), reasoning.clone());
+            reasoning_emitted = true;
         }
         for (key, label) in [
             (STATEFUL_STORE, "store"),
@@ -797,7 +941,131 @@ pub fn encode_request(request: &ChatRequest, warnings: &mut Vec<Warning>) -> Val
             }
         }
     }
+    // 类型化 response_format 以 text.format 出站（text 面板在场时已让位原文）。
+    if let Some(format) = text_format {
+        obj.insert("text".into(), json!({ "format": format }));
+    }
+    // 面板逃生舱缺席时以类型化 effort 兜底，保持「旋钮跨请求不丢失」。
+    if !reasoning_emitted && let Some(effort) = request.reasoning {
+        obj.insert("reasoning".into(), json!({ "effort": effort.as_str() }));
+    }
+    // 未知字段逃生舱最后应用：本族字段按目标协议白名单回写（不覆盖类型化
+    // 字段，Responses-only 字段不会写进族内互回的 chat 请求），跨族字段丢弃
+    // 告警。
+    apply_provider_extra(
+        &mut obj,
+        request,
+        OPENAI_PROVIDER,
+        crate::core::ir::ExtraWriteback::TargetFields(RESPONSES_EXTRA_WRITEBACK_FIELDS),
+        warnings,
+    );
     Value::Object(obj)
+}
+
+/// Responses `text.format` → IR `response_format`（chat wire 形状）。
+///
+/// `json_object` 同形；`json_schema` 的扁平字段收进 `json_schema` 子对象；
+/// `text` 等价缺省返回 `None`；未知形状不提升——text 面板逃生舱原文留存，
+/// 同族回写不受影响，跨族出站随面板整体告警。
+fn response_format_from_text_format(format: &Value) -> Option<Value> {
+    match format.get("type").and_then(Value::as_str) {
+        Some("json_object") => Some(json!({ "type": "json_object" })),
+        Some("json_schema") => {
+            let Value::Object(fields) = format else {
+                return None;
+            };
+            let mut inner = fields.clone();
+            inner.remove("type");
+            Some(json!({ "type": "json_schema", "json_schema": inner }))
+        }
+        _ => None,
+    }
+}
+
+/// IR `response_format`（chat 形状）→ Responses `text.format`。
+///
+/// `json_object` 同形；`json_schema` 子对象摊平为顶层字段；`type=text`
+/// 等价缺省不写；其余形状无法表达，记 warning 返回 `None`。
+fn text_format_from_response_format(
+    response_format: Option<&Value>,
+    warnings: &mut Vec<Warning>,
+) -> Option<Value> {
+    let response_format = response_format?;
+    match response_format.get("type").and_then(Value::as_str) {
+        Some("json_object") => Some(response_format.clone()),
+        Some("json_schema") => {
+            let Some(inner) = response_format
+                .get("json_schema")
+                .and_then(Value::as_object)
+            else {
+                warnings.push(Warning::unsupported(
+                    warning_feature::RESPONSE_FORMAT,
+                    format!(
+                        "response_format 的 json_schema 缺少子对象，无法以 text.format 表达: {response_format}"
+                    ),
+                ));
+                return None;
+            };
+            let mut format = inner.clone();
+            format.insert("type".to_string(), json!("json_schema"));
+            Some(Value::Object(format))
+        }
+        Some("text") => None,
+        _ => {
+            warnings.push(Warning::unsupported(
+                warning_feature::RESPONSE_FORMAT,
+                format!(
+                    "OpenAI Responses 无法表达该 response_format 形状，已丢弃: {response_format}"
+                ),
+            ));
+            None
+        }
+    }
+}
+
+/// 解码 wire `tool_choice` 为 IR 类型化枚举（Responses 的工具选择为扁平
+/// `{"type":"function","name"}` 形状）。已知形状之外直接拒绝，避免跨协议
+/// 转换时静默降级为上游 400。
+fn decode_tool_choice(value: &Value) -> Result<ToolChoice, DecodeError> {
+    match value {
+        Value::String(s) => match s.as_str() {
+            "auto" => Ok(ToolChoice::Auto),
+            "none" => Ok(ToolChoice::None),
+            "required" => Ok(ToolChoice::Required),
+            other => Err(DecodeError::InvalidToolChoice {
+                detail: format!("未知字符串值 {other:?}"),
+            }),
+        },
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(DecodeError::InvalidToolChoice {
+                    detail: "对象形状仅支持 {\"type\":\"function\"}".to_string(),
+                });
+            }
+            let name = map.get("name").and_then(Value::as_str).unwrap_or_default();
+            if name.is_empty() {
+                return Err(DecodeError::InvalidToolChoice {
+                    detail: "type=function 缺少 name".to_string(),
+                });
+            }
+            Ok(ToolChoice::Tool {
+                name: name.to_string(),
+            })
+        }
+        _ => Err(DecodeError::InvalidToolChoice {
+            detail: "仅支持字符串或对象".to_string(),
+        }),
+    }
+}
+
+/// 编码 IR tool_choice 为 Responses wire 值。
+fn encode_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::None => json!("none"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::Tool { name } => json!({ "type": "function", "name": name }),
+    }
 }
 
 /// 编码 user 消息为 message 项；媒体 part 映射为 `input_image`/`input_file`。
@@ -817,13 +1085,14 @@ fn encode_user_item(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Value
                 data,
                 provider_options,
             } => {
-                if let Some(part) = encode_media_part(media_type, data, provider_options) {
+                if let Some(part) = encode_media_part(media_type, data, provider_options, warnings)
+                {
                     parts.push(part);
                 }
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                 ));
             }
@@ -846,6 +1115,7 @@ fn encode_media_part(
     media_type: &str,
     data: &crate::core::ir::MediaSource,
     provider_options: &crate::core::ir::ProviderOptions,
+    warnings: &mut Vec<Warning>,
 ) -> Option<Value> {
     let openai = provider_options.get(OPENAI_PROVIDER);
     // provider 托管引用（file_id）经逃生舱回传（同协议族无损）。
@@ -863,6 +1133,21 @@ fn encode_media_part(
         part.insert("type".into(), json!(part_type));
         part.insert("file_id".into(), json!(file_id));
         return Some(Value::Object(part));
+    }
+
+    // base64 数据源拼 data URL 需要完整 `type/subtype`：IR 里仅顶层段的类别
+    // 标记拼不出合法 data URL，丢弃并告警。远程 URL 无需媒体类型（part 类型
+    // 承载类别），不受此限。
+    if matches!(data, crate::core::ir::MediaSource::Data { .. })
+        && !crate::core::ir::is_full_media_type(media_type)
+    {
+        warnings.push(Warning::unsupported(
+            warning_feature::MEDIA,
+            format!(
+                "OpenAI Responses 的 data URL 需要完整媒体类型，{media_type:?} 无法承载，已丢弃"
+            ),
+        ));
+        return None;
     }
 
     let is_image = crate::core::ir::top_level_media_type(media_type) == "image";
@@ -886,7 +1171,7 @@ fn encode_media_part(
                 }
             } else {
                 let filename = openai
-                    .and_then(|o| o.get(FILE_NAME))
+                    .and_then(|o| o.get(FILE_NAME_KEY))
                     .and_then(Value::as_str)
                     .unwrap_or("data");
                 part.insert("filename".into(), json!(filename));
@@ -970,13 +1255,13 @@ fn encode_assistant_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec
             }
             ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "media",
+                    warning_feature::MEDIA,
                     format!("OpenAI Responses 助手消息不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                 ));
             }
@@ -996,6 +1281,14 @@ fn encode_tool_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Valu
                 output,
                 ..
             } => {
+                // 官方类型 `output: string | 内容数组`：非字符串载荷（Gemini
+                // functionResponse.response 对象、Anthropic 块数组等跨族来源）
+                // 序列化为 JSON 字符串——值经序列化保留，与 chat 出站整形
+                // 同规（同为无损形状归一，不告警）。
+                let output = match output {
+                    Value::String(text) => json!(text),
+                    other => json!(other.to_string()),
+                };
                 items.push(json!({
                     "type": "function_call_output",
                     "call_id": tool_call_id,
@@ -1004,7 +1297,7 @@ fn encode_tool_items(message: &Message, warnings: &mut Vec<Warning>) -> Vec<Valu
             }
             _ => {
                 warnings.push(Warning::unsupported(
-                    "tool_result",
+                    warning_feature::TOOL_RESULT,
                     "tool 消息含非 ToolResult part，已丢弃",
                 ));
             }
@@ -1040,18 +1333,7 @@ fn content_options(part: &mut ContentPart, openai: Value) {
 
 /// 聚合消息中所有 text part 为一个字符串。
 fn text_parts(parts: &[ContentPart]) -> Option<String> {
-    let texts: Vec<&str> = parts
-        .iter()
-        .filter_map(|p| match p {
-            ContentPart::Text { text, .. } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    if texts.is_empty() {
-        None
-    } else {
-        Some(texts.concat())
-    }
+    crate::core::ir::text_content(parts)
 }
 
 // ---- 上游响应解码：wire → IR ----
@@ -1227,30 +1509,58 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     None
 }
 
+/// 判断非流式 Responses 对象是否明确以失败状态结束。
+pub fn response_is_failed(value: &Value) -> bool {
+    value.get("status").and_then(Value::as_str) == Some("failed")
+}
+
 /// 从 usage 对象解析 IR 四分量（input 不含缓存的减法约定）。
 fn parse_usage_object(usage: &serde_json::Map<String, Value>) -> Option<Usage> {
-    let input = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = usage
-        .get("input_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cache_write = usage
-        .get("input_tokens_details")
-        .and_then(|d| d.get("cache_write_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let mut has_metric = false;
+    let input = match usage.get("input_tokens") {
+        None => 0,
+        Some(value) => {
+            has_metric = true;
+            value.as_u64()?
+        }
+    };
+    let (cached, cache_write) = match usage.get("input_tokens_details") {
+        None | Some(Value::Null) => (0, 0),
+        Some(value) => {
+            let details = value.as_object()?;
+            let cached = match details.get("cached_tokens") {
+                None => 0,
+                Some(value) => {
+                    has_metric = true;
+                    value.as_u64()?
+                }
+            };
+            let cache_write = match details.get("cache_write_tokens") {
+                None => 0,
+                Some(value) => {
+                    has_metric = true;
+                    value.as_u64()?
+                }
+            };
+            (cached, cache_write)
+        }
+    };
+    let output = match usage.get("output_tokens") {
+        None => 0,
+        Some(value) => {
+            has_metric = true;
+            value.as_u64()?
+        }
+    };
+    if !has_metric {
+        return None;
+    }
     Some(Usage {
         input_tokens: input.saturating_sub(cached).saturating_sub(cache_write),
-        output_tokens: usage
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        output_tokens: output,
         cache_read_tokens: cached,
         cache_write_tokens: cache_write,
+        cache_write_1h_tokens: 0,
         raw: Some(Value::Object(usage.clone())),
     })
 }
@@ -1276,6 +1586,7 @@ fn convert_usage(wire: WireUsage) -> Usage {
         output_tokens: wire.output_tokens,
         cache_read_tokens: cached,
         cache_write_tokens: cache_write,
+        cache_write_1h_tokens: 0,
         raw,
     }
 }
@@ -1407,13 +1718,13 @@ pub fn encode_response(response: &ChatResponse) -> Value {
             ContentPart::ToolResult { .. } => {}
             ContentPart::Media { media_type, .. } => {
                 warnings.push(Warning::unsupported(
-                    "media",
+                    warning_feature::MEDIA,
                     format!("OpenAI Responses 响应输出不支持媒体内容（{media_type}），已丢弃"),
                 ));
             }
             ContentPart::Custom { kind, .. } => {
                 warnings.push(Warning::unsupported(
-                    "custom",
+                    warning_feature::CUSTOM,
                     format!("OpenAI Responses 不支持 {kind} 内容块，已丢弃"),
                 ));
             }
@@ -1473,10 +1784,11 @@ fn encode_usage(usage: &Usage) -> Value {
 
 /// 流式解码器：把上游 Responses SSE 事件解码为 IR 流事件。
 ///
-/// 对齐 AI SDK：`output_item.added` 开启块（message→text、function_call→tool、
+/// `output_item.added` 开启块（message→text、function_call→tool、
 /// reasoning→reasoning），`output_text.delta`/`function_call_arguments.delta`/
 /// `reasoning_summary_text.delta` 产出增量，`output_item.done` 收尾（function_call
-/// 在此解析出完整 arguments），`response.completed`/`incomplete` 产出 Finish。
+/// 在此解析出完整 arguments），`response.completed`/`incomplete` 产出 Finish，
+/// `error` 事件产出 IR Error（流内报错不再静默吞掉）。
 #[derive(Default)]
 pub struct StreamDecoder {
     /// 按 output_index 维护进行中的工具调用（arguments 跨帧累积）。
@@ -1501,10 +1813,16 @@ pub struct DecodeStreamChunk {
 
 impl StreamDecoder {
     /// 解码单个上游 SSE 事件为若干 IR 流事件。
-    pub fn process(&mut self, value: &Value) -> DecodeStreamChunk {
-        let wire = match serde_json::from_value::<WireStreamEvent>(value.clone()) {
+    pub fn process(&mut self, value: &str) -> DecodeStreamChunk {
+        let wire = match serde_json::from_str::<WireStreamEvent>(value) {
             Ok(wire) => wire,
-            Err(_) => return DecodeStreamChunk::delivery(Vec::new()),
+            Err(err) => {
+                return DecodeStreamChunk::delivery(decode_failed_frame(
+                    &err,
+                    value,
+                    ErrorMessageShape::TopLevelOnErrorType,
+                ));
+            }
         };
 
         let mut events = Vec::new();
@@ -1578,7 +1896,7 @@ impl StreamDecoder {
                             openai.insert(REASONING_ENCRYPTED.into(), json!(encrypted));
                         }
                         events.push(StreamEvent::ReasoningStart {
-                            // 对齐 AI SDK：reasoning-start id 为 `${itemId}:${summaryIndex}`。
+                            // reasoning-start id 为 `${itemId}:${summaryIndex}`。
                             id: format!("{id}:0"),
                             provider_options: if openai.is_empty() {
                                 HashMap::new()
@@ -1723,6 +2041,12 @@ impl StreamDecoder {
                     provider_metadata: HashMap::new(),
                 });
             }
+            WireStreamEvent::Error { message, error } => {
+                let text = message
+                    .or_else(|| error.and_then(|body| body.message))
+                    .unwrap_or_default();
+                events.push(StreamEvent::Error { message: text });
+            }
         }
 
         DecodeStreamChunk { events, is_output }
@@ -1744,8 +2068,10 @@ impl DecodeStreamChunk {
 ///
 /// 维护进行中的块状态，把事件还原为 Responses 事件流：`response.created`/
 /// `response.output_item.added`/`response.output_text.delta`/`response.output_text.
-/// done`/`response.output_item.done`/`response.completed`。调用方负责把每帧包成
-/// SSE 发送；`StreamStart` 的 warnings 随 `response.created` 的 `gateway` 字段下发。
+/// done`/`response.output_item.done`/`response.completed`。`output_text.done` 与
+/// 终端 `response.completed` 的 `response.output` 按官方契约承载完整文本与完整
+/// 条目数组；流收尾时未显式关闭的块在此补收。调用方负责把每帧包成 SSE 发送；
+/// `StreamStart` 的 warnings 随 `response.created` 的 `gateway` 字段下发。
 #[derive(Default)]
 pub struct StreamEncoder {
     /// 进行中的文本块 id（`output_item.added` 记录，`output_item.done` 消费）。
@@ -1759,6 +2085,10 @@ pub struct StreamEncoder {
     inbound_model: Option<String>,
     /// `StreamStart` 转换的 warnings，随首个 `response.created` 的 `gateway` 字段下发。
     pending_warnings: Vec<Warning>,
+    /// `response.created` 已下发后才到达的 warnings（如 chat 上游流中段才
+    /// 开启的 tool call 缺 name/id）：Responses 无独立告警事件，改随终端
+    /// `response.completed` 的 `response.gateway` 下发，不静默滞留。
+    late_warnings: Vec<Warning>,
     /// output_index 分配：每个 output item 一个递增的唯一索引。下游 SDK 按
     /// output_index 索引进行中的工具调用与活跃项，多 item 共用 0 会互相覆盖。
     next_item_index: usize,
@@ -1768,6 +2098,20 @@ pub struct StreamEncoder {
     reasoning_indexes: HashMap<String, usize>,
     /// 进行中工具调用的 output_index（按 call_id）。
     tool_indexes: HashMap<String, usize>,
+    /// 进行中文本块已累积的完整文本：`output_text.done` 与最终 message 项
+    /// 按官方契约承载全文，而非恒空。
+    text_accumulated: String,
+    /// reasoning 项按 item_id 累积的 summary 文本（最终项回传）。
+    reasoning_texts: HashMap<String, String>,
+    /// reasoning 项 start 事件携带的 encrypted_content（最终项原样回传）。
+    reasoning_encrypted: HashMap<String, Option<Value>>,
+    /// 已收尾 output 项的最终形状（按 output_index 归序后进 `response.completed`
+    /// 的 `response.output`，官方契约要求终端帧承载完整条目数组）。
+    final_items: Vec<(usize, Value)>,
+    /// `response.created` 是否已下发：官方契约要求它是首帧，上游流缺元数据
+    /// （如 chat 上游 chunk 缺 id/model、Gemini 上游缺 responseId/modelVersion）
+    /// 时由首个内容/终端事件前合成补发，见 [`StreamEncoder::ensure_created`]。
+    created_emitted: bool,
 }
 
 /// 进行中的工具调用（出站侧）。
@@ -1793,55 +2137,180 @@ impl StreamEncoder {
         index
     }
 
+    /// 关闭进行中的文本块：以累积全文下发 `output_text.done`/
+    /// `content_part.done`/`output_item.done` 三帧，并把最终 message 项登记
+    /// 进完成集（供 `response.completed` 的 output 数组承载）。
+    fn close_text_block(&mut self) -> Vec<SseFrame> {
+        let Some(item_id) = self.text_id.clone() else {
+            return Vec::new();
+        };
+        let output_index = self.text_index.take().unwrap_or(0);
+        self.text_id = None;
+        let full_text = std::mem::take(&mut self.text_accumulated);
+        let item = json!({
+            "type": "message",
+            "id": item_id,
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": full_text, "annotations": [] }],
+        });
+        self.final_items.push((output_index, item.clone()));
+        vec![
+            SseFrame::named(
+                "response.output_text.done",
+                json!({
+                    "type": "response.output_text.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": full_text,
+                })
+                .to_string(),
+            ),
+            SseFrame::named(
+                "response.content_part.done",
+                json!({
+                    "type": "response.content_part.done",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": { "type": "output_text", "text": full_text, "annotations": [] },
+                })
+                .to_string(),
+            ),
+            SseFrame::named(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    /// 关闭 reasoning 项：以累积 summary 与 encrypted_content 构造最终条目，
+    /// 登记进完成集并下发 `summary_part.done` + `output_item.done`。
+    /// 无 start 也无增量的 id 无内容可收，跳过（不产出幽灵条目）。
+    fn close_reasoning_item(&mut self, ir_id: &str) -> Vec<SseFrame> {
+        let base_id = strip_summary_suffix(ir_id).to_string();
+        let Some(output_index) = self.reasoning_indexes.remove(&base_id) else {
+            return Vec::new();
+        };
+        let encrypted = self.reasoning_encrypted.remove(&base_id).flatten();
+        let text = self.reasoning_texts.remove(&base_id).unwrap_or_default();
+        let mut item = serde_json::Map::new();
+        item.insert("type".into(), json!("reasoning"));
+        item.insert("id".into(), json!(base_id));
+        match encrypted {
+            Some(enc) => item.insert("encrypted_content".into(), enc),
+            None => item.insert("encrypted_content".into(), Value::Null),
+        };
+        item.insert(
+            "summary".into(),
+            json!([{ "type": "summary_text", "text": text }]),
+        );
+        let item = Value::Object(item);
+        self.final_items.push((output_index, item.clone()));
+        vec![
+            SseFrame::named(
+                "response.reasoning_summary_part.done",
+                json!({
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": base_id,
+                    "output_index": output_index,
+                    "summary_index": 0,
+                })
+                .to_string(),
+            ),
+            SseFrame::named(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                })
+                .to_string(),
+            ),
+        ]
+    }
+
+    /// 关闭 function_call 项：构造最终条目、登记进完成集并产出
+    /// `output_item.done`（arguments 为累积的完整参数串）。
+    fn close_function_call(&mut self, call_id: &str, tool_name: &str, arguments: &str) -> SseFrame {
+        let output_index = self.tool_indexes.remove(call_id).unwrap_or(0);
+        let item = json!({
+            "type": "function_call",
+            "id": format!("fc_{call_id}"),
+            "call_id": call_id,
+            "name": tool_name,
+            "arguments": arguments,
+        });
+        self.final_items.push((output_index, item.clone()));
+        SseFrame::named(
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "output_index": output_index,
+                "item": item,
+            })
+            .to_string(),
+        )
+    }
+
     /// 编码一个 IR 流事件，返回需要下发的 SSE 帧（可能为空）。
     pub fn encode(&mut self, event: &StreamEvent) -> Vec<SseFrame> {
         match event {
             StreamEvent::StreamStart { warnings } => {
                 // warnings 留存，待首个 `response.created`（含真实 id）下发出。
-                self.pending_warnings.extend(warnings.clone());
+                if self.created_emitted {
+                    // 首帧已过（如 chat 上游流中段补发的告警）：created 只发一次，
+                    // 改随终端 response.completed 的 gateway 字段下发。
+                    self.late_warnings.extend(warnings.clone());
+                } else {
+                    self.pending_warnings.extend(warnings.clone());
+                }
                 Vec::new()
             }
             StreamEvent::ResponseMetadata { id, model } => {
                 self.id = id.clone();
                 self.model = model.clone();
                 // 首个 `response.created` 在拿到真实 id/model 后下发，避免占位 id
-                // 与 `response.completed` 的真实 id 不一致。
-                let mut response = serde_json::Map::new();
-                response.insert("id".into(), json!(id));
-                response.insert("object".into(), json!("response"));
-                response.insert("status".into(), json!("in_progress"));
-                let model = self.inbound_model.as_deref().unwrap_or(model);
-                response.insert("model".into(), json!(model));
-                if let Some(gateway) =
-                    crate::core::openai_chat::encode_warnings(&self.pending_warnings)
-                {
-                    response.insert("gateway".into(), gateway);
+                // 与 `response.completed` 的真实 id 不一致。已合成过首帧（上游
+                // 流从未产出元数据）时只更新 id/model 供后续帧使用，不重复宣告。
+                if self.created_emitted {
+                    return Vec::new();
                 }
-                self.pending_warnings.clear();
-                vec![SseFrame::named(
-                    "response.created",
-                    json!({ "type": "response.created", "response": response }).to_string(),
-                )]
+                self.created_emitted = true;
+                vec![self.created_frame()]
             }
             StreamEvent::TextStart {
                 id,
                 provider_options,
             } => {
+                let mut frames = self.ensure_created();
                 self.text_id = Some(id.clone());
                 let output_index = self.next_output_index();
                 self.text_index = Some(output_index);
+                self.text_accumulated.clear();
                 let item_id = provider_options
                     .get(OPENAI_PROVIDER)
                     .and_then(|o| o.get(ITEM_ID))
                     .and_then(Value::as_str)
                     .unwrap_or(id);
-                vec![
+                frames.extend(vec![
                     SseFrame::named(
                         "response.output_item.added",
                         json!({
                             "type": "response.output_item.added",
                             "output_index": output_index,
-                            "item": { "type": "message", "id": item_id, "phase": "final_answer" },
+                            "item": {
+                                "type": "message",
+                                "id": item_id,
+                                "role": "assistant",
+                                "content": [],
+                            },
                         })
                         .to_string(),
                     ),
@@ -1856,12 +2325,15 @@ impl StreamEncoder {
                         })
                         .to_string(),
                     ),
-                ]
+                ]);
+                frames
             }
             StreamEvent::TextDelta { id, delta, .. } => {
+                let mut frames = self.ensure_created();
                 let item_id = self.text_id.as_deref().unwrap_or(id);
                 let output_index = self.text_index.unwrap_or(0);
-                vec![SseFrame::named(
+                self.text_accumulated.push_str(delta);
+                frames.push(SseFrame::named(
                     "response.output_text.delta",
                     json!({
                         "type": "response.output_text.delta",
@@ -1871,50 +2343,19 @@ impl StreamEncoder {
                         "delta": delta,
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
-            StreamEvent::TextEnd { id, .. } => {
-                let item_id = self.text_id.as_deref().unwrap_or(id).to_string();
-                let output_index = self.text_index.take().unwrap_or(0);
-                self.text_id = None;
-                vec![
-                    SseFrame::named(
-                        "response.output_text.done",
-                        json!({
-                            "type": "response.output_text.done",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "text": "",
-                        })
-                        .to_string(),
-                    ),
-                    SseFrame::named(
-                        "response.content_part.done",
-                        json!({
-                            "type": "response.content_part.done",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "part": { "type": "output_text", "text": "", "annotations": [] },
-                        })
-                        .to_string(),
-                    ),
-                    SseFrame::named(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": { "type": "message", "id": item_id, "role": "assistant" },
-                        })
-                        .to_string(),
-                    ),
-                ]
+            StreamEvent::TextEnd { .. } => {
+                let mut frames = self.ensure_created();
+                frames.extend(self.close_text_block());
+                frames
             }
             StreamEvent::ReasoningStart {
                 id,
                 provider_options,
             } => {
+                let mut frames = self.ensure_created();
                 let item_id = provider_options
                     .get(OPENAI_PROVIDER)
                     .and_then(|o| o.get(ITEM_ID))
@@ -1924,8 +2365,11 @@ impl StreamEncoder {
                     .get(OPENAI_PROVIDER)
                     .and_then(|o| o.get(REASONING_ENCRYPTED));
                 let output_index = self.next_output_index();
-                self.reasoning_indexes
-                    .insert(strip_summary_suffix(id).to_string(), output_index);
+                let base_id = strip_summary_suffix(id).to_string();
+                self.reasoning_indexes.insert(base_id.clone(), output_index);
+                self.reasoning_encrypted
+                    .insert(base_id.clone(), encrypted.cloned());
+                self.reasoning_texts.insert(base_id, String::new());
                 let mut item = serde_json::Map::new();
                 item.insert("type".into(), json!("reasoning"));
                 item.insert("id".into(), json!(item_id));
@@ -1933,7 +2377,7 @@ impl StreamEncoder {
                     Some(enc) => item.insert("encrypted_content".into(), enc.clone()),
                     None => item.insert("encrypted_content".into(), Value::Null),
                 };
-                vec![SseFrame::named(
+                frames.push(SseFrame::named(
                     "response.output_item.added",
                     json!({
                         "type": "response.output_item.added",
@@ -1941,49 +2385,58 @@ impl StreamEncoder {
                         "item": Value::Object(item),
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
             StreamEvent::ReasoningDelta { id, delta, .. } => {
-                let item_id = strip_summary_suffix(id);
-                let output_index = self.reasoning_indexes.get(item_id).copied().unwrap_or(0);
-                vec![SseFrame::named(
+                let mut frames = self.ensure_created();
+                let base_id = strip_summary_suffix(id).to_string();
+                // 无 start 事件的增量：惰性补齐 output_index 并补发 added 事件，
+                // 使下游看到的流序与官方契约一致（added 先于任何 delta）。
+                let (output_index, added_frames) = match self.reasoning_indexes.get(&base_id) {
+                    Some(index) => (*index, Vec::new()),
+                    None => {
+                        let index = self.next_output_index();
+                        self.reasoning_indexes.insert(base_id.clone(), index);
+                        self.reasoning_encrypted.insert(base_id.clone(), None);
+                        self.reasoning_texts.insert(base_id.clone(), String::new());
+                        let added = SseFrame::named(
+                            "response.output_item.added",
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": index,
+                                "item": { "type": "reasoning", "id": base_id, "summary": [] },
+                            })
+                            .to_string(),
+                        );
+                        (index, vec![added])
+                    }
+                };
+                self.reasoning_texts
+                    .entry(base_id.clone())
+                    .or_default()
+                    .push_str(delta);
+                frames.extend(added_frames);
+                frames.push(SseFrame::named(
                     "response.reasoning_summary_text.delta",
                     json!({
                         "type": "response.reasoning_summary_text.delta",
-                        "item_id": item_id,
+                        "item_id": base_id,
                         "output_index": output_index,
                         "summary_index": 0,
                         "delta": delta,
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
             StreamEvent::ReasoningEnd { id, .. } => {
-                let item_id = strip_summary_suffix(id);
-                let output_index = self.reasoning_indexes.remove(item_id).unwrap_or(0);
-                vec![
-                    SseFrame::named(
-                        "response.reasoning_summary_part.done",
-                        json!({
-                            "type": "response.reasoning_summary_part.done",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "summary_index": 0,
-                        })
-                        .to_string(),
-                    ),
-                    SseFrame::named(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": { "type": "reasoning", "id": item_id },
-                        })
-                        .to_string(),
-                    ),
-                ]
+                let mut frames = self.ensure_created();
+                frames.extend(self.close_reasoning_item(id));
+                frames
             }
             StreamEvent::ToolInputStart { id, tool_name, .. } => {
+                let mut frames = self.ensure_created();
                 let output_index = self.next_output_index();
                 self.tool_indexes.insert(id.clone(), output_index);
                 self.tools.insert(
@@ -1993,7 +2446,7 @@ impl StreamEncoder {
                         arguments: String::new(),
                     },
                 );
-                vec![SseFrame::named(
+                frames.push(SseFrame::named(
                     "response.output_item.added",
                     json!({
                         "type": "response.output_item.added",
@@ -2007,14 +2460,16 @@ impl StreamEncoder {
                         },
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
             StreamEvent::ToolInputDelta { id, delta, .. } => {
                 if let Some(tool) = self.tools.get_mut(id) {
                     tool.arguments.push_str(delta);
                 }
                 let output_index = self.tool_indexes.get(id).copied().unwrap_or(0);
-                vec![SseFrame::named(
+                let mut frames = self.ensure_created();
+                frames.push(SseFrame::named(
                     "response.function_call_arguments.delta",
                     json!({
                         "type": "response.function_call_arguments.delta",
@@ -2023,7 +2478,8 @@ impl StreamEncoder {
                         "delta": delta,
                     })
                     .to_string(),
-                )]
+                ));
+                frames
             }
             StreamEvent::ToolInputEnd { id, .. } => {
                 // 终端事件：以累积的完整 arguments 下发 `output_item.done`，关闭
@@ -2031,22 +2487,9 @@ impl StreamEncoder {
                 let Some(tool) = self.tools.remove(id) else {
                     return Vec::new();
                 };
-                let output_index = self.tool_indexes.remove(id).unwrap_or(0);
-                vec![SseFrame::named(
-                    "response.output_item.done",
-                    json!({
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "item": {
-                            "type": "function_call",
-                            "id": format!("fc_{id}"),
-                            "call_id": id,
-                            "name": tool.tool_name,
-                            "arguments": tool.arguments,
-                        },
-                    })
-                    .to_string(),
-                )]
+                let mut frames = self.ensure_created();
+                frames.push(self.close_function_call(id, &tool.tool_name, &tool.arguments));
+                frames
             }
             StreamEvent::ToolCall {
                 tool_call_id,
@@ -2055,49 +2498,37 @@ impl StreamEncoder {
                 ..
             } => {
                 // 兜底：非增量路径（如直接以完整工具调用编码）同样关闭 function_call 项。
-                let output_index = self.tool_indexes.remove(tool_call_id).unwrap_or(0);
-                vec![SseFrame::named(
-                    "response.output_item.done",
-                    json!({
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "item": {
-                            "type": "function_call",
-                            "id": format!("fc_{tool_call_id}"),
-                            "call_id": tool_call_id,
-                            "name": tool_name,
-                            "arguments": input.to_string(),
-                        },
-                    })
-                    .to_string(),
-                )]
+                self.tools.remove(tool_call_id);
+                let mut frames = self.ensure_created();
+                frames.push(self.close_function_call(tool_call_id, tool_name, &input.to_string()));
+                frames
             }
             StreamEvent::Finish {
                 finish_reason,
                 usage,
                 ..
             } => {
-                // 上游解码器（如 openai_chat）可能不发 ToolInputEnd，靠累积器 flush 收尾；
-                // 流结束前把仍打开的 function_call 项逐个关闭，避免下游收到未闭合工具。
+                // 流结束前把未收尾的项逐个关闭：上游解码器（如 openai_chat）可能
+                // 不发 TextEnd/ToolInputEnd，靠此处 flush 收尾，避免下游收到未闭合
+                // 条目或残缺的终端 output 数组。
+                let mut frames = self.ensure_created();
+                frames.extend(self.close_text_block());
+                let mut open_reasoning: Vec<(usize, String)> = self
+                    .reasoning_indexes
+                    .iter()
+                    .map(|(id, index)| (*index, id.clone()))
+                    .collect();
+                open_reasoning.sort_unstable_by_key(|(index, _)| *index);
+                for (_, id) in open_reasoning {
+                    frames.extend(self.close_reasoning_item(&id));
+                }
                 let pending: Vec<(String, OpenStreamTool)> =
                     std::mem::take(&mut self.tools).into_iter().collect();
-                let mut pending_tools = Vec::new();
                 for (call_id, tool) in pending {
-                    let output_index = self.tool_indexes.remove(&call_id).unwrap_or(0);
-                    pending_tools.push(SseFrame::named(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": {
-                                "type": "function_call",
-                                "id": format!("fc_{call_id}"),
-                                "call_id": call_id,
-                                "name": tool.tool_name,
-                                "arguments": tool.arguments,
-                            },
-                        })
-                        .to_string(),
+                    frames.push(self.close_function_call(
+                        &call_id,
+                        &tool.tool_name,
+                        &tool.arguments,
                     ));
                 }
                 let (status, incomplete) = encode_status(finish_reason);
@@ -2114,19 +2545,76 @@ impl StreamEncoder {
                 response.insert("status".into(), json!(status));
                 let model = self.inbound_model.as_deref().unwrap_or(&self.model);
                 response.insert("model".into(), json!(model));
-                response.insert("output".into(), Value::Array(Vec::new()));
+                // 官方契约：终端帧的 response.output 承载完整条目数组（按
+                // output_index 归序），不再恒空。
+                self.final_items.sort_by_key(|(index, _)| *index);
+                let output: Vec<Value> = self.final_items.drain(..).map(|(_, item)| item).collect();
+                response.insert("output".into(), Value::Array(output));
                 if let Some(reason) = incomplete {
                     response.insert("incomplete_details".into(), json!({ "reason": reason }));
                 }
                 response.insert("usage".into(), encode_usage(usage));
-                let mut frames = pending_tools;
+                // created 帧之后才到达的 warnings 随终端帧补发：Responses 无独立
+                // 告警事件，挂在 response.gateway（SDK 容忍未知键）。
+                let late_warnings = std::mem::take(&mut self.late_warnings);
+                if let Some(gateway) = crate::core::openai_chat::encode_warnings(&late_warnings) {
+                    response.insert("gateway".into(), gateway);
+                }
                 frames.push(SseFrame::named(
                     "response.completed",
                     json!({ "type": "response.completed", "response": response }).to_string(),
                 ));
                 frames
             }
+            // 流内错误以 `event: error` 下发（与网关兜底错误帧同形状），
+            // 由调用方感知并终止流。
+            StreamEvent::Error { message } => {
+                let mut frames = self.ensure_created();
+                frames.push(stream_error_frame(message));
+                frames
+            }
         }
+    }
+
+    /// 上游流从未产出 `ResponseMetadata` 时（chat 上游 chunk 缺 id/model、
+    /// Gemini 上游缺 responseId/modelVersion 等实际存在的形状），首个内容或
+    /// 终端事件前合成最小元数据补发 `response.created`：下游 SDK 按官方契约
+    /// 期待 created 为首帧，缺失即协议破坏；`pending_warnings` 也只随该帧
+    /// 下发，不补发会整条滞留。占位 id 与终端帧的真实 id 可能不一致——
+    /// 元数据迟到时以 [`Self::id`] 的更新值为准，该折衷仅发生在上游完全不发
+    /// 元数据的畸形流上。
+    fn ensure_created(&mut self) -> Vec<SseFrame> {
+        if self.created_emitted {
+            return Vec::new();
+        }
+        self.created_emitted = true;
+        vec![self.created_frame()]
+    }
+
+    /// 构造 `response.created` 帧：以当前已知 id/model 填充（合成路径下为
+    /// 占位值），携带留存的 warnings。
+    fn created_frame(&mut self) -> SseFrame {
+        let mut response = serde_json::Map::new();
+        response.insert(
+            "id".into(),
+            json!(if self.id.is_empty() {
+                "resp_stream"
+            } else {
+                self.id.as_str()
+            }),
+        );
+        response.insert("object".into(), json!("response"));
+        response.insert("status".into(), json!("in_progress"));
+        let model = self.inbound_model.as_deref().unwrap_or(&self.model);
+        response.insert("model".into(), json!(model));
+        if let Some(gateway) = crate::core::openai_chat::encode_warnings(&self.pending_warnings) {
+            response.insert("gateway".into(), gateway);
+        }
+        self.pending_warnings.clear();
+        SseFrame::named(
+            "response.created",
+            json!({ "type": "response.created", "response": response }).to_string(),
+        )
     }
 }
 
@@ -2154,6 +2642,12 @@ pub fn encode_error(status: u16, message: &str) -> Value {
             "code": null,
         }
     })
+}
+
+/// 流内错误的入站 SSE 帧（`event: error`，500 语义）。流式编码器消费 IR
+/// Error 事件与网关兜底路径共用，保证形状一致。
+pub fn stream_error_frame(message: &str) -> SseFrame {
+    SseFrame::named("error", encode_error(500, message).to_string())
 }
 
 /// 编码为 OpenAI `GET /v1/models` 列表（Responses 与 Chat Completions 共用 Models API）。
@@ -2205,6 +2699,150 @@ mod tests {
         assert!(warnings.is_empty(), "同协议往返不应产出 warning");
     }
 
+    /// 多条 System 消息聚合为单条 instructions（空文本跳过，`\n\n` 连接，
+    /// 与 anthropic / chat 出站归并语义一致）。
+    #[test]
+    fn multiple_system_messages_aggregate_into_instructions() {
+        let request = ChatRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Text {
+                        text: "你是天气助手".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentPart::Text {
+                        text: "上海天气如何？".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::System,
+                    content: vec![ContentPart::Text {
+                        text: "输出一律使用 JSON".to_string(),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&request, &mut warnings);
+        assert_eq!(
+            encoded["instructions"],
+            json!("你是天气助手\n\n输出一律使用 JSON")
+        );
+        // System 消息不进入 input 序列。
+        let input = encoded["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+    }
+
+    /// 流内错误编码：以 `event: error` 帧下发 OpenAI 错误 JSON，与网关兜底
+    /// 错误帧（`stream_error_frame`）同形状。
+    #[test]
+    fn stream_error_event_encodes_to_named_error_frame() {
+        let mut encoder = StreamEncoder::new(None);
+        let frames = encoder.encode(&StreamEvent::Error {
+            message: "Overloaded".to_string(),
+        });
+        // 上游流从未产出元数据：错误帧前先合成 `response.created`（官方契约
+        // 的首帧），再下发错误帧。
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].event.as_deref(), Some("response.created"));
+        assert_eq!(frames[1], stream_error_frame("Overloaded"));
+        assert_eq!(frames[1].event.as_deref(), Some("error"));
+        let body: Value = serde_json::from_str(&frames[1].data).expect("错误帧载荷应为 JSON");
+        assert_eq!(
+            body,
+            json!({ "error": { "message": "Overloaded", "type": "api_error", "code": null } })
+        );
+    }
+
+    /// 流内 `error` 事件解码为 IR Error：官方顶层 `message` 与嵌套
+    /// `error.message` 两种形状都认，不产出其他事件。流首错误帧即此形状，
+    /// 网关 peek 窗口对 IR Error 的归类（可 failover）由此打通。
+    #[test]
+    fn stream_error_event_decodes_to_ir_error() {
+        let top_level = json!({
+            "type": "error",
+            "code": "insufficient_quota",
+            "message": "quota exceeded",
+        });
+        let decoded = StreamDecoder::default().process(&top_level.to_string());
+        assert!(!decoded.is_output);
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "quota exceeded".to_string(),
+            }]
+        );
+
+        let nested = json!({
+            "type": "error",
+            "error": {
+                "type": "insufficient_quota",
+                "code": "insufficient_quota",
+                "message": "You exceeded your current quota",
+            },
+        });
+        let decoded = StreamDecoder::default().process(&nested.to_string());
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "You exceeded your current quota".to_string(),
+            }]
+        );
+    }
+
+    /// 形状畸形的错误帧（顶层 message 类型不符导致解析失败）仍提取错误语义；
+    /// 未建模的事件类型留痕后跳过，不误判为错误。
+    #[test]
+    fn malformed_frames_surface_error_semantics_or_skip() {
+        let malformed = json!({
+            "type": "error",
+            "message": 42,
+            "error": { "message": "boom" },
+        });
+        let decoded = StreamDecoder::default().process(&malformed.to_string());
+        assert_eq!(
+            decoded.events,
+            vec![StreamEvent::Error {
+                message: "boom".to_string(),
+            }]
+        );
+
+        let unmodeled = json!({
+            "type": "response.output_text.done",
+            "item_id": "msg_1",
+            "text": "done",
+        });
+        let decoded = StreamDecoder::default().process(&unmodeled.to_string());
+        assert_eq!(decoded.events, Vec::new());
+    }
+
     /// 多模态黄金样例请求 decode → encode 往返还原 wire，文本与媒体混排顺序不丢。
     ///
     /// 覆盖 input_image（base64 data URL + detail / 远程 URL）与 input_file
@@ -2241,7 +2879,7 @@ mod tests {
                 data: crate::core::ir::MediaSource::Data { base64 },
                 provider_options,
             } if media_type == "application/pdf" && base64 == "JVBERi0xLjQK"
-                && provider_options.get("openai").and_then(|o| o.get(FILE_NAME))
+                && provider_options.get("openai").and_then(|o| o.get(FILE_NAME_KEY))
                     == Some(&Value::String("doc.pdf".to_string()))
         ));
         assert!(matches!(parts[4], ContentPart::Text { .. }));
@@ -2254,8 +2892,8 @@ mod tests {
         ));
     }
 
-    /// 跨协议：音频媒体（audio/mp3）在 Responses 出站编码为 `input_file`（对齐
-    /// AI SDK：Responses 无 input_audio 输入 part，音频媒体映射为文件）。
+    /// 跨协议：音频媒体（audio/mp3）在 Responses 出站编码为 `input_file`
+    ///（Responses 无 input_audio 输入 part，音频媒体映射为文件）。
     #[test]
     fn audio_media_encodes_to_input_file() {
         use crate::core::ir::Message;
@@ -2285,7 +2923,10 @@ mod tests {
             response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
             provider_options: HashMap::new(),
+            warnings: Vec::new(),
         };
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);
@@ -2401,7 +3042,7 @@ mod tests {
         ];
         for raw in frames {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }
@@ -2427,7 +3068,7 @@ mod tests {
             include_str!("__fixtures__/stream_reasoning_done.json"),
         ] {
             let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
-            for event in decoder.process(&wire).events {
+            for event in decoder.process(&wire.to_string()).events {
                 accumulator.push(event);
             }
         }
@@ -2452,6 +3093,210 @@ mod tests {
         assert_eq!(
             provider_options["openai"][REASONING_ENCRYPTED], "enc_stream",
             "流式 reasoning 应携带 encrypted_content"
+        );
+    }
+
+    /// 流式出站 message 项形状对齐官方契约：added 携带 `role` 与空 `content`
+    /// 初始形态（无非官方 `phase`），done 与终端 `response.completed` 的
+    /// output 数组承载完整条目。
+    #[test]
+    fn stream_message_item_shape_matches_official_contract() {
+        let mut encoder = StreamEncoder::new(None);
+        let mut frames = Vec::new();
+        for event in [
+            StreamEvent::ResponseMetadata {
+                id: "resp_1".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            StreamEvent::TextStart {
+                id: "msg_1".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "msg_1".to_string(),
+                delta: "Hel".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "msg_1".to_string(),
+                delta: "lo".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextEnd {
+                id: "msg_1".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::Finish {
+                finish_reason: FinishReason {
+                    unified: FinishReasonUnified::Stop,
+                    raw: None,
+                },
+                usage: Usage::default(),
+                provider_metadata: HashMap::new(),
+            },
+        ] {
+            frames.extend(encoder.encode(&event));
+        }
+
+        let added = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_item.added"))
+            .expect("应有 added 帧");
+        let payload: Value = serde_json::from_str(&added.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["item"],
+            json!({ "type": "message", "id": "msg_1", "role": "assistant", "content": [] }),
+            "added 项应为 role + 空 content 初始形态，无 phase"
+        );
+
+        let text_done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_text.done"))
+            .expect("应有 text done 帧");
+        let payload: Value = serde_json::from_str(&text_done.data).expect("载荷应为 JSON");
+        assert_eq!(payload["text"], json!("Hello"), "done 应承载累积全文");
+
+        let item_done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_item.done"))
+            .expect("应有 item done 帧");
+        let payload: Value = serde_json::from_str(&item_done.data).expect("载荷应为 JSON");
+        let final_item = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{ "type": "output_text", "text": "Hello", "annotations": [] }],
+        });
+        assert_eq!(payload["item"], final_item, "done 项应承载完整条目");
+
+        let completed = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.completed"))
+            .expect("应有 completed 帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["response"]["output"],
+            json!([final_item]),
+            "终端帧 output 应承载完整条目数组"
+        );
+    }
+
+    /// 上游不发 TextEnd 时（如 chat 解码器的流形状），文本块在流收尾处补收：
+    /// done 帧与终端 output 数组仍然齐备且全文完整。
+    #[test]
+    fn stream_finish_closes_unclosed_text_block() {
+        let mut encoder = StreamEncoder::new(None);
+        let mut frames = Vec::new();
+        for event in [
+            StreamEvent::ResponseMetadata {
+                id: "resp_2".to_string(),
+                model: "gpt-4o".to_string(),
+            },
+            StreamEvent::TextStart {
+                id: "msg_2".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::TextDelta {
+                id: "msg_2".to_string(),
+                delta: "你好".to_string(),
+                provider_options: HashMap::new(),
+            },
+            StreamEvent::Finish {
+                finish_reason: FinishReason {
+                    unified: FinishReasonUnified::Stop,
+                    raw: None,
+                },
+                usage: Usage::default(),
+                provider_metadata: HashMap::new(),
+            },
+        ] {
+            frames.extend(encoder.encode(&event));
+        }
+
+        let done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_text.done"))
+            .expect("收尾应补发 text done 帧");
+        let payload: Value = serde_json::from_str(&done.data).expect("载荷应为 JSON");
+        assert_eq!(payload["text"], json!("你好"));
+
+        let completed = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.completed"))
+            .expect("应有 completed 帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["response"]["output"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// 无 start 事件的 reasoning 增量：惰性补发 added（output_index 新分配，
+    /// 不回落 0 与既有项冲突），流序保持 added 先于 delta 的官方契约。
+    #[test]
+    fn reasoning_delta_without_start_allocates_index_and_synthesizes_added() {
+        let mut encoder = StreamEncoder::new(None);
+        // 先占用 output_index 0（文本块）。
+        encoder
+            .encode(&StreamEvent::TextStart {
+                id: "msg_1".to_string(),
+                provider_options: HashMap::new(),
+            })
+            .len();
+        let frames = encoder.encode(&StreamEvent::ReasoningDelta {
+            id: "rs_9:0".to_string(),
+            delta: "推理中".to_string(),
+            provider_options: HashMap::new(),
+        });
+
+        assert_eq!(
+            frames[0].event.as_deref(),
+            Some("response.output_item.added"),
+            "首帧应为补发的 added"
+        );
+        let payload: Value = serde_json::from_str(&frames[0].data).expect("载荷应为 JSON");
+        assert_eq!(payload["output_index"], json!(1), "应分配新索引而非 0");
+        assert_eq!(payload["item"]["type"], json!("reasoning"));
+
+        let payload: Value = serde_json::from_str(&frames[1].data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["output_index"],
+            json!(1),
+            "delta 应与补发的 added 同索引"
+        );
+
+        // 收尾：done 帧承载累积 summary，终端数组包含 reasoning 项。
+        let mut frames = encoder.encode(&StreamEvent::ReasoningEnd {
+            id: "rs_9:0".to_string(),
+            provider_options: HashMap::new(),
+        });
+        frames.extend(encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: None,
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        }));
+        let item_done = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.output_item.done"))
+            .expect("应有 reasoning done 帧");
+        let payload: Value = serde_json::from_str(&item_done.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["item"]["summary"],
+            json!([{ "type": "summary_text", "text": "推理中" }]),
+            "done 项应承载累积 summary"
+        );
+        let completed = frames
+            .iter()
+            .find(|f| f.event.as_deref() == Some("response.completed"))
+            .expect("应有 completed 帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("载荷应为 JSON");
+        assert_eq!(
+            payload["response"]["output"].as_array().map(Vec::len),
+            Some(2)
         );
     }
 
@@ -2487,8 +3332,36 @@ mod tests {
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 2);
 
+        // 其余终端事件（incomplete/failed）同规：usage 挂在 response.usage 下。
+        for terminal in ["response.incomplete", "response.failed"] {
+            let frame = json!({
+                "type": terminal,
+                "response": {
+                    "usage": { "input_tokens": 7, "output_tokens": 3, "total_tokens": 10 }
+                }
+            });
+            let usage = sniff_usage(&frame).expect("终端帧应提取 usage");
+            assert_eq!(usage.input_tokens, 7, "{terminal} 应提取 input");
+            assert_eq!(usage.output_tokens, 3, "{terminal} 应提取 output");
+        }
+
         // 无 usage 字段的帧返回 None。
         assert!(sniff_usage(&json!({ "type": "response.output_text.delta" })).is_none());
+        assert!(
+            sniff_usage(&json!({ "type": "response.completed", "response": { "id": "r" } }))
+                .is_none(),
+            "终端帧缺 usage 时应返回 None"
+        );
+        assert!(sniff_usage(&json!({ "usage": { "input_tokens": "invalid" } })).is_none());
+        assert!(sniff_usage(&json!({ "usage": { "unrelated": 1 } })).is_none());
+    }
+
+    #[test]
+    fn response_is_failed_only_for_explicit_failed_status() {
+        assert!(response_is_failed(&json!({ "status": "failed" })));
+        assert!(!response_is_failed(&json!({ "status": "completed" })));
+        assert!(!response_is_failed(&json!({ "status": "incomplete" })));
+        assert!(!response_is_failed(&json!({ "status": 500 })));
     }
 
     /// 请求有状态特性（store/previous_response_id）出站时显式 warning 并丢弃。
@@ -2595,30 +3468,135 @@ mod tests {
             presence_penalty: Some(0.5),
             frequency_penalty: None,
             seed: Some(42),
-            response_format: Some(json!({ "type": "json_object" })),
+            response_format: None,
             tools: Vec::new(),
             tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
             provider_options: HashMap::new(),
+            warnings: Vec::new(),
         };
         let mut warnings = Vec::new();
         let encoded = encode_request(&request, &mut warnings);
         assert!(encoded.get("top_k").is_none(), "Responses 无 top_k 字段");
         assert!(encoded.get("seed").is_none(), "Responses 无 seed 字段");
         assert!(encoded.get("stop").is_none(), "Responses 无 stop 字段");
-        for feature in [
-            "top_k",
-            "n",
-            "seed",
-            "stop",
-            "presence_penalty",
-            "response_format",
-        ] {
+        for feature in ["top_k", "n", "seed", "stop", "presence_penalty"] {
             assert!(
                 warnings.iter().any(|w| matches!(
                     w,
                     Warning::Unsupported { feature: f, .. } if f == feature
                 )),
                 "{feature} 丢弃应记 warning"
+            );
+        }
+    }
+
+    /// response_format ↔ text.format 等价双向映射：json_object 同形、
+    /// json_schema 摊平/收拢，同族出站面板原文优先不重复写 format，跨族到
+    /// chat 按类型化 response_format 回写。
+    #[test]
+    fn response_format_and_text_format_interop() {
+        // responses 入站 text.format json_schema：类型化提升（chat 形状收拢）。
+        let format = json!({
+            "type": "json_schema",
+            "name": "answer",
+            "schema": { "type": "object" },
+            "strict": true
+        });
+        let wire = json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "text": { "format": format }
+        });
+        let ir = decode_request(&wire).expect("应可解码");
+        assert_eq!(
+            ir.response_format,
+            Some(json!({
+                "type": "json_schema",
+                "json_schema": { "name": "answer", "schema": { "type": "object" }, "strict": true }
+            })),
+            "json_schema 扁平字段应收拢进 json_schema 子对象"
+        );
+
+        // 同族出站：text 面板原文优先，不重复写 format。
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(encoded["text"], json!({ "format": format }));
+
+        // 跨族出站：类型化 response_format 回写 chat response_format；
+        // text 面板整体仍无承载，随 provider_options 告警（与 thinking 面板
+        // 跨族同规，format 之外的面板子键确有损失）。
+        let mut warnings = Vec::new();
+        let chat_encoded = crate::core::openai_chat::encode_request(&ir, &mut warnings);
+        assert_eq!(
+            chat_encoded["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": { "name": "answer", "schema": { "type": "object" }, "strict": true }
+            })
+        );
+        assert!(
+            warnings.iter().any(|w| matches!(
+                w,
+                Warning::Unsupported { feature: f, .. } if f == warning_feature::PROVIDER_OPTIONS
+            )),
+            "text 面板整体跨族无承载应记 provider_options 告警"
+        );
+
+        // chat 入站 json_object 经 IR 到 responses 出站为 text.format。
+        let chat_wire = json!({
+            "model": "gpt-5",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "response_format": { "type": "json_object" }
+        });
+        let ir = crate::core::openai_chat::decode_request(&chat_wire).expect("chat 请求应可解码");
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            encoded["text"],
+            json!({ "format": { "type": "json_object" } })
+        );
+    }
+
+    /// 无法表达的 response_format 形状（未知 type、json_schema 缺子对象）出站
+    /// 记 warning；type=text 等价缺省不写不告警。
+    #[test]
+    fn inexpressible_response_format_warns_and_text_type_is_default() {
+        let chat_request = |response_format: Value| {
+            crate::core::openai_chat::decode_request(&json!({
+                "model": "gpt-5",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "response_format": response_format
+            }))
+            .expect("chat 请求应可解码")
+        };
+
+        let ir = chat_request(json!({ "type": "text" }));
+        let mut warnings = Vec::new();
+        let encoded = encode_request(&ir, &mut warnings);
+        assert!(warnings.is_empty());
+        assert!(
+            encoded.get("text").is_none(),
+            "type=text 等价缺省，不应写 text.format"
+        );
+
+        for shape in [
+            json!({ "type": "heat_map", "style": "warm" }),
+            json!({ "type": "json_schema" }),
+        ] {
+            let ir = chat_request(shape.clone());
+            let mut warnings = Vec::new();
+            let encoded = encode_request(&ir, &mut warnings);
+            assert!(encoded.get("text").is_none(), "无法表达不应写 text.format");
+            assert!(
+                warnings.iter().any(|w| matches!(
+                    w,
+                    Warning::Unsupported { feature: f, .. } if f == warning_feature::RESPONSE_FORMAT
+                )),
+                "形状 {shape} 出站应记 response_format 告警"
             );
         }
     }
@@ -2630,5 +3608,235 @@ mod tests {
         let wire: Value = serde_json::from_str(raw).expect("fixture 应可解析");
         let encoded = encode_model_list(&["fast".to_string(), "gpt-4o".to_string()]);
         assert_eq!(encoded, wire, "列表编码应与黄金样例一致");
+    }
+
+    // ---- 以下为本批协议兼容性修复的用例 ----
+
+    /// function_call_output.output 的非字符串载荷（Gemini functionResponse
+    /// 对象、Anthropic 块数组等跨族来源）序列化为 JSON 字符串——官方类型为
+    /// `string | 内容数组`，对象原样写上会被 OpenAI 拒绝；字符串载荷透传。
+    #[test]
+    fn function_call_output_shapes_non_string_payloads_to_json_string() {
+        let request = ChatRequest {
+            model: "gpt-5".to_string(),
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentPart::ToolCall {
+                        tool_call_id: "call_1".to_string(),
+                        tool_name: "get_weather".to_string(),
+                        input: json!({}),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+                Message {
+                    role: Role::Tool,
+                    content: vec![ContentPart::ToolResult {
+                        tool_call_id: "call_1".to_string(),
+                        tool_name: String::new(),
+                        output: json!({ "result": "晴，26 度" }),
+                        provider_options: HashMap::new(),
+                    }],
+                    provider_options: HashMap::new(),
+                },
+            ],
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            n: None,
+            stop: Vec::new(),
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            response_format: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            provider_options: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        let wire = encode_request(&request, &mut warnings);
+        assert_eq!(
+            wire["input"][1]["output"],
+            json!(r#"{"result":"晴，26 度"}"#),
+            "对象载荷应序列化为 JSON 字符串"
+        );
+        assert!(warnings.is_empty(), "无损形状归一不告警: {warnings:?}");
+
+        // 字符串载荷透传，不双重引号。
+        let mut request = request;
+        request.messages[1].content[0] = ContentPart::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            tool_name: String::new(),
+            output: json!("纯文本结果"),
+            provider_options: HashMap::new(),
+        };
+        let wire = encode_request(&request, &mut warnings);
+        assert_eq!(wire["input"][1]["output"], json!("纯文本结果"));
+    }
+
+    /// 上游流从未产出 ResponseMetadata（如 chat 上游 chunk 缺 id/model）：
+    /// 首个内容事件前合成最小元数据补发 `response.created`，官方首帧契约
+    /// 不破坏、pending_warnings 随该帧下发；元数据迟到时更新 id 不重复宣告。
+    #[test]
+    fn stream_without_metadata_synthesizes_created_first_frame() {
+        let mut encoder = StreamEncoder::new(None);
+        // warnings 先到（StreamStart）：只入队不产帧。
+        assert!(
+            encoder
+                .encode(&StreamEvent::StreamStart {
+                    warnings: vec![Warning::unsupported("top_k", "已丢弃")]
+                })
+                .is_empty()
+        );
+        let frames = encoder.encode(&StreamEvent::TextStart {
+            id: "msg_1".to_string(),
+            provider_options: HashMap::new(),
+        });
+        // 首帧必须是合成 response.created：占位 id + 携带留存的 warnings。
+        assert_eq!(frames[0].event.as_deref(), Some("response.created"));
+        let created: Value = serde_json::from_str(&frames[0].data).expect("应为 JSON");
+        assert_eq!(created["response"]["id"], json!("resp_stream"));
+        assert_eq!(created["response"]["status"], json!("in_progress"));
+        assert_eq!(
+            created["response"]["gateway"]["warnings"][0]["feature"],
+            json!("top_k"),
+            "pending_warnings 应随合成首帧下发"
+        );
+        // 后续 added 帧照常。
+        assert_eq!(
+            frames[1].event.as_deref(),
+            Some("response.output_item.added")
+        );
+
+        // 元数据迟到：更新 id/model 供终端帧使用，不重复宣告 created。
+        let frames = encoder.encode(&StreamEvent::ResponseMetadata {
+            id: "resp_real".to_string(),
+            model: "gpt-5".to_string(),
+        });
+        assert!(frames.is_empty(), "已宣告过 created 不应重复: {frames:?}");
+        let frames = encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: None,
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        });
+        let completed = frames
+            .iter()
+            .find(|frame| frame.event.as_deref() == Some("response.completed"))
+            .expect("应有终端帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("应为 JSON");
+        assert_eq!(
+            payload["response"]["id"],
+            json!("resp_real"),
+            "终端帧应使用迟到的真实 id"
+        );
+    }
+
+    /// created 帧已下发后才到达的流式告警（如 chat 上游流中段补发的
+    /// tool call 告警）：Responses 无独立告警事件，改随终端
+    /// `response.completed` 的 `response.gateway` 下发，不静默滞留。
+    #[test]
+    fn late_stream_warnings_ride_terminal_completed() {
+        let mut encoder = StreamEncoder::new(None);
+        let frames = encoder.encode(&StreamEvent::ResponseMetadata {
+            id: "resp_1".to_string(),
+            model: "gpt-5".to_string(),
+        });
+        let created: Value = serde_json::from_str(&frames[0].data).expect("created 帧应为 JSON");
+        assert!(
+            created["response"]["gateway"].is_null(),
+            "无告警时 created 不带 gateway: {created:?}"
+        );
+        // created 之后的流式告警：created 只发一次，不能滞留丢弃。
+        assert!(
+            encoder
+                .encode(&StreamEvent::StreamStart {
+                    warnings: vec![Warning::compatibility(
+                        warning_feature::TOOL_CALL,
+                        "流式 tool call 首帧缺 name，已兜底空名"
+                    )]
+                })
+                .is_empty()
+        );
+        let frames = encoder.encode(&StreamEvent::Finish {
+            finish_reason: FinishReason {
+                unified: FinishReasonUnified::Stop,
+                raw: None,
+            },
+            usage: Usage::default(),
+            provider_metadata: HashMap::new(),
+        });
+        let completed = frames
+            .iter()
+            .find(|frame| frame.event.as_deref() == Some("response.completed"))
+            .expect("应有终端帧");
+        let payload: Value = serde_json::from_str(&completed.data).expect("应为 JSON");
+        assert_eq!(
+            payload["response"]["gateway"]["warnings"][0]["feature"],
+            json!("tool_call"),
+            "迟到告警应随终端帧下发: {payload:?}"
+        );
+    }
+
+    /// 族内互回按目标协议过滤：chat 入站的 chat-only 字段（logprobs 等）在
+    /// Responses 出站被丢弃并告警；双合法字段（service_tier）双向保留。
+    #[test]
+    fn openai_family_extra_writeback_filters_by_target_protocol() {
+        let chat = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "logprobs": true,
+            "logit_bias": { "1": 1 },
+            "service_tier": "flex",
+        });
+        let ir = decode_request_wire_chat(&chat);
+        let mut warnings = Vec::new();
+        let wire = encode_request(&ir, &mut warnings);
+        assert!(
+            wire.get("logprobs").is_none() && wire.get("logit_bias").is_none(),
+            "chat-only 字段不应写进 Responses 请求: {wire}"
+        );
+        assert_eq!(wire["service_tier"], json!("flex"), "双合法字段保留");
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Unsupported { feature, details }]
+                if feature == warning_feature::UNKNOWN_FIELDS
+                    && details.as_deref().is_some_and(|d| d.contains("logprobs")
+                        && d.contains("logit_bias"))
+        ));
+
+        // 反向：Responses-only 字段在 chat 出站同样过滤。
+        let responses = json!({
+            "model": "gpt-4o",
+            "input": [{ "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": "hi" }] }],
+            "truncation": "auto",
+            "service_tier": "flex",
+        });
+        let ir = decode_request(&responses).expect("应可解码");
+        let mut warnings = Vec::new();
+        let chat_wire = crate::core::openai_chat::encode_request(&ir, &mut warnings);
+        assert!(
+            chat_wire.get("truncation").is_none(),
+            "Responses-only 字段过滤"
+        );
+        assert_eq!(chat_wire["service_tier"], json!("flex"));
+        assert!(matches!(
+            warnings.as_slice(),
+            [Warning::Unsupported { feature, .. }] if feature == warning_feature::UNKNOWN_FIELDS
+        ));
+    }
+
+    /// 测试助手：以 chat 协议解码请求 wire。
+    fn decode_request_wire_chat(wire: &Value) -> ChatRequest {
+        crate::core::openai_chat::decode_request(wire).expect("chat 请求应可解码")
     }
 }

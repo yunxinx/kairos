@@ -38,7 +38,9 @@ pub(super) fn routes() -> Router<AdminDeps> {
 #[derive(Debug, Serialize)]
 pub(super) struct TokenView {
     pub(super) id: i64,
-    pub(super) token_key: String,
+    /// 令牌 key 的 SHA-256 指纹（读取面一律掩码）；明文只在创建响应
+    /// [`TokenCreatedView::plaintext_key`] 出现一次。
+    pub(super) token_key_fingerprint: String,
     pub(super) name: String,
     pub(super) limit_usd_micros: Option<i64>,
     pub(super) rate_limit_rpm: Option<u64>,
@@ -57,7 +59,7 @@ impl TokenView {
             available_balance(record.token.limit_usd_micros, settled_usd_micros)?;
         Ok(Self {
             id: record.id,
-            token_key: record.token.token_key,
+            token_key_fingerprint: record.token.token_key,
             name: record.token.name,
             limit_usd_micros: record.token.limit_usd_micros,
             rate_limit_rpm: record.token.rate_limit_rpm,
@@ -76,7 +78,7 @@ impl TokenView {
     ) -> Result<Self, AdminError> {
         let masked = mask_token_key(&record.token.token_key);
         let mut view = Self::from_record(record, settled_usd_micros)?;
-        view.token_key = masked;
+        view.token_key_fingerprint = masked;
         Ok(view)
     }
 }
@@ -97,7 +99,7 @@ pub(super) fn available_balance(
 }
 
 async fn token_view(pool: &SqlitePool, record: TokenRecord) -> Result<TokenView, AdminError> {
-    let settled = store::get_token_settled(pool, &record.token.token_key)
+    let settled = store::settlement::get_token_settled(pool, &record.token.token_key)
         .await
         .map_err(AdminError::Store)?;
     TokenView::from_record(record, settled)
@@ -107,7 +109,7 @@ async fn token_view_masked(
     pool: &SqlitePool,
     record: TokenRecord,
 ) -> Result<TokenView, AdminError> {
-    let settled = store::get_token_settled(pool, &record.token.token_key)
+    let settled = store::settlement::get_token_settled(pool, &record.token.token_key)
         .await
         .map_err(AdminError::Store)?;
     TokenView::from_record_masked(record, settled)
@@ -127,7 +129,7 @@ pub(super) async fn list_user_tokens(
     let records = store::resources::list_token_records_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
-    let settled = store::list_token_settled_for_user(&deps.pool, id)
+    let settled = store::settlement::list_token_settled_for_user(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?;
     let views = records
@@ -147,7 +149,7 @@ pub(super) async fn list_tokens(
     let records = store::resources::list_token_records_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
-    let settled = store::list_token_settled_for_user(&deps.pool, identity.user_id())
+    let settled = store::settlement::list_token_settled_for_user(&deps.pool, identity.user_id())
         .await
         .map_err(AdminError::Store)?;
     let views = records
@@ -333,6 +335,44 @@ pub(super) struct TokenEnabledUpdate {
     enabled: bool,
 }
 
+/// 记录令牌启停变更；事件与实际写入共用同一事务。
+async fn record_enabled_change(
+    conn: &mut SqliteConnection,
+    identity: &ManagementIdentity,
+    existing: &TokenRecord,
+    enabled: bool,
+) -> Result<(), AdminError> {
+    store::record_audit(
+        conn,
+        identity.actor(),
+        "tokens",
+        &store::SystemLogEvent::new(
+            "tokens.enabled_changed",
+            serde_json::json!({
+                "user_id": existing.token.user_id,
+                "token_id": existing.id,
+                "token_name": existing.token.name,
+                "before_enabled": existing.token.enabled,
+                "enabled": enabled,
+            }),
+            format!(
+                "修改用户 {} 的令牌 {}（{}）状态 {} → {}",
+                existing.token.user_id,
+                existing.id,
+                existing.token.name,
+                if existing.token.enabled {
+                    "启用"
+                } else {
+                    "停用"
+                },
+                if enabled { "启用" } else { "停用" }
+            ),
+        ),
+    )
+    .await
+    .map_err(AdminError::Store)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TokenCreate {
@@ -369,22 +409,35 @@ fn generate_token_key() -> String {
     format!("{TOKEN_KEY_PREFIX}{random_part}")
 }
 
+/// 创建响应：TokenView 之上附带一次性的明文 key。
+///
+/// 库内与后续所有读取面只存指纹；本字段是明文唯一的出现点，前端应即时展示
+/// 或复制，之后无法再从任何接口取回。
+#[derive(Debug, Serialize)]
+pub(super) struct TokenCreatedView {
+    #[serde(flatten)]
+    view: TokenView,
+    plaintext_key: String,
+}
+
 pub(super) async fn create_token(
     State(deps): State<AdminDeps>,
     Extension(identity): Extension<ManagementIdentity>,
     body: Result<Json<TokenCreate>, axum::extract::rejection::JsonRejection>,
-) -> Result<(axum::http::StatusCode, Json<TokenView>), AdminError> {
+) -> Result<(axum::http::StatusCode, Json<TokenCreatedView>), AdminError> {
     let create = body.map_err(AdminError::bad_body)?.0;
-    let token = Token {
-        token_key: {
-            let snapshot = deps.snapshot.read().await;
-            loop {
-                let candidate = generate_token_key();
-                if !snapshot.tokens.contains_key(&candidate) {
-                    break candidate;
-                }
+    let plaintext_key = {
+        let snapshot = deps.snapshot.read().await;
+        loop {
+            let candidate = generate_token_key();
+            let fingerprint = store::token_key_fingerprint(&candidate);
+            if !snapshot.tokens.contains_key(&fingerprint) {
+                break candidate;
             }
-        },
+        }
+    };
+    let token = Token {
+        token_key: store::token_key_fingerprint(&plaintext_key),
         name: create.name,
         // 新令牌尚无累计结算，因此初始余额与累计上限数值相同。
         limit_usd_micros: create.balance_usd_micros,
@@ -400,15 +453,19 @@ pub(super) async fn create_token(
     crate::store::resources::insert_token(&mut tx, &token, now)
         .await
         .map_err(AdminError::Store)?;
-    crate::store::initialize_token_settlement(&mut tx, &token.token_key, 0, now)
+    crate::store::settlement::initialize_token_settlement(&mut tx, &token.token_key, 0, now)
         .await
         .map_err(AdminError::Store)?;
     tx.commit().await.map_err(db_err)?;
     reload_and_swap(&deps).await?;
     let created = read_token_record_by_key(&deps, &token.token_key).await?;
+    let view = token_view(&deps.pool, created).await?;
     Ok((
         axum::http::StatusCode::CREATED,
-        Json(token_view(&deps.pool, created).await?),
+        Json(TokenCreatedView {
+            view,
+            plaintext_key,
+        }),
     ))
 }
 
@@ -438,6 +495,9 @@ pub(super) async fn update_token(
     crate::store::resources::update_token_attributes(&mut tx, id, &attributes)
         .await
         .map_err(AdminError::Store)?;
+    if existing.token.enabled != attributes.enabled {
+        record_enabled_change(&mut tx, &identity, &existing, attributes.enabled).await?;
+    }
     if let Some(command) = balance_change {
         super::token_balance::apply_token_balance_command(
             &mut tx,
@@ -478,37 +538,7 @@ pub(super) async fn set_token_enabled(
         store::resources::set_token_enabled(&mut tx, id, enabled)
             .await
             .map_err(AdminError::Store)?;
-        if cross_owner {
-            store::record_audit(
-                &mut tx,
-                identity.actor(),
-                "tokens",
-                &store::SystemLogEvent::new(
-                    "tokens.enabled_changed",
-                    serde_json::json!({
-                        "user_id": existing.token.user_id,
-                        "token_id": id,
-                        "token_name": existing.token.name,
-                        "before_enabled": existing.token.enabled,
-                        "enabled": enabled,
-                    }),
-                    format!(
-                        "修改用户 {} 的令牌 {}（{}）状态 {} → {}",
-                        existing.token.user_id,
-                        id,
-                        existing.token.name,
-                        if existing.token.enabled {
-                            "启用"
-                        } else {
-                            "停用"
-                        },
-                        if enabled { "启用" } else { "停用" }
-                    ),
-                ),
-            )
-            .await
-            .map_err(AdminError::Store)?;
-        }
+        record_enabled_change(&mut tx, &identity, &existing, enabled).await?;
     }
     tx.commit().await.map_err(db_err)?;
     if existing.token.enabled != enabled {
@@ -534,10 +564,10 @@ pub(super) async fn delete_token(
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("令牌 {id} 不存在")))?;
     reject_cross_owner_mutation(&identity, &deleted)?;
-    let settled = store::get_token_settled_on_conn(&mut tx, &deleted.token.token_key)
+    let settled = store::settlement::get_token_settled_on_conn(&mut tx, &deleted.token.token_key)
         .await
         .map_err(AdminError::Store)?;
-    store::delete_token_balance(&mut tx, &deleted.token.token_key)
+    store::settlement::delete_token_balance(&mut tx, &deleted.token.token_key)
         .await
         .map_err(AdminError::Store)?;
     store::resources::delete_token(&mut tx, id)
@@ -565,7 +595,7 @@ async fn delete_tokens(
         records.push(record);
     }
     for record in &records {
-        store::delete_token_balance(&mut tx, &record.token.token_key)
+        store::settlement::delete_token_balance(&mut tx, &record.token.token_key)
             .await
             .map_err(AdminError::Store)?;
         store::resources::delete_token(&mut tx, record.id)

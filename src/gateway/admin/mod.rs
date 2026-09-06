@@ -2,7 +2,7 @@
 //!
 //! 管理面与协议面物理隔离：配置文件中可选的管理监听地址（`admin_listen`）配置了
 //! 才启动，未配置即管理面整体关闭，协议监听不注册任何管理路由。资源 API **只**
-//! 接受登录签发的会话（`ksess_…` Bearer）。配置里的 `admin_password` 是 root 的
+//! 接受登录签发的 HttpOnly Cookie 会话。配置里的 `admin_password` 是 root 的
 //! Web UI 登录口令种子，哈希后进库；把它原样放进 `Authorization` 不会通过认证。
 //! `webui/dist` 静态资源与 SPA 回退挂在 fallback 上、免认证。产物缺失时管理面
 //! 退化为纯 API。
@@ -17,6 +17,7 @@ mod auth;
 mod billing;
 mod catalog;
 mod channels;
+mod health;
 mod logs;
 mod models;
 mod my_models;
@@ -39,16 +40,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
-    gateway::http::extract_bearer,
     runtime,
     store::StoreError,
     store::users::{ManagementRole, UserRecord},
 };
 
 use self::auth::{AdminAuth, ManagementIdentity};
+use super::failover::ChannelCooldowns;
+use super::logging::RequestLogWriter;
+use super::network::OutboundClients;
 use super::throttle::AuthThrottle;
 
 const MAX_BULK_TARGETS: usize = 500;
@@ -122,12 +125,20 @@ pub(super) struct AdminDeps {
     pub(super) pool: SqlitePool,
     pub(super) snapshot: crate::runtime::SnapshotHandle,
     pub(super) client: reqwest::Client,
+    pub(super) outbound_clients: OutboundClients,
     pub(super) throttle: AuthThrottle,
+    /// Argon2id 是刻意昂贵的阻塞工作；独立预算限制同时运行的校验数量，避免登录
+    /// 洪峰把 tokio blocking 池和内存同时占满。permit 只覆盖一次口令校验。
+    pub(super) password_verifiers: Arc<Semaphore>,
     /// 数据库文件路径：日志维护的磁盘占用统计需要读主库与 WAL 边车的实际大小，
     /// SQL 层拿不到 WAL 文件尺寸，只能走文件系统。
     pub(super) db_path: std::path::PathBuf,
     /// 串行化「库提交后重载快照」，避免慢重载用旧库状态回退覆盖新快照。
     pub(super) reload_lock: Arc<Mutex<()>>,
+    /// 结算队列写入器；管理面重放成功后通过同一通知通道立即唤醒后台消费。
+    pub(super) request_log_writer: RequestLogWriter,
+    /// 渠道冷却表：与协议面共享同一实例，健康端点只读展示当前冷却中的渠道。
+    pub(super) channel_cooldowns: ChannelCooldowns,
 }
 
 /// 开启 SQLite 写事务并立即取得写保留锁。
@@ -152,10 +163,29 @@ pub fn router(
     pool: SqlitePool,
     snapshot: crate::runtime::SnapshotHandle,
     db_path: std::path::PathBuf,
+    channel_cooldowns: ChannelCooldowns,
+) -> Router {
+    router_with_writer(
+        pool.clone(),
+        snapshot,
+        db_path,
+        RequestLogWriter::start(pool),
+        channel_cooldowns,
+    )
+}
+
+/// 组装管理面路由并注入共享的请求日志写入器。
+pub fn router_with_writer(
+    pool: SqlitePool,
+    snapshot: crate::runtime::SnapshotHandle,
+    db_path: std::path::PathBuf,
+    request_log_writer: RequestLogWriter,
+    channel_cooldowns: ChannelCooldowns,
 ) -> Router {
     // 未配置自定义 TLS/DNS 时，rustls 后端下 `ClientBuilder::build` 只在
     // builder 事先记下错误时失败；本路径未设置会失败的选项。
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("未配置会失败的 ClientBuilder 选项，rustls 客户端应能构建");
     let throttle = AuthThrottle::new();
@@ -163,13 +193,18 @@ pub fn router(
         pool: pool.clone(),
         snapshot: snapshot.clone(),
         client,
+        outbound_clients: OutboundClients::new(),
         throttle: throttle.clone(),
+        password_verifiers: Arc::new(Semaphore::new(4)),
         db_path,
         reload_lock: Arc::new(Mutex::new(())),
+        request_log_writer,
+        channel_cooldowns,
     };
     let root_only = Router::new()
         .merge(channels::routes())
         .merge(channels::model_routes())
+        .merge(health::routes())
         .merge(models::order_routes())
         .merge(probes::routes())
         .merge(settings::routes())
@@ -199,16 +234,16 @@ pub fn router(
         .merge(root_only)
         .merge(admin_plus)
         .merge(signed_in)
+        .route_layer(middleware::from_fn(auth::same_origin_guard))
         .route_layer(middleware::from_fn_with_state(
             AdminAuth { pool },
             auth::admin_auth,
         ));
     // 管理 API 整体挂在 `/api` 下，SPA 独占根命名空间。
     //
-    // 此前两者共用一个扁平命名空间，于是每个 SPA 路由都得起个别名来躲开同名 API
-    // （`/token` 躲 `/tokens`、`/config` 躲 `/settings`、`/admin/users` 躲 `/users`），
-    // `/login` 更是只能按 method 拆成「POST 给 API、GET 给 SPA」。两个参考项目都给
-    // 管理 API 加了前缀（旧 kairos `baseURL: '/api'`、one-api `router.Group("/api")`）。
+    // 管理 API 与 SPA 曾共用扁平命名空间：SPA 路由只能起别名躲开同名 API，
+    // 深链刷新也无法返回页面。API 统一收进 `/api` 前缀后，SPA 独占根命名空间，
+    // 深链刷新才能正常命中页面路由。
     let api = Router::new()
         .merge(protected)
         .merge(users::public_routes())
@@ -240,7 +275,7 @@ pub(super) fn format_usd_micros(micros: i64) -> String {
 
 /// admin 不能管理 admin/root；user 不能管理任何人；改角色到更高档需 root。
 ///
-/// root 全局唯一（内置 id=1，ADR-0009 修订）：任何角色都不能把别人升成 root，
+/// root 全局唯一（内置 id=1）：任何角色都不能把别人升成 root，
 /// 也不能经创建接口造出第二个 root。「最后一个 root」保护仍是兜底——它另经
 /// 直连数据库等旁路守住禁用/删除。
 pub(in crate::gateway::admin) fn reject_user_management(
@@ -296,14 +331,6 @@ pub(super) fn parse_comma_list(raw: Option<&str>) -> Vec<String> {
 /// 此处只提供事务开启/提交的 sqlx 错误到 `AdminError` 的映射。
 pub(super) fn db_err(err: sqlx::Error) -> AdminError {
     AdminError::Store(StoreError::Query(err))
-}
-
-/// 从请求头取当前管理会话明文，供只保留当前会话的凭据更新使用。
-pub(super) fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(extract_bearer)
 }
 
 /// 提交后全量重载快照并原子替换，使新资源即时生效且与库一致。

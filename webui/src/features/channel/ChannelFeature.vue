@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onScopeDispose, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
@@ -28,6 +28,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { CHANNEL_SUMMARY_KEY, invalidateChannelCaches } from '@/composables/useChannelDirectory';
+import { useChannelHealth } from '@/composables/useChannelHealth';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -36,6 +37,7 @@ import ChannelProbeWindow from '@/features/channel/ChannelProbeWindow.vue';
 import OverflowChips from '@/components/ui/OverflowChips.vue';
 import { listedModelChips } from '@/lib/model-list';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type ChannelWindowPayload =
   | { kind: 'editor'; channel: ChannelView | null }
@@ -60,6 +62,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<ChannelWindowPayload>();
@@ -77,6 +80,51 @@ const channels = computed(() => channelsQuery.data.value ?? []);
 const showTableSkeleton = computed(
   () => channelsQuery.isPending.value && !channelsQuery.data.value,
 );
+
+const { enabled: healthEnabled, cooldowns } = useChannelHealth();
+
+// 冷却剩余随本地时钟每秒走动：健康数据只在渠道缓存失效时刷新，徽标若只取
+// 渲染时刻快照会冻结在打开页面时的数值。到期条目按剩余归零本地清除——到期
+// 是时间事实而非投影缺失，待下次健康刷新自然收编。
+const cooldownNow = ref(Date.now());
+let cooldownTimer: ReturnType<typeof setInterval> | undefined;
+
+/** channel_id → 未到期的冷却剩余毫秒；到期条目剔除，徽标随之清除。 */
+const activeCooldowns = computed(() => {
+  const map = new Map<number, number>();
+  for (const [id, entry] of cooldowns.value) {
+    const remaining = entry.cooldown_until - cooldownNow.value;
+    if (remaining > 0) map.set(id, remaining);
+  }
+  return map;
+});
+
+watch(
+  () => activeCooldowns.value.size > 0,
+  (ticking) => {
+    if (ticking && cooldownTimer === undefined) {
+      cooldownTimer = setInterval(() => {
+        cooldownNow.value = Date.now();
+      }, 1_000);
+    } else if (!ticking && cooldownTimer !== undefined) {
+      clearInterval(cooldownTimer);
+      cooldownTimer = undefined;
+    }
+  },
+  { immediate: true },
+);
+
+onScopeDispose(() => {
+  if (cooldownTimer !== undefined) clearInterval(cooldownTimer);
+});
+
+/** 冷却剩余毫秒 → `分:秒` 计时形态。 */
+function formatCooldownRemaining(remainingMillis: number): string {
+  const totalSeconds = Math.ceil(remainingMillis / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
 
 const statusOptions = computed(() => {
   const enabled = channels.value.filter((channel) => channel.enabled).length;
@@ -146,7 +194,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.channel.id === id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await invalidateChannels();
   },
   onError: (err, id) => {
@@ -304,11 +352,16 @@ function openProbe(channel: ChannelView) {
             <TableHead>{{ t('channel.requestProtocol') }}</TableHead>
             <TableHead>{{ t('channel.models') }}</TableHead>
             <TableHead align="center">{{ t('channel.status') }}</TableHead>
+            <TableHead v-if="healthEnabled" align="center">{{ t('channel.health') }}</TableHead>
             <TableHead align="center">{{ t('common.actions') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" has-select-column :columns="6" />
+          <TableRowsSkeleton
+            v-if="showTableSkeleton"
+            has-select-column
+            :columns="healthEnabled ? 7 : 6"
+          />
           <template v-else>
             <TableRow
               v-for="channel in filteredChannels"
@@ -346,6 +399,24 @@ function openProbe(channel: ChannelView) {
                   {{ channel.enabled ? t('channel.statusEnabled') : t('channel.statusDisabled') }}
                 </button>
               </TableCell>
+              <TableCell v-if="healthEnabled" align="center" data-testid="channel-health">
+                <span
+                  v-if="activeCooldowns.has(channel.id)"
+                  class="inline-flex items-center justify-center gap-1.5"
+                  data-testid="channel-cooldown"
+                >
+                  <span class="badge badge-danger" data-testid="channel-cooldown-badge">
+                    {{ t('channel.cooling') }}
+                  </span>
+                  <span class="text-fg-muted text-xs" data-testid="channel-cooldown-remaining">
+                    {{
+                      t('channel.cooldownRemaining', {
+                        time: formatCooldownRemaining(activeCooldowns.get(channel.id)!),
+                      })
+                    }}
+                  </span>
+                </span>
+              </TableCell>
               <TableCell align="center">
                 <span class="inline-flex items-center justify-center gap-1">
                   <button
@@ -382,7 +453,7 @@ function openProbe(channel: ChannelView) {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="6" class="h-24 whitespace-normal">
+              <TableCell :colspan="healthEnabled ? 7 : 6" class="h-24 whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}
@@ -448,7 +519,7 @@ function openProbe(channel: ChannelView) {
         confirm-test-id="channel-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.channel.id)"
       />
       <ConfirmWindow
@@ -465,9 +536,16 @@ function openProbe(channel: ChannelView) {
         confirm-test-id="channel-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

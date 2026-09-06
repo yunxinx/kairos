@@ -109,7 +109,7 @@ pub(super) async fn adjust_user_balance(
         }));
     }
 
-    let change = store::adjust_user_balance(&mut tx, id, delta)
+    let change = store::settlement::adjust_user_balance(&mut tx, id, delta)
         .await
         .map_err(map_user_store_err)?;
     let record = BalanceOperationRecord {

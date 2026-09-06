@@ -26,7 +26,7 @@ pub(super) fn routes() -> Router<AdminDeps> {
 
 /// 单价区间（micro-USD / 1M tokens，已折后）。
 ///
-/// 价格按渠道定（ADR-0007），同一个可调用名挂在多条渠道上就可能有多个单价；
+/// 价格按渠道定，同一个可调用名挂在多条渠道上就可能有多个单价；
 /// 请求实际落哪条由路由决定，所以这里给区间而不是假装只有一个数。
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(super) struct PriceRange {
@@ -51,6 +51,8 @@ pub(super) struct MyModelView {
     cache_read: Option<PriceRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_write: Option<PriceRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_write_1h: Option<PriceRange>,
 }
 
 /// 一个模型组一段。同一个名字可以出现在多段里（组是允许名单，不是分区）。
@@ -234,6 +236,11 @@ fn model_view(
         output: range(&candidates, |price| Some(price.output_micros), discount_bp),
         cache_read: range(&candidates, |price| price.cache_read_micros, discount_bp),
         cache_write: range(&candidates, |price| price.cache_write_micros, discount_bp),
+        cache_write_1h: range(
+            &candidates,
+            |price| price.cache_write_1h_micros,
+            discount_bp,
+        ),
     }
 }
 
@@ -251,6 +258,7 @@ mod tests {
             output_micros: 8_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let pricey = resources::Price {
             channel_id: 2,
@@ -259,6 +267,7 @@ mod tests {
             output_micros: 8_000_000,
             cache_read_micros: Some(500_000),
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let candidates = vec![&cheap, &pricey];
         assert_eq!(
@@ -300,6 +309,7 @@ mod tests {
             output_micros: 10_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let candidates = vec![&price];
         assert_eq!(

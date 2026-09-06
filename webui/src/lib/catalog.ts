@@ -82,6 +82,8 @@ export function applyCatalogPrice(
       catalog.cache_write_micros,
       existing?.cache_write_micros ?? null,
     ),
+    // 目录无 1h 档字段：目录填价保持现状（已有 1h 价保留，空档仍空）。
+    cache_write_1h_micros: existing?.cache_write_1h_micros ?? null,
   };
 }
 

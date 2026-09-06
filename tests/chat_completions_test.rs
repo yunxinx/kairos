@@ -54,6 +54,7 @@ async fn valid_token_routes_request_and_logs() {
     assert_eq!(received[0]["messages"][0]["content"], "hi");
 
     // SQLite 落一条请求日志。
+    common::wait_for_request_persistence(&gw.pool).await;
     let rows = sqlx::query_as::<_, (String, String, String, String, i64, i64)>(
         "SELECT token_name, inbound_protocol, model, channel, status_code, latency_ms \
          FROM request_log",
@@ -220,6 +221,7 @@ async fn upstream_error_status_is_passthrough() {
     );
 
     // 日志记录的是上游状态码。
+    common::wait_for_request_persistence(&gw.pool).await;
     let rows = sqlx::query_as::<_, (i64,)>("SELECT status_code FROM request_log")
         .fetch_all(&gw.pool)
         .await
@@ -312,6 +314,7 @@ async fn stream_request_returns_sse_and_logs() {
     assert!(saw_finish_usage, "finish 帧应携带 usage");
 
     // 流式计费落库：usage 10/2 → input 10 × 2.5 + output 2 × 10 = 25 + 20 = 45 micro-USD。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_micros \
          FROM request_log",
@@ -519,4 +522,73 @@ async fn auth_failures_are_throttled_per_ip() {
         reqwest::StatusCode::TOO_MANY_REQUESTS,
         "超过窗口失败次数应 429"
     );
+}
+
+/// 历史中 assistant tool_calls 的非法 arguments 不再拒绝整请求：解码兜底
+/// 空对象继续出站，兼容动作以 `gateway.warnings` 随响应面回传下游。
+#[tokio::test]
+async fn illegal_tool_arguments_fall_back_with_warning() {
+    // 走跨协议路由（chat 入站 → Anthropic 渠道）以经过 IR 编码面——同协议
+    // 直通路径原样转发字节，warning 无从谈起。
+    fn anthropic_channel_seed(base: &str) -> common::Seed {
+        let mut seed = common::test_seed(base);
+        seed.channels[0].protocol = kairos::config::Protocol::AnthropicMessages;
+        seed
+    }
+    let mut gw = TestGateway::start_with(anthropic_channel_seed).await;
+
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_01x", "type": "message", "role": "assistant", "model": "claude-sonnet",
+        "content": [{ "type": "text", "text": "ok" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": { "input_tokens": 25, "output_tokens": 12 }
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/chat/completions", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "{oops" }
+                    }]
+                },
+                { "role": "tool", "tool_call_id": "call_1", "content": "晴" }
+            ]
+        }))
+        .send()
+        .await
+        .expect("下游请求应能到达网关");
+
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "非法 arguments 应兜底而非 400"
+    );
+
+    let body: Value = resp.json().await.expect("响应应可解析");
+    assert_eq!(
+        body["gateway"]["warnings"][0]["type"],
+        json!("compatibility"),
+        "兜底动作应随响应面回传下游"
+    );
+    assert_eq!(
+        body["gateway"]["warnings"][0]["feature"],
+        json!("tool_arguments")
+    );
+
+    // mock 上游收到的出站请求（Anthropic 格式）中 tool_use input 已兜底为空对象。
+    let received = gw.upstream.received();
+    assert_eq!(
+        received[0]["messages"][0]["content"][0]["type"],
+        json!("tool_use")
+    );
+    assert_eq!(received[0]["messages"][0]["content"][0]["input"], json!({}));
 }

@@ -40,7 +40,8 @@ pub(super) struct LogEntry {
     id: i64,
     created_at: i64,
     token_name: String,
-    token_key: String,
+    /// 令牌 key 的 SHA-256 指纹（管理面读取一律掩码；指纹本身不可逆）。
+    token_key_fingerprint: String,
     inbound_protocol: String,
     model: String,
     outbound_model: Option<String>,
@@ -52,10 +53,14 @@ pub(super) struct LogEntry {
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
+    /// cache 写入中 1h TTL 档明细（写入总数的子集）。
+    cache_write_1h_tokens: u64,
     input_price_usd_micros: i64,
     output_price_usd_micros: i64,
     cache_read_price_usd_micros: i64,
     cache_write_price_usd_micros: i64,
+    /// 1h TTL 档价格快照；0 表示价格行未配置该档。
+    cache_write_1h_price_usd_micros: i64,
     /// 渠道原价（折扣前）。
     base_cost_usd_micros: i64,
     /// 万分比折扣率（10000 = 原价）。
@@ -64,37 +69,54 @@ pub(super) struct LogEntry {
     cost_usd_micros: i64,
     /// 费用是否已完成所属用户钱包结算。
     settled: bool,
+    /// 上游响应是否明确携带 usage 字段；显式的全零 usage 仍为已报告。
+    usage_reported: bool,
+    /// 该行是否对应已实际派发上游的尝试；`false` 表示未出站即终局
+    ///（全部渠道冷却 / 无可用密钥、本地计费拒绝、出站安全策略拒绝等），
+    /// 行上无渠道与费用。
+    dispatched: bool,
     request_body: Option<String>,
     response_body: Option<String>,
 }
 
 impl LogEntry {
     /// 从存储行构造 wire 条目；完整 body 字节以 base64 编码，令牌 key 按管理面规则脱敏。
-    pub(super) fn from_store_log(log: store::RequestLog) -> Self {
+    pub(super) fn from_store_log(
+        log: store::request_log::RequestLog,
+        reveal_topology: bool,
+    ) -> Self {
         Self {
             id: log.id,
             created_at: log.created_at,
             token_name: log.token_name,
-            token_key: mask_token_key(&log.token_key),
+            token_key_fingerprint: mask_token_key(&log.token_key),
             inbound_protocol: log.inbound_protocol,
             model: log.model,
-            outbound_model: log.outbound_model,
-            channel: log.channel,
-            channel_key: log.channel_key,
+            outbound_model: reveal_topology.then_some(log.outbound_model).flatten(),
+            channel: if reveal_topology {
+                log.channel
+            } else {
+                String::new()
+            },
+            channel_key: reveal_topology.then_some(log.channel_key).flatten(),
             status_code: log.status_code,
             latency_ms: log.latency_ms,
             input_tokens: log.input_tokens,
             output_tokens: log.output_tokens,
             cache_read_tokens: log.cache_read_tokens,
             cache_write_tokens: log.cache_write_tokens,
+            cache_write_1h_tokens: log.cache_write_1h_tokens,
             input_price_usd_micros: log.price.input_micros,
             output_price_usd_micros: log.price.output_micros,
             cache_read_price_usd_micros: log.price.cache_read_micros,
             cache_write_price_usd_micros: log.price.cache_write_micros,
+            cache_write_1h_price_usd_micros: log.price.cache_write_1h_micros,
             base_cost_usd_micros: log.base_cost_usd_micros,
             discount_bp: log.discount_bp,
             cost_usd_micros: log.cost_usd_micros,
             settled: log.settled,
+            usage_reported: log.usage_reported,
+            dispatched: log.dispatched,
             request_body: log.request_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
             response_body: log.response_body.map(|bytes| BASE64_STANDARD.encode(bytes)),
         }
@@ -104,7 +126,6 @@ impl LogEntry {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct LogQueryParams {
-    token_key: Option<String>,
     token_name: Option<String>,
     model: Option<String>,
     channel: Option<String>,
@@ -114,7 +135,7 @@ pub(super) struct LogQueryParams {
     settled: Option<bool>,
     discount_bp: Option<i64>,
     inbound_protocol: Option<String>,
-    sort_by: Option<store::RequestLogSortBy>,
+    sort_by: Option<store::request_log::RequestLogSortBy>,
     sort_dir: Option<store::SortDir>,
     page: Option<u64>,
     page_size: Option<u64>,
@@ -139,13 +160,20 @@ pub(super) async fn query_logs(
     let params = query
         .map_err(|rejection| AdminError::InvalidBody(format!("查询参数非法: {rejection}")))?
         .0;
-    let mut filter =
-        store::RequestLogQuery::new(params.page.unwrap_or(1), params.page_size.unwrap_or(20));
+    let reveal_topology = identity
+        .role()
+        .at_least(crate::store::users::ManagementRole::Admin);
+    let mut filter = store::request_log::RequestLogQuery::new(
+        params.page.unwrap_or(1),
+        params.page_size.unwrap_or(20),
+    );
     filter.user_id = identity.owner_scope();
-    filter.token_key = params.token_key;
+    // token_key 是凭证，不是普通查询维度。普通用户已由 user_id 收窄，管理员
+    // 使用名称和稳定日志 id 定位；禁用精确 key 过滤可避免脱敏展示旁出现存在性探测。
+    filter.token_key = None;
     filter.token_name = params.token_name;
     filter.model = params.model;
-    filter.channel = params.channel;
+    filter.channel = reveal_topology.then_some(params.channel).flatten();
     filter.keyword = params.keyword.filter(|keyword| !keyword.trim().is_empty());
     filter.from_created_at = params.from_created_at;
     filter.to_created_at = params.to_created_at;
@@ -155,11 +183,15 @@ pub(super) async fn query_logs(
     filter.sort_by = params.sort_by.unwrap_or_default();
     filter.sort_dir = params.sort_dir.unwrap_or_default();
 
-    let (rows, total, unsettled_total) = store::query_request_log_page(&deps.pool, &filter)
-        .await
-        .map_err(AdminError::Store)?;
+    let (rows, total, unsettled_total) =
+        store::request_log::query_request_log_page(&deps.pool, &filter)
+            .await
+            .map_err(AdminError::Store)?;
     Ok(Json(LogPage {
-        items: rows.into_iter().map(LogEntry::from_store_log).collect(),
+        items: rows
+            .into_iter()
+            .map(|log| LogEntry::from_store_log(log, reveal_topology))
+            .collect(),
         page: filter.page,
         page_size: filter.page_size,
         total,
@@ -175,7 +207,7 @@ pub(super) async fn get_log(
 ) -> Result<Json<LogEntry>, AdminError> {
     identity.require_admin_capability(ManagementCapability::ViewLogsStats)?;
     let id = parse_log_id(&raw)?;
-    let log = store::get_request_log(&deps.pool, id)
+    let log = store::request_log::get_request_log(&deps.pool, id)
         .await
         .map_err(AdminError::Store)?
         .filter(|log| {
@@ -184,7 +216,10 @@ pub(super) async fn get_log(
                 .is_none_or(|owner| owner == log.user_id)
         })
         .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
-    Ok(Json(LogEntry::from_store_log(log)))
+    let reveal_topology = identity
+        .role()
+        .at_least(crate::store::users::ManagementRole::Admin);
+    Ok(Json(LogEntry::from_store_log(log, reveal_topology)))
 }
 
 /// 解析路径中的日志 id；非整数视为不存在。
@@ -224,7 +259,7 @@ async fn log_size(
     State(deps): State<AdminDeps>,
     Extension(_identity): Extension<ManagementIdentity>,
 ) -> Result<Json<LogSizeView>, AdminError> {
-    let stats = store::log_store_stats(&deps.pool, &deps.db_path)
+    let stats = store::request_log::log_store_stats(&deps.pool, &deps.db_path)
         .await
         .map_err(AdminError::Store)?;
     Ok(Json(LogSizeView {
@@ -255,9 +290,10 @@ async fn cleanup_logs(
     }
     let now = crate::gateway::logging::unix_millis();
     let cutoff = now.saturating_sub((days as i64).saturating_mul(MS_PER_DAY));
-    let removed_request_logs = store::purge_settled_request_logs_before(&deps.pool, cutoff)
-        .await
-        .map_err(AdminError::Store)?;
+    let removed_request_logs =
+        store::request_log::purge_settled_request_logs_before(&deps.pool, cutoff)
+            .await
+            .map_err(AdminError::Store)?;
     let removed_system_logs = store::purge_system_logs_before(&deps.pool, cutoff)
         .await
         .map_err(AdminError::Store)?;

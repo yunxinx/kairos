@@ -14,24 +14,26 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
 
 async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -40,13 +42,13 @@ async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Respon
 async fn login(gw: &TestGateway, email: &str, password: &str) -> String {
     let resp = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": email, "password": password }))
         .send()
         .await
         .expect("登录应可达");
     assert_eq!(resp.status(), StatusCode::OK);
-    let body: Value = resp.json().await.expect("登录应可解析");
-    body["token"].as_str().expect("应有会话").to_string()
+    common::session_cookie(&resp)
 }
 
 fn completion_body() -> Value {
@@ -187,7 +189,10 @@ async fn plan_groups_gate_create_rebind_requests_and_recover() {
     .await;
     assert_eq!(token_resp.status(), StatusCode::CREATED);
     let token: Value = token_resp.json().await.expect("令牌应可解析");
-    let key = token["token_key"].as_str().expect("应有 key").to_string();
+    let key = token["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
     let token_row_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
@@ -339,7 +344,10 @@ async fn admin_tokens_follow_plan_group_allowlist() {
     .await;
     assert_eq!(created_token.status(), StatusCode::CREATED);
     let token: Value = created_token.json().await.expect("令牌应可解析");
-    let key = token["token_key"].as_str().expect("应有 key").to_string();
+    let key = token["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
     let token_id = token["id"].as_i64().expect("应有 id");
 
     admin_json(
@@ -432,7 +440,8 @@ async fn delete_group_clears_assignments_and_root_can_use_any_group() {
 
     let deleted = reqwest::Client::new()
         .delete(admin_url(&gw, "/model-groups/coding"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删组应可达");

@@ -200,6 +200,7 @@ const saveMutation = useMutation({
     }
   },
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['users'] });
   },

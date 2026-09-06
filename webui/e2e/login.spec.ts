@@ -1,9 +1,7 @@
 import { expect, test } from './fixtures';
-import { E2E_ADMIN_EMAIL, E2E_ADMIN_PASSWORD } from './helpers/gateway';
-import { e2eRootHeaders } from './helpers/session';
+import { E2E_ADMIN_EMAIL, E2E_ADMIN_ORIGIN, E2E_ADMIN_PASSWORD } from './helpers/gateway';
+import { e2eRootHeaders, loginViaApi } from './helpers/session';
 import { seedUser } from './helpers/users';
-
-const ADMIN_KEY_STORAGE = 'kairos-admin-key';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -37,7 +35,6 @@ test.describe('email password login', () => {
     await page.getByRole('button', { name: /sign in|登录/i }).click();
     await expect(page.getByText(/invalid email or password|邮箱或密码不正确/i)).toBeVisible();
     await expect(page).toHaveURL(/\/login/);
-    expect(await page.evaluate((key) => localStorage.getItem(key), ADMIN_KEY_STORAGE)).toBeNull();
   });
 
   test('keeps the session across refresh', async ({ page }) => {
@@ -49,8 +46,6 @@ test.describe('email password login', () => {
     await page.reload();
     await expect(page).toHaveURL(/\/overview/);
     await expect(page.getByRole('navigation')).toBeVisible();
-    const stored = await page.evaluate((key) => localStorage.getItem(key), ADMIN_KEY_STORAGE);
-    expect(stored?.startsWith('ksess_')).toBe(true);
   });
 
   test('clears the session on sign out', async ({ page }) => {
@@ -62,7 +57,6 @@ test.describe('email password login', () => {
     await page.getByTestId('account-menu-trigger').click();
     await page.getByTestId('nav-logout').click();
     await page.waitForURL('**/login');
-    expect(await page.evaluate((key) => localStorage.getItem(key), ADMIN_KEY_STORAGE)).toBeNull();
     await page.reload();
     await expect(page).toHaveURL(/\/login/);
   });
@@ -74,7 +68,7 @@ test.describe('email password login', () => {
     await seedUser(page, { email: secondEmail, role: 'user' });
 
     const rootToken = await page.request.post('/api/tokens', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
       data: {
         name: 'cache-a-only',
         balance_usd_micros: null,
@@ -83,13 +77,9 @@ test.describe('email password login', () => {
       },
     });
     expect(rootToken.ok(), await rootToken.text()).toBeTruthy();
-    const secondLogin = await page.request.post('/api/login', {
-      data: { email: secondEmail, password: 'password1' },
-    });
-    expect(secondLogin.ok(), await secondLogin.text()).toBeTruthy();
-    const secondSession = (await secondLogin.json()) as { token: string };
+    await loginViaApi(page, secondEmail, 'password1');
     const secondToken = await page.request.post('/api/tokens', {
-      headers: { Authorization: `Bearer ${secondSession.token}` },
+      headers: { Origin: E2E_ADMIN_ORIGIN },
       data: {
         name: 'cache-b-only',
         balance_usd_micros: null,
@@ -99,6 +89,9 @@ test.describe('email password login', () => {
     });
     expect(secondToken.ok(), await secondToken.text()).toBeTruthy();
 
+    // 切换回 root 前先清掉第二用户的会话：否则 /login 被已登录守卫弹回概览，
+    // UI 登录表单不会渲染。
+    await page.context().clearCookies();
     await page.goto('/login');
     await page.locator('#login-email').fill(E2E_ADMIN_EMAIL);
     await page.locator('#login-password').fill(E2E_ADMIN_PASSWORD);
@@ -109,8 +102,6 @@ test.describe('email password login', () => {
       page.locator('[data-testid="token-row"]', { hasText: 'cache-a-only' }),
     ).toBeVisible();
 
-    const rootSession = await page.evaluate((key) => localStorage.getItem(key), ADMIN_KEY_STORAGE);
-    expect(rootSession).not.toBeNull();
     let releaseStaleRequest: (() => void) | undefined;
     const staleRequestGate = new Promise<void>((resolve) => {
       releaseStaleRequest = resolve;
@@ -138,10 +129,7 @@ test.describe('email password login', () => {
         await route.continue();
         return;
       }
-      if (
-        requestPhase === 'stale-root' &&
-        route.request().headers().authorization === `Bearer ${rootSession}`
-      ) {
+      if (requestPhase === 'stale-root') {
         markStaleRequestStarted?.();
         await staleRequestGate;
         await route.fulfill({
@@ -172,9 +160,6 @@ test.describe('email password login', () => {
     releaseStaleRequest?.();
     await staleRequestFinished;
     await expect(page).toHaveURL(/\/overview/);
-    expect(
-      await page.evaluate((key) => localStorage.getItem(key), ADMIN_KEY_STORAGE),
-    ).not.toBeNull();
 
     requestPhase = 'second-account';
     await page

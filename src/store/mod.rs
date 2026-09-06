@@ -1,16 +1,20 @@
-//! SQLite 存储层：版本化迁移 + 请求日志落库 + 用户钱包结算。
+//! SQLite 存储层门面：连接治理、版本化迁移与跨领域查询辅助。
 //!
-//! 本模块承载请求日志（`request_log`）、系统日志（`system_log`）、冒烟记录
-//! （`smoke_probe`）、管理用户钱包（`user_balance`）与令牌累计结算
-//! （`token_balance`，只保存令牌累计结算）。金额一律整数 micro-USD（ADR-0002）。管理面 `/stats` 与
-//! `/stats/lifetime` 聚合也在此查询（时间窗夹取与日志分页同一惯例）。
+//! 领域实现拆在各子模块：请求日志（[`request_log`]：落库、待结算队列、
+//! 查询与统计）、结算（[`settlement`]：计费预留、用户钱包与令牌累计结算）、
+//! 资源（[`resources`]）、用户（[`users`]）、套餐（[`plans`]）、价格目录
+//! （[`catalog`]）与系统日志（`system_log`）。本文件保留打开库与迁移、
+//! 库文件权限收敛、存量明文 key 指纹换算、WAL checkpoint，以及分页与
+//! WHERE 拼接等共享查询辅助。金额一律整数 micro-USD。
 
 pub mod balance_operations;
 pub mod catalog;
 pub mod channel_keys;
 mod ids;
 pub mod plans;
+pub mod request_log;
 pub mod resources;
+pub mod settlement;
 mod system_log;
 pub mod users;
 
@@ -20,18 +24,15 @@ pub use system_log::{
     record_audit_detached, record_system_error, record_system_warn,
 };
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    AssertSqlSafe, Row, SqliteConnection, SqlitePool,
+    Connection, Row, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
 };
 use thiserror::Error;
-
-use crate::core::billing::PriceSnapshot;
 
 /// 存储层错误，向上抛给应用边界。
 #[derive(Debug, Error)]
@@ -42,8 +43,15 @@ pub enum StoreError {
     Migrate(sqlx::migrate::MigrateError),
     #[error("数据库操作失败: {0}")]
     Query(sqlx::Error),
+    #[error("请求日志持久化超过请求截止时间")]
+    PersistenceTimeout,
     #[error("读取数据库文件元数据 {path} 失败: {source}")]
     FileMetadata {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("设置数据库文件 {path} 权限失败: {source}")]
+    SetPermissions {
         path: PathBuf,
         source: std::io::Error,
     },
@@ -58,6 +66,8 @@ pub enum StoreError {
     MissingToken(String),
     #[error("资源数据非法: {0}")]
     InvalidResource(String),
+    #[error("管理主体无权操作该记录")]
+    PermissionDenied,
     #[error("不能删除或降级最后一个 root")]
     LastRootProtected,
     #[error("用户 {0} 不存在")]
@@ -72,6 +82,12 @@ pub enum StoreError {
     EntityIdClockBeforeEpoch,
     #[error("资源 id 空间已耗尽")]
     EntityIdExhausted,
+    #[error("用户余额不足以预留本次请求费用")]
+    InsufficientFunds,
+    #[error("令牌累计结算上限不足以预留本次请求费用")]
+    TokenLimitExceeded,
+    #[error("请求费用预留与已有请求身份不一致")]
+    ReservationConflict,
 }
 
 /// 写锁等待上限：与 sqlx-sqlite 缺省一致，此处显式声明意图——SQLite 单写者下
@@ -82,6 +98,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// 缺库文件时自动创建（`create_if_missing`），迁移脚本内建在 `migrations/`。
 /// 连接选项统一治理 SQLite 的坏默认值：外键强制、写锁排队、WAL 日志模式。
+/// 连接建立后立即把库文件与既有边车收紧为 owner-only 权限。
 pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
@@ -101,14 +118,249 @@ pub async fn open(path: &Path) -> Result<SqlitePool, StoreError> {
         .await
         .map_err(StoreError::Connect)?;
 
+    tighten_database_file_permissions(path).await?;
+
     sqlx::migrate!()
         .run(&pool)
         .await
         .map_err(StoreError::Migrate)?;
 
     ids::initialize(&pool).await?;
+    hash_legacy_token_key_plaintext(path).await?;
 
     Ok(pool)
+}
+
+/// 令牌 key 的库内存储形态：SHA-256 的十六进制指纹。
+///
+/// 明文只出现在两处边界——签发时的创建响应，与入站认证头。库内
+/// （tokens、token_balance、request_log、request_log_outbox、
+/// billing_reservations）一律只存指纹，WAL/备份/任何 DB 读取都还原不出
+/// 可用凭证。换算确定性且无盐：认证侧对呈现的明文做同一换算后查快照。
+pub fn token_key_fingerprint(token_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest: [u8; 32] = Sha256::digest(token_key.as_bytes()).into();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// 存量令牌 key 明文换算的完成标记（settings 表）；写入即代表库内已全量指纹化。
+const SETTING_TOKEN_KEYS_HASHED: &str = "token_keys_hashed";
+
+/// 把存量库中的令牌 key 明文原地换算为指纹。
+///
+/// 覆盖五张表：tokens、token_balance、request_log、request_log_outbox 与
+/// billing_reservations，其中 outbox 元数据与预留恢复元数据里的 JSON 载荷
+/// 同步重写。换算不可逆（明文从此只存在于创建响应与调用方），全部动作与
+/// 完成标记在同一写事务中提交，中断即整体回滚、重启重跑；已有标记时直接
+/// 返回。新库空表扫描为无操作。逐行 JSON 解析失败时保留原行并告警——那本
+/// 就是损坏数据，不能借换算之手伪造。
+///
+/// 子表 `token_balance` 外键引用 `tokens(token_key)` 且未声明 DEFERRABLE：
+/// 立即外键下「父行改键前子表先改、父行改键时子表仍指旧值」都会被拒。换算
+/// 走关闭外键的专用连接（启动路径独占，无并发写入者），提交前以
+/// `pragma_foreign_key_check` 复核引用一致性，不一致即回滚报错；应用连接池
+/// 的外键强制不受影响。
+pub(crate) async fn hash_legacy_token_key_plaintext(path: &Path) -> Result<(), StoreError> {
+    // 换算要原位改写两类 JSON 载荷：outbox 队列元数据与预留恢复元数据。
+    use request_log::PendingRequestLog;
+    use settlement::BillingAttemptRecovery;
+
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .foreign_keys(false);
+    let mut conn = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(StoreError::Connect)?;
+    let mut tx = conn
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(StoreError::Query)?;
+
+    // 完成标记与换算同事务读写：标记在场即代表此前已完成，直接返回。
+    let flagged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM settings WHERE setting_key = ?")
+        .bind(SETTING_TOKEN_KEYS_HASHED)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+    if flagged.is_some() {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Ok(());
+    }
+
+    // 先读后写：JSON 重写需要行上的明文 token_key 作为换算来源，与列更新
+    // 之前完成读取。
+    let outbox_rows: Vec<(i64, String, Vec<u8>)> =
+        sqlx::query("SELECT id, token_key, metadata FROM request_log_outbox")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<i64, _>("id").map_err(StoreError::Query)?,
+                    row.try_get::<String, _>("token_key")
+                        .map_err(StoreError::Query)?,
+                    row.try_get::<Vec<u8>, _>("metadata")
+                        .map_err(StoreError::Query)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+    for (outbox_id, token_key, metadata) in outbox_rows {
+        let Ok(mut pending) = serde_json::from_slice::<PendingRequestLog>(&metadata) else {
+            tracing::warn!(outbox_id, "存量 outbox 元数据无法解析，指纹换算跳过该行");
+            continue;
+        };
+        pending.log.token_key = token_key_fingerprint(&token_key);
+        let encoded = serde_json::to_vec(&pending).map_err(|err| {
+            StoreError::InvalidResource(format!("outbox 元数据重编码失败: {err}"))
+        })?;
+        sqlx::query("UPDATE request_log_outbox SET metadata = ? WHERE id = ?")
+            .bind(encoded)
+            .bind(outbox_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+    }
+
+    let reservation_rows: Vec<(String, Vec<u8>)> =
+        sqlx::query("SELECT token_key, recovery_metadata FROM billing_reservations")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String, _>("token_key")
+                        .map_err(StoreError::Query)?,
+                    row.try_get::<Vec<u8>, _>("recovery_metadata")
+                        .map_err(StoreError::Query)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+    for (token_key, metadata) in reservation_rows {
+        let Ok(mut recovery) = serde_json::from_slice::<BillingAttemptRecovery>(&metadata) else {
+            // 告警只打指纹：此处 token_key 还是库中明文遗留 key，直接输出会把
+            // 可用凭证写进进程日志。
+            tracing::warn!(
+                token_key = %token_key_fingerprint(&token_key),
+                "存量预留恢复元数据无法解析，指纹换算跳过该行"
+            );
+            continue;
+        };
+        if let Some(result) = recovery.result.as_deref_mut() {
+            result.token_key = token_key_fingerprint(&token_key);
+        }
+        let encoded = serde_json::to_vec(&recovery)
+            .map_err(|err| StoreError::InvalidResource(format!("恢复元数据重编码失败: {err}")))?;
+        sqlx::query("UPDATE billing_reservations SET recovery_metadata = ? WHERE token_key = ?")
+            .bind(encoded)
+            .bind(&token_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+    }
+
+    let plain_keys: Vec<String> = sqlx::query("SELECT token_key FROM tokens")
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?
+        .into_iter()
+        .map(|row| {
+            row.try_get::<String, _>("token_key")
+                .map_err(StoreError::Query)
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+
+    // 子表先改、父表后改：关闭外键后顺序不再是正确性依据，保留既有次序
+    // 仅利于阅读（对账表在凭证表之前）。
+    for plain in &plain_keys {
+        let fingerprint = token_key_fingerprint(plain);
+        for table in [
+            "UPDATE token_balance SET token_key = ? WHERE token_key = ?",
+            "UPDATE request_log SET token_key = ? WHERE token_key = ?",
+            "UPDATE request_log_outbox SET token_key = ? WHERE token_key = ?",
+            "UPDATE billing_reservations SET token_key = ? WHERE token_key = ?",
+        ] {
+            sqlx::query(table)
+                .bind(&fingerprint)
+                .bind(plain)
+                .execute(&mut *tx)
+                .await
+                .map_err(StoreError::Query)?;
+        }
+        sqlx::query("UPDATE tokens SET token_key = ? WHERE token_key = ?")
+            .bind(&fingerprint)
+            .bind(plain)
+            .execute(&mut *tx)
+            .await
+            .map_err(StoreError::Query)?;
+    }
+
+    resources::set_setting(
+        &mut tx,
+        SETTING_TOKEN_KEYS_HASHED,
+        &serde_json::Value::Bool(true),
+    )
+    .await?;
+
+    // 提交前复核引用一致性：关外键写入不触发约束，损坏必须在此拦下而不是
+    // 落库后由运行期外键错误暴露。
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(StoreError::Query)?;
+    if violations > 0 {
+        tx.rollback().await.map_err(StoreError::Query)?;
+        return Err(StoreError::InvalidResource(format!(
+            "令牌 key 指纹换算后仍有 {violations} 处悬挂引用，已回滚"
+        )));
+    }
+    tx.commit().await.map_err(StoreError::Query)?;
+    Ok(())
+}
+
+/// 把数据库文件与既有边车（WAL/SHM）的权限收紧为 owner-only（0o600）。
+///
+/// 库文件承载渠道密钥、令牌 key 与对话 body，不能按进程 umask 宽松落盘。
+/// SQLite 创建 `-wal`/`-journal`/`-shm` 边车时按库文件当时的权限原样派生
+/// （不受 umask 影响），因此只需在首次写事务前归一库文件；连接阶段可能已
+/// 产生的边车在此一并归一，其后新建的自然继承 0o600。边车尚未创建是正常
+/// 状态（首次写事务才落盘），缺席时跳过。
+async fn tighten_database_file_permissions(path: &Path) -> Result<(), StoreError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut wal_path = path.to_path_buf();
+    wal_path.as_mut_os_string().push("-wal");
+    let mut shm_path = path.to_path_buf();
+    shm_path.as_mut_os_string().push("-shm");
+    let targets = [path.to_path_buf(), wal_path, shm_path];
+    tokio::task::spawn_blocking(move || -> Result<(), StoreError> {
+        for target in targets {
+            match std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StoreError::SetPermissions {
+                        path: target,
+                        source,
+                    });
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| StoreError::SetPermissions {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(err.to_string()),
+    })?
 }
 
 /// 写一条冒烟记录，返回时间有序 id。
@@ -122,818 +374,6 @@ pub async fn insert_smoke(pool: &SqlitePool, note: &str) -> Result<i64, StoreErr
         .map_err(StoreError::Query)?;
 
     Ok(id)
-}
-
-/// 一条请求日志的可持久化字段。
-#[derive(Debug, Clone)]
-pub struct RequestLog {
-    /// 时间有序主键：新增时由存储层分配，插入构造时填 0。
-    pub id: i64,
-    /// unix 毫秒时间戳。
-    pub created_at: i64,
-    pub token_name: String,
-    pub token_key: String,
-    /// 归属管理用户，写入时定格。
-    ///
-    /// 冗余存储而非 JOIN `tokens`：令牌删除后归属仍在，日志过滤与用量统计不缩水。
-    /// `0` 为存量行或归属未知，不匹配任何真实用户。
-    pub user_id: i64,
-    pub inbound_protocol: String,
-    /// 入站模型名（下游请求的 `model`，别名或统一模型 ID 原样保留）。
-    pub model: String,
-    /// 实际出站模型名（别名改写后或统一模型落到的已登记模型）。
-    ///
-    /// 存量行或尚未出站的失败请求为 `None`。
-    pub outbound_model: Option<String>,
-    pub channel: String,
-    /// 本次出站使用的密钥身份（名称或 id），绝不保存密钥明文。
-    pub channel_key: Option<String>,
-    pub status_code: i64,
-    pub latency_ms: i64,
-    /// usage 四分量。
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    /// 计费时的四档价格快照（micro-USD / 1M tokens）。
-    pub price: PriceSnapshot,
-    /// 渠道原价（micro-USD），不套用折扣。
-    pub base_cost_usd_micros: i64,
-    /// 本次使用的万分比折扣率（10000 = 原价）。
-    pub discount_bp: i64,
-    /// 本次实收（micro-USD，折后）。
-    ///
-    /// 补扣/豁免按此列入账；对账时由 `base_cost_usd_micros` 与 `discount_bp` 复核。
-    pub cost_usd_micros: i64,
-    /// 费用是否已完成所属用户钱包结算；结算失败时为 `false`，供对账补扣。
-    pub settled: bool,
-    /// 一次下游入站请求的身份；同一请求的多次出站尝试共用。存量行可能为 `None`。
-    pub request_id: Option<String>,
-    /// 可选的入站请求原始字节（仅 `logging.full_body` 开启时保存）。
-    pub request_body: Option<Vec<u8>>,
-    /// 可选的入站响应原始字节（仅 `logging.full_body` 开启时保存）。
-    ///
-    /// 非流式为返回下游的 JSON 字节；流式为实际下发的 SSE 帧 wire 文本拼接。
-    pub response_body: Option<Vec<u8>>,
-}
-
-/// 落一条请求日志，返回时间有序 id。
-pub async fn insert_request_log(pool: &SqlitePool, log: &RequestLog) -> Result<i64, StoreError> {
-    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
-    insert_request_log_on(&mut conn, log).await
-}
-
-/// 在已有连接/事务上插入请求日志，供结算与日志同事务提交。
-pub async fn insert_request_log_on(
-    conn: &mut SqliteConnection,
-    log: &RequestLog,
-) -> Result<i64, StoreError> {
-    let id = ids::next_id()?;
-    sqlx::query(
-        "INSERT INTO request_log \
-         (id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-          channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
-          cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-          cache_read_price_usd_micros, cache_write_price_usd_micros, \
-          base_cost_usd_micros, discount_bp, cost_usd_micros, \
-          settled, request_id, request_body, response_body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(log.created_at)
-    .bind(&log.token_name)
-    .bind(&log.token_key)
-    .bind(log.user_id)
-    .bind(&log.inbound_protocol)
-    .bind(&log.model)
-    .bind(&log.outbound_model)
-    .bind(&log.channel)
-    .bind(&log.channel_key)
-    .bind(log.status_code)
-    .bind(log.latency_ms)
-    .bind(log.input_tokens as i64)
-    .bind(log.output_tokens as i64)
-    .bind(log.cache_read_tokens as i64)
-    .bind(log.cache_write_tokens as i64)
-    .bind(log.price.input_micros)
-    .bind(log.price.output_micros)
-    .bind(log.price.cache_read_micros)
-    .bind(log.price.cache_write_micros)
-    .bind(log.base_cost_usd_micros)
-    .bind(log.discount_bp)
-    .bind(log.cost_usd_micros)
-    .bind(log.settled as i64)
-    .bind(&log.request_id)
-    .bind(&log.request_body)
-    .bind(&log.response_body)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-
-    Ok(id)
-}
-
-/// 所属用户的钱包余额。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UserWallet {
-    /// 用户当前剩余（micro-USD），可为负（在途透支）。
-    pub balance_usd_micros: i64,
-    /// 用户累计结算总额（micro-USD）。
-    pub settled_usd_micros: i64,
-}
-
-/// 单个令牌的累计结算。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TokenSettlement {
-    /// 该令牌累计结算总额（micro-USD），用于 `limit_usd` 上限检查。
-    pub settled_usd_micros: i64,
-}
-
-/// 网关准入所需的组合快照：用户钱包与令牌累计结算来自同一读取边界。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AdmissionSnapshot {
-    pub wallet: UserWallet,
-    pub token: TokenSettlement,
-}
-
-/// 令牌首次出现时建立累计结算行，并把初始余额记入所属用户钱包；已存在则原样返回。
-///
-/// 初始余额已经是整数 micro-USD。仅在新建结算行时入账，避免重启或重复调用
-/// 把同一令牌的初始额再加一遍。
-pub async fn initialize_token_settlement(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-    initial_balance_usd_micros: i64,
-    now: i64,
-) -> Result<TokenSettlement, StoreError> {
-    let inserted = sqlx::query(
-        "INSERT INTO token_balance (token_key, settled_usd_micros, created_at) \
-         VALUES (?, 0, ?) \
-         ON CONFLICT(token_key) DO NOTHING",
-    )
-    .bind(token_key)
-    .bind(now)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-
-    if inserted.rows_affected() == 1 && initial_balance_usd_micros != 0 {
-        let credited = sqlx::query(
-            "UPDATE user_balance SET balance_usd_micros = balance_usd_micros + ? \
-             WHERE user_id = (SELECT user_id FROM tokens WHERE token_key = ?)",
-        )
-        .bind(initial_balance_usd_micros)
-        .bind(token_key)
-        .execute(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-        if credited.rows_affected() == 0 {
-            return Err(StoreError::MissingToken(token_key.to_string()));
-        }
-    }
-
-    get_token_settlement(conn, token_key)
-        .await?
-        .ok_or(StoreError::MissingToken(token_key.to_string()))
-}
-
-/// 读取令牌累计结算；令牌不存在返回 `None`。
-pub async fn get_token_settlement(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-) -> Result<Option<TokenSettlement>, StoreError> {
-    let row = sqlx::query_scalar::<_, i64>(
-        "SELECT settled_usd_micros FROM token_balance WHERE token_key = ?",
-    )
-    .bind(token_key)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-
-    Ok(row.map(|settled_usd_micros| TokenSettlement { settled_usd_micros }))
-}
-
-/// 读取令牌所属用户的钱包与该令牌累计结算。
-pub async fn get_admission_snapshot(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-) -> Result<Option<AdmissionSnapshot>, StoreError> {
-    let row = sqlx::query_as::<_, (i64, i64, i64)>(
-        "SELECT ub.balance_usd_micros, ub.settled_usd_micros, \
-                COALESCE(tb.settled_usd_micros, 0) \
-         FROM tokens t \
-         INNER JOIN user_balance ub ON ub.user_id = t.user_id \
-         LEFT JOIN token_balance tb ON tb.token_key = t.token_key \
-         WHERE t.token_key = ?",
-    )
-    .bind(token_key)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    Ok(
-        row.map(|(balance, user_settled, token_settled)| AdmissionSnapshot {
-            wallet: UserWallet {
-                balance_usd_micros: balance,
-                settled_usd_micros: user_settled,
-            },
-            token: TokenSettlement {
-                settled_usd_micros: token_settled,
-            },
-        }),
-    )
-}
-
-/// 删除令牌累计结算行；不存在视为成功（幂等）。
-///
-/// 供删除令牌时同事务清理：结算行若残留，同 key 重建令牌会经
-/// `initialize_token_settlement` 的冲突跳过、不再把初始额写入用户钱包。
-pub async fn delete_token_balance(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-) -> Result<(), StoreError> {
-    sqlx::query("DELETE FROM token_balance WHERE token_key = ?")
-        .bind(token_key)
-        .execute(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    Ok(())
-}
-
-/// 结算一次费用：从所属用户钱包扣减（可为负），并增加用户与该令牌的累计结算。
-///
-/// 用户钱包以 `UPDATE` 原子完成；SQLite 单写者串行化保证单调。
-pub async fn settle_charge(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-    cost_usd_micros: i64,
-) -> Result<TokenSettlement, StoreError> {
-    let user_id: Option<i64> = sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = ?")
-        .bind(token_key)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    let user_id = user_id.ok_or_else(|| StoreError::MissingToken(token_key.to_string()))?;
-    apply_charge(conn, user_id, token_key, cost_usd_micros, true).await?;
-
-    get_token_settlement(conn, token_key)
-        .await?
-        .ok_or(StoreError::MissingToken(token_key.to_string()))
-}
-
-/// 向指定用户钱包结算，并在令牌仍存在时累计令牌结算额。
-///
-/// `require_token` 只供在线请求结算使用；历史日志已经冻结 `user_id`，令牌删除后仍须
-/// 能补扣钱包，因此历史路径把令牌累计视为可选的附属更新。
-async fn apply_charge(
-    conn: &mut SqliteConnection,
-    user_id: i64,
-    token_key: &str,
-    cost_usd_micros: i64,
-    require_token: bool,
-) -> Result<(), StoreError> {
-    let updated = sqlx::query(
-        "UPDATE user_balance \
-         SET balance_usd_micros = balance_usd_micros - ?, \
-             settled_usd_micros = settled_usd_micros + ? \
-         WHERE user_id = ?",
-    )
-    .bind(cost_usd_micros)
-    .bind(cost_usd_micros)
-    .bind(user_id)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    if updated.rows_affected() == 0 {
-        return Err(StoreError::MissingWallet(user_id));
-    }
-
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
-    let token_updated = sqlx::query(
-        "INSERT INTO token_balance (token_key, settled_usd_micros, created_at) \
-         SELECT token_key, ?, ? FROM tokens WHERE token_key = ? AND user_id = ? \
-         ON CONFLICT(token_key) DO UPDATE SET \
-           settled_usd_micros = settled_usd_micros + excluded.settled_usd_micros",
-    )
-    .bind(cost_usd_micros)
-    .bind(created_at)
-    .bind(token_key)
-    .bind(user_id)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    if require_token && token_updated.rows_affected() == 0 {
-        return Err(StoreError::MissingToken(token_key.to_string()));
-    }
-    Ok(())
-}
-
-/// 读用户钱包。插入用户时同步建行；缺失视为数据损坏。
-pub async fn get_user_wallet(pool: &SqlitePool, user_id: i64) -> Result<UserWallet, StoreError> {
-    let (balance_usd_micros, settled_usd_micros) = sqlx::query_as(
-        "SELECT balance_usd_micros, settled_usd_micros FROM user_balance WHERE user_id = ?",
-    )
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(StoreError::Query)?
-    .ok_or(StoreError::MissingWallet(user_id))?;
-    Ok(UserWallet {
-        balance_usd_micros,
-        settled_usd_micros,
-    })
-}
-
-/// 全部用户钱包，供管理列表一次取回。
-pub async fn list_user_wallets(pool: &SqlitePool) -> Result<HashMap<i64, UserWallet>, StoreError> {
-    let rows =
-        sqlx::query("SELECT user_id, balance_usd_micros, settled_usd_micros FROM user_balance")
-            .fetch_all(pool)
-            .await
-            .map_err(StoreError::Query)?;
-    let mut wallets = HashMap::with_capacity(rows.len());
-    for row in rows {
-        let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
-        let balance: i64 = row
-            .try_get("balance_usd_micros")
-            .map_err(StoreError::Query)?;
-        let settled: i64 = row
-            .try_get("settled_usd_micros")
-            .map_err(StoreError::Query)?;
-        wallets.insert(
-            user_id,
-            UserWallet {
-                balance_usd_micros: balance,
-                settled_usd_micros: settled,
-            },
-        );
-    }
-    Ok(wallets)
-}
-
-/// 一次用户钱包相对调整产生的事实。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BalanceChange {
-    pub before_usd_micros: i64,
-    pub after_usd_micros: i64,
-    pub settled_usd_micros: i64,
-}
-
-/// 相对调整用户钱包：充值传正数、扣减传负数。
-///
-/// 前后值来自同一条原子 `UPDATE ... RETURNING`，调用方可直接用于审计，不需要在
-/// 事务外预读一个可能已过时的钱包快照。
-pub async fn adjust_user_balance(
-    conn: &mut SqliteConnection,
-    user_id: i64,
-    delta_usd_micros: i64,
-) -> Result<BalanceChange, StoreError> {
-    let row = sqlx::query(
-        "UPDATE user_balance SET balance_usd_micros = balance_usd_micros + ? \
-         WHERE user_id = ? RETURNING balance_usd_micros, settled_usd_micros",
-    )
-    .bind(delta_usd_micros)
-    .bind(user_id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    let row = row.ok_or(StoreError::MissingWallet(user_id))?;
-    let after_usd_micros: i64 = row
-        .try_get("balance_usd_micros")
-        .map_err(StoreError::Query)?;
-    let settled_usd_micros: i64 = row
-        .try_get("settled_usd_micros")
-        .map_err(StoreError::Query)?;
-    let before_usd_micros = after_usd_micros
-        .checked_sub(delta_usd_micros)
-        .ok_or_else(|| StoreError::InvalidResource("余额调整超出整数范围".to_string()))?;
-    Ok(BalanceChange {
-        before_usd_micros,
-        after_usd_micros,
-        settled_usd_micros,
-    })
-}
-
-/// 读取指定用户令牌的累计结算额，避免令牌列表为每个用户扫描整张结算表。
-pub async fn list_token_settled_for_user(
-    pool: &SqlitePool,
-    user_id: i64,
-) -> Result<HashMap<String, i64>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT tb.token_key, tb.settled_usd_micros \
-         FROM token_balance tb JOIN tokens t ON t.token_key = tb.token_key \
-         WHERE t.user_id = ?",
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    .map_err(StoreError::Query)?;
-    let mut settled = HashMap::with_capacity(rows.len());
-    for row in rows {
-        settled.insert(
-            row.try_get("token_key").map_err(StoreError::Query)?,
-            row.try_get("settled_usd_micros")
-                .map_err(StoreError::Query)?,
-        );
-    }
-    Ok(settled)
-}
-
-/// 单令牌累计结算额；无结算行视为 0。
-pub async fn get_token_settled(pool: &SqlitePool, token_key: &str) -> Result<i64, StoreError> {
-    sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-        .bind(token_key)
-        .fetch_optional(pool)
-        .await
-        .map_err(StoreError::Query)
-        .map(|amount: Option<i64>| amount.unwrap_or(0))
-}
-
-/// 在调用方事务内读取单令牌累计结算额；无结算行视为 0。
-pub async fn get_token_settled_on_conn(
-    conn: &mut SqliteConnection,
-    token_key: &str,
-) -> Result<i64, StoreError> {
-    sqlx::query_scalar("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-        .bind(token_key)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(StoreError::Query)
-        .map(|amount: Option<i64>| amount.unwrap_or(0))
-}
-
-/// 列表排序方向；缺省新→旧。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SortDir {
-    Asc,
-    #[default]
-    Desc,
-}
-
-impl SortDir {
-    /// SQL `ASC` / `DESC` 片段（含前导空格）。
-    pub(crate) fn sql(self) -> &'static str {
-        match self {
-            Self::Asc => " ASC",
-            Self::Desc => " DESC",
-        }
-    }
-}
-
-/// 请求日志可排序列：时间与计量，不含类别/身份列。
-///
-/// 只接受白名单，拼进 `ORDER BY` 的是静态片段，避免把查询参数当标识符。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestLogSortBy {
-    #[default]
-    Created,
-    Tokens,
-    Latency,
-    Cache,
-    Cost,
-}
-
-/// 请求日志查询过滤条件与分页。全部过滤维度可选，缺省即不限。
-#[derive(Debug, Clone, Default)]
-pub struct RequestLogQuery {
-    /// 按归属管理用户精确过滤。
-    ///
-    /// 普通用户查询时由管理面强制注入自己的 id；`None` 表示不限（admin/root 看全量）。
-    pub user_id: Option<i64>,
-    /// 按令牌 key 精确过滤。
-    pub token_key: Option<String>,
-    /// 按令牌展示名精确过滤。列表接口脱敏 `token_key`，行内筛选只能按名匹配。
-    pub token_name: Option<String>,
-    /// 按模型精确过滤。
-    pub model: Option<String>,
-    /// 按渠道名精确过滤。
-    pub channel: Option<String>,
-    /// 综合关键字：对 `token_key`/`token_name`/`model`/`channel` 做 LIKE 子串匹配（OR）。
-    pub keyword: Option<String>,
-    /// 只返回 `created_at >= from_created_at`。
-    pub from_created_at: Option<i64>,
-    /// 只返回 `created_at <= to_created_at`。
-    pub to_created_at: Option<i64>,
-    /// 按是否已完成所属用户钱包结算过滤；`None` 表示不限。
-    pub settled: Option<bool>,
-    /// 按该次使用的万分比折扣率精确过滤；`None` 表示不限。
-    pub discount_bp: Option<i64>,
-    /// 精确匹配的入站协议；空表示不限。
-    pub inbound_protocols: Vec<String>,
-    /// 排序列；缺省时间。
-    pub sort_by: RequestLogSortBy,
-    /// 排序方向；缺省倒序。
-    pub sort_dir: SortDir,
-    /// 页码，从 1 起。
-    pub page: u64,
-    /// 每页条数。
-    pub page_size: u64,
-}
-
-impl RequestLogQuery {
-    /// 用必填的分页参数构造查询，过滤维度缺省为空。
-    pub fn new(page: u64, page_size: u64) -> Self {
-        let (page, page_size) = clamp_page(page, page_size);
-        Self {
-            page,
-            page_size,
-            ..Self::default()
-        }
-    }
-}
-
-/// 按 `filter` 分页查询请求日志（缺省时间倒序），返回本页条目（不含 body）。
-async fn query_request_logs_on(
-    conn: &mut SqliteConnection,
-    filter: &RequestLogQuery,
-) -> Result<Vec<RequestLog>, StoreError> {
-    let mut qb = sqlx::QueryBuilder::new(
-        "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-         channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
-         cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, \
-         base_cost_usd_micros, discount_bp, cost_usd_micros, \
-         settled FROM request_log",
-    );
-    push_request_log_filters(&mut qb, filter);
-    push_request_log_order(&mut qb, filter);
-    push_limit_offset(&mut qb, filter.page, filter.page_size);
-
-    let rows = qb
-        .build()
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-
-    let mut logs = Vec::with_capacity(rows.len());
-    for row in rows {
-        logs.push(map_request_log_row(&row, false)?);
-    }
-    Ok(logs)
-}
-
-/// 按主键读一条请求日志（含 body）；不存在返回 `None`。
-pub async fn get_request_log(pool: &SqlitePool, id: i64) -> Result<Option<RequestLog>, StoreError> {
-    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
-    get_request_log_on_conn(&mut conn, id).await
-}
-
-/// 在现有连接/事务上按主键读取请求日志（含 body）。
-pub async fn get_request_log_on_conn(
-    conn: &mut SqliteConnection,
-    id: i64,
-) -> Result<Option<RequestLog>, StoreError> {
-    let row = sqlx::query(
-        "SELECT id, created_at, token_name, token_key, user_id, inbound_protocol, model, outbound_model, \
-         channel, channel_key, status_code, latency_ms, input_tokens, output_tokens, cache_read_tokens, \
-         cache_write_tokens, input_price_usd_micros, output_price_usd_micros, \
-         cache_read_price_usd_micros, cache_write_price_usd_micros, \
-         base_cost_usd_micros, discount_bp, cost_usd_micros, \
-         settled, request_body, response_body FROM request_log WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    row.map(|row| map_request_log_row(&row, true)).transpose()
-}
-
-/// 未结算请求日志的运营闭环结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnsettledLogAction {
-    /// 已补扣或豁免，行现为已结算。
-    Closed,
-    /// 该行已经是已结算。
-    AlreadySettled,
-    /// 没有这条日志。
-    NotFound,
-}
-
-/// 对未结算日志补扣：按行上费用写入所属用户钱包（允许透支），并标为已结算。
-///
-/// 费用为 0 时只翻 `settled`。已结算或缺失不改余额。
-pub async fn settle_unsettled_log(
-    conn: &mut SqliteConnection,
-    id: i64,
-) -> Result<UnsettledLogAction, StoreError> {
-    let Some((token_key, mut user_id, cost, settled)) = load_log_settlement(conn, id).await? else {
-        return Ok(UnsettledLogAction::NotFound);
-    };
-    if settled {
-        return Ok(UnsettledLogAction::AlreadySettled);
-    }
-    if cost > 0 {
-        // 迁移前无法回填归属的存量行以 0 表示未知。仅这类行退回当前令牌关系；
-        // 新行始终以日志冻结的 user_id 为准，令牌删除也不会改变债务归属。
-        if user_id == 0 {
-            user_id = sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = ?")
-                .bind(&token_key)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(StoreError::Query)?
-                .ok_or_else(|| StoreError::MissingToken(token_key.clone()))?;
-        }
-        apply_charge(conn, user_id, &token_key, cost, false).await?;
-    }
-    mark_request_log_settled(conn, id).await?;
-    Ok(UnsettledLogAction::Closed)
-}
-
-/// 豁免未结算日志：只翻 `settled`，不动余额。
-pub async fn waive_unsettled_log(
-    conn: &mut SqliteConnection,
-    id: i64,
-) -> Result<UnsettledLogAction, StoreError> {
-    let Some((_, _, _, settled)) = load_log_settlement(conn, id).await? else {
-        return Ok(UnsettledLogAction::NotFound);
-    };
-    if settled {
-        return Ok(UnsettledLogAction::AlreadySettled);
-    }
-    mark_request_log_settled(conn, id).await?;
-    Ok(UnsettledLogAction::Closed)
-}
-
-/// 读一条日志的结算所需字段；不存在返回 `None`。
-async fn load_log_settlement(
-    conn: &mut SqliteConnection,
-    id: i64,
-) -> Result<Option<(String, i64, i64, bool)>, StoreError> {
-    let row = sqlx::query(
-        "SELECT token_key, user_id, cost_usd_micros, settled FROM request_log WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let token_key: String = row.try_get("token_key").map_err(StoreError::Query)?;
-    let user_id: i64 = row.try_get("user_id").map_err(StoreError::Query)?;
-    let cost: i64 = row.try_get("cost_usd_micros").map_err(StoreError::Query)?;
-    let settled = row
-        .try_get::<i64, _>("settled")
-        .map_err(StoreError::Query)?
-        != 0;
-    Ok(Some((token_key, user_id, cost, settled)))
-}
-
-async fn mark_request_log_settled(conn: &mut SqliteConnection, id: i64) -> Result<(), StoreError> {
-    sqlx::query("UPDATE request_log SET settled = 1 WHERE id = ?")
-        .bind(id)
-        .execute(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    Ok(())
-}
-
-/// 按 `filter` 分页查询请求日志（时间倒序），返回本页条目。
-pub async fn query_request_logs(
-    pool: &SqlitePool,
-    filter: &RequestLogQuery,
-) -> Result<Vec<RequestLog>, StoreError> {
-    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
-    query_request_logs_on(&mut conn, filter).await
-}
-
-/// 在同一事务内读本页条目、过滤总数与未结算条数。
-///
-/// 未结算计数套用同一套令牌/模型/关键字/时间过滤，但忽略 `settled` 维，
-/// 便于列表在「看全部」时仍提示有多少条待对账。
-pub async fn query_request_log_page(
-    pool: &SqlitePool,
-    filter: &RequestLogQuery,
-) -> Result<(Vec<RequestLog>, u64, u64), StoreError> {
-    let mut tx = pool.begin().await.map_err(StoreError::Query)?;
-    let logs = query_request_logs_on(&mut tx, filter).await?;
-    let total = count_request_logs_on(&mut tx, filter).await?;
-    let mut unsettled_filter = filter.clone();
-    unsettled_filter.settled = Some(false);
-    let unsettled_total = count_request_logs_on(&mut tx, &unsettled_filter).await?;
-    tx.commit().await.map_err(StoreError::Query)?;
-    Ok((logs, total, unsettled_total))
-}
-
-/// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
-async fn count_request_logs_on(
-    conn: &mut SqliteConnection,
-    filter: &RequestLogQuery,
-) -> Result<u64, StoreError> {
-    let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*) AS cnt FROM request_log");
-    push_request_log_filters(&mut qb, filter);
-
-    let row = qb
-        .build()
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(StoreError::Query)?;
-    let count: i64 = row.try_get("cnt").map_err(StoreError::Query)?;
-    Ok(as_count(count))
-}
-
-/// 按 `filter` 统计满足条件的日志总数（用于分页总页数）。
-pub async fn count_request_logs(
-    pool: &SqlitePool,
-    filter: &RequestLogQuery,
-) -> Result<u64, StoreError> {
-    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
-    count_request_logs_on(&mut conn, filter).await
-}
-
-/// 单批删除的行数：批间提交让请求路径的结算写入得以插队，避免单事务长写锁。
-const LOG_PURGE_BATCH_ROWS: u64 = 5_000;
-
-/// 删除早于截止时刻的**已结算**请求日志，返回删除总行数。
-///
-/// 未结算行是对账队列（补扣/豁免的依据），删除即坏账，永不清理。分批提交：
-/// SQLite 单写者下一次性删百万行会长时间占住写锁，把请求路径的结算写入
-/// 挤到 `busy_timeout` 之外。
-pub async fn purge_settled_request_logs_before(
-    pool: &SqlitePool,
-    cutoff_created_at: i64,
-) -> Result<u64, StoreError> {
-    let mut removed = 0u64;
-    loop {
-        let result = sqlx::query(
-            "DELETE FROM request_log WHERE id IN ( \
-                SELECT id FROM request_log WHERE created_at < ? AND settled != 0 \
-                LIMIT ?)",
-        )
-        .bind(cutoff_created_at)
-        .bind(LOG_PURGE_BATCH_ROWS as i64)
-        .execute(pool)
-        .await
-        .map_err(StoreError::Query)?;
-        let affected = result.rows_affected();
-        removed += affected;
-        if affected < LOG_PURGE_BATCH_ROWS {
-            return Ok(removed);
-        }
-    }
-}
-
-/// 日志存储占用与行数快照，供 root 在设置页决定何时清理。
-///
-/// 体积走**文件系统**：主库文件 + WAL 边车的实际字节数。SQL 的
-/// `page_count × page_size` 只覆盖主库文件，WAL（批量写入期间可能相当大，
-/// 见 [`purge_settled_request_logs_before`] 的分批提交）拿不到——判断磁盘
-/// 压力需要的是文件系统真相。两个 `COUNT(*)` 在清理后体量有界，按需拉取。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogStoreStats {
-    /// 主库文件字节数（含空闲页：删除不回缩，后续写入逐步复用）。
-    pub db_size_bytes: u64,
-    /// `<db>-wal` 边车字节数；边车不存在（checkpoint 成功截断或尚未写入）为 0。
-    pub wal_size_bytes: u64,
-    pub request_log_rows: u64,
-    pub system_log_rows: u64,
-}
-
-pub async fn log_store_stats(
-    pool: &SqlitePool,
-    db_path: &Path,
-) -> Result<LogStoreStats, StoreError> {
-    // 这是管理面的运维诊断：主库路径来自已经打开的配置，读取失败不能伪装成
-    // 「0 字节」。WAL 尚未创建是正常状态，只有 NotFound 才折算为 0。
-    let db_size_bytes = tokio::fs::metadata(db_path)
-        .await
-        .map_err(|source| StoreError::FileMetadata {
-            path: db_path.to_path_buf(),
-            source,
-        })?
-        .len();
-    let mut wal_path = db_path.to_path_buf();
-    // 在 OsString 层追加后缀，保留非 UTF-8 路径的原始字节；display() 再拼接会
-    // 经过 lossy UTF-8 转换，导致合法的 Unix 路径找不到对应的 WAL 文件。
-    wal_path.as_mut_os_string().push("-wal");
-    let wal_size_bytes = match tokio::fs::metadata(&wal_path).await {
-        Ok(meta) => meta.len(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(source) => {
-            return Err(StoreError::FileMetadata {
-                path: wal_path,
-                source,
-            });
-        }
-    };
-    let request_log_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_log")
-        .fetch_one(pool)
-        .await
-        .map_err(StoreError::Query)?;
-    let system_log_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system_log")
-        .fetch_one(pool)
-        .await
-        .map_err(StoreError::Query)?;
-    Ok(LogStoreStats {
-        db_size_bytes,
-        wal_size_bytes,
-        request_log_rows: as_count(request_log_rows),
-        system_log_rows: as_count(system_log_rows),
-    })
 }
 
 /// 清理后的收尾：尝试把 WAL 全量并入主库并将边车截断为零。
@@ -960,438 +400,28 @@ pub async fn checkpoint_wal_truncate(pool: &SqlitePool) -> Result<(), StoreError
     Ok(())
 }
 
-/// `/stats` 缺省时间窗（天）。
-const DEFAULT_STATS_DAYS: u64 = 7;
-/// `/stats` 时间窗上限（天）；外部传入的 `days` 夹取到 `[1, MAX]`。
-const MAX_STATS_DAYS: u64 = 90;
-
-const MS_PER_DAY: i64 = 86_400_000;
-/// `days=1` 时趋势按 UTC 小时补齐，长度为 24。
-const HOURS_PER_DAY: i64 = 24;
-
-/// 把外部传入的 `days` 夹取到合法时间窗：缺省 7，下限 1，上限 90。
-pub fn clamp_stats_days(days: Option<u64>) -> u64 {
-    days.unwrap_or(DEFAULT_STATS_DAYS).clamp(1, MAX_STATS_DAYS)
+/// 列表排序方向；缺省新→旧。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDir {
+    Asc,
+    #[default]
+    Desc,
 }
 
-/// `/stats` 只读聚合：时间窗内请求量、token、费用与分布。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stats {
-    pub summary: StatsSummary,
-    pub daily: Vec<DailyBucket>,
-    pub by_model: Vec<CostShare>,
-    pub by_channel: Vec<CostShare>,
-}
-
-/// 时间窗汇总。令牌数/渠道数来自资源表（当前存量），其余来自 `request_log`。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatsSummary {
-    pub request_count: u64,
-    pub success_count: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    /// 实收（折后）合计。
-    pub cost_usd_micros: i64,
-    /// 渠道原价合计（成本）。
-    pub base_cost_usd_micros: i64,
-    /// 毛利：实收 - 渠道原价（折后合计减原价合计）。
-    pub gross_profit_usd_micros: i64,
-    /// 令牌数：全局视图为全部令牌，归属视图只数该用户自己的。
-    pub token_count: u64,
-    /// 出站渠道数。归属视图为 `None`：渠道是运营视角的数字，普通用户不该看到。
-    pub channel_count: Option<u64>,
-}
-
-/// 趋势桶：`days=1` 为 UTC 小时（24 点），否则为日历日；无流量的桶补零。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DailyBucket {
-    pub date: String,
-    pub request_count: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cost_usd_micros: i64,
-    pub base_cost_usd_micros: i64,
-    pub gross_profit_usd_micros: i64,
-}
-
-/// 按模型或按渠道的费用/请求分布。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CostShare {
-    pub name: String,
-    pub request_count: u64,
-    pub cost_usd_micros: i64,
-    pub base_cost_usd_micros: i64,
-    pub gross_profit_usd_micros: i64,
-}
-
-/// 全量累计：不受 `/stats` 时间窗影响。
-///
-/// 口径：`request_count` 按 `request_id` 去重（存量无 id 的行回退到主键），
-/// 表示下游入站次数；`total_tokens` 含全部请求日志行（含未结算），
-/// `cost_usd_micros` 只计 HTTP 2xx 且已结算的费用。并列展示时
-/// 不要把 token 合计当成已入账费用的用量。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LifetimeStats {
-    pub request_count: u64,
-    pub cost_usd_micros: i64,
-    pub base_cost_usd_micros: i64,
-    pub gross_profit_usd_micros: i64,
-    pub total_tokens: u64,
-}
-
-/// 聚合 `days` 天（已夹取）内的 stats。费用只计 HTTP 2xx（与计费「仅成功结算」一致）。
-///
-/// `user_id` 为 `Some` 时只统计该用户名下的流量（普通用户视图），并省略渠道数。
-pub async fn query_stats(
-    pool: &SqlitePool,
-    days: u64,
-    user_id: Option<i64>,
-) -> Result<Stats, StoreError> {
-    let days = clamp_stats_days(Some(days));
-    let now_millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0);
-    let today = now_millis.div_euclid(MS_PER_DAY);
-    let start_day = today.saturating_sub(days as i64 - 1);
-    let from_created_at = start_day.saturating_mul(MS_PER_DAY);
-
-    let summary_sql = format!(
-        "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS success_count, \
-         COALESCE(SUM(input_tokens), 0) AS input_tokens, \
-         COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-           AS cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
-           AS base_cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
-           AS gross_profit_usd_micros \
-         FROM request_log WHERE created_at >= ?{}",
-        user_scope_clause(user_id)
-    );
-    let mut summary_query = sqlx::query(AssertSqlSafe(summary_sql)).bind(from_created_at);
-    if let Some(user_id) = user_id {
-        summary_query = summary_query.bind(user_id);
-    }
-    let summary_row = summary_query
-        .fetch_one(pool)
-        .await
-        .map_err(StoreError::Query)?;
-
-    let token_count = match user_id {
-        Some(user_id) => {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE user_id = ?")
-                .bind(user_id)
-                .fetch_one(pool)
-                .await
-                .map_err(StoreError::Query)?;
-            as_count(count)
+impl SortDir {
+    /// SQL `ASC` / `DESC` 片段（含前导空格）。
+    pub(crate) fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => " ASC",
+            Self::Desc => " DESC",
         }
-        None => count_rows(pool, "SELECT COUNT(*) AS cnt FROM tokens").await?,
-    };
-    // 渠道数只在全局视图给出：普通用户看不到渠道，也不需要知道有多少条。
-    let channel_count = match user_id {
-        Some(_) => None,
-        None => Some(count_rows(pool, "SELECT COUNT(*) AS cnt FROM channels").await?),
-    };
-
-    let summary = StatsSummary {
-        request_count: as_count(
-            summary_row
-                .try_get("request_count")
-                .map_err(StoreError::Query)?,
-        ),
-        success_count: as_count(
-            summary_row
-                .try_get("success_count")
-                .map_err(StoreError::Query)?,
-        ),
-        input_tokens: as_count(
-            summary_row
-                .try_get("input_tokens")
-                .map_err(StoreError::Query)?,
-        ),
-        output_tokens: as_count(
-            summary_row
-                .try_get("output_tokens")
-                .map_err(StoreError::Query)?,
-        ),
-        cost_usd_micros: summary_row
-            .try_get("cost_usd_micros")
-            .map_err(StoreError::Query)?,
-        base_cost_usd_micros: summary_row
-            .try_get("base_cost_usd_micros")
-            .map_err(StoreError::Query)?,
-        gross_profit_usd_micros: summary_row
-            .try_get("gross_profit_usd_micros")
-            .map_err(StoreError::Query)?,
-        token_count,
-        channel_count,
-    };
-
-    let daily = if days == 1 {
-        query_hourly_buckets(pool, from_created_at, user_id).await?
-    } else {
-        query_daily_buckets(pool, from_created_at, days, user_id).await?
-    };
-    let by_model = query_cost_share(pool, from_created_at, CostDimension::Model, user_id).await?;
-    let by_channel =
-        query_cost_share(pool, from_created_at, CostDimension::Channel, user_id).await?;
-
-    Ok(Stats {
-        summary,
-        daily,
-        by_model,
-        by_channel,
-    })
-}
-
-/// 全量累计：请求数、成功结算费用、四分量 token 合计。
-///
-/// `user_id` 为 `Some` 时只累计该用户名下的流量。
-pub async fn query_lifetime_stats(
-    pool: &SqlitePool,
-    user_id: Option<i64>,
-) -> Result<LifetimeStats, StoreError> {
-    let sql = format!(
-        "SELECT COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-           AS cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
-           AS base_cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
-           AS gross_profit_usd_micros, \
-         COALESCE(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens), 0) \
-           AS total_tokens \
-         FROM request_log{}",
-        lifetime_user_scope_clause(user_id)
-    );
-    let mut query = sqlx::query(AssertSqlSafe(sql));
-    if let Some(user_id) = user_id {
-        query = query.bind(user_id);
     }
-    let row = query.fetch_one(pool).await.map_err(StoreError::Query)?;
-
-    Ok(LifetimeStats {
-        request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
-        cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
-        base_cost_usd_micros: row
-            .try_get("base_cost_usd_micros")
-            .map_err(StoreError::Query)?,
-        gross_profit_usd_micros: row
-            .try_get("gross_profit_usd_micros")
-            .map_err(StoreError::Query)?,
-        total_tokens: as_count(row.try_get("total_tokens").map_err(StoreError::Query)?),
-    })
-}
-
-/// 把趋势查询行映射为桶；`date` 列已是展示用标签。
-fn trend_bucket(row: &sqlx::sqlite::SqliteRow) -> Result<DailyBucket, StoreError> {
-    Ok(DailyBucket {
-        date: row.try_get("date").map_err(StoreError::Query)?,
-        request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
-        input_tokens: as_count(row.try_get("input_tokens").map_err(StoreError::Query)?),
-        output_tokens: as_count(row.try_get("output_tokens").map_err(StoreError::Query)?),
-        cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
-        base_cost_usd_micros: row
-            .try_get("base_cost_usd_micros")
-            .map_err(StoreError::Query)?,
-        gross_profit_usd_micros: row
-            .try_get("gross_profit_usd_micros")
-            .map_err(StoreError::Query)?,
-    })
-}
-
-/// `days=1`：当日 UTC 0–23 时补齐，标签为 `YYYY-MM-DDTHH:00:00Z`。
-async fn query_hourly_buckets(
-    pool: &SqlitePool,
-    from_created_at: i64,
-    user_id: Option<i64>,
-) -> Result<Vec<DailyBucket>, StoreError> {
-    let sql = format!(
-        "WITH RECURSIVE calendar(ts, n) AS ( \
-            SELECT datetime(? / 1000, 'unixepoch') AS ts, 1 AS n \
-            UNION ALL \
-            SELECT datetime(ts, '+1 hour'), n + 1 FROM calendar WHERE n < ? \
-         ) \
-         SELECT strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) AS date, \
-                COALESCE(agg.request_count, 0) AS request_count, \
-                COALESCE(agg.input_tokens, 0) AS input_tokens, \
-                COALESCE(agg.output_tokens, 0) AS output_tokens, \
-                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros, \
-                COALESCE(agg.base_cost_usd_micros, 0) AS base_cost_usd_micros, \
-                COALESCE(agg.gross_profit_usd_micros, 0) AS gross_profit_usd_micros \
-         FROM calendar \
-         LEFT JOIN ( \
-            SELECT strftime('%Y-%m-%dT%H:00:00Z', created_at / 1000, 'unixepoch') AS hour, \
-                   COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-                   COALESCE(SUM(input_tokens), 0) AS input_tokens, \
-                   COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
-            FROM request_log WHERE created_at >= ?{} \
-            GROUP BY hour \
-         ) agg ON agg.hour = strftime('%Y-%m-%dT%H:00:00Z', calendar.ts) \
-         ORDER BY calendar.ts",
-        user_scope_clause(user_id)
-    );
-    let mut query = sqlx::query(AssertSqlSafe(sql))
-        .bind(from_created_at)
-        .bind(HOURS_PER_DAY)
-        .bind(from_created_at);
-    if let Some(user_id) = user_id {
-        query = query.bind(user_id);
-    }
-    let rows = query.fetch_all(pool).await.map_err(StoreError::Query)?;
-
-    rows.iter().map(trend_bucket).collect()
-}
-
-/// 逐日序列：用 SQLite 日历补齐无流量日，日期为 UTC `YYYY-MM-DD`。
-async fn query_daily_buckets(
-    pool: &SqlitePool,
-    from_created_at: i64,
-    days: u64,
-    user_id: Option<i64>,
-) -> Result<Vec<DailyBucket>, StoreError> {
-    let sql = format!(
-        "WITH RECURSIVE calendar(day, n) AS ( \
-            SELECT date(? / 1000, 'unixepoch') AS day, 1 AS n \
-            UNION ALL \
-            SELECT date(day, '+1 day'), n + 1 FROM calendar WHERE n < ? \
-         ) \
-         SELECT calendar.day AS date, \
-                COALESCE(agg.request_count, 0) AS request_count, \
-                COALESCE(agg.input_tokens, 0) AS input_tokens, \
-                COALESCE(agg.output_tokens, 0) AS output_tokens, \
-                COALESCE(agg.cost_usd_micros, 0) AS cost_usd_micros, \
-                COALESCE(agg.base_cost_usd_micros, 0) AS base_cost_usd_micros, \
-                COALESCE(agg.gross_profit_usd_micros, 0) AS gross_profit_usd_micros \
-         FROM calendar \
-         LEFT JOIN ( \
-            SELECT date(created_at / 1000, 'unixepoch') AS day, \
-                   COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-                   COALESCE(SUM(input_tokens), 0) AS input_tokens, \
-                   COALESCE(SUM(output_tokens), 0) AS output_tokens, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros ELSE 0 END), 0) AS cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN base_cost_usd_micros ELSE 0 END), 0) AS base_cost_usd_micros, \
-                   COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-                        THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) AS gross_profit_usd_micros \
-            FROM request_log WHERE created_at >= ?{} \
-            GROUP BY day \
-         ) agg ON agg.day = calendar.day \
-         ORDER BY calendar.day",
-        user_scope_clause(user_id)
-    );
-    let mut query = sqlx::query(AssertSqlSafe(sql))
-        .bind(from_created_at)
-        .bind(days as i64)
-        .bind(from_created_at);
-    if let Some(user_id) = user_id {
-        query = query.bind(user_id);
-    }
-    let rows = query.fetch_all(pool).await.map_err(StoreError::Query)?;
-
-    rows.iter().map(trend_bucket).collect()
-}
-
-/// 分布聚合的分组列。
-enum CostDimension {
-    Model,
-    Channel,
-}
-
-/// 按模型或按渠道聚合费用/请求；费用仅计 2xx。
-async fn query_cost_share(
-    pool: &SqlitePool,
-    from_created_at: i64,
-    dimension: CostDimension,
-    user_id: Option<i64>,
-) -> Result<Vec<CostShare>, StoreError> {
-    let column = match dimension {
-        CostDimension::Model => "model",
-        CostDimension::Channel => "channel",
-    };
-    let sql = format!(
-        "SELECT {column} AS name, COUNT(DISTINCT COALESCE(request_id, CAST(id AS TEXT))) AS request_count, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN cost_usd_micros ELSE 0 END), 0) \
-           AS cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 THEN base_cost_usd_micros ELSE 0 END), 0) \
-           AS base_cost_usd_micros, \
-         COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 AND settled = 1 \
-             THEN cost_usd_micros - base_cost_usd_micros ELSE 0 END), 0) \
-           AS gross_profit_usd_micros \
-         FROM request_log WHERE created_at >= ?{} \
-         GROUP BY {column} \
-         ORDER BY cost_usd_micros DESC, name ASC",
-        user_scope_clause(user_id)
-    );
-    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(from_created_at);
-    if let Some(user_id) = user_id {
-        query = query.bind(user_id);
-    }
-    let rows = query.fetch_all(pool).await.map_err(StoreError::Query)?;
-
-    let mut shares = Vec::with_capacity(rows.len());
-    for row in rows {
-        shares.push(CostShare {
-            name: row.try_get("name").map_err(StoreError::Query)?,
-            request_count: as_count(row.try_get("request_count").map_err(StoreError::Query)?),
-            cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
-            base_cost_usd_micros: row
-                .try_get("base_cost_usd_micros")
-                .map_err(StoreError::Query)?,
-            gross_profit_usd_micros: row
-                .try_get("gross_profit_usd_micros")
-                .map_err(StoreError::Query)?,
-        });
-    }
-    Ok(shares)
-}
-
-/// 执行 `SELECT COUNT(*) AS cnt ...`，把结果夹到非负 u64。
-async fn count_rows(pool: &SqlitePool, sql: &'static str) -> Result<u64, StoreError> {
-    let row = sqlx::query(sql)
-        .fetch_one(pool)
-        .await
-        .map_err(StoreError::Query)?;
-    let count: i64 = row.try_get("cnt").map_err(StoreError::Query)?;
-    Ok(as_count(count))
 }
 
 /// SQLite 聚合整数转计数；负值视为 0。
 pub(crate) fn as_count(value: i64) -> u64 {
     value.max(0) as u64
-}
-
-/// 归属过滤片段，拼在已有 `WHERE` 之后；`Some` 时调用方须紧接着 bind 该 id。
-///
-/// 用拼接而非 `(? IS NULL OR user_id = ?)`：后者会让 SQLite 放弃
-/// `idx_request_log_user_id`，而归属视图正是最常走的那条路径。
-fn user_scope_clause(user_id: Option<i64>) -> &'static str {
-    if user_id.is_some() {
-        " AND user_id = ?"
-    } else {
-        ""
-    }
-}
-
-/// 同 [`user_scope_clause`]，但用于本身没有 `WHERE` 的查询。
-fn lifetime_user_scope_clause(user_id: Option<i64>) -> &'static str {
-    if user_id.is_some() {
-        " WHERE user_id = ?"
-    } else {
-        ""
-    }
 }
 
 /// 页码从 1 起，每页条数夹到 `[1, 200]`。请求日志与系统日志共用。
@@ -1464,89 +494,6 @@ pub(crate) fn push_limit_offset(
     qb.push(" OFFSET ").push_bind(offset as i64);
 }
 
-/// 把 `filter` 中非空条件以 AND 拼入 WHERE 子句。
-fn push_request_log_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &RequestLogQuery) {
-    let mut first = true;
-    if let Some(user_id) = filter.user_id {
-        push_where_cond(qb, &mut first, "user_id = ");
-        qb.push_bind(user_id);
-    }
-    if let Some(token_key) = &filter.token_key {
-        push_where_cond(qb, &mut first, "token_key = ");
-        qb.push_bind(token_key);
-    }
-    if let Some(token_name) = &filter.token_name {
-        push_where_cond(qb, &mut first, "token_name = ");
-        qb.push_bind(token_name);
-    }
-    if let Some(model) = &filter.model {
-        push_where_cond(qb, &mut first, "model = ");
-        qb.push_bind(model);
-    }
-    if let Some(channel) = &filter.channel {
-        push_where_cond(qb, &mut first, "channel = ");
-        qb.push_bind(channel);
-    }
-    if let Some(keyword) = filter
-        .keyword
-        .as_deref()
-        .map(str::trim)
-        .filter(|kw| !kw.is_empty())
-    {
-        let pattern = like_substring_pattern(keyword);
-        push_where_cond(qb, &mut first, "(token_key LIKE ");
-        qb.push_bind(pattern.clone());
-        qb.push(" ESCAPE '\\' OR token_name LIKE ");
-        qb.push_bind(pattern.clone());
-        qb.push(" ESCAPE '\\' OR model LIKE ");
-        qb.push_bind(pattern.clone());
-        qb.push(" ESCAPE '\\' OR channel LIKE ");
-        qb.push_bind(pattern);
-        qb.push(" ESCAPE '\\')");
-    }
-    push_created_at_range(qb, &mut first, filter.from_created_at, filter.to_created_at);
-    if let Some(settled) = filter.settled {
-        push_where_cond(qb, &mut first, "settled = ");
-        qb.push_bind(settled as i64);
-    }
-    if let Some(discount_bp) = filter.discount_bp {
-        push_where_cond(qb, &mut first, "discount_bp = ");
-        qb.push_bind(discount_bp);
-    }
-    push_column_in(
-        qb,
-        &mut first,
-        "inbound_protocol",
-        &filter.inbound_protocols,
-    );
-}
-
-/// 把白名单排序列拼进 `ORDER BY`；同向 `id` 保证分页稳定。
-fn push_request_log_order(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, filter: &RequestLogQuery) {
-    qb.push(" ORDER BY ");
-    match filter.sort_by {
-        RequestLogSortBy::Created => {
-            qb.push("created_at");
-        }
-        RequestLogSortBy::Tokens => {
-            // 与 Token 列一致：只计 input/output，缓存档有单独列。
-            qb.push("(input_tokens + output_tokens)");
-        }
-        RequestLogSortBy::Latency => {
-            qb.push("latency_ms");
-        }
-        RequestLogSortBy::Cache => {
-            qb.push("(cache_read_tokens + cache_write_tokens)");
-        }
-        RequestLogSortBy::Cost => {
-            qb.push("cost_usd_micros");
-        }
-    }
-    qb.push(filter.sort_dir.sql());
-    qb.push(", id");
-    qb.push(filter.sort_dir.sql());
-}
-
 /// 关键字 → LIKE 子串模式：转义 `\`/`%`/`_`（配合 `ESCAPE '\'`），两端补 `%`。
 pub(crate) fn like_substring_pattern(keyword: &str) -> String {
     let mut pattern = String::with_capacity(keyword.len() + 2);
@@ -1561,89 +508,26 @@ pub(crate) fn like_substring_pattern(keyword: &str) -> String {
     pattern
 }
 
-/// 把请求日志行映射为 `RequestLog`。列表查询不选 BLOB 列，`include_body` 为 false。
-fn map_request_log_row(
-    row: &sqlx::sqlite::SqliteRow,
-    include_body: bool,
-) -> Result<RequestLog, StoreError> {
-    let price = PriceSnapshot {
-        input_micros: row
-            .try_get("input_price_usd_micros")
-            .map_err(StoreError::Query)?,
-        output_micros: row
-            .try_get("output_price_usd_micros")
-            .map_err(StoreError::Query)?,
-        cache_read_micros: row
-            .try_get("cache_read_price_usd_micros")
-            .map_err(StoreError::Query)?,
-        cache_write_micros: row
-            .try_get("cache_write_price_usd_micros")
-            .map_err(StoreError::Query)?,
-    };
-    Ok(RequestLog {
-        id: row.try_get("id").map_err(StoreError::Query)?,
-        created_at: row.try_get("created_at").map_err(StoreError::Query)?,
-        token_name: row.try_get("token_name").map_err(StoreError::Query)?,
-        token_key: row.try_get("token_key").map_err(StoreError::Query)?,
-        user_id: row.try_get("user_id").map_err(StoreError::Query)?,
-        inbound_protocol: row.try_get("inbound_protocol").map_err(StoreError::Query)?,
-        model: row.try_get("model").map_err(StoreError::Query)?,
-        outbound_model: row.try_get("outbound_model").map_err(StoreError::Query)?,
-        channel: row.try_get("channel").map_err(StoreError::Query)?,
-        channel_key: row.try_get("channel_key").map_err(StoreError::Query)?,
-        status_code: row.try_get("status_code").map_err(StoreError::Query)?,
-        latency_ms: row.try_get("latency_ms").map_err(StoreError::Query)?,
-        input_tokens: row.try_get("input_tokens").map_err(StoreError::Query)?,
-        output_tokens: row.try_get("output_tokens").map_err(StoreError::Query)?,
-        cache_read_tokens: row
-            .try_get("cache_read_tokens")
-            .map_err(StoreError::Query)?,
-        cache_write_tokens: row
-            .try_get("cache_write_tokens")
-            .map_err(StoreError::Query)?,
-        price,
-        base_cost_usd_micros: row
-            .try_get("base_cost_usd_micros")
-            .map_err(StoreError::Query)?,
-        discount_bp: row.try_get("discount_bp").map_err(StoreError::Query)?,
-        cost_usd_micros: row.try_get("cost_usd_micros").map_err(StoreError::Query)?,
-        settled: row
-            .try_get::<i64, _>("settled")
-            .map_err(StoreError::Query)?
-            != 0,
-        request_id: None,
-        request_body: if include_body {
-            row.try_get("request_body").map_err(StoreError::Query)?
-        } else {
-            None
-        },
-        response_body: if include_body {
-            row.try_get("response_body").map_err(StoreError::Query)?
-        } else {
-            None
-        },
-    })
-}
-
+/// 跨领域测试共享的建库与播种辅助。
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::open;
     use crate::core::billing::PriceSnapshot;
-    use serde_json::json;
-    use sqlx::Connection;
+    use crate::store::request_log::RequestLog;
+    use crate::store::resources;
+    use sqlx::{SqliteConnection, SqlitePool};
 
     /// 建一个临时 SQLite 连接池并跑完全部迁移。
-    async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
+    pub(crate) async fn test_pool() -> (tempfile::TempDir, SqlitePool) {
         let dir = tempfile::tempdir().expect("应能创建临时目录");
         let pool = open(&dir.path().join("test.db"))
             .await
             .expect("应能打开临时库");
         (dir, pool)
     }
-
     /// 直写一条令牌定义行：`token_balance` 外键指向 `tokens`，余额相关测试
     /// 需先有归属令牌。
-    async fn seed_token(conn: &mut SqliteConnection, token_key: &str) {
+    pub(crate) async fn seed_token(conn: &mut SqliteConnection, token_key: &str) {
         sqlx::query(
             "INSERT INTO tokens (token_key, name, enabled, created_at) VALUES (?, ?, 1, 0)",
         )
@@ -1653,6 +537,50 @@ mod tests {
         .await
         .expect("应能写令牌行");
     }
+    pub(crate) fn sample_log(created_at: i64, settled: bool) -> RequestLog {
+        RequestLog {
+            id: 0,
+            created_at,
+            token_name: "t".to_string(),
+            token_key: "sk-a".to_string(),
+            user_id: resources::ROOT_USER_ID,
+            inbound_protocol: "openai_chat".to_string(),
+            model: "m".to_string(),
+            outbound_model: None,
+            channel_key: None,
+            channel: "c".to_string(),
+            status_code: 200,
+            latency_ms: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
+            usage_reported: false,
+            price: PriceSnapshot::default(),
+            cost_usd_micros: 1,
+            base_cost_usd_micros: 0,
+            discount_bp: 10_000,
+            settled,
+            request_id: None,
+            billing_attempt_id: None,
+            dispatched: true,
+            request_body: None,
+            response_body: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::billing::PriceSnapshot;
+    use crate::store::request_log::RequestLog;
+    use crate::store::settlement::{
+        BillingAttemptRecovery, get_admission_snapshot, initialize_token_settlement,
+    };
+    use crate::store::test_support::{seed_token, test_pool};
+    use sqlx::Connection;
 
     /// 空库迁移后即有内置 root（id=1）与零额钱包；尚未设密码。
     #[tokio::test]
@@ -1707,70 +635,6 @@ mod tests {
         assert_eq!(remaining_col, 0, "token_balance 不应再存剩余余额");
     }
 
-    /// 同一用户的多把令牌共用钱包：扣第一把，第二把读到同一剩余；settled 仍按令牌分开。
-    #[tokio::test]
-    async fn tokens_of_same_user_share_wallet() {
-        let (_dir, pool) = test_pool().await;
-        let mut conn = pool.acquire().await.expect("应能获取连接");
-        seed_token(&mut conn, "sk-a").await;
-        seed_token(&mut conn, "sk-b").await;
-        initialize_token_settlement(&mut conn, "sk-a", 5_000_000, 1)
-            .await
-            .expect("应能初始化 a");
-        initialize_token_settlement(&mut conn, "sk-b", 0, 1)
-            .await
-            .expect("应能初始化 b");
-
-        settle_charge(&mut conn, "sk-a", 1_000_000)
-            .await
-            .expect("应能结算");
-
-        let a = get_admission_snapshot(&mut conn, "sk-a")
-            .await
-            .expect("应能读")
-            .expect("a 应有视图");
-        let b = get_admission_snapshot(&mut conn, "sk-b")
-            .await
-            .expect("应能读")
-            .expect("b 应有视图");
-        assert_eq!(a.wallet.balance_usd_micros, 4_000_000);
-        assert_eq!(b.wallet.balance_usd_micros, 4_000_000);
-        assert_eq!(a.token.settled_usd_micros, 1_000_000);
-        assert_eq!(b.token.settled_usd_micros, 0);
-    }
-
-    /// 钱包相对调整：充值/扣减同一原语，只动剩余、不动累计结算额。
-    #[tokio::test]
-    async fn adjust_user_balance_recharges_and_deducts() {
-        let (_dir, pool) = test_pool().await;
-        let mut conn = pool.acquire().await.expect("应能获取连接");
-        seed_token(&mut conn, "sk-a").await;
-        initialize_token_settlement(&mut conn, "sk-a", 10_000_000, 1)
-            .await
-            .expect("应能初始化余额");
-
-        let change = adjust_user_balance(&mut conn, resources::ROOT_USER_ID, 5_000_000)
-            .await
-            .expect("应能充值");
-        assert_eq!(change.before_usd_micros, 10_000_000);
-        assert_eq!(change.after_usd_micros, 15_000_000);
-        assert_eq!(change.settled_usd_micros, 0, "调账不动累计结算额");
-
-        let change = adjust_user_balance(&mut conn, resources::ROOT_USER_ID, -3_000_000)
-            .await
-            .expect("应能扣减");
-        assert_eq!(change.before_usd_micros, 15_000_000);
-        assert_eq!(change.after_usd_micros, 12_000_000);
-        assert_eq!(change.settled_usd_micros, 0);
-
-        // 令牌视图读到的剩余就是所属用户的钱包。
-        let view = get_admission_snapshot(&mut conn, "sk-a")
-            .await
-            .expect("应能读")
-            .expect("应有视图");
-        assert_eq!(view.wallet.balance_usd_micros, 12_000_000);
-    }
-
     /// 连接选项治理 SQLite 坏默认值：WAL 日志模式、NORMAL 同步、外键强制、
     /// 写锁排队 5 秒（缺省分别是 DELETE、FULL、关闭、立即 BUSY）。
     #[tokio::test]
@@ -1803,6 +667,62 @@ mod tests {
         assert_eq!(busy_timeout, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
     }
 
+    /// 新建库文件与 WAL/SHM 边车都以 owner-only 权限落盘：库内容含渠道
+    /// 密钥、令牌 key 与对话 body，不能按进程 umask 宽松创建。
+    #[tokio::test]
+    async fn open_creates_database_files_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let path = dir.path().join("owner-only.db");
+        let pool = open(&path).await.expect("应能建库");
+        insert_smoke(&pool, "wal-priming")
+            .await
+            .expect("应能写入触发 WAL 落盘");
+        pool.close().await;
+
+        let mode = std::fs::metadata(&path)
+            .expect("应能读取库文件")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "新建库文件应为 0600");
+
+        for sidecar in [
+            format!("{}-wal", path.display()),
+            format!("{}-shm", path.display()),
+        ] {
+            let Ok(metadata) = std::fs::metadata(&sidecar) else {
+                // 边车在 checkpoint 后可能已截断移除；存在即必须 owner-only。
+                continue;
+            };
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "{sidecar} 应按库文件权限派生为 0600"
+            );
+        }
+    }
+
+    /// 既有库文件以更宽权限落盘（历史版本或外部创建）时，打开后归一为 0600。
+    #[tokio::test]
+    async fn open_normalizes_loose_database_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let path = dir.path().join("loose.db");
+        std::fs::File::create(&path).expect("应能创建空库文件");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("应能设置宽权限");
+
+        let _pool = open(&path).await.expect("应能打开既有库");
+
+        let mode = std::fs::metadata(&path)
+            .expect("应能读取库文件")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "既有库文件应归一为 0600");
+    }
+
     /// 业务表一律 STRICT：错类型写入直接报错，而非按亲和性静默收下。逐表探测，
     /// 任一表回退成非 STRICT 都会被此测试捕获。探测方向：INTEGER 列写 TEXT/REAL；
     /// `settings` 无 INTEGER 列，用 BLOB 写 TEXT 列（STRICT 拒绝，非 STRICT 的
@@ -1830,9 +750,14 @@ mod tests {
                 models: vec![],
                 model_aliases: std::collections::HashMap::new(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: crate::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         )
         .await
@@ -1884,6 +809,12 @@ mod tests {
                 "INSERT INTO request_log (token_name, inbound_protocol, model, channel, \
                      status_code, latency_ms, created_at) \
                  VALUES ('t', 'openai_chat', 'm', 'c', 200, 10, 'not-a-number')",
+            ),
+            (
+                "request_log_outbox",
+                "INSERT INTO request_log_outbox \
+                     (id, token_key, user_id, cost_usd_micros, metadata) \
+                 VALUES ('not-a-number', 'k', 1, 0, x'00')",
             ),
             (
                 "channels",
@@ -2154,7 +1085,8 @@ mod tests {
             .await
             .expect("应能查余额");
         assert!(balance.is_none(), "孤儿余额行应被迁移清理");
-        let balance = get_admission_snapshot(&mut conn, "sk-live")
+        // 明文 key 在 open() 的指纹换算中转为 SHA-256，按指纹读取存量令牌。
+        let balance = get_admission_snapshot(&mut conn, &token_key_fingerprint("sk-live"))
             .await
             .expect("应能查余额")
             .expect("存量令牌应能读到用户钱包");
@@ -2170,11 +1102,11 @@ mod tests {
         .await
         .expect("应有 root 钱包");
         assert_eq!(wallet, (1_500_000, 200));
-        let owner: i64 =
-            sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = 'sk-live'")
-                .fetch_one(&mut *conn)
-                .await
-                .expect("令牌应有归属");
+        let owner: i64 = sqlx::query_scalar("SELECT user_id FROM tokens WHERE token_key = ?")
+            .bind(token_key_fingerprint("sk-live"))
+            .fetch_one(&mut *conn)
+            .await
+            .expect("令牌应有归属");
         assert_eq!(owner, 1);
 
         let id = insert_smoke(&pool, "after-upgrade")
@@ -2183,380 +1115,58 @@ mod tests {
         assert!(id >= 1, "AUTOINCREMENT 计数应延续");
     }
 
-    /// 请求日志分页查询：时间倒序、LIMIT/OFFSET 生效、过滤维度生效。
+    /// 存量明文 key 换算遇到损坏的恢复元数据：该行跳过不 panic、原样保留
+    /// （不半写），其余行照常完成换算；完成标记仍然落盘——坏行交给人工
+    /// 处置，不阻塞库的打开与使用。
     #[tokio::test]
-    async fn request_log_query_paginates_and_filters() {
-        let (_dir, pool) = test_pool().await;
-        let price = PriceSnapshot {
-            input_micros: 2_500_000,
-            output_micros: 10_000_000,
-            cache_read_micros: 1_250_000,
-            cache_write_micros: 10_000_000,
-        };
-        for (i, model) in ["gpt-4o", "gpt-4o-mini", "gpt-4o", "gpt-4o-mini"]
-            .iter()
-            .enumerate()
-        {
-            insert_request_log(
-                &pool,
-                &RequestLog {
-                    id: 0,
-                    created_at: 1000 + i as i64,
-                    token_name: format!("t{i}"),
-                    token_key: "sk-a".to_string(),
-                    user_id: resources::ROOT_USER_ID,
-                    inbound_protocol: "openai_chat".to_string(),
-                    model: model.to_string(),
-                    outbound_model: None,
-                    channel_key: None,
-                    channel: "c1".to_string(),
-                    status_code: 200,
-                    latency_ms: 10,
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                    price,
-                    cost_usd_micros: i as i64,
-                    base_cost_usd_micros: 0,
-                    discount_bp: 10_000,
-                    settled: true,
-                    request_id: None,
-                    request_body: None,
-                    response_body: None,
-                },
-            )
+    async fn legacy_plaintext_hash_skips_corrupted_recovery_metadata() {
+        // 先建一个全新库（迁移全部应用），再手工摘掉完成标记、把一行预留的
+        // recovery_metadata 换成损坏字节与明文 key——模拟「指纹化迁移前崩溃
+        // 损坏」的存量形态。
+        let dir = tempfile::tempdir().expect("应能创建临时目录");
+        let path = dir.path().join("legacy-hash.db");
+        let pool = open(&path).await.expect("应能建库");
+        // 换算在首次 open 已完成（标记已落）；清掉标记、注入明文时代的
+        // token 与预留行，模拟「指纹化迁移前崩溃 + 元数据损坏」的存量库。
+        sqlx::query("DELETE FROM settings WHERE setting_key = 'token_keys_hashed'")
+            .execute(&pool)
             .await
-            .expect("应能写请求日志");
-        }
-
-        // 分页：每页 2 条，第一页取最新两条（时间倒序）。
-        let page1 = RequestLogQuery::new(1, 2);
-        let rows = query_request_logs(&pool, &page1).await.expect("应能查询");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].created_at, 1003, "倒序：最新在前");
-        assert_eq!(rows[1].created_at, 1002);
-
-        // 页码 2：取剩余两条。
-        let page2 = RequestLogQuery::new(2, 2);
-        let rows = query_request_logs(&pool, &page2).await.expect("应能查询");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].created_at, 1001);
-        assert_eq!(rows[1].created_at, 1000);
-
-        // 按模型过滤 + 统计总数。
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.model = Some("gpt-4o".to_string());
-        let rows = query_request_logs(&pool, &filter).await.expect("应能过滤");
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.model == "gpt-4o"));
-        assert_eq!(
-            count_request_logs(&pool, &filter).await.expect("应能统计"),
-            2
-        );
-
-        // 时间范围过滤。
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.from_created_at = Some(1002);
-        let rows = query_request_logs(&pool, &filter).await.expect("应能过滤");
-        assert_eq!(
-            count_request_logs(&pool, &filter).await.expect("应能统计"),
-            2
-        );
-        assert!(rows.iter().all(|r| r.created_at >= 1002));
-
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.sort_dir = SortDir::Asc;
-        let rows = query_request_logs(&pool, &filter).await.expect("应能正序");
-        assert_eq!(rows[0].created_at, 1000);
-        assert_eq!(rows[3].created_at, 1003);
-
-        filter.sort_by = RequestLogSortBy::Cost;
-        let rows = query_request_logs(&pool, &filter)
-            .await
-            .expect("应能按费用排");
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.cost_usd_micros)
-                .collect::<Vec<_>>(),
-            [0, 1, 2, 3]
-        );
-
-        let mut proto = RequestLogQuery::new(1, 10);
-        proto.inbound_protocols = vec!["openai_chat".to_string()];
-        assert_eq!(
-            count_request_logs(&pool, &proto)
+            .expect("应能清完成标记");
+        // 明文时代的 tokens 行（列主换算以 tokens 表为驱动，行必须在场）。
+        for (name, key) in [("good", "sk-legacy-good"), ("bad", "sk-legacy-bad")] {
+            sqlx::query("INSERT INTO tokens (token_key, name, user_id) VALUES (?, ?, 1)")
+                .bind(key)
+                .bind(name)
+                .execute(&pool)
                 .await
-                .expect("应能按协议过滤"),
-            4
-        );
-        proto.inbound_protocols = vec!["anthropic_messages".to_string()];
-        assert_eq!(
-            count_request_logs(&pool, &proto)
-                .await
-                .expect("应能按协议过滤"),
-            0
-        );
-    }
-
-    /// `keyword` 综合搜索：对 token_key/token_name/model/channel 做 LIKE OR 子串匹配，
-    /// 与其余条件 AND 组合；`%`/`_` 等通配符按字面量转义。
-    #[tokio::test]
-    async fn request_log_query_filters_by_keyword() {
-        let (_dir, pool) = test_pool().await;
-        let price = PriceSnapshot {
-            input_micros: 0,
-            output_micros: 0,
-            cache_read_micros: 0,
-            cache_write_micros: 0,
-        };
-        let rows = [
-            ("sk-alpha", "生产令牌", "gpt-4o", "azure-east"),
-            ("sk-beta", "测试", "claude-3", "openai-direct"),
-            ("sk-gamma", "试用", "gpt-4o-mini", "azure-west"),
-        ];
-        for (i, (token_key, token_name, model, channel)) in rows.iter().enumerate() {
-            insert_request_log(
-                &pool,
-                &RequestLog {
-                    id: 0,
-                    created_at: 2000 + i as i64,
-                    token_name: (*token_name).to_string(),
-                    token_key: (*token_key).to_string(),
-                    user_id: resources::ROOT_USER_ID,
-                    inbound_protocol: "openai_chat".to_string(),
-                    model: (*model).to_string(),
-                    outbound_model: None,
-                    channel_key: None,
-                    channel: (*channel).to_string(),
-                    status_code: 200,
-                    latency_ms: 10,
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                    price,
-                    cost_usd_micros: 0,
-                    base_cost_usd_micros: 0,
-                    discount_bp: 10_000,
-                    settled: true,
-                    request_id: None,
-                    request_body: None,
-                    response_body: None,
-                },
-            )
-            .await
-            .expect("应能写请求日志");
+                .expect("应能注入明文令牌行");
         }
 
-        // 命中 token_key 子串。
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.keyword = Some("alpha".to_string());
-        let rows = query_request_logs(&pool, &filter).await.expect("应能查询");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].token_key, "sk-alpha");
-
-        // 命中 channel 子串（OR 语义：azure 命中两条）。
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.keyword = Some("azure".to_string());
-        assert_eq!(
-            count_request_logs(&pool, &filter).await.expect("应能统计"),
-            2
-        );
-
-        // 命中 token_name（中文）并与模型条件 AND 组合。
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.keyword = Some("令牌".to_string());
-        filter.model = Some("gpt-4o".to_string());
-        let rows = query_request_logs(&pool, &filter).await.expect("应能查询");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].token_name, "生产令牌");
-
-        // 通配符按字面量处理：`_` 不应匹配任意字符。
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.keyword = Some("sk_".to_string());
-        let rows = query_request_logs(&pool, &filter).await.expect("应能查询");
-        assert!(rows.is_empty(), "转义后 `_` 不是通配符");
-
-        // 空白关键字视作不过滤。
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.keyword = Some("   ".to_string());
-        assert_eq!(
-            count_request_logs(&pool, &filter).await.expect("应能统计"),
-            3
-        );
-    }
-
-    /// 行内筛选按列精确匹配：渠道/令牌名不是关键字 OR，子串不误伤。
-    #[tokio::test]
-    async fn request_log_query_filters_exact_channel_and_token_name() {
-        let (_dir, pool) = test_pool().await;
         let price = PriceSnapshot {
-            input_micros: 0,
-            output_micros: 0,
+            input_micros: 1,
+            output_micros: 1,
             cache_read_micros: 0,
             cache_write_micros: 0,
+            cache_write_1h_micros: 0,
         };
-        let rows = [
-            ("生产", "sk-a", "gpt-4o", "azure"),
-            ("生产备用", "sk-b", "gpt-4o", "azure-east"),
-        ];
-        for (i, (token_name, token_key, model, channel)) in rows.iter().enumerate() {
-            insert_request_log(
-                &pool,
-                &RequestLog {
-                    id: 0,
-                    created_at: 3000 + i as i64,
-                    token_name: (*token_name).to_string(),
-                    token_key: (*token_key).to_string(),
-                    user_id: resources::ROOT_USER_ID,
-                    inbound_protocol: "openai_chat".to_string(),
-                    model: (*model).to_string(),
-                    outbound_model: None,
-                    channel_key: None,
-                    channel: (*channel).to_string(),
-                    status_code: 200,
-                    latency_ms: 10,
-                    input_tokens: 1,
-                    output_tokens: 1,
-                    cache_read_tokens: 0,
-                    cache_write_tokens: 0,
-                    price,
-                    cost_usd_micros: 0,
-                    base_cost_usd_micros: 0,
-                    discount_bp: 10_000,
-                    settled: true,
-                    request_id: None,
-                    request_body: None,
-                    response_body: None,
-                },
-            )
-            .await
-            .expect("应能写请求日志");
-        }
-
-        let mut by_channel = RequestLogQuery::new(1, 10);
-        by_channel.channel = Some("azure".to_string());
-        let rows = query_request_logs(&pool, &by_channel)
-            .await
-            .expect("应能按渠道精确过滤");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].channel, "azure");
-
-        let mut by_name = RequestLogQuery::new(1, 10);
-        by_name.token_name = Some("生产".to_string());
-        let rows = query_request_logs(&pool, &by_name)
-            .await
-            .expect("应能按令牌名精确过滤");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].token_name, "生产");
-    }
-
-    /// Token 列排序只计 input+output：缓存量大的行不应排到展示量更小的行前面。
-    #[tokio::test]
-    async fn request_log_tokens_sort_excludes_cache() {
-        let (_dir, pool) = test_pool().await;
-        let price = PriceSnapshot {
-            input_micros: 0,
-            output_micros: 0,
-            cache_read_micros: 0,
-            cache_write_micros: 0,
-        };
-        insert_request_log(
-            &pool,
-            &RequestLog {
+        let good_recovery = serde_json::to_vec(&BillingAttemptRecovery {
+            token_name: "t".to_string(),
+            model: "gpt-4o".to_string(),
+            outbound_model: None,
+            channel: "c1".to_string(),
+            channel_key: None,
+            inbound_protocol: "openai_chat".to_string(),
+            started: 1,
+            price,
+            discount_bp: 10_000,
+            request_body: None,
+            // 带上已完成的结果载荷：JSON 内 token_key 的换算发生在 result 里，
+            // 缺席则无 JSON 内换算面可断言。
+            result: Some(Box::new(RequestLog {
                 id: 0,
                 created_at: 1,
                 token_name: "t".to_string(),
-                token_key: "sk-a".to_string(),
-                user_id: resources::ROOT_USER_ID,
-                inbound_protocol: "openai_chat".to_string(),
-                model: "cached".to_string(),
-                outbound_model: None,
-                channel_key: None,
-                channel: "c1".to_string(),
-                status_code: 200,
-                latency_ms: 10,
-                input_tokens: 10,
-                output_tokens: 10,
-                cache_read_tokens: 1_000,
-                cache_write_tokens: 0,
-                price,
-                cost_usd_micros: 0,
-                base_cost_usd_micros: 0,
-                discount_bp: 10_000,
-                settled: true,
-                request_id: None,
-                request_body: None,
-                response_body: None,
-            },
-        )
-        .await
-        .expect("应能写请求日志");
-        insert_request_log(
-            &pool,
-            &RequestLog {
-                id: 0,
-                created_at: 2,
-                token_name: "t".to_string(),
-                token_key: "sk-a".to_string(),
-                user_id: resources::ROOT_USER_ID,
-                inbound_protocol: "openai_chat".to_string(),
-                model: "heavy".to_string(),
-                outbound_model: None,
-                channel_key: None,
-                channel: "c1".to_string(),
-                status_code: 200,
-                latency_ms: 10,
-                input_tokens: 20,
-                output_tokens: 20,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                price,
-                cost_usd_micros: 0,
-                base_cost_usd_micros: 0,
-                discount_bp: 10_000,
-                settled: true,
-                request_id: None,
-                request_body: None,
-                response_body: None,
-            },
-        )
-        .await
-        .expect("应能写请求日志");
-
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.sort_by = RequestLogSortBy::Tokens;
-        filter.sort_dir = SortDir::Desc;
-        let rows = query_request_logs(&pool, &filter)
-            .await
-            .expect("应能按 Token 列排序");
-        assert_eq!(
-            rows.iter()
-                .map(|row| row.model.as_str())
-                .collect::<Vec<_>>(),
-            ["heavy", "cached"]
-        );
-    }
-
-    /// 分页参数在查询边界防御：`Default` 派生的 page/page_size 为 0 时不 panic、
-    /// 不下溢，且行为等同于第一页。
-    #[tokio::test]
-    async fn request_log_query_defends_zero_pagination() {
-        let (_dir, pool) = test_pool().await;
-        let price = PriceSnapshot {
-            input_micros: 2_500_000,
-            output_micros: 10_000_000,
-            cache_read_micros: 1_250_000,
-            cache_write_micros: 10_000_000,
-        };
-        insert_request_log(
-            &pool,
-            &RequestLog {
-                id: 0,
-                created_at: 1000,
-                token_name: "t".to_string(),
-                token_key: "sk-a".to_string(),
+                token_key: "sk-legacy-good".to_string(),
                 user_id: resources::ROOT_USER_ID,
                 inbound_protocol: "openai_chat".to_string(),
                 model: "gpt-4o".to_string(),
@@ -2564,315 +1174,101 @@ mod tests {
                 channel_key: None,
                 channel: "c1".to_string(),
                 status_code: 200,
-                latency_ms: 10,
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                price,
-                cost_usd_micros: 12,
-                base_cost_usd_micros: 0,
-                discount_bp: 10_000,
-                settled: true,
-                request_id: None,
-                request_body: None,
-                response_body: None,
-            },
-        )
-        .await
-        .expect("应能写请求日志");
-
-        // `RequestLogQuery::default()` 的 page/page_size 均为 0，不应引发下溢。
-        let rows = query_request_logs(&pool, &RequestLogQuery::default())
-            .await
-            .expect("page=0 不应 panic");
-        assert_eq!(rows.len(), 1, "page=0 视作第一页且 page_size 至少为 1");
-
-        // 超大页码：offset 经 i64::MAX 夹取不回绕成负偏移，SQLite 不报错，返回空页。
-        let huge = RequestLogQuery::new(u64::MAX, 200);
-        let rows = query_request_logs(&pool, &huge)
-            .await
-            .expect("超大页码不应触发负 OFFSET 报错");
-        assert!(rows.is_empty(), "超大页码应返回空页而非报错");
-    }
-
-    /// 出站模型列可空：存量行不写出站名；新行写入后原样读回。
-    #[tokio::test]
-    async fn request_log_outbound_model_nullable_and_roundtrips() {
-        let (_dir, pool) = test_pool().await;
-        sqlx::query(
-            "INSERT INTO request_log (created_at, token_name, inbound_protocol, model, channel, \
-                 status_code, latency_ms) \
-             VALUES (1, 't', 'openai_chat', 'fast', 'c1', 200, 10)",
-        )
-        .execute(&pool)
-        .await
-        .expect("缺 outbound_model 的存量行应能写入");
-
-        let rows = query_request_logs(&pool, &RequestLogQuery::new(1, 10))
-            .await
-            .expect("应能查询");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].model, "fast");
-        assert_eq!(rows[0].outbound_model, None, "旧行出站名可空");
-
-        insert_request_log(
-            &pool,
-            &RequestLog {
-                id: 0,
-                created_at: 2,
-                token_name: "t".to_string(),
-                token_key: "sk-a".to_string(),
-                user_id: resources::ROOT_USER_ID,
-                inbound_protocol: "openai_chat".to_string(),
-                model: "fast".to_string(),
-                outbound_model: Some("gpt-4o-mini".to_string()),
-                channel_key: None,
-                channel: "c1".to_string(),
-                status_code: 200,
-                latency_ms: 10,
+                latency_ms: 1,
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
-                price: PriceSnapshot::default(),
-                cost_usd_micros: 0,
-                base_cost_usd_micros: 0,
-                discount_bp: 10_000,
-                settled: true,
-                request_id: None,
-                request_body: None,
-                response_body: None,
-            },
-        )
-        .await
-        .expect("应能写出站模型");
-
-        let rows = query_request_logs(&pool, &RequestLogQuery::new(1, 10))
-            .await
-            .expect("应能查询");
-        assert_eq!(rows[0].outbound_model.as_deref(), Some("gpt-4o-mini"));
-        assert_eq!(rows[1].outbound_model, None);
-        assert!(rows[1].settled, "缺 settled 列的存量行默认已结算");
-    }
-
-    /// 迁移 0016：热表过滤列有索引；未结算费用不进入 stats 聚合。
-    #[tokio::test]
-    async fn request_log_indexes_exist_and_unsettled_cost_is_excluded() {
-        let (_dir, pool) = test_pool().await;
-        let names: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'request_log'",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("应能查索引");
-        for expected in [
-            "idx_request_log_created_at",
-            "idx_request_log_token_key",
-            "idx_request_log_model",
-        ] {
-            assert!(
-                names.iter().any(|name| name == expected),
-                "应有索引 {expected}，实际 {names:?}"
-            );
-        }
-
-        let price = PriceSnapshot::default();
-        insert_request_log(
-            &pool,
-            &RequestLog {
-                id: 0,
-                created_at: 1,
-                token_name: "t".to_string(),
-                token_key: "sk-a".to_string(),
-                user_id: resources::ROOT_USER_ID,
-                inbound_protocol: "openai_chat".to_string(),
-                model: "gpt-4o".to_string(),
-                outbound_model: None,
-                channel_key: None,
-                channel: "c1".to_string(),
-                status_code: 200,
-                latency_ms: 10,
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
+                usage_reported: false,
                 price,
-                cost_usd_micros: 9_999,
+                cost_usd_micros: 0,
                 base_cost_usd_micros: 0,
                 discount_bp: 10_000,
                 settled: false,
                 request_id: None,
+                billing_attempt_id: None,
+                dispatched: true,
                 request_body: None,
                 response_body: None,
-            },
-        )
-        .await
-        .expect("应能写未结算日志");
-        insert_request_log(
-            &pool,
-            &RequestLog {
-                id: 0,
-                created_at: 2,
-                token_name: "t".to_string(),
-                token_key: "sk-a".to_string(),
-                user_id: resources::ROOT_USER_ID,
-                inbound_protocol: "openai_chat".to_string(),
-                model: "gpt-4o".to_string(),
-                outbound_model: None,
-                channel_key: None,
-                channel: "c1".to_string(),
-                status_code: 200,
-                latency_ms: 10,
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-                price,
-                cost_usd_micros: 100,
-                base_cost_usd_micros: 0,
-                discount_bp: 10_000,
-                settled: true,
-                request_id: None,
-                request_body: None,
-                response_body: None,
-            },
-        )
-        .await
-        .expect("应能写已结算日志");
-
-        let lifetime = query_lifetime_stats(&pool, None).await.expect("应能聚合");
-        assert_eq!(lifetime.cost_usd_micros, 100, "未结算费用不应计入");
-    }
-
-    fn sample_log(created_at: i64, settled: bool) -> RequestLog {
-        RequestLog {
-            id: 0,
-            created_at,
-            token_name: "t".to_string(),
-            token_key: "sk-a".to_string(),
-            user_id: resources::ROOT_USER_ID,
-            inbound_protocol: "openai_chat".to_string(),
-            model: "m".to_string(),
-            outbound_model: None,
-            channel_key: None,
-            channel: "c".to_string(),
-            status_code: 200,
-            latency_ms: 1,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
-            price: PriceSnapshot::default(),
-            cost_usd_micros: 1,
-            base_cost_usd_micros: 0,
-            discount_bp: 10_000,
-            settled,
-            request_id: None,
-            request_body: None,
-            response_body: None,
+            })),
+            result_settlement_error: None,
+            upstream_reached: true,
+        })
+        .expect("合法恢复元数据应可编码");
+        for (attempt, key, metadata) in [
+            ("attempt-good", "sk-legacy-good", good_recovery),
+            ("attempt-bad", "sk-legacy-bad", b"not-json".to_vec()),
+        ] {
+            sqlx::query(
+                "INSERT INTO billing_reservations \
+                 (attempt_id, request_id, token_key, user_id, reserved_cost_usd_micros, \
+                  recovery_metadata, status, dispatched, result_persisted, created_at, updated_at) \
+                 VALUES (?, ?, ?, 1, 0, ?, 'reserved', 1, 0, 1, 1)",
+            )
+            .bind(attempt)
+            .bind(format!("req-{attempt}"))
+            .bind(key)
+            .bind(&metadata)
+            .execute(&pool)
+            .await
+            .expect("应能注入预留行");
         }
-    }
+        pool.close().await;
 
-    /// 同一下游请求的多跳对账行按 `request_id` 计一次；无 id 的存量行仍按主键计。
-    #[tokio::test]
-    async fn lifetime_stats_counts_unique_request_id() {
-        let (_dir, pool) = test_pool().await;
-        let mut hop1 = sample_log(1, true);
-        hop1.request_id = Some("req-shared".to_string());
-        hop1.status_code = 429;
-        let mut hop2 = sample_log(2, true);
-        hop2.request_id = Some("req-shared".to_string());
-        insert_request_log(&pool, &hop1)
-            .await
-            .expect("应能写失败跳");
-        insert_request_log(&pool, &hop2)
-            .await
-            .expect("应能写成功跳");
-        insert_request_log(&pool, &sample_log(3, true))
-            .await
-            .expect("应能写无 id 存量行");
+        // 重新 open：换算对坏行跳过、好行完成，库正常可用。
+        let pool = open(&path).await.expect("坏行不应阻塞库打开");
+        let mut conn = pool.acquire().await.expect("应能获取连接");
 
-        let lifetime = query_lifetime_stats(&pool, None).await.expect("应能聚合");
-        assert_eq!(
-            lifetime.request_count, 2,
-            "共享 request_id 的两跳计 1，加上一条存量"
-        );
-    }
+        let flagged: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM settings WHERE setting_key = 'token_keys_hashed'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("应能查标记");
+        assert_eq!(flagged, 1, "完成标记仍应落盘（坏行交人工处置）");
 
-    /// 请求日志分页的 settled 过滤；未结算计数忽略 settled 维。
-    #[tokio::test]
-    async fn request_log_page_filters_settled_and_counts_unsettled() {
-        let (_dir, pool) = test_pool().await;
-        insert_request_log(&pool, &sample_log(1, false))
-            .await
-            .expect("应能写未结算日志");
-        insert_request_log(&pool, &sample_log(2, true))
-            .await
-            .expect("应能写已结算日志");
-
-        let mut filter = RequestLogQuery::new(1, 10);
-        filter.settled = Some(false);
-        let (rows, total, unsettled_total) = query_request_log_page(&pool, &filter)
-            .await
-            .expect("应能分页");
-        assert_eq!(rows.len(), 1);
-        assert!(!rows[0].settled);
-        assert_eq!(total, 1);
-        assert_eq!(unsettled_total, 1);
-    }
-
-    /// 列表查询不读 body；按 id 详情才返回 BLOB。
-    #[tokio::test]
-    async fn request_log_list_omits_bodies_and_detail_returns_them() {
-        let (_dir, pool) = test_pool().await;
-        let mut log = sample_log(1, true);
-        log.request_body = Some(b"{\"model\":\"gpt-4o\"}".to_vec());
-        log.response_body = Some(b"{\"ok\":true}".to_vec());
-        let id = insert_request_log(&pool, &log)
-            .await
-            .expect("应能写带 body 的日志");
-
-        let (rows, _, _) = query_request_log_page(&pool, &RequestLogQuery::new(1, 10))
-            .await
-            .expect("应能分页");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].request_body.is_none(), "列表不应读 request_body");
-        assert!(rows[0].response_body.is_none(), "列表不应读 response_body");
-
-        let detail = get_request_log(&pool, id)
-            .await
-            .expect("应能按 id 读取")
-            .expect("详情应存在");
-        assert_eq!(
-            detail.request_body.as_deref(),
-            Some(b"{\"model\":\"gpt-4o\"}".as_slice())
-        );
-        assert_eq!(
-            detail.response_body.as_deref(),
-            Some(b"{\"ok\":true}".as_slice())
-        );
-        assert!(
-            get_request_log(&pool, id + 1)
+        let (bad_key, bad_meta): (String, Vec<u8>) =
+            sqlx::query_as("SELECT token_key, recovery_metadata FROM billing_reservations WHERE attempt_id = 'attempt-bad'")
+                .fetch_one(&mut *conn)
                 .await
-                .expect("不存在也应成功")
-                .is_none()
+                .expect("坏行应保留");
+        assert_eq!(
+            bad_key,
+            token_key_fingerprint("sk-legacy-bad"),
+            "表列换算以 tokens 表为驱动对所有表统一生效，坏行不例外（列换算不依赖 JSON 可解析）"
         );
-    }
+        assert_eq!(bad_meta, b"not-json", "损坏元数据应原样保留");
 
-    /// 主库文件读取失败必须显式报错，不能把路径错误伪装成零字节占用。
-    #[tokio::test]
-    async fn log_store_stats_reports_database_metadata_errors() {
-        let (dir, pool) = test_pool().await;
-        let missing_path = dir.path().join("missing.db");
-        let err = log_store_stats(&pool, &missing_path)
-            .await
-            .expect_err("主库 metadata 失败应向上返回");
-        assert!(matches!(
-            err,
-            StoreError::FileMetadata { path, source }
-                if path == missing_path && source.kind() == std::io::ErrorKind::NotFound
-        ));
+        let good_key: String = sqlx::query_scalar(
+            "SELECT token_key FROM billing_reservations WHERE attempt_id = 'attempt-good'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("好行应在场");
+        assert_eq!(
+            good_key,
+            token_key_fingerprint("sk-legacy-good"),
+            "合法行应完成明文→指纹换算"
+        );
+        // 合法行的 JSON 内 token_key 同步换算：恢复任务按指纹定位行，
+        // JSON 内仍是明文会让恢复路径找不到行。
+        let good_meta: Vec<u8> = sqlx::query_scalar(
+            "SELECT recovery_metadata FROM billing_reservations WHERE attempt_id = 'attempt-good'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("好行元数据应在场");
+        let recovery: BillingAttemptRecovery =
+            serde_json::from_slice(&good_meta).expect("好行元数据应可解析");
+        assert_eq!(
+            recovery
+                .result
+                .map(|result| result.token_key.clone())
+                .unwrap_or_default(),
+            token_key_fingerprint("sk-legacy-good"),
+            "结果载荷内的 token_key 应同步换算为指纹"
+        );
     }
 
     /// 活动读事务会令 SQLite 返回 busy=1；checkpoint 辅助必须检查结果行，不能只
@@ -2902,101 +1298,5 @@ mod tests {
         checkpoint_wal_truncate(&pool)
             .await
             .expect("读事务结束后应能完成 checkpoint");
-    }
-
-    /// 系统日志分页与关键字过滤。
-    #[tokio::test]
-    async fn system_log_page_filters_by_keyword() {
-        let (_dir, pool) = test_pool().await;
-        insert_system_log(&pool, "error", "billing", "结算失败")
-            .await
-            .expect("应能写系统日志");
-        insert_system_log(&pool, "error", "catalog", "目录同步失败")
-            .await
-            .expect("应能写系统日志");
-
-        let mut filter = SystemLogQuery::new(1, 10);
-        filter.keyword = Some("billing".to_string());
-        let page = query_system_log_page(&pool, &filter)
-            .await
-            .expect("应能查询系统日志");
-        assert_eq!(page.total, 1);
-        assert_eq!(page.items.len(), 1);
-        assert_eq!(page.items[0].target, "billing");
-        assert_eq!(page.items[0].message, "结算失败");
-        assert_eq!(page.targets, vec!["billing".to_string()]);
-
-        let mut by_level = SystemLogQuery::new(1, 10);
-        by_level.levels = vec!["warn".to_string()];
-        let empty = query_system_log_page(&pool, &by_level)
-            .await
-            .expect("应能按级别过滤");
-        assert_eq!(empty.total, 0);
-
-        let mut by_target = SystemLogQuery::new(1, 10);
-        by_target.targets = vec!["catalog".to_string()];
-        let catalog = query_system_log_page(&pool, &by_target)
-            .await
-            .expect("应能按目标过滤");
-        assert_eq!(catalog.total, 1);
-        assert_eq!(catalog.items[0].target, "catalog");
-    }
-
-    #[tokio::test]
-    async fn structured_system_log_event_roundtrips_and_legacy_rows_fallback() {
-        let (_dir, pool) = test_pool().await;
-        let event = SystemLogEvent::new(
-            "billing.user_balance_adjusted",
-            json!({ "user_id": 42, "delta_usd_micros": 1_000_000 }),
-            "用户 42 余额 +$1.00",
-        );
-        let mut tx = pool.begin().await.expect("应能开启事务");
-        record_audit(
-            &mut tx,
-            Actor {
-                user_id: 1,
-                email: "root@example.com",
-            },
-            "billing",
-            &event,
-        )
-        .await
-        .expect("结构化事件应能写入");
-        tx.commit().await.expect("应能提交事务");
-
-        insert_system_log(&pool, "error", "catalog", "旧式日志")
-            .await
-            .expect("旧式日志应能写入");
-        let page = query_system_log_page(&pool, &SystemLogQuery::new(1, 10))
-            .await
-            .expect("应能查询系统日志");
-        let structured = page
-            .items
-            .iter()
-            .find(|item| item.event_code.as_deref() == Some("billing.user_balance_adjusted"))
-            .expect("应取回事件编码");
-        assert_eq!(
-            structured.event_params,
-            Some(json!({
-                "user_id": 42,
-                "delta_usd_micros": 1_000_000
-            }))
-        );
-        let legacy = page
-            .items
-            .iter()
-            .find(|item| item.message == "旧式日志")
-            .expect("应取回旧式日志");
-        assert!(legacy.event_code.is_none());
-        assert!(legacy.event_params.is_none());
-
-        let malformed = sqlx::query(
-            "INSERT INTO system_log \
-             (created_at, level, target, message, event_code, event_params) \
-             VALUES (0, 'info', 'test', 'fallback', 'test.invalid', 'not-json')",
-        )
-        .execute(&pool)
-        .await;
-        assert!(malformed.is_err(), "事件参数必须是合法 JSON");
     }
 }

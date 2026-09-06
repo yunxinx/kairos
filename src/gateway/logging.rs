@@ -1,12 +1,13 @@
 //! 请求日志与计费结果的持久化适配。
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
 use crate::{
     config::Protocol,
-    core::billing::{self, BillingError, PriceSnapshot},
+    core::billing::{self, Error as BillingError, PriceSnapshot},
     core::ir::Usage,
     store,
     store::resources::Token,
@@ -14,9 +15,54 @@ use crate::{
 
 use super::http::Deps;
 
+/// 同一令牌/模型/渠道组合的 usage 缺失告警冷却窗口。
+const USAGE_WARNING_COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct UsageWarningKey {
+    token_key: String,
+    model: String,
+    channel: String,
+}
+
+/// usage 缺失告警的进程内去重器，避免异常上游把 system_log 写满。
+struct UsageWarningGate {
+    seen: HashMap<UsageWarningKey, std::time::Instant>,
+}
+
+impl UsageWarningGate {
+    pub(super) fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// 组合首次出现或冷却期已过时允许落一条告警。
+    fn should_warn(&mut self, token_key: &str, model: &str, channel: &str) -> bool {
+        self.seen
+            .retain(|_, recorded| recorded.elapsed() < USAGE_WARNING_COOLDOWN);
+        let key = UsageWarningKey {
+            token_key: token_key.to_string(),
+            model: model.to_string(),
+            channel: channel.to_string(),
+        };
+        match self.seen.get_mut(&key) {
+            Some(recorded) if recorded.elapsed() < USAGE_WARNING_COOLDOWN => false,
+            Some(recorded) => {
+                *recorded = std::time::Instant::now();
+                true
+            }
+            None => {
+                self.seen.insert(key, std::time::Instant::now());
+                true
+            }
+        }
+    }
+}
+
 /// 一次请求的计费结果，供日志落库。
 ///
-/// 请求日志的 `settled` 由 [`log_request`] 按结算成败填写，调用方不必预置。
+/// 请求日志的 `settled` 由后台结算结果填写，调用方不必预置。
 #[derive(Debug, Clone)]
 pub(super) struct Billing {
     pub(super) usage: Usage,
@@ -29,6 +75,12 @@ pub(super) struct Billing {
     pub(super) cost_usd_micros: i64,
     /// 费用不可表示时保留错误；该请求只能写成未结算，禁止用零费用掩盖。
     pub(super) calculation_error: Option<BillingError>,
+    /// 上游结果是否显式包含 usage。
+    ///
+    /// 该状态不能由 token 数值推断：显式回报的全零 usage 是可信结果，按
+    /// 实际值结算；缺失 usage 字段的结果不产生费用，由结果入队路径释放
+    /// 预留并告警。
+    pub(super) usage_reported: bool,
     pub(super) request_body: Option<Bytes>,
     pub(super) response_body: Option<Vec<u8>>,
 }
@@ -42,6 +94,7 @@ impl Default for Billing {
             discount_bp: billing::DEFAULT_DISCOUNT_BP,
             cost_usd_micros: 0,
             calculation_error: None,
+            usage_reported: false,
             request_body: None,
             response_body: None,
         }
@@ -52,6 +105,7 @@ impl Billing {
     /// 从 usage 与价格受检构造计费结果；失败时保留原始 usage/价格并标记未结算。
     pub(super) fn try_calculated(
         usage: Usage,
+        usage_reported: bool,
         price: PriceSnapshot,
         discount_bp: i64,
         request_body: Option<Bytes>,
@@ -65,6 +119,7 @@ impl Billing {
             discount_bp,
             cost_usd_micros: charge.cost_usd_micros,
             calculation_error: None,
+            usage_reported,
             request_body,
             response_body,
         })
@@ -73,6 +128,7 @@ impl Billing {
     /// 从 usage 与价格受检构造计费结果；失败时保留原始 usage/价格并标记未结算。
     pub(super) fn calculated(
         usage: Usage,
+        usage_reported: bool,
         price: PriceSnapshot,
         discount_bp: i64,
         request_body: Option<Bytes>,
@@ -80,6 +136,7 @@ impl Billing {
     ) -> Self {
         match Self::try_calculated(
             usage.clone(),
+            usage_reported,
             price,
             discount_bp,
             request_body.clone(),
@@ -87,6 +144,7 @@ impl Billing {
         ) {
             Ok(billing) => billing,
             Err(err) => Self {
+                usage_reported,
                 usage,
                 price,
                 base_cost_usd_micros: 0,
@@ -127,228 +185,459 @@ fn utf8_prefix_len(bytes: &[u8], max: usize) -> usize {
     }
 }
 
-/// 尽量在同一事务内结算并插入请求日志；最后使用时间在提交后再尽力刷新。
-///
-/// `channel` 非空表示该请求已通过计费准入并选定出站渠道：此时刷新
-/// `last_used_at`。准入拒绝（402）与尚未路由的错误 `channel` 为空，不刷新。
-/// `last_used_at` 只是展示元数据，失败不得回滚已成功的扣费与日志。
-///
-/// 结算成功后若插入失败，回滚扣费并尽力单独写入 `settled = false` 的请求日志。
-/// 开事务或结算失败时同样尽力留下未结算请求日志，并记入系统日志。
-/// HTTP 2xx 且 usage 四分量全零时另记一条 warn 系统日志，使上游漏报 usage 可观测。
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn log_request(
+/// 一次请求日志的调用侧字段。
+pub(super) struct RequestLogDraft<'a> {
+    pub(super) token: &'a Token,
+    pub(super) model: &'a str,
+    pub(super) outbound_model: Option<&'a str>,
+    pub(super) channel: &'a str,
+    pub(super) channel_key: Option<&'a str>,
+    pub(super) status: u16,
+    pub(super) started: i64,
+    pub(super) billing: Billing,
+    pub(super) inbound_protocol: Protocol,
+    pub(super) request_id: &'a str,
+    /// 实际出站调用的唯一计费身份；未进入出站阶段的请求日志为 `None`。
+    pub(super) billing_attempt_id: Option<&'a str>,
+    /// 出站尝试是否确认到达上游：收到响应、或发送错误为非连接类时为
+    /// `true`；连接失败（TCP 未建立）为 `false`。仅对带计费身份且缺失
+    /// usage 的日志参与告警分类，未出站的日志该值不产生作用。
+    pub(super) upstream_reached: bool,
+    /// 该行是否对应已实际派发上游的尝试；`false` 表示未出站即终局的
+    /// 零费用失败行（无渠道、无计费身份）。
+    pub(super) dispatched: bool,
+    /// 请求级绝对截止时刻；设置后队列持久化不得越过该时刻。
+    pub(super) deadline: Option<tokio::time::Instant>,
+}
+
+/// 持久化队列的唤醒端；队列内容本身在 SQLite 中，通知丢失由周期扫描兜底。
+#[derive(Clone)]
+pub struct RequestLogWriter {
+    wake_sender: tokio::sync::mpsc::Sender<()>,
+}
+
+impl RequestLogWriter {
+    pub fn start(pool: sqlx::SqlitePool) -> Self {
+        let (wake_sender, wake_receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(run_request_log_writer(pool, wake_receiver));
+        let writer = Self { wake_sender };
+        writer.wake();
+        writer
+    }
+
+    pub(super) fn wake(&self) {
+        let _ = self.wake_sender.try_send(());
+    }
+}
+
+/// 把请求结果追加到持久化队列；响应路径不执行余额更新与最终日志事务。
+pub(super) async fn queue_request_log(
     deps: &Deps,
-    token: &Token,
-    model: &str,
-    outbound_model: Option<&str>,
-    channel: &str,
-    channel_key: Option<&str>,
-    status: u16,
-    started: i64,
-    billing: Billing,
-    inbound_protocol: Protocol,
-    request_id: &str,
-) {
+    draft: RequestLogDraft<'_>,
+) -> Result<(), store::StoreError> {
+    let deadline = draft.deadline;
+    let operation = queue_request_log_inner(deps, draft);
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| store::StoreError::PersistenceTimeout)?,
+        None => operation.await,
+    }
+}
+
+async fn queue_request_log_inner(
+    deps: &Deps,
+    draft: RequestLogDraft<'_>,
+) -> Result<(), store::StoreError> {
     let now = unix_millis();
     let max_bytes = deps.snapshot.read().await.log_body_max_bytes;
-    if (200..300).contains(&status) && billing.usage.is_zero() {
-        store::record_system_warn(
-            &deps.pool,
-            "billing",
-            &store::SystemLogEvent::new(
-                "billing.usage_missing",
-                serde_json::json!({
-                    "token_name": token.name,
-                    "model": model,
-                    "channel": channel,
-                }),
-                format!(
-                    "上游未回报 usage，本次按零计费（token={} model={model} channel={channel}）",
-                    token.name
-                ),
-            ),
-        )
-        .await;
-    }
-    let mut log = store::RequestLog {
+    let settlement_error = draft
+        .billing
+        .calculation_error
+        .map(|err| format!("费用计算失败，未执行结算: {err}"));
+    let log = store::request_log::RequestLog {
         id: 0,
         created_at: now,
-        token_name: token.name.clone(),
-        token_key: token.token_key.clone(),
-        user_id: token.user_id,
-        inbound_protocol: protocol_name(inbound_protocol).to_string(),
-        model: model.to_string(),
-        outbound_model: outbound_model.map(str::to_string),
-        channel: channel.to_string(),
-        channel_key: channel_key.map(str::to_string),
-        status_code: status as i64,
-        latency_ms: now - started,
-        input_tokens: billing.usage.input_tokens,
-        output_tokens: billing.usage.output_tokens,
-        cache_read_tokens: billing.usage.cache_read_tokens,
-        cache_write_tokens: billing.usage.cache_write_tokens,
-        price: billing.price,
-        base_cost_usd_micros: billing.base_cost_usd_micros,
-        discount_bp: billing.discount_bp,
-        cost_usd_micros: billing.cost_usd_micros,
-        settled: billing.calculation_error.is_none() && billing.cost_usd_micros == 0,
-        request_id: Some(request_id.to_string()),
-        request_body: clip_logged_body(billing.request_body.map(|bytes| bytes.to_vec()), max_bytes),
-        response_body: clip_logged_body(billing.response_body, max_bytes),
+        token_name: draft.token.name.clone(),
+        token_key: draft.token.token_key.clone(),
+        user_id: draft.token.user_id,
+        inbound_protocol: protocol_name(draft.inbound_protocol).to_string(),
+        model: draft.model.to_string(),
+        outbound_model: draft.outbound_model.map(str::to_string),
+        channel: draft.channel.to_string(),
+        channel_key: draft.channel_key.map(str::to_string),
+        status_code: i64::from(draft.status),
+        latency_ms: now - draft.started,
+        input_tokens: draft.billing.usage.input_tokens,
+        output_tokens: draft.billing.usage.output_tokens,
+        cache_read_tokens: draft.billing.usage.cache_read_tokens,
+        cache_write_tokens: draft.billing.usage.cache_write_tokens,
+        cache_write_1h_tokens: draft.billing.usage.cache_write_1h_tokens,
+        usage_reported: draft.billing.usage_reported,
+        price: draft.billing.price,
+        base_cost_usd_micros: draft.billing.base_cost_usd_micros,
+        discount_bp: draft.billing.discount_bp,
+        cost_usd_micros: draft.billing.cost_usd_micros,
+        // 结算终态在入队时确定：回报 usage 的出站尝试（含显式全零）由后台
+        // 按实际用量消费预留；缺失 usage 的尝试不产生费用，入队即视为已
+        // 结算，预留随入队事务释放；从未出站的零费用日志天然无预留可消费。
+        settled: settlement_error.is_none()
+            && (draft.billing_attempt_id.is_none() || !draft.billing.usage_reported),
+        request_id: Some(draft.request_id.to_string()),
+        billing_attempt_id: draft.billing_attempt_id.map(str::to_string),
+        dispatched: draft.dispatched,
+        request_body: clip_logged_body(
+            draft.billing.request_body.map(|bytes| bytes.to_vec()),
+            max_bytes,
+        ),
+        response_body: clip_logged_body(draft.billing.response_body, max_bytes),
     };
+    let pending = store::request_log::PendingRequestLog {
+        log,
+        settlement_error,
+        upstream_reached: draft.upstream_reached,
+    };
+    // 结果与预留状态变更在同一事务原子落库；结果进 outbox 后，预留行不再
+    // 持有载荷副本，崩溃恢复从预留重建的只有「无结果按零费用释放」一种形态。
+    store::request_log::enqueue_pending_request_log(&deps.pool, pending).await?;
+    deps.request_log_writer.wake();
+    Ok(())
+}
 
-    if let Some(err) = billing.calculation_error {
-        log.settled = false;
-        write_unsettled_request_log(
-            deps,
-            log,
-            "billing",
-            &format!("费用计算失败，未执行结算: {err}"),
+const REQUEST_LOG_BATCH_SIZE: i64 = 16;
+const REQUEST_LOG_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// 只有超过正常请求总时限仍未写入结果的预留才进入恢复，给响应路径留下
+/// 足够时间处理短暂的数据库写锁或调度延迟。
+const BILLING_RECOVERY_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+/// 终态预留行的清理节奏：随写入循环节流到 10 分钟一次，而非每秒全量扫描。
+const RESERVATION_PURGE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+async fn run_request_log_writer(
+    pool: sqlx::SqlitePool,
+    mut wake_receiver: tokio::sync::mpsc::Receiver<()>,
+) {
+    let mut retry = tokio::time::interval(REQUEST_LOG_RETRY_INTERVAL);
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    retry.tick().await;
+    let mut usage_warning_gate = UsageWarningGate::new();
+    let mut purge_tick = tokio::time::interval(RESERVATION_PURGE_INTERVAL);
+    purge_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    purge_tick.tick().await;
+    loop {
+        tokio::select! {
+            wake = wake_receiver.recv() => {
+                if wake.is_none() {
+                    break;
+                }
+            }
+            _ = retry.tick() => {}
+            _ = purge_tick.tick() => {
+                purge_terminal_reservations(&pool).await;
+                continue;
+            }
+        }
+        if let Err(err) = store::settlement::recover_orphan_billing_attempts(
+            &pool,
+            BILLING_RECOVERY_MAX_AGE,
+            REQUEST_LOG_BATCH_SIZE,
+        )
+        .await
+        {
+            tracing::error!(error = %err, "崩溃遗留的计费预留恢复失败，将稍后重试");
+        }
+        if let Err(err) = drain_pending_request_logs(&pool, &mut usage_warning_gate).await {
+            tracing::error!(error = %err, "后台请求日志持久化失败，将稍后重试");
+        }
+    }
+}
+
+/// 按保留期分批清理终态预留行；失败只记 error，下一轮再试。
+async fn purge_terminal_reservations(pool: &sqlx::SqlitePool) {
+    let now = unix_millis();
+    let cutoff = now.saturating_sub(store::settlement::BILLING_RESERVATION_RETENTION_MILLIS);
+    if let Err(err) =
+        store::settlement::purge_terminal_billing_reservations_before(pool, cutoff).await
+    {
+        tracing::error!(error = %err, "终态计费预留清理失败，将稍后重试");
+    }
+}
+
+async fn drain_pending_request_logs(
+    pool: &sqlx::SqlitePool,
+    usage_warning_gate: &mut UsageWarningGate,
+) -> Result<(), store::StoreError> {
+    loop {
+        let pending =
+            store::request_log::load_pending_request_logs(pool, REQUEST_LOG_BATCH_SIZE).await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for item in pending {
+            let log = item.log.clone();
+            let usage_reported = item.log.usage_reported;
+            let upstream_reached = item.upstream_reached;
+            if let Err(err) = process_pending_request_log(pool, usage_warning_gate, item).await {
+                // 结算事务失败时只隔离当前记录并继续消费后续记录。隔离本身
+                // 也失败才向上返回；此时保留队列状态，下一轮仍会重试该动作。
+                let reason = format!("持久化请求日志失败: {err}");
+                store::request_log::isolate_pending_request_log(
+                    pool,
+                    log.id,
+                    &reason,
+                    Some(REQUEST_LOG_RETRY_INTERVAL),
+                )
+                .await?;
+                record_request_log_notes(
+                    pool,
+                    usage_warning_gate,
+                    &log,
+                    usage_reported,
+                    upstream_reached,
+                    Some(reason),
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn process_pending_request_log(
+    pool: &sqlx::SqlitePool,
+    usage_warning_gate: &mut UsageWarningGate,
+    mut pending: store::request_log::PendingRequestLog,
+) -> Result<(), store::StoreError> {
+    if let Some(reason) = pending.settlement_error.take() {
+        pending.log.settled = false;
+        // 费用计算失败是确定性故障：原始记录保留在隔离状态，主队列继续
+        // 消费其它请求；人工修复价格或数据后可按 request_id 重放。
+        store::request_log::isolate_pending_request_log(pool, pending.log.id, &reason, None)
+            .await?;
+        record_request_log_notes(
+            pool,
+            usage_warning_gate,
+            &pending.log,
+            pending.log.usage_reported,
+            pending.upstream_reached,
+            Some(reason),
+            None,
         )
         .await;
-        return;
+        return Ok(());
     }
 
-    let mut tx = match deps.pool.begin().await {
-        Ok(tx) => tx,
-        Err(err) => {
-            log.settled = false;
-            write_unsettled_request_log(
-                deps,
-                log,
-                "request_log",
-                &format!("结算/日志事务开启失败: {err}"),
+    // 结算只针对仍需财务动作的记录：已结算的入队记录（缺失 usage 的出站
+    // 尝试）以释放为终态，预留已在入队事务中归还，这里只落最终日志。
+    if pending.log.cost_usd_micros > 0
+        || (pending.log.billing_attempt_id.is_some() && !pending.log.settled)
+    {
+        let mut tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(store::StoreError::Query)?;
+        let settlement = match pending.log.billing_attempt_id.as_deref() {
+            Some(attempt_id) => {
+                store::settlement::settle_billing_attempt(
+                    &mut tx,
+                    attempt_id,
+                    pending.log.cost_usd_micros,
+                )
+                .await
+            }
+            None => store::settlement::settle_charge(
+                &mut tx,
+                &pending.log.token_key,
+                pending.log.cost_usd_micros,
             )
-            .await;
-            return;
-        }
-    };
-
-    if billing.cost_usd_micros > 0 {
-        match store::settle_charge(&mut tx, &token.token_key, billing.cost_usd_micros).await {
-            Ok(_) => log.settled = true,
+            .await
+            .map(|_| ()),
+        };
+        match settlement {
+            Ok(()) => {
+                pending.log.settled = true;
+                let touch_error = match finish_pending_request_log(&mut tx, &pending.log).await {
+                    Ok(touch_error) => touch_error,
+                    Err(err) => return Err(rollback_request_log_transaction(tx, err).await),
+                };
+                tx.commit().await.map_err(store::StoreError::Query)?;
+                record_request_log_notes(
+                    pool,
+                    usage_warning_gate,
+                    &pending.log,
+                    pending.log.usage_reported,
+                    pending.upstream_reached,
+                    None,
+                    touch_error,
+                )
+                .await;
+                return Ok(());
+            }
             Err(err) => {
-                rollback_and_write_unsettled(deps, tx, log, "settle", format!("结算失败: {err}"))
-                    .await;
-                return;
+                let reason = format!("结算失败: {err}");
+                tx.rollback().await.map_err(store::StoreError::Query)?;
+                // 隔离写入与失败详情是独立事务，避免一个坏请求再次阻塞后续
+                // 记录。指数间隔由存储层按失败次数计算，持续保留原始结果。
+                store::request_log::isolate_pending_request_log(
+                    pool,
+                    pending.log.id,
+                    &reason,
+                    Some(Duration::from_secs(1)),
+                )
+                .await?;
+                record_request_log_notes(
+                    pool,
+                    usage_warning_gate,
+                    &pending.log,
+                    pending.log.usage_reported,
+                    pending.upstream_reached,
+                    Some(reason),
+                    None,
+                )
+                .await;
+                return Ok(());
             }
         }
     }
 
-    if let Err(err) = store::insert_request_log_on(&mut tx, &log).await {
-        rollback_and_write_unsettled(
-            deps,
-            tx,
-            log,
-            "request_log",
-            format!("请求日志同事务插入失败，事务已回滚: {err}"),
-        )
-        .await;
-        return;
-    }
+    pending.log.settled = true;
 
-    if let Err(err) = tx.commit().await {
-        log.settled = false;
-        write_unsettled_request_log(
-            deps,
-            log,
-            "request_log",
-            &format!("结算/日志提交失败: {err}"),
-        )
-        .await;
-        return;
-    }
-
-    touch_last_used_best_effort(&deps.pool, &log).await;
+    let mut tx = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(store::StoreError::Query)?;
+    let touch_error = match finish_pending_request_log(&mut tx, &pending.log).await {
+        Ok(touch_error) => touch_error,
+        Err(err) => return Err(rollback_request_log_transaction(tx, err).await),
+    };
+    tx.commit().await.map_err(store::StoreError::Query)?;
+    record_request_log_notes(
+        pool,
+        usage_warning_gate,
+        &pending.log,
+        pending.log.usage_reported,
+        pending.upstream_reached,
+        None,
+        touch_error,
+    )
+    .await;
+    Ok(())
 }
 
-/// 已出站的请求刷新 `last_used_at`；尚未路由则跳过。失败只记系统日志。
-async fn touch_last_used_best_effort(pool: &sqlx::SqlitePool, log: &store::RequestLog) {
-    if log.channel.is_empty() {
-        return;
+/// 在一个事务内写最终日志、刷新最后使用时间并删除队列项。
+async fn finish_pending_request_log(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    log: &store::request_log::RequestLog,
+) -> Result<Option<String>, store::StoreError> {
+    store::request_log::insert_request_log_with_id_on(tx, log, log.id).await?;
+    let touch_error = if log.channel.is_empty() {
+        None
+    } else {
+        store::resources::touch_token_used(tx, &log.token_key, log.created_at)
+            .await
+            .err()
+            .map(|err| err.to_string())
+    };
+    store::request_log::delete_pending_request_log_on(tx, log.id).await?;
+    Ok(touch_error)
+}
+
+async fn rollback_request_log_transaction(
+    tx: sqlx::Transaction<'_, sqlx::Sqlite>,
+    error: store::StoreError,
+) -> store::StoreError {
+    if let Err(rollback_error) = tx.rollback().await {
+        tracing::error!(
+            error = %error,
+            rollback_error = %rollback_error,
+            "请求日志事务回滚失败"
+        );
     }
-    let mut conn = match pool.acquire().await {
-        Ok(conn) => conn,
-        Err(err) => {
-            store::record_system_warn(
-                pool,
-                "request_log",
-                &store::SystemLogEvent::new(
-                    "request_log.token_last_used_update_failed",
-                    serde_json::json!({ "error": err.to_string() }),
-                    format!("刷新令牌最后使用时间失败: {err}"),
+    error
+}
+
+async fn record_request_log_notes(
+    pool: &sqlx::SqlitePool,
+    usage_warning_gate: &mut UsageWarningGate,
+    log: &store::request_log::RequestLog,
+    usage_reported: bool,
+    upstream_reached: bool,
+    settlement_error: Option<String>,
+    touch_error: Option<String>,
+) {
+    if !usage_reported
+        && log.billing_attempt_id.is_some()
+        && usage_warning_gate.should_warn(&log.token_key, &log.model, &log.channel)
+    {
+        // 两类告警共用去重门控：上游未达是确定无费用的对账提示，已受理
+        // 而缺失 usage 则提示可能产生费用，都需要人工复核。
+        let (event_code, message) = if upstream_reached {
+            (
+                "billing.usage_missing",
+                format!(
+                    "上游已受理但未回报 usage，可能已产生费用；本次未计费、预留已释放，请人工对账（request_id={} token={} model={} channel={} protocol={}）",
+                    log.request_id.as_deref().unwrap_or(""),
+                    log.token_name,
+                    log.model,
+                    log.channel,
+                    log.inbound_protocol,
                 ),
             )
-            .await;
-            return;
-        }
-    };
-    if let Err(err) =
-        store::resources::touch_token_used(&mut conn, &log.token_key, log.created_at).await
-    {
+        } else {
+            (
+                "billing.upstream_unreached",
+                format!(
+                    "上游连接未建立，本次出站尝试未产生费用、预留已释放（request_id={} token={} model={} channel={} protocol={}）",
+                    log.request_id.as_deref().unwrap_or(""),
+                    log.token_name,
+                    log.model,
+                    log.channel,
+                    log.inbound_protocol,
+                ),
+            )
+        };
+        store::record_system_warn(
+            pool,
+            "billing",
+            &store::SystemLogEvent::new(
+                event_code,
+                serde_json::json!({
+                    "request_id": log.request_id,
+                    "token_name": log.token_name,
+                    "model": log.model,
+                    "channel": log.channel,
+                    "inbound_protocol": log.inbound_protocol,
+                    "usage_reported": false,
+                    "upstream_reached": upstream_reached,
+                    "reservation_released": true,
+                }),
+                message,
+            ),
+        )
+        .await;
+    }
+    if let Some(reason) = settlement_error {
+        store::record_system_error(
+            pool,
+            "billing",
+            &store::SystemLogEvent::new(
+                "request_log.unsettled",
+                serde_json::json!({ "reason": reason, "request_id": log.request_id }),
+                reason,
+            ),
+        )
+        .await;
+    }
+    if let Some(error) = touch_error {
         store::record_system_warn(
             pool,
             "request_log",
             &store::SystemLogEvent::new(
                 "request_log.token_last_used_update_failed",
-                serde_json::json!({ "error": err.to_string() }),
-                format!("刷新令牌最后使用时间失败: {err}"),
+                serde_json::json!({ "error": error, "request_id": log.request_id }),
+                "刷新令牌最后使用时间失败".to_string(),
             ),
         )
         .await;
-    }
-}
-
-/// 回滚进行中的结算事务后，尽力留下未结算请求日志。
-async fn rollback_and_write_unsettled(
-    deps: &Deps,
-    tx: sqlx::Transaction<'_, sqlx::Sqlite>,
-    mut log: store::RequestLog,
-    system_target: &str,
-    reason: String,
-) {
-    log.settled = false;
-    let reason = match tx.rollback().await {
-        Ok(()) => reason,
-        Err(err) => format!("{reason}；事务回滚也失败: {err}"),
-    };
-    write_unsettled_request_log(deps, log, system_target, &reason).await;
-}
-
-/// 尽力写入未结算请求日志，并记一条系统日志。请求日志落库失败时系统日志带上两次错误。
-async fn write_unsettled_request_log(
-    deps: &Deps,
-    log: store::RequestLog,
-    system_target: &str,
-    reason: &str,
-) {
-    match store::insert_request_log(&deps.pool, &log).await {
-        Ok(_) => {
-            touch_last_used_best_effort(&deps.pool, &log).await;
-            store::record_system_error(
-                &deps.pool,
-                system_target,
-                &store::SystemLogEvent::new(
-                    "request_log.unsettled",
-                    serde_json::json!({ "reason": reason }),
-                    reason.to_string(),
-                ),
-            )
-            .await;
-        }
-        Err(err) => {
-            store::record_system_error(
-                &deps.pool,
-                "request_log",
-                &store::SystemLogEvent::new(
-                    "request_log.fallback_write_failed",
-                    serde_json::json!({ "reason": reason, "error": err.to_string() }),
-                    format!("{reason}；回退写入也失败: {err}"),
-                ),
-            )
-            .await;
-        }
     }
 }
 
@@ -358,6 +647,7 @@ pub(super) fn protocol_name(inbound_protocol: Protocol) -> &'static str {
         Protocol::OpenAiChat => "openai_chat",
         Protocol::OpenAiResponses => "openai_responses",
         Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::Gemini => "gemini",
     }
 }
 

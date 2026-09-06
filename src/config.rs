@@ -59,7 +59,7 @@ pub struct Database {
     pub path: PathBuf,
 }
 
-/// wire 协议：三种出站/入站协议共用同一枚举。
+/// wire 协议：出站/入站协议共用同一枚举。
 #[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
 pub enum Protocol {
     #[serde(rename = "openai_chat")]
@@ -68,6 +68,71 @@ pub enum Protocol {
     OpenAiResponses,
     #[serde(rename = "anthropic_messages")]
     AnthropicMessages,
+    #[serde(rename = "gemini")]
+    Gemini,
+}
+
+/// 渠道级 reasoning 思维链兼容输出模式。
+///
+/// 控制两个方向：面向 chat 上游的请求编码是否把 IR Reasoning part 回写为
+/// assistant `reasoning_content`（DeepSeek 系工具轮要求思维链随历史回放），
+/// 以及 chat 下游的流式响应是否以 `delta.reasoning_content` 增量下发。
+/// 缺省 `auto`：按出站模型名与渠道 base_url 命中 reasoning 厂商提示词表
+/// 自动开启，存量渠道在名字不命中时行为不变。
+#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningOutputMode {
+    /// 按厂商提示词表自动判定。
+    #[default]
+    Auto,
+    /// 强制开启，供改名后端渠道使用。
+    Always,
+    /// 强制关闭，杜绝别名误伤。
+    Off,
+}
+
+impl ReasoningOutputMode {
+    /// 该渠道在给定出站模型名下是否启用 reasoning 兼容输出。
+    pub fn enables_reasoning_content(self, model: &str, base_url: &str) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Off => false,
+            Self::Auto => {
+                is_reasoning_vendor_identifier(model) || is_reasoning_vendor_identifier(base_url)
+            }
+        }
+    }
+}
+
+/// reasoning 厂商提示词表：出站模型名或渠道 base_url 含这些子串（大小写
+/// 不敏感）即视为把 `reasoning_content` 作为一等字段的厂商。
+const REASONING_VENDOR_HINTS: &[&str] = &["deepseek", "mimo"];
+
+fn is_reasoning_vendor_identifier(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    REASONING_VENDOR_HINTS
+        .iter()
+        .any(|hint| value.contains(hint))
+}
+
+/// 渠道级会话缓存键回写模式。
+///
+/// 控制面向 OpenAI Chat 上游的 IR 出站请求是否把网关解析出的会话标识
+/// （显式 `x-kairos-session-id` 头优先，IR 稳定前缀哈希兜底）回写为
+/// `prompt_cache_key`，让跨协议族的多轮请求也获得上游自动缓存的会话亲和。
+/// 缺省 `off`：不改动出站请求，下游显式携带的缓存键照常透传。直通快路径
+/// 字节直搬，不经过本开关。
+#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCacheKeyMode {
+    /// 不回写。
+    #[default]
+    Off,
+    /// 下游未显式携带 `prompt_cache_key` 时回写会话标识。
+    Auto,
+    /// 无条件回写，覆盖下游显式携带的 `prompt_cache_key`（供统一会话亲和
+    /// 策略，如下游每轮发送随机键破坏亲和时）。
+    Always,
 }
 
 /// 配置解析错误，向上抛给应用边界。
@@ -125,6 +190,31 @@ impl Config {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// 自动挡按出站模型名与渠道 base_url 判定（大小写不敏感子串）；always
+    /// 无条件开启，off 无条件关闭。
+    #[test]
+    fn reasoning_output_mode_resolves_by_vendor_hints() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("deepseek-chat", "http://localhost:1", true),
+            ("DeepSeek-R1", "http://localhost:1", true),
+            ("gpt-4o", "https://api.mimo.example/v1", true),
+            ("gpt-4o", "http://localhost:1", false),
+            ("xiaomi-mimo", "http://localhost:1", true),
+        ];
+        for (model, base_url, expected) in cases {
+            assert_eq!(
+                ReasoningOutputMode::Auto.enables_reasoning_content(model, base_url),
+                *expected,
+                "auto 判定 {model} @ {base_url}"
+            );
+        }
+        assert!(ReasoningOutputMode::Always.enables_reasoning_content("gpt-4o", "http://x"));
+        assert!(
+            !ReasoningOutputMode::Off
+                .enables_reasoning_content("deepseek-chat", "https://api.deepseek.com")
+        );
+    }
 
     /// 全字段（含可选管理监听与种子邮箱/密码）配置可解析，相对路径相对配置文件目录解析。
     #[test]
@@ -209,7 +299,7 @@ mod tests {
         }
     }
 
-    /// 已废弃的资源段（v1 的 tokens/channels/prices/logging）出现在配置中直接报错，
+    /// 已废弃的资源段（tokens/channels/prices/logging）出现在配置中直接报错，
     /// 不做兼容迁移。
     #[test]
     fn deprecated_resource_segments_are_rejected() {

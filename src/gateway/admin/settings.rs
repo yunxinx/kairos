@@ -6,7 +6,7 @@ use crate::store;
 use crate::store::resources::Settings;
 
 use super::auth::ManagementIdentity;
-use super::{AdminDeps, AdminError, db_err, reload_and_swap};
+use super::{AdminDeps, AdminError, begin_write, db_err, reload_and_swap};
 
 pub(super) fn routes() -> Router<AdminDeps> {
     Router::new().route("/settings", get(get_settings).put(update_settings))
@@ -32,7 +32,7 @@ async fn update_settings(
     let settings = body.map_err(AdminError::bad_body)?;
     validate_settings(&settings)?;
     let before = read_settings(&deps).await?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::upsert_settings(&mut tx, &settings)
         .await
         .map_err(AdminError::Store)?;
@@ -85,6 +85,15 @@ fn settings_changes(before: &Settings, after: &Settings) -> Vec<String> {
     diff!(retry_backoff_cap_ms);
     diff!(retry_after_cap_secs);
     diff!(rate_limit_rpm);
+    diff!(request_rectify);
+    diff!(allow_private_networks);
+    if before.private_network_allowlist != after.private_network_allowlist {
+        changes.push(format!(
+            "private_network_allowlist {} 项 → {} 项",
+            before.private_network_allowlist.len(),
+            after.private_network_allowlist.len()
+        ));
+    }
     changes
 }
 
@@ -134,6 +143,26 @@ fn validate_settings(settings: &Settings) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody(
             "log_body_max_bytes 必须大于 0".to_string(),
         ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for entry in &settings.private_network_allowlist {
+        let host = entry.trim();
+        if host.is_empty()
+            || host.contains('/')
+            || host.contains("//")
+            || host.contains('*')
+            || host.chars().any(char::is_whitespace)
+        {
+            return Err(AdminError::InvalidBody(
+                "private_network_allowlist 只接受精确主机名或 IP，不接受 URL、路径和通配符"
+                    .to_string(),
+            ));
+        }
+        if !seen.insert(host.to_ascii_lowercase()) {
+            return Err(AdminError::InvalidBody(format!(
+                "private_network_allowlist 包含重复项 {host}"
+            )));
+        }
     }
     Ok(())
 }

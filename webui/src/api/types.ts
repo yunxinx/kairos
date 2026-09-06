@@ -1,22 +1,34 @@
 /** 渠道 wire 协议，与后端 `Protocol` serde rename 一致。 */
-export type Protocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages';
+export type Protocol = 'openai_chat' | 'openai_responses' | 'anthropic_messages' | 'gemini';
 
 export const PROTOCOLS: readonly Protocol[] = [
   'openai_chat',
   'openai_responses',
   'anthropic_messages',
+  'gemini',
 ];
+
+/** 渠道 reasoning 思维链兼容输出模式，与后端 `ReasoningOutputMode` serde rename 一致。 */
+export type ReasoningOutputMode = 'auto' | 'always' | 'off';
+
+export const REASONING_OUTPUT_MODES: readonly ReasoningOutputMode[] = ['auto', 'always', 'off'];
+
+/** 渠道会话缓存键回写模式，与后端 `SessionCacheKeyMode` serde rename 一致。 */
+export type SessionCacheKeyMode = 'off' | 'auto' | 'always';
+
+export const SESSION_CACHE_KEY_MODES: readonly SessionCacheKeyMode[] = ['off', 'auto', 'always'];
 
 /** 运行时收窄日志/表单里的协议字符串。 */
 export function isProtocol(value: string): value is Protocol {
   return (PROTOCOLS as readonly string[]).includes(value);
 }
 
-/** 出站路径段，与网关 `protocol::upstream_path` 对齐。 */
+/** 出站路径段，与网关 `protocol::upstream_path` 对齐；Gemini 模型名在路径上，展示为 `{model}` 占位。 */
 const UPSTREAM_PATH: Record<Protocol, string> = {
   openai_chat: '/chat/completions',
   openai_responses: '/responses',
   anthropic_messages: '/messages',
+  gemini: '/v1beta/models/{model}:generateContent',
 };
 
 /** 渠道出站 URL：去掉 base_url 尾斜杠后接协议路径。 */
@@ -46,6 +58,12 @@ export interface TokenCreate extends TokenAttributes {
   balance_usd_micros: number | null;
 }
 
+/** 创建响应在 TokenView 之上额外返回一次性的明文 key；此后任何接口都不再提供。 */
+export interface TokenCreatedView extends TokenView {
+  /** 明文 key，仅创建响应返回一次。 */
+  plaintext_key: string;
+}
+
 export interface BulkDeleteResult<T> {
   deleted: T[];
 }
@@ -59,7 +77,8 @@ export interface ChannelModelTarget {
 export interface TokenView extends TokenAttributes {
   /** 库生成的稳定身份；管理面按它定位令牌。 */
   id: number;
-  token_key: string;
+  /** 令牌 key 的 SHA-256 指纹（读取面一律掩码）；明文只在创建响应出现一次。 */
+  token_key_fingerprint: string;
   /** 累计消费上限；`null` 表示无限额。 */
   limit_usd_micros: number | null;
   /** 派生可用余额 = 累计消费上限 - 累计已结算；`null` 表示无限额。 */
@@ -82,11 +101,21 @@ export interface Channel {
   models: string[];
   model_aliases: Record<string, string>;
   timeout_ms: number;
+  /** 渠道级预首字节总时限（毫秒）；缺省 120000。 */
+  request_timeout_ms: number;
   max_retries: number;
   /** 是否启用：禁用的渠道不参与路由与失败切换。 */
   enabled: boolean;
   /** 保存时把新加入的可调用名并入该组；`default` 表示不自动入组。 */
   model_group: string;
+  /** reasoning 思维链兼容输出模式；缺省 auto（按厂商提示词表自动判定）。 */
+  reasoning_output: ReasoningOutputMode;
+  /** 会话缓存键回写模式；缺省 off（不改动出站请求）。 */
+  session_cache_key: SessionCacheKeyMode;
+  /** 自动缓存断点注入；缺省 false，仅对 Anthropic Messages 渠道生效。 */
+  injects_cache_breakpoints: boolean;
+  /** 下游断开时是否立即取消上游消费；缺省 true（断开即止损）。 */
+  abort_on_disconnect: boolean;
 }
 
 /** 渠道上的一把上游密钥；模型白/黑名单为可选的逗号名单。 */
@@ -134,10 +163,31 @@ export function channelWriteBody(view: ChannelView): Channel {
     models: view.models,
     model_aliases: view.model_aliases,
     timeout_ms: view.timeout_ms,
+    request_timeout_ms: view.request_timeout_ms,
     max_retries: view.max_retries,
     enabled: view.enabled,
     model_group: view.model_group,
+    reasoning_output: view.reasoning_output,
+    session_cache_key: view.session_cache_key,
+    injects_cache_breakpoints: view.injects_cache_breakpoints,
+    abort_on_disconnect: view.abort_on_disconnect,
   };
+}
+
+/** 冷却中渠道的一行健康展示。 */
+export interface ChannelHealthEntry {
+  channel_id: number;
+  /** 渠道名；取自当前快照，已删除渠道的残留冷却记录不出现。 */
+  channel: string;
+  /** 冷却到期时刻（unix 毫秒）。 */
+  cooldown_until: number;
+  /** 触发冷却时的连续可重试失败计数（上游 402/403 即时冷却时为 0）。 */
+  consecutive_failures: number;
+}
+
+/** `GET /channels/health` 响应：当前冷却中的渠道清单，无冷却时为空数组。 */
+export interface ChannelHealthView {
+  channels: ChannelHealthEntry[];
 }
 
 /** 同名渠道顺序表里的一行：某个可调用名在多条渠道上的完整尝试顺序。 */
@@ -146,7 +196,7 @@ export interface ChannelModelOrder {
   channel_ids: number[];
 }
 
-/** 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）。 */
+/** 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens），cache 写入可细分 1h 档。 */
 export interface Price {
   channel_id: number;
   model: string;
@@ -154,6 +204,8 @@ export interface Price {
   output_micros: number;
   cache_read_micros: number | null;
   cache_write_micros: number | null;
+  /** 1h TTL 档单价；null 表示未配置，整行按 cache_write 单一费率计。 */
+  cache_write_1h_micros: number | null;
 }
 
 /** 组名单一条：钉渠道的已登记名，或统一模型 ID。 */
@@ -170,7 +222,7 @@ export interface ModelGroup {
 export interface UnifiedMember {
   channel_id: number;
   model: string;
-  /** GET 读视图：渠道仍在、已启用且仍登记该名。写契约不含此字段。 */
+  /** GET 读视图：渠道启用、登记该名、已定价且有可用密钥。写契约不含此字段。 */
   available?: boolean;
 }
 
@@ -212,6 +264,9 @@ export interface Settings {
   retry_after_cap_secs: number;
   /** 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。 */
   rate_limit_rpm: number;
+  request_rectify: boolean;
+  allow_private_networks: boolean;
+  private_network_allowlist: string[];
 }
 
 /** 目录中一条提供方 × 模型的四档单价（micro-USD / 1M tokens）。 */
@@ -281,6 +336,10 @@ export interface PlanCapabilities {
   toggle_user_tokens: boolean;
   view_own_plan_groups: boolean;
   view_other_groups: boolean;
+  view_channels: boolean;
+  view_prices: boolean;
+  view_model_groups: boolean;
+  view_unified_models: boolean;
   edit_prices: boolean;
   edit_model_groups: boolean;
   edit_unified_models: boolean;
@@ -397,6 +456,7 @@ export interface MyModelView {
   output?: PriceRange;
   cache_read?: PriceRange;
   cache_write?: PriceRange;
+  cache_write_1h?: PriceRange;
 }
 
 /** 一个模型组一段；同一个名字可以出现在多段里（组是允许名单，不是分区）。 */
@@ -425,7 +485,6 @@ export interface LoginRequest {
 }
 
 export interface LoginView {
-  token: string;
   expires_at: number;
   user: UserView;
 }
@@ -467,7 +526,8 @@ export interface LogEntry {
   id: number;
   created_at: number;
   token_name: string;
-  token_key: string;
+  /** 令牌 key 的掩码指纹（不可逆，非凭证）。 */
+  token_key_fingerprint: string;
   inbound_protocol: string;
   model: string;
   /** 实际出站模型名；旧行可能为 null。 */
@@ -483,6 +543,10 @@ export interface LogEntry {
   output_price_usd_micros: number;
   cache_read_price_usd_micros: number;
   cache_write_price_usd_micros: number;
+  /** cache 写入中 1h TTL 档明细（写入总数的子集）。 */
+  cache_write_1h_tokens: number;
+  /** 1h TTL 档价格快照；0 表示价格行未配置该档。 */
+  cache_write_1h_price_usd_micros: number;
   /** 渠道原价（折扣前）。 */
   base_cost_usd_micros: number;
   /** 万分比折扣率；10000 表示原价。 */
@@ -491,6 +555,10 @@ export interface LogEntry {
   cost_usd_micros: number;
   /** 费用是否已完成所属用户钱包结算。 */
   settled: boolean;
+  /** 请求是否实际发往上游；false 表示未出站即终局（余额拒绝、无可用渠道等）。旧数据无此字段。 */
+  dispatched?: boolean;
+  /** 上游响应是否明确携带 usage；显式零用量也属于已报告。 */
+  usage_reported: boolean;
   /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
   request_body: string | null;
   /** 列表接口为 null；详情 `GET /logs/{id}` 才返回 base64 body。 */
@@ -521,8 +589,7 @@ export type SystemLogSortBy = 'created';
 
 /** 日志列表查询。 */
 export interface LogQuery {
-  token_key?: string;
-  /** 按令牌展示名精确过滤；列表里的 `token_key` 已脱敏，行内筛选用这个。 */
+  /** 按令牌展示名精确过滤；列表里的 `token_key_fingerprint` 已脱敏，行内筛选用这个。 */
   token_name?: string;
   model?: string;
   /** 按渠道名精确过滤。 */
@@ -598,6 +665,8 @@ export interface CleanupResultView {
 export interface StatsSummary {
   request_count: number;
   success_count: number;
+  /** 未出站即终局（余额拒绝、无可用渠道等）的请求数，与 request_count（仅已出站）分列。 */
+  not_dispatched: number;
   input_tokens: number;
   output_tokens: number;
   cost_usd_micros: number;
@@ -639,7 +708,9 @@ export interface StatsView {
 
 /** `/stats/lifetime` 全量累计，不受时间窗影响。
  *
- * `request_count` 与 `total_tokens` 含未结算行；`cost_usd_micros` 只计已结算的成功费用。
+ * 只统计已出站（dispatched = 1）的请求；未出站即终局的请求单列在 `/stats`
+ * 的 `summary.not_dispatched`。`request_count` 与 `total_tokens` 含未结算行；
+ * `cost_usd_micros` 统计所有已结算尝试。
  */
 export interface LifetimeStats {
   request_count: number;

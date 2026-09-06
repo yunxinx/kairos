@@ -35,6 +35,7 @@ import { useToast } from '@/composables/useToast';
 import PlanEditorWindow from '@/features/plans/PlanEditorWindow.vue';
 import { formatDiscountBp, formatUnixMillis, formatUsdMicros } from '@/lib/format';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type PlanWindowPayload =
   /** 新建时 `plan` 为 null，受众由点的是哪个按钮决定；编辑时受众取自 `plan`。 */
@@ -90,6 +91,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<PlanWindowPayload>();
@@ -199,7 +201,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (win) => win.payload.kind === 'delete' && win.payload.plan.id === plan.id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await queryClient.invalidateQueries({ queryKey: ['plans'] });
   },
   onError: (err, plan) => {
@@ -283,7 +285,7 @@ watch(plans, (rows) => {
     const planId = payload.kind === 'editor' ? payload.plan?.id : payload.plan.id;
     const latest = rows.find((plan) => plan.id === planId);
     if (!latest && payload.kind === 'delete') continue;
-    if (!latest && payload.kind === 'editor') closeWindow(entry.id);
+    if (!latest && payload.kind === 'editor') closeWindow(entry.id, true);
     else if (latest && payload.kind === 'editor') payload.plan = latest;
   }
 });
@@ -574,7 +576,7 @@ watch(plans, (rows) => {
         confirm-test-id="plan-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.plan)"
       />
       <ConfirmWindow
@@ -591,9 +593,16 @@ watch(plans, (rows) => {
         confirm-test-id="plan-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

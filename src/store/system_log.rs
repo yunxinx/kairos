@@ -403,3 +403,106 @@ pub async fn purge_system_logs_before(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::test_support::test_pool;
+    use serde_json::json;
+
+    /// 系统日志分页与关键字过滤。
+    #[tokio::test]
+    async fn system_log_page_filters_by_keyword() {
+        let (_dir, pool) = test_pool().await;
+        insert_system_log(&pool, "error", "billing", "结算失败")
+            .await
+            .expect("应能写系统日志");
+        insert_system_log(&pool, "error", "catalog", "目录同步失败")
+            .await
+            .expect("应能写系统日志");
+
+        let mut filter = SystemLogQuery::new(1, 10);
+        filter.keyword = Some("billing".to_string());
+        let page = query_system_log_page(&pool, &filter)
+            .await
+            .expect("应能查询系统日志");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].target, "billing");
+        assert_eq!(page.items[0].message, "结算失败");
+        assert_eq!(page.targets, vec!["billing".to_string()]);
+
+        let mut by_level = SystemLogQuery::new(1, 10);
+        by_level.levels = vec!["warn".to_string()];
+        let empty = query_system_log_page(&pool, &by_level)
+            .await
+            .expect("应能按级别过滤");
+        assert_eq!(empty.total, 0);
+
+        let mut by_target = SystemLogQuery::new(1, 10);
+        by_target.targets = vec!["catalog".to_string()];
+        let catalog = query_system_log_page(&pool, &by_target)
+            .await
+            .expect("应能按目标过滤");
+        assert_eq!(catalog.total, 1);
+        assert_eq!(catalog.items[0].target, "catalog");
+    }
+
+    #[tokio::test]
+    async fn structured_system_log_event_roundtrips_and_legacy_rows_fallback() {
+        let (_dir, pool) = test_pool().await;
+        let event = SystemLogEvent::new(
+            "billing.user_balance_adjusted",
+            json!({ "user_id": 42, "delta_usd_micros": 1_000_000 }),
+            "用户 42 余额 +$1.00",
+        );
+        let mut tx = pool.begin().await.expect("应能开启事务");
+        record_audit(
+            &mut tx,
+            Actor {
+                user_id: 1,
+                email: "root@example.com",
+            },
+            "billing",
+            &event,
+        )
+        .await
+        .expect("结构化事件应能写入");
+        tx.commit().await.expect("应能提交事务");
+
+        insert_system_log(&pool, "error", "catalog", "旧式日志")
+            .await
+            .expect("旧式日志应能写入");
+        let page = query_system_log_page(&pool, &SystemLogQuery::new(1, 10))
+            .await
+            .expect("应能查询系统日志");
+        let structured = page
+            .items
+            .iter()
+            .find(|item| item.event_code.as_deref() == Some("billing.user_balance_adjusted"))
+            .expect("应取回事件编码");
+        assert_eq!(
+            structured.event_params,
+            Some(json!({
+                "user_id": 42,
+                "delta_usd_micros": 1_000_000
+            }))
+        );
+        let legacy = page
+            .items
+            .iter()
+            .find(|item| item.message == "旧式日志")
+            .expect("应取回旧式日志");
+        assert!(legacy.event_code.is_none());
+        assert!(legacy.event_params.is_none());
+
+        let malformed = sqlx::query(
+            "INSERT INTO system_log \
+             (created_at, level, target, message, event_code, event_params) \
+             VALUES (0, 'info', 'test', 'fallback', 'test.invalid', 'not-json')",
+        )
+        .execute(&pool)
+        .await;
+        assert!(malformed.is_err(), "事件参数必须是合法 JSON");
+    }
+}

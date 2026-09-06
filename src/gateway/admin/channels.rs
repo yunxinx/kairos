@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::gateway::{logging, routing};
 use crate::store;
+use crate::store::channel_keys::api_key_requests_preservation;
 use crate::store::resources::{Channel, ChannelRecord};
 
-use super::auth::ManagementIdentity;
+use super::auth::{ManagementCapability, ManagementIdentity};
 use super::models::reject_unhidden_unified_collision;
 use super::{
     AdminDeps, AdminError, BulkDeleteBody, BulkDeleteResult, begin_write, db_err, reload_and_swap,
@@ -68,7 +69,9 @@ struct ChannelSummaryView {
 /// 列出全部渠道名录。路由层已限制为 admin+；响应只含模型视图所需的安全字段。
 async fn list_channel_summaries(
     State(deps): State<AdminDeps>,
+    Extension(identity): Extension<ManagementIdentity>,
 ) -> Result<Json<Vec<ChannelSummaryView>>, AdminError> {
+    identity.require_capability(ManagementCapability::ViewChannels)?;
     let snapshot = deps.snapshot.read().await;
     Ok(Json(
         snapshot
@@ -88,7 +91,8 @@ async fn list_channel_summaries(
 
 /// 渠道读视图：库生成的稳定身份 + 定义字段（同级展开序列化）。
 ///
-/// 写契约仍是无 id 的 `Channel`；id 只随读响应返回。
+/// 写契约仍是无 id 的 `Channel`；id 只随读响应返回。密钥条目随读取面掩码，
+/// 明文不回显。
 #[derive(Debug, Serialize)]
 struct ChannelView {
     id: i64,
@@ -136,6 +140,7 @@ async fn create_channel(
     let mut channel = body.map_err(AdminError::bad_body)?;
     normalize_channel_group(&mut channel);
     validate_channel(&channel)?;
+    require_plaintext_keys(&channel)?;
     let mut tx = begin_write(&deps).await?;
     reject_unknown_group_on_conn(&mut tx, &channel.model_group).await?;
     let channels = crate::store::resources::list_channel_records_on_conn(&mut tx)
@@ -240,16 +245,10 @@ async fn update_channel(
         None,
     )?;
     let previous = current.channel.clone();
+    resolve_preserved_keys(&mut channel, &current.keys)?;
     crate::store::resources::update_channel(&mut tx, id, &channel)
         .await
         .map_err(AdminError::Store)?;
-    crate::store::resources::retain_channel_prices(
-        &mut tx,
-        id,
-        &crate::store::resources::channel_callable_names(&channel),
-    )
-    .await
-    .map_err(AdminError::Store)?;
     enroll_channel_models(&mut tx, id, Some(&previous), &channel).await?;
     store::record_audit(
         &mut tx,
@@ -306,7 +305,7 @@ async fn delete_channel(
 ) -> Result<Json<ChannelView>, AdminError> {
     let id = parse_channel_id(raw_id)?;
     let deleted = read_channel_record(&deps, id).await?;
-    let mut tx = deps.pool.begin().await.map_err(db_err)?;
+    let mut tx = begin_write(&deps).await?;
     crate::store::resources::delete_channel(&mut tx, id)
         .await
         .map_err(AdminError::Store)?;
@@ -424,13 +423,6 @@ async fn delete_channel_models(
         crate::store::resources::update_channel(&mut tx, record.id, &record.channel)
             .await
             .map_err(AdminError::Store)?;
-        crate::store::resources::retain_channel_prices(
-            &mut tx,
-            record.id,
-            &crate::store::resources::channel_callable_names(&record.channel),
-        )
-        .await
-        .map_err(AdminError::Store)?;
     }
     store::record_audit(
         &mut tx,
@@ -501,6 +493,32 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
         return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
     }
     reject_non_http_url(&channel.base_url)?;
+    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
+        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
+        .contains(&channel.timeout_ms)
+    {
+        return Err(AdminError::InvalidBody(format!(
+            "timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
+            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+        )));
+    }
+    if !(crate::store::resources::MIN_REQUEST_TIMEOUT_MS
+        ..=crate::store::resources::MAX_REQUEST_TIMEOUT_MS)
+        .contains(&channel.request_timeout_ms)
+    {
+        return Err(AdminError::InvalidBody(format!(
+            "request_timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_REQUEST_TIMEOUT_MS,
+            crate::store::resources::MAX_REQUEST_TIMEOUT_MS
+        )));
+    }
+    if channel.max_retries > crate::store::resources::MAX_CHANNEL_RETRIES {
+        return Err(AdminError::InvalidBody(format!(
+            "max_retries 不能超过 {}",
+            crate::store::resources::MAX_CHANNEL_RETRIES
+        )));
+    }
     if channel.keys.is_empty() {
         return Err(AdminError::InvalidBody("keys 不能为空".to_string()));
     }
@@ -508,9 +526,6 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
     for key in &channel.keys {
         if key.name.trim().is_empty() {
             return Err(AdminError::InvalidBody("密钥 name 不能为空".to_string()));
-        }
-        if key.api_key.trim().is_empty() {
-            return Err(AdminError::InvalidBody("密钥 api_key 不能为空".to_string()));
         }
         if key.weight < 0 {
             return Err(AdminError::InvalidBody(
@@ -523,6 +538,44 @@ fn validate_channel(channel: &Channel) -> Result<(), AdminError> {
                 key.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// 创建渠道要求每把密钥都是明文：空串或掩码串在创建时没有「原值」可保留，
+/// 一律拒绝，避免把掩码形态当成真实密钥存库。
+fn require_plaintext_keys(channel: &Channel) -> Result<(), AdminError> {
+    for key in &channel.keys {
+        if key.api_key.trim().is_empty() {
+            return Err(AdminError::InvalidBody("密钥 api_key 不能为空".to_string()));
+        }
+        if api_key_requests_preservation(&key.api_key) {
+            return Err(AdminError::InvalidBody(
+                "密钥 api_key 不能为掩码形态，请提供明文".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 更新渠道时把「保留原值」的密钥条目解析为库中明文。
+///
+/// 空串或掩码串（含 `*`）按 `name` 匹配当前渠道的既有密钥，从其
+/// `StoredChannelKey` 取原值替换，明文不经 wire 往返；`name` 无匹配时没有
+/// 原值可保留，按非空校验失败处理。
+fn resolve_preserved_keys(
+    channel: &mut Channel,
+    current: &[crate::store::resources::StoredChannelKey],
+) -> Result<(), AdminError> {
+    for key in &mut channel.keys {
+        if !api_key_requests_preservation(&key.api_key) {
+            continue;
+        }
+        let preserved = current
+            .iter()
+            .find(|stored| stored.name == key.name)
+            .ok_or_else(|| AdminError::InvalidBody("密钥 api_key 不能为空".to_string()))?;
+        key.api_key = preserved.expose_api_key().to_string();
     }
     Ok(())
 }

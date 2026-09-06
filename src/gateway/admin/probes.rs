@@ -14,6 +14,7 @@ use serde_json::Value;
 use crate::config::Protocol;
 use crate::core::ir::{ChatRequest, ContentPart, Message, Role};
 use crate::gateway::http::{OutboundAuth, upstream_error_message};
+use crate::gateway::network::NetworkPolicy;
 use crate::gateway::protocol;
 use crate::store::resources::{Channel, StoredChannelKey, select_channel_key};
 
@@ -93,23 +94,39 @@ async fn test_channel(
     let model = resolve_probe_model(channel, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("模型 {requested} 不在渠道 {id} 的清单中"))
     })?;
+    let snapshot = deps.snapshot.read().await.clone();
+    let allow_private_networks = snapshot.allow_private_networks;
+    let network_policy =
+        NetworkPolicy::new(allow_private_networks, &snapshot.private_network_allowlist);
     let key = select_channel_key(&record.keys, requested).ok_or_else(|| {
         AdminError::InvalidBody(format!("渠道 {id} 没有可用于模型 {requested} 的启用密钥"))
     })?;
     let request = minimal_probe_request(&model);
     let mut warnings = Vec::new();
     let outbound = protocol::encode_request(&request, channel.protocol, &mut warnings);
+    // Gemini 的模型名承载在路径端点上（model-in-path）。
     let upstream_url = format!(
         "{}{}",
         channel.base_url.trim_end_matches('/'),
-        protocol::upstream_path(channel.protocol)
+        protocol::upstream_path(channel.protocol, &model, false)
     );
+    network_policy
+        .validate_target(&upstream_url)
+        .map_err(|err| AdminError::InvalidBody(err.to_string()))?;
 
     let started = Instant::now();
     let send = deps
-        .client
+        .outbound_clients
+        .for_policy(
+            &network_policy,
+            network_policy.target_allowlisted(&upstream_url),
+        )
         .post(&upstream_url)
-        .timeout(Duration::from_millis(channel.timeout_ms))
+        .timeout(Duration::from_millis(
+            channel
+                .timeout_ms
+                .clamp(1, crate::store::resources::MAX_CHANNEL_TIMEOUT_MS),
+        ))
         .apply_outbound_auth(channel.protocol, key)
         .json(&outbound)
         .send()
@@ -175,7 +192,10 @@ fn minimal_probe_request(model: &str) -> ChatRequest {
         response_format: None,
         tools: Vec::new(),
         tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
         provider_options: HashMap::new(),
+        warnings: Vec::new(),
     }
 }
 
@@ -202,8 +222,10 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 // --- 上游模型列表 ---
 
-/// 上游模型列表的路径段（相对 `base_url`）：OpenAI 与 Anthropic 均为 `{base}/models`。
+/// 上游模型列表的路径段（相对 `base_url`）：OpenAI 与 Anthropic 均为
+/// `{base}/models`；Gemini 为官方 `{base}/v1beta/models`。
 const UPSTREAM_MODELS_PATH: &str = "/models";
+const GEMINI_UPSTREAM_MODELS_PATH: &str = "/v1beta/models";
 
 /// 拉取上游模型列表的草稿请求：仅含出站相关字段，渠道无需已保存。
 ///
@@ -240,8 +262,15 @@ async fn list_upstream_models(
     if draft.api_key.trim().is_empty() {
         return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
     }
-    if draft.timeout_ms < 1 {
-        return Err(AdminError::InvalidBody("timeout_ms 不能小于 1".to_string()));
+    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
+        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
+        .contains(&draft.timeout_ms)
+    {
+        return Err(AdminError::InvalidBody(format!(
+            "timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
+            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+        )));
     }
     let key = StoredChannelKey::new(
         0,
@@ -254,13 +283,21 @@ async fn list_upstream_models(
         None,
         0,
     );
-    let url = format!(
-        "{}{}",
-        draft.base_url.trim_end_matches('/'),
-        UPSTREAM_MODELS_PATH
-    );
+    let models_path = match draft.protocol {
+        Protocol::Gemini => GEMINI_UPSTREAM_MODELS_PATH,
+        _ => UPSTREAM_MODELS_PATH,
+    };
+    let url = format!("{}{}", draft.base_url.trim_end_matches('/'), models_path);
+    let snapshot = deps.snapshot.read().await.clone();
+    let allow_private_networks = snapshot.allow_private_networks;
+    let network_policy =
+        NetworkPolicy::new(allow_private_networks, &snapshot.private_network_allowlist);
+    network_policy
+        .validate_target(&url)
+        .map_err(|err| AdminError::InvalidBody(err.to_string()))?;
     let send = deps
-        .client
+        .outbound_clients
+        .for_policy(&network_policy, network_policy.target_allowlisted(&url))
         .get(&url)
         .timeout(Duration::from_millis(draft.timeout_ms))
         .apply_outbound_auth(draft.protocol, &key)
@@ -282,23 +319,41 @@ async fn list_upstream_models(
             status_code,
         )));
     }
-    let models = parse_upstream_models(&body_text)?;
+    let models = parse_upstream_models(&body_text, draft.protocol)?;
     Ok(Json(UpstreamModelsView { models }))
 }
 
-/// 从 `{"data": [{"id": ...}]}` 解析模型 id 数组；无 `id` 的条目跳过。
-fn parse_upstream_models(body: &str) -> Result<Vec<String>, AdminError> {
+/// 按协议解析上游模型列表：OpenAI/Anthropic 为 `{"data":[{"id"}]}`；
+/// Gemini 为 `{"models":[{"name":"models/<id>"}]}`，剥前缀取裸 id。
+fn parse_upstream_models(body: &str, protocol: Protocol) -> Result<Vec<String>, AdminError> {
     let parsed: Value = serde_json::from_str(body)
         .map_err(|_| AdminError::Upstream("上游响应不是合法 JSON".to_string()))?;
-    let data = parsed
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| AdminError::Upstream("上游响应缺少 data 数组".to_string()))?;
-    Ok(data
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect())
+    match protocol {
+        Protocol::Gemini => {
+            let models = parsed
+                .get("models")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AdminError::Upstream("上游响应缺少 models 数组".to_string()))?;
+            Ok(models
+                .iter()
+                .filter_map(|item| item.get("name").and_then(Value::as_str))
+                .filter_map(|name| name.strip_prefix("models/"))
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect())
+        }
+        _ => {
+            let data = parsed
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| AdminError::Upstream("上游响应缺少 data 数组".to_string()))?;
+            Ok(data
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect())
+        }
+    }
 }
 
 /// 出站请求发送失败的错误摘要：超时与连接失败措辞与探测保持一致。

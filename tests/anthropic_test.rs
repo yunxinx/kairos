@@ -60,11 +60,12 @@ async fn openai_inbound_to_anthropic_channel_non_stream() {
 
     // 计费：input 25 + output 12。
     // 费用 = 25*2.5/1M + 12*10/1M = 62 + 120 = 182 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64) = sqlx::query_as(
         "SELECT settled_usd_micros, input_tokens FROM token_balance JOIN request_log \
          ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询计费");
@@ -103,9 +104,15 @@ async fn openai_inbound_drops_anthropic_reasoning_with_warning() {
     let body: Value = resp.json().await.expect("响应应可解析");
     // reasoning 被丢弃，仅 text 保留。
     assert_eq!(body["choices"][0]["message"]["content"], "结果是 185");
-    // 显式 warning：reasoning 丢弃。
-    assert_eq!(body["gateway"]["warnings"][0]["type"], "unsupported");
-    assert_eq!(body["gateway"]["warnings"][0]["feature"], "reasoning");
+    // 显式 warning：reasoning 丢弃（按 feature 定位——告警序列里还有
+    // max_tokens 补默认的 compatibility 告警，位置不保证）。
+    let reasoning_warning = body["gateway"]["warnings"]
+        .as_array()
+        .expect("应有 warnings")
+        .iter()
+        .find(|warning| warning["feature"] == "reasoning")
+        .expect("应有 reasoning 告警");
+    assert_eq!(reasoning_warning["type"], "unsupported");
 }
 
 /// Anthropic 入站 → OpenAI 渠道：非流式。
@@ -143,6 +150,7 @@ async fn anthropic_inbound_to_openai_channel() {
     }));
 
     // 日志 inbound_protocol 落 anthropic_messages。
+    common::wait_for_request_persistence(&gw.pool).await;
     let protocol: String = sqlx::query_scalar("SELECT inbound_protocol FROM request_log")
         .fetch_one(&gw.pool)
         .await
@@ -188,16 +196,70 @@ async fn anthropic_passthrough_forwards_and_bills() {
     assert_eq!(received[0]["messages"][0]["content"], "hi");
 
     // 计费：input 100 + output 20 = 100*2.5/1M + 20*10/1M = 250 + 200 = 450 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64, i64) = sqlx::query_as(
         "SELECT settled_usd_micros, input_tokens FROM token_balance JOIN request_log \
          ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
     )
-    .bind(TEST_TOKEN_KEY)
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
     .fetch_one(&gw.pool)
     .await
     .expect("应能查询计费");
     assert_eq!(row.0, 450);
     assert_eq!(row.1, 100);
+}
+
+/// Anthropic 直通 + 1h 分档计费：usage 的 cache_creation 明细按
+/// 1h/5m 双速率拆分计价，日志记录 1h 明细与价格快照。
+#[tokio::test]
+async fn anthropic_passthrough_bills_1h_cache_write_tier() {
+    let mut gw = TestGateway::start_with(|base| {
+        let mut seed = anthropic_channel_seed(base);
+        seed.prices[0].cache_write_1h_micros = Some(20_000_000);
+        seed
+    })
+    .await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "id": "msg_01t", "type": "message", "role": "assistant", "model": TEST_MODEL,
+        "content": [{ "type": "text", "text": "直通" }],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {
+            "input_tokens": 100, "output_tokens": 20,
+            "cache_creation_input_tokens": 300, "cache_read_input_tokens": 40,
+            "cache_creation": { "ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200 }
+        }
+    })));
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/v1/messages", gw.base_url()))
+        .bearer_auth(TEST_TOKEN_KEY)
+        .json(&json!({
+            "model": TEST_MODEL,
+            "max_tokens": 1024,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .send()
+        .await
+        .expect("应能请求网关");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 1h 写入 200 × 20.0 + 5m 写入 100 × 10.0 + input 100 × 2.5 + output 20 × 10.0
+    // + read 40 × 1.25（micro-USD / 1M tokens）= 4000 + 1000 + 250 + 200 + 50 = 5500。
+    common::wait_for_request_persistence(&gw.pool).await;
+    let row: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT settled_usd_micros, cache_write_1h_tokens, cache_write_1h_price_usd_micros, \
+         cache_write_tokens FROM token_balance JOIN request_log \
+         ON token_balance.token_key = request_log.token_key WHERE token_balance.token_key = ?",
+    )
+    .bind(common::fingerprint(TEST_TOKEN_KEY))
+    .fetch_one(&gw.pool)
+    .await
+    .expect("应能查询计费");
+    assert_eq!(row.0, 5500);
+    assert_eq!(row.1, 200);
+    assert_eq!(row.2, 20_000_000);
+    assert_eq!(row.3, 300);
 }
 
 /// OpenAI chat 入站 → Anthropic 渠道：流式跨协议，下游收到 openai chunk 帧。
@@ -268,9 +330,10 @@ async fn openai_inbound_to_anthropic_channel_streaming() {
     assert_eq!(finish.data["usage"]["completion_tokens"], 2);
 
     // 计费：input 10 + output 2 = 10*2.5/1M + 2*10/1M = 25 + 20 = 45 微元。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能查询计费");
@@ -327,9 +390,10 @@ async fn anthropic_passthrough_streaming_bills_split_usage() {
 
     // 计费：input 50 + output 5 = 50*2.5/1M + 5*10/1M = 125 + 50 = 175 微元
     // （message_start 的 input 与 message_delta 的 output 逐分量 max 合并）。
+    common::wait_for_request_persistence(&gw.pool).await;
     let row: (i64,) =
         sqlx::query_as("SELECT settled_usd_micros FROM token_balance WHERE token_key = ?")
-            .bind(TEST_TOKEN_KEY)
+            .bind(common::fingerprint(TEST_TOKEN_KEY))
             .fetch_one(&gw.pool)
             .await
             .expect("应能查询计费");

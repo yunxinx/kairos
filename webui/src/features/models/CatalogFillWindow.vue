@@ -201,8 +201,10 @@ const writeMutation = useMutation({
     }
   },
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['prices'] });
+    await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },
   onError: (err) => {
     error(extractApiError(err).message);

@@ -5,8 +5,8 @@
 
 use axum::{
     http::{
-        HeaderValue, Method, StatusCode, Uri,
-        header::{self, CACHE_CONTROL, CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS},
+        HeaderName, HeaderValue, Method, StatusCode, Uri,
+        header::{self, CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS},
     },
     response::{IntoResponse, Response},
 };
@@ -70,11 +70,22 @@ fn file_response(path: &str, data: std::borrow::Cow<'static, [u8]>) -> Response 
                 header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(CSP),
             ),
+            (REFERRER_POLICY, HeaderValue::from_static("no-referrer")),
+            (
+                PERMISSIONS_POLICY,
+                HeaderValue::from_static(PERMISSIONS_POLICY_VALUE),
+            ),
         ],
         data,
     )
         .into_response()
 }
+
+/// `Permissions-Policy` 在当前 http 版本没有预置常量，按标准头名补上。
+const PERMISSIONS_POLICY: HeaderName = HeaderName::from_static("permissions-policy");
+
+/// 管理台不申请摄像头、麦克风与地理位置权限。
+const PERMISSIONS_POLICY_VALUE: &str = "camera=(), microphone=(), geolocation=()";
 
 /// 管理台内容安全策略：全部资源仅同源 + 头像 data URL。
 ///
@@ -132,7 +143,8 @@ mod tests {
     use super::serve;
     use axum::http::{Method, StatusCode, header};
 
-    /// 所有静态响应都带 CSP 与 nosniff；脚本只允许同源。
+    /// 所有静态响应都带 CSP、nosniff、Referrer-Policy 与 Permissions-Policy；
+    /// 脚本只允许同源。
     /// `webui/dist` 缺失（纯 API 构建）时无静态响应可测，直接跳过。
     #[tokio::test]
     async fn static_responses_carry_csp() {
@@ -153,6 +165,20 @@ mod tests {
                 .headers()
                 .get(header::X_CONTENT_TYPE_OPTIONS)
                 .is_some()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::REFERRER_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(&super::PERMISSIONS_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(super::PERMISSIONS_POLICY_VALUE)
         );
     }
 }

@@ -101,14 +101,24 @@ function handleRowClick(event: MouseEvent) {
     data-testid="log-row"
     :data-log-id="String(entry.id)"
     :data-model="entry.model"
-    :data-token-key="entry.token_key"
     :data-status-code="String(entry.status_code)"
     class="group cursor-pointer transition-colors"
     :class="rowClass"
     @click="handleRowClick"
   >
     <TableCell class="text-fg-muted font-mono text-xs whitespace-nowrap">
-      {{ formatUnixMillis(entry.created_at, locale) }}
+      <div class="flex flex-col items-start gap-0.5">
+        <span>{{ formatUnixMillis(entry.created_at, locale) }}</span>
+        <!-- 未出站即终局的请求（余额拒绝、无可用渠道等）：仅在字段明确为 false 时渲染。 -->
+        <span
+          v-if="entry.dispatched === false"
+          class="badge badge-neutral text-fg-muted w-fit px-1 py-0 text-[9px] font-medium"
+          :title="t('logs.notDispatched')"
+          data-testid="log-not-dispatched"
+        >
+          {{ t('logs.notDispatched') }}
+        </span>
+      </div>
     </TableCell>
 
     <TableCell v-if="visible.token">
@@ -129,9 +139,9 @@ function handleRowClick(event: MouseEvent) {
         </div>
         <div
           class="text-fg-muted truncate font-mono text-[10px] opacity-80"
-          :title="entry.token_key"
+          :title="entry.token_key_fingerprint"
         >
-          {{ maskTokenKey(entry.token_key) }}
+          {{ maskTokenKey(entry.token_key_fingerprint) }}
         </div>
       </div>
     </TableCell>

@@ -1,0 +1,57 @@
+---
+source: tests/phase2_blackbox_test.rs
+expression: frames
+---
+[
+  {
+    "event": "message_start",
+    "data": {
+      "message": {
+        "content": [],
+        "id": "msg_stream",
+        "model": "fast",
+        "role": "assistant",
+        "type": "message",
+        "usage": {
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
+      "type": "message_start"
+    }
+  },
+  {
+    "event": "content_block_start",
+    "data": {
+      "content_block": {
+        "text": "",
+        "type": "text"
+      },
+      "index": 0,
+      "type": "content_block_start"
+    }
+  },
+  {
+    "event": "content_block_delta",
+    "data": {
+      "delta": {
+        "text": "你好",
+        "type": "text_delta"
+      },
+      "index": 0,
+      "type": "content_block_delta"
+    }
+  },
+  {
+    "event": "error",
+    "data": {
+      "error": {
+        "message": "Overloaded",
+        "type": "api_error"
+      },
+      "type": "error"
+    }
+  }
+]

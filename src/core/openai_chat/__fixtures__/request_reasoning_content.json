@@ -1,0 +1,11 @@
+{
+  "model": "deepseek-reasoner",
+  "messages": [
+    { "role": "user", "content": "925 ÷ 5 等于多少？" },
+    {
+      "role": "assistant",
+      "content": "925 ÷ 5 = 185",
+      "reasoning_content": "先算 900 ÷ 5 = 180，再算 25 ÷ 5 = 5，合起来 185。"
+    }
+  ]
+}

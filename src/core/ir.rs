@@ -1,6 +1,6 @@
 //! 规范表示（IR）：网关内部唯一的消息规范模型。
 //!
-//! 形状遵循 ADR-0001 与 Vercel AI SDK `LanguageModelV4`：严格的 role + content
+//! 严格的 role + content
 //! parts 核心，配 `provider_options`（入）/`provider_metadata`（出）逃生舱。
 //! 所有协议适配器都在此中枢与各自 wire 类型之间双向编解码，wire 类型不出
 //! 适配器边界。
@@ -13,14 +13,14 @@ use serde_json::Value;
 
 /// 逃生舱：`provider_options`（入站解析留存）与 `provider_metadata`（出站/响应侧）。
 ///
-/// 形状对齐 AI SDK `Record<string, JSONObject>`：外层按 provider 名，内层为
+/// 外层按 provider 名，内层为
 /// provider 特有字段。Anthropic thinking signature、Responses encrypted reasoning
 /// 均经此往返。
 pub type ProviderOptions = HashMap<String, Value>;
 
 /// 转换过程中无法表达的内容或设置，随响应显式回传给下游。
 ///
-/// 形状对齐 AI SDK `SharedV4Warning`。跨协议族转换是有损的（ADR-0001）：丢失的
+/// 跨协议族转换是有损的：丢失的
 /// reasoning、目标协议不支持的媒体类型或采样参数等一律记 warning，不静默吞掉。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -59,6 +59,152 @@ impl Warning {
     }
 }
 
+/// warning `feature` 词汇表：跨协议转换中触发信息损失或兼容整形的主题名。
+///
+/// 各适配器统一引用本表构造 warning；下游与日志侧按值聚合统计，改名即
+/// 破坏契约，须同步调整消费方。新增触发条件在此登记，不再手写字面量。
+pub mod warning_feature {
+    /// 媒体 part（image/document/audio 等）在目标协议无承载形态，已丢弃。
+    pub const MEDIA: &str = "media";
+    /// 未知或目标协议不支持的自定义内容块，已丢弃。
+    pub const CUSTOM: &str = "custom";
+    /// top-k 采样在目标协议无对应字段，或被 thinking 采样约束剥离。
+    pub const TOP_K: &str = "top_k";
+    /// top-p 采样在目标协议无对应字段，或被 thinking 采样约束下限整形。
+    pub const TOP_P: &str = "top_p";
+    /// temperature 在目标协议无对应字段，或被 thinking 采样约束整形为 1。
+    pub const TEMPERATURE: &str = "temperature";
+    /// presence penalty 在目标协议无对应字段，已丢弃。
+    pub const PRESENCE_PENALTY: &str = "presence_penalty";
+    /// frequency penalty 在目标协议无对应字段，已丢弃。
+    pub const FREQUENCY_PENALTY: &str = "frequency_penalty";
+    /// seed 在目标协议无对应字段，已丢弃。
+    pub const SEED: &str = "seed";
+    /// stop 序列在目标协议无对应字段，已丢弃。
+    pub const STOP: &str = "stop";
+    /// 单请求多候选（n）在目标协议无对应字段，已丢弃。
+    pub const N: &str = "n";
+    /// reasoning / thinking 内容在目标协议无承载通道，已丢弃（含渠道级
+    /// 兼容输出开关关闭时的历史回放丢弃）。
+    pub const REASONING: &str = "reasoning";
+    /// Anthropic thinking 配置因上游硬约束被整体剥离（tool_choice 强制时）。
+    pub const THINKING: &str = "thinking";
+    /// JSON 输出设置（response_format）在目标协议无对应表达。
+    pub const RESPONSE_FORMAT: &str = "response_format";
+    /// provider 逃生舱设置（请求级/消息级/内容级/工具级）在目标协议无法
+    /// 表达，已丢弃。
+    pub const PROVIDER_OPTIONS: &str = "provider_options";
+    /// tool 消息携带非 tool_result 的内容 part，无法表达已丢弃。
+    pub const TOOL_RESULT: &str = "tool_result";
+    /// tool call 的 arguments 非合法 JSON 对象，兜底为空对象。
+    pub const TOOL_ARGUMENTS: &str = "tool_arguments";
+    /// Anthropic 出站 tool 的 input_schema 已归一化改写（union 摊平、
+    /// 非 object 根兜底等）。
+    pub const INPUT_SCHEMA: &str = "input_schema";
+    /// tool_choice 因不合规被降级为 `auto`（如引用的工具不在工具列表）。
+    pub const TOOL_CHOICE: &str = "tool_choice";
+    /// 请求级并行工具调用开关在目标协议无承载字段（并行能力由协议缺省语义
+    /// 决定），已丢弃。
+    pub const PARALLEL_TOOL_CALLS: &str = "parallel_tool_calls";
+    /// 请求级白名单外的顶层未知字段在目标协议无法表达，已丢弃。
+    pub const UNKNOWN_FIELDS: &str = "unknown_fields";
+    /// Anthropic `pause_turn`（暂停待续）终态经 IR 无法承载续传语义，按
+    /// 普通流结束处理。
+    pub const PAUSE_TURN: &str = "pause_turn";
+    /// 缓存断点超过目标协议预算（Anthropic 上限 4 个），按 render order
+    /// 保留靠后者、牺牲最早者。
+    pub const CACHE_BREAKPOINT: &str = "cache_breakpoint";
+    /// 流式工具调用首帧字段缺席（name/id），已按兼容形状兜底（空名/序号 id）。
+    pub const TOOL_CALL: &str = "tool_call";
+    /// 上游安全拦截（如 Gemini `promptFeedback.blockReason`），内容被拒发。
+    pub const SAFETY: &str = "safety";
+    /// 回放的工具调用缺少思考签名，已注入占位哨兵规避上游校验拒绝。
+    pub const THOUGHT_SIGNATURE: &str = "thought_signature";
+    /// 目标协议必填的输出上限缺席，已补网关默认值（如 Anthropic max_tokens
+    /// 补 4096），语义从「不限」变为默认值封顶。
+    pub const MAX_TOKENS: &str = "max_tokens";
+    /// 上游失败终态（如 Gemini 畸形工具调用）在目标协议的 finish 枚举无
+    /// 承载值，已映射为自然完成（stop / end_turn）。
+    pub const FINISH: &str = "finish";
+}
+
+/// 未知字段逃生舱在 provider 逃生舱内的键：`provider_options[<provider>]["extra"]`。
+///
+/// 各适配器入站解码把本协议白名单外的顶层字段收进该键，同族出站原样回写，
+/// 跨族出站丢弃并记 [`warning_feature::UNKNOWN_FIELDS`] warning。
+pub const PROVIDER_EXTRA_KEY: &str = "extra";
+
+/// 消息级 / 内容级 / 工具级逃生舱的跨族丢弃告警。
+///
+/// `provider_options` 中不属于 `family`（本协议 provider 键）的条目在目标
+/// 协议无承载，逐 provider 记 [`warning_feature::PROVIDER_OPTIONS`]；本族
+/// 条目由各适配器按形状自行读写，不经本函数告警。请求级逃生舱的同一语义
+/// 由各适配器出站编码另行处理（需放行字段记忆集与未知字段 extra）。
+pub(crate) fn warn_dropped_provider_options(
+    provider_options: &ProviderOptions,
+    family: &str,
+    level: &str,
+    warnings: &mut Vec<Warning>,
+) {
+    for (provider, value) in provider_options {
+        if provider == family {
+            continue;
+        }
+        let carried = match value {
+            Value::Object(map) => !map.is_empty(),
+            Value::Null => false,
+            _ => true,
+        };
+        if carried {
+            warnings.push(Warning::unsupported(
+                warning_feature::PROVIDER_OPTIONS,
+                format!("{provider} 的{level}逃生舱设置无法表达，已丢弃"),
+            ));
+        }
+    }
+}
+
+/// 遍历 content parts 携带的逃生舱：出站可承载形态的 part 逐个产出
+/// `provider_options`，Custom part 跳过。
+///
+/// Custom part 整块丢弃时已记 [`warning_feature::CUSTOM`] 告警，其逃生舱
+/// 随整块丢弃不再单独告警；其余 part 一律视为有承载形态，由调用方按
+/// 本族键判定去留（配合 [`warn_dropped_provider_options`] 使用）。
+pub(crate) fn part_provider_options(
+    parts: &[ContentPart],
+) -> impl Iterator<Item = &ProviderOptions> {
+    parts.iter().filter_map(|part| match part {
+        ContentPart::Text {
+            provider_options, ..
+        }
+        | ContentPart::Reasoning {
+            provider_options, ..
+        }
+        | ContentPart::Media {
+            provider_options, ..
+        }
+        | ContentPart::ToolCall {
+            provider_options, ..
+        }
+        | ContentPart::ToolResult {
+            provider_options, ..
+        } => Some(provider_options),
+        ContentPart::Custom { .. } => None,
+    })
+}
+
+/// 媒体 part 逃生舱约定键：文件名。
+///
+/// chat `file.filename` 与 responses `input_file.filename` 共用
+/// `provider_options["openai"]["filename"]` 承载，跨协议转换不静默丢失。
+pub const FILE_NAME_KEY: &str = "filename";
+
+/// 媒体 part 逃生舱约定键：provider 托管文件引用（file_id）。
+///
+/// 网关不持有托管引用，以空 `MediaSource::Data` 占位、本键保留原值；
+/// 同协议族出站回传，跨协议族丢弃时记 warning。
+pub const FILE_ID_KEY: &str = "file_id";
+
 /// 消息角色。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,8 +217,7 @@ pub enum Role {
 
 /// 媒体 part 的数据源：原始字节（base64）或 URL 二选一。
 ///
-/// 形状对齐 AI SDK `FilePart` 的 `data` 判别联合（`{type:'data'}`/`{type:'url'}`）；
-/// 网关只承载两种载体，`reference` 等 provider 托管形态经 `provider_options`
+/// 网关只承载原始字节与 URL 两种载体，`reference` 等 provider 托管形态经 `provider_options`
 /// 逃生舱表达。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
@@ -98,16 +243,31 @@ pub fn split_data_url(url: &str) -> Option<(String, String)> {
 
 /// 媒体类型顶层段（`image/png` → `image`）；无 `/` 时原样返回。
 ///
-/// 对齐 AI SDK `getTopLevelMediaType`：目标协议按顶层段判定媒体类别（Anthropic
+/// 目标协议按顶层段判定媒体类别（Anthropic
 /// 据此分派 `image`/`document`，Responses 据此分派 `input_image`/`input_file`）。
 pub fn top_level_media_type(media_type: &str) -> &str {
     media_type.split('/').next().unwrap_or(media_type)
 }
 
+/// 媒体类型是否为完整 `type/subtype` 形态（子类型非空且非通配 `*`）。
+///
+/// IR 的 `media_type` 允许仅顶层段的类别标记（如 `image`、`document`）——
+/// wire 的 part 类型（chat `image_url`、Anthropic image/document 块）只表达
+/// 类别时，标记承载「目标协议应映射为图片还是文档」的判别信息，往返必需。
+/// 但 wire 上要求完整 IANA 类型的位置（Anthropic base64 source 的
+/// `media_type`、data URL、Gemini `mimeType`）不得写出标记值——完整类型
+/// 未知时要么省略字段（可省的位置，如 Gemini `fileData.mimeType`），要么
+/// 丢弃并告警（必填的位置），由各出站面按本判定选择。
+pub fn is_full_media_type(media_type: &str) -> bool {
+    match media_type.split_once('/') {
+        Some((_, subtype)) => !subtype.is_empty() && subtype != "*",
+        None => false,
+    }
+}
+
 /// 消息内容 part 枚举。`type` 为 serde tag，序列化为 `snake_case`。
 ///
-/// `media` 由 ADR-0001 预留的占位演进为携带真实载荷的媒体 part（形状演进
-/// 见 ADR-0003）；跨协议族转换有损时记 warning 而非静默吞掉。
+/// 跨协议族转换有损时记 warning 而非静默吞掉。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
@@ -117,23 +277,25 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 推理内容。v1 的 openai_chat 非流式路径不产出，同协议族经逃生舱往返。
+    /// 推理内容。同协议族经逃生舱往返；跨协议族转换有损时记 warning。
     Reasoning {
         text: String,
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 媒体内容（多模态）。`media_type` 为 IANA 媒体类型（如 `image/png`），
-    /// 携带数据源（base64 字节或 URL）+ provider_options 逃生舱。v1 的 `File`
-    /// 占位演进为此形状，wire 类型不出适配器边界。
+    /// 媒体内容（多模态）。`media_type` 为 IANA 媒体类型（如 `image/png`）；
+    /// wire part 类型只表达类别时（chat `image_url`、Anthropic image/document
+    /// 块的 URL source）允许仅顶层段的类别标记（`image`/`document` 等）——
+    /// 标记承载出站面的图片/文档判别，是否可写上 wire 由
+    /// [`is_full_media_type`] 在各出站面判定。携带数据源（base64 字节或 URL）
+    /// + provider_options 逃生舱；wire 类型不出适配器边界。
     Media {
         media_type: String,
         data: MediaSource,
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 工具调用。`input` 统一为 `Value`（AI SDK prompt 侧对象/流侧字符串的
-    /// 不一致不照搬）。
+    /// 工具调用。`input` 统一为 `Value`。
     ToolCall {
         tool_call_id: String,
         tool_name: String,
@@ -155,6 +317,17 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
+}
+
+/// 拼接内容中的文本段，忽略媒体与工具段。
+pub(crate) fn text_content(parts: &[ContentPart]) -> Option<String> {
+    let mut text = String::new();
+    for part in parts {
+        if let ContentPart::Text { text: value, .. } = part {
+            text.push_str(value);
+        }
+    }
+    (!text.is_empty()).then_some(text)
 }
 
 /// 一条消息：角色 + 有序 content parts + 逃生舱。
@@ -186,14 +359,20 @@ pub struct FinishReason {
     pub raw: Option<String>,
 }
 
-/// usage 四分量 + raw 兜底。四分量对齐价格表四档（input/output/cache_read/cache_write），
-/// `raw` 保留上游原始 usage 形状，供后续计费与对账。
+/// usage 四分量 + 1h 写入明细 + raw 兜底。四分量对齐价格表四档
+/// （input/output/cache_read/cache_write），`raw` 保留上游原始 usage 形状，
+/// 供后续计费与对账。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// cache 写入中 1h TTL 档的明细：[`Self::cache_write_tokens`] 的子集，
+    /// 不参与任何 prompt 总额与用量统计。仅 Anthropic 上游回报
+    /// `cache_creation.ephemeral_1h_input_tokens` 时非零。
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
 }
@@ -203,23 +382,25 @@ impl Usage {
     ///
     /// Anthropic 的 usage 分散在各事件（`message_start` 有输入侧 input/cache 早期值，
     /// `message_delta` 有最终 output），任一帧都不完整；逐分量取 max 可无顺序依赖地
-    /// 合并出最终值（bifrost passthrough 同款机制）。
+    /// 合并出最终值。
     pub fn union_max(&mut self, other: Usage) {
         self.input_tokens = self.input_tokens.max(other.input_tokens);
         self.output_tokens = self.output_tokens.max(other.output_tokens);
         self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        self.cache_write_1h_tokens = self.cache_write_1h_tokens.max(other.cache_write_1h_tokens);
         if self.raw.is_none() {
             self.raw = other.raw;
         }
     }
 
-    /// 四分量是否全为零（上游未回报 usage 时的嗅探/解码缺省值）。
+    /// 计费相关分量是否全为零（上游未回报 usage 时的嗅探/解码缺省值）。
     pub fn is_zero(&self) -> bool {
         self.input_tokens == 0
             && self.output_tokens == 0
             && self.cache_read_tokens == 0
             && self.cache_write_tokens == 0
+            && self.cache_write_1h_tokens == 0
     }
 }
 
@@ -231,6 +412,127 @@ pub struct Tool {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
+    /// 工具级逃生舱，形状与 content part 一致。
+    ///
+    /// 承载缓存断点（cache_control）等 provider 特有的工具设置：Anthropic
+    /// 的工具断点约定键为 `provider_options["anthropic"]["cache_control"]`
+    /// （见 CONTEXT.md 缓存断点词条与 ADR-0014）。
+    #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
+    pub provider_options: ProviderOptions,
+}
+
+/// 工具选择：跨协议类型化枚举。
+///
+/// 三协议的 wire 形状差异（Anthropic 的 `any`、Chat 的嵌套 `function` 对象、
+/// Responses 的扁平 `function` 对象）由各适配器双向承担；Anthropic 附加语义
+/// （如 `disable_parallel_tool_use`）经请求级逃生舱
+/// `provider_options["anthropic"]["tool_choice_extra"]` 保留，只在
+/// Anthropic 出站写回。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Tool { name: String },
+}
+
+/// reasoning 请求旋钮的档位。
+///
+/// OpenAI 官方档位为 none 到 max（realtime 封顶 xhigh，支持度随模型）；
+/// `ultra` 是客户端扩展档位，IR 收入以
+/// 保真，跨族映射时钳到 [`ReasoningEffort::Max`]。Anthropic 侧
+/// 原生档位为 `output_config.effort` 的 low/medium/high/xhigh/max（无
+/// none/minimal），legacy 模型走 budget_tokens 阶梯
+/// （[`ReasoningEffort::budget_tokens`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    /// 解析 wire 侧 effort 字符串；未知值返回 `None`，由调用方决定拒绝方式。
+    pub fn parse_effort(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    /// wire 侧 effort 字符串（chat 与 responses 面板共用）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    /// Anthropic budget 阶梯：effort → `budget_tokens`（legacy budget 路径）；
+    /// `None` 档对应 `thinking: disabled`，无预算。阶梯为网关规范换算表
+    /// （512/1024/8192/24576/32768/128000）；`Ultra` 钳到 `Max` 同档，
+    /// 避免选最深思考时映射落空。
+    pub fn budget_tokens(self) -> Option<u32> {
+        match self {
+            Self::None => None,
+            Self::Minimal => Some(512),
+            Self::Low => Some(1024),
+            Self::Medium => Some(8192),
+            Self::High => Some(24576),
+            Self::XHigh => Some(32768),
+            Self::Max | Self::Ultra => Some(128_000),
+        }
+    }
+
+    /// Anthropic 原生 effort 档位（`output_config.effort` 面）：官方取值为
+    /// low/medium/high/xhigh/max，无 none/minimal/ultra。`Minimal` 归 `low`，
+    /// `Ultra` 钳到 `max`；`None` 档无 effort 语义（对应 `thinking: disabled`），
+    /// 返回 `None`。与 [`ReasoningEffort::budget_tokens`] 分别服务
+    /// adaptive/native-effort 与 legacy budget 两条模型形态。
+    pub fn native_effort(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Minimal | Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max | Self::Ultra => Some("max"),
+        }
+    }
+
+    /// Anthropic budget → effort 的有损反向映射，阈值与正向阶梯一致；
+    /// 超过 32768 归 `Max`（budget 路径上见不到 `Ultra`）。`disabled`/`adaptive`
+    /// 与缺 budget 由调用方另行处理，不经本函数。
+    pub fn from_budget(tokens: u32) -> Self {
+        match tokens {
+            0..=512 => Self::Minimal,
+            513..=1024 => Self::Low,
+            1025..=8192 => Self::Medium,
+            8193..=24576 => Self::High,
+            24577..=32768 => Self::XHigh,
+            _ => Self::Max,
+        }
+    }
 }
 
 /// 非流式聊天请求的 IR 中枢。
@@ -265,7 +567,17 @@ pub struct ChatRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<Value>,
+    pub tool_choice: Option<ToolChoice>,
+    /// 是否允许模型一次发起多个工具调用。chat/responses 原生承载；Anthropic
+    /// 无请求级字段，以 `tool_choice.disable_parallel_tool_use` 反语义表达，
+    /// 映射时取反（`false` → `disable: true`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    /// reasoning 请求旋钮（effort 档位）。Anthropic 原始 `thinking` 配置经
+    /// `provider_options["anthropic"]["thinking"]` 逃生舱无损往返，本字段
+    /// 只承载可枚举的 effort 语义；本族逃生舱缺席时按协议形状兜底出站。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningEffort>,
     /// 请求级逃生舱：入站解析留存的 provider 特有请求设置。
     ///
     /// Anthropic 的 `thinking`（budget_tokens/display）是请求级而非消息级配置：
@@ -273,6 +585,126 @@ pub struct ChatRequest {
     /// 预算设置丢失。跨协议族出站时丢弃并记 warning。
     #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
     pub provider_options: ProviderOptions,
+    /// 入站解码侧的兼容动作记录（拒绝改兜底的有损面），随响应面回传下游。
+    ///
+    /// 出站编码的转换损失由各适配器 `encode_request` 另行积累，两者在网关
+    /// 响应面合流；适配器编码不消费本字段。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Warning>,
+}
+
+impl ChatRequest {
+    /// 读取指定 provider 未知字段逃生舱内的字段集合；键缺席或非对象时为 `None`。
+    pub(crate) fn provider_extra(&self, provider: &str) -> Option<&serde_json::Map<String, Value>> {
+        self.provider_options
+            .get(provider)?
+            .get(PROVIDER_EXTRA_KEY)?
+            .as_object()
+    }
+}
+
+/// 从入站 wire 请求对象捕获白名单外的顶层字段（未知字段逃生舱的捕获面）。
+///
+/// 请求对象非 JSON object 时返回空集（形状错误由 wire 解码另行拒绝）。
+pub(crate) fn capture_unknown_fields(
+    value: &Value,
+    known: &[&str],
+) -> serde_json::Map<String, Value> {
+    let mut extra = serde_json::Map::new();
+    if let Some(fields) = value.as_object() {
+        for (key, field) in fields {
+            if !known.contains(&key.as_str()) {
+                extra.insert(key.clone(), field.clone());
+            }
+        }
+    }
+    extra
+}
+
+/// 出站面未知字段逃生舱的回写策略：本族 `extra` 内字段如何落到出站对象。
+///
+/// 策略张力：chat 与 responses 共用一个 `openai` 逃生舱键（族内互回不区分
+/// 来源协议），但两个适配器各自只认识本方 wire 的顶层字段——OpenAI 服务端
+/// 对未知顶层请求参数直接 400，族内互回若不按目标协议过滤，chat 入站的
+/// `logprobs`/`logit_bias`/`user` 等 chat-only 字段会被原样写进 Responses
+/// 请求，请求在到达模型前就被拒绝（反向同理）。anthropic/google 两个键与
+/// 协议一一对应，同族即同协议，extra 内字段全部来自本协议 wire，保持原样
+/// 回写以维持同族往返 byte-shape 一致。
+///
+/// 白名单维护（[`ExtraWriteback::TargetFields`] 的列表）：内容是「目标协议
+/// 服务端接受的顶层请求字段」，包含已类型化字段与官方在册但网关未类型化
+/// 的字段（如 `service_tier`/`metadata` 两协议都接受，必须双侧登记以保持
+/// 族内互回往返）。协议演进时（厂商新增顶层参数）同步登记；字段提升为 IR
+/// 类型化字段后仍保留在列表——列表语义是「目标协议认识这个键」，与「网关
+/// 是否类型化」正交。遗漏真实字段会让同族互回丢弃合法字段，多列不存在的
+/// 字段只影响恰好同名的未知字段，宁可从宽。
+pub(crate) enum ExtraWriteback<'a> {
+    /// 本族逃生舱与协议一一对应（anthropic/google）：原样回写，不按字段
+    /// 过滤。
+    WholeFamily,
+    /// 本族逃生舱由多个协议共享（openai = chat + responses）：仅回写目标
+    /// 协议认识的顶层字段，其余丢弃并记 [`warning_feature::UNKNOWN_FIELDS`]
+    /// 告警。
+    TargetFields(&'a [&'static str]),
+}
+
+/// 出站编码的未知字段逃生舱处理：本族字段按策略回写、跨族字段丢弃并告警。
+///
+/// `family` 为本适配器的 provider 键；`writeback` 决定本族 `extra` 内字段
+/// 的回写方式（见 [`ExtraWriteback`]）。其他 provider 的字段一律丢弃并记
+/// [`warning_feature::UNKNOWN_FIELDS`] warning，details 携带字段名。
+pub(crate) fn apply_provider_extra(
+    obj: &mut serde_json::Map<String, Value>,
+    request: &ChatRequest,
+    family: &str,
+    writeback: ExtraWriteback<'_>,
+    warnings: &mut Vec<Warning>,
+) {
+    if let Some(extra) = request.provider_extra(family) {
+        match writeback {
+            ExtraWriteback::WholeFamily => {
+                for (key, field) in extra {
+                    obj.entry(key.clone()).or_insert(field.clone());
+                }
+            }
+            ExtraWriteback::TargetFields(known) => {
+                let mut dropped: Vec<&str> = Vec::new();
+                for (key, field) in extra {
+                    if known.contains(&key.as_str()) {
+                        obj.entry(key.clone()).or_insert(field.clone());
+                    } else {
+                        dropped.push(key.as_str());
+                    }
+                }
+                if !dropped.is_empty() {
+                    warnings.push(Warning::unsupported(
+                        warning_feature::UNKNOWN_FIELDS,
+                        format!(
+                            "{family} 的未知字段 {} 不被目标协议接受，已丢弃",
+                            dropped.join("、")
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for provider in request.provider_options.keys() {
+        if provider == family {
+            continue;
+        }
+        let Some(extra) = request.provider_extra(provider) else {
+            continue;
+        };
+        if !extra.is_empty() {
+            warnings.push(Warning::unsupported(
+                warning_feature::UNKNOWN_FIELDS,
+                format!(
+                    "{provider} 的未知字段 {} 无法在目标协议表达，已丢弃",
+                    extra.keys().cloned().collect::<Vec<_>>().join("、")
+                ),
+            ));
+        }
+    }
 }
 
 /// 为没有显式会话头的请求计算前缀亲和标识。
@@ -291,7 +723,11 @@ pub(crate) fn prefix_hash(request: &ChatRequest) -> u64 {
         write_message_prefix(&mut hasher, message);
     }
     for message in request.messages.iter().take(2) {
-        write_message_prefix(&mut hasher, message);
+        // system 消息已在前一轮全量计入：前两条里再哈希会让首条 system
+        // 重复进入摘要，去重后语义仍是「system 全文 + 前两条消息」。
+        if message.role != Role::System {
+            write_message_prefix(&mut hasher, message);
+        }
     }
     hasher.finish()
 }
@@ -331,7 +767,7 @@ pub struct ChatResponse {
 
 /// 流式事件（IR 侧）：start/delta/end 成对事件 + 生命周期事件。
 ///
-/// 形状遵循 ADR-0001 与 AI SDK `LanguageModelV4StreamPart`：text/reasoning/
+/// text/reasoning/
 /// tool-input 三类 content 各以 start/delta/end 成对出现，tool-call 在 input
 /// 汇聚完成后单发，生命周期事件含 stream-start/response-metadata/finish。
 /// 流式与非流式同构——`StreamAccumulator` 可将流无损归约为 `ChatResponse`。
@@ -404,7 +840,11 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "ProviderOptions::is_empty")]
         provider_options: ProviderOptions,
     },
-    /// 生命周期：流开始，携带本次转换的 warnings（对齐 AI SDK `stream-start`）。
+    /// 生命周期：流开始，携带本次转换的 warnings。
+    ///
+    /// 流式解码中途发现的 warnings（如响应流中无法下发的媒体 part）以再次
+    /// 出现的 StreamStart 下发：累积器按追加处理，各协议入站编码器转为独立
+    /// warnings 帧下发。
     StreamStart {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         warnings: Vec<Warning>,
@@ -418,12 +858,54 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         provider_metadata: ProviderOptions,
     },
+    /// 生命周期：上游在 200 之后于流内报错（如 Anthropic `event: error` 的
+    /// overloaded_error）。可多次出现；网关消费到即向下游下发入站协议错误帧
+    /// 并按已累积 usage 结算后终止流。
+    Error { message: String },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::prefix_hash;
+    use super::{prefix_hash, warning_feature};
     use serde_json::json;
+
+    /// 词汇表常量与 wire 值逐一定值：`gateway.warnings[].feature` 是下游与
+    /// 日志侧的聚合键，改名属破坏性变更，须显式改本表并同步消费方。
+    #[test]
+    fn warning_feature_values_are_pinned() {
+        let expected = [
+            (warning_feature::MEDIA, "media"),
+            (warning_feature::CUSTOM, "custom"),
+            (warning_feature::TOP_K, "top_k"),
+            (warning_feature::TOP_P, "top_p"),
+            (warning_feature::TEMPERATURE, "temperature"),
+            (warning_feature::PRESENCE_PENALTY, "presence_penalty"),
+            (warning_feature::FREQUENCY_PENALTY, "frequency_penalty"),
+            (warning_feature::SEED, "seed"),
+            (warning_feature::STOP, "stop"),
+            (warning_feature::N, "n"),
+            (warning_feature::REASONING, "reasoning"),
+            (warning_feature::THINKING, "thinking"),
+            (warning_feature::RESPONSE_FORMAT, "response_format"),
+            (warning_feature::PROVIDER_OPTIONS, "provider_options"),
+            (warning_feature::TOOL_RESULT, "tool_result"),
+            (warning_feature::TOOL_ARGUMENTS, "tool_arguments"),
+            (warning_feature::INPUT_SCHEMA, "input_schema"),
+            (warning_feature::TOOL_CHOICE, "tool_choice"),
+            (warning_feature::PARALLEL_TOOL_CALLS, "parallel_tool_calls"),
+            (warning_feature::UNKNOWN_FIELDS, "unknown_fields"),
+            (warning_feature::PAUSE_TURN, "pause_turn"),
+            (warning_feature::CACHE_BREAKPOINT, "cache_breakpoint"),
+            (warning_feature::TOOL_CALL, "tool_call"),
+            (warning_feature::SAFETY, "safety"),
+            (warning_feature::THOUGHT_SIGNATURE, "thought_signature"),
+            (warning_feature::MAX_TOKENS, "max_tokens"),
+            (warning_feature::FINISH, "finish"),
+        ];
+        for (constant, value) in expected {
+            assert_eq!(constant, value);
+        }
+    }
 
     fn request(messages: serde_json::Value) -> super::ChatRequest {
         serde_json::from_value(json!({
@@ -431,6 +913,38 @@ mod tests {
             "messages": messages,
         }))
         .expect("测试请求应能解码")
+    }
+
+    /// Tool 的工具级逃生舱 serde 形状：空时省略（wire 零噪音），携带
+    /// cache_control 断点时随序列化出现且解码还原。
+    #[test]
+    fn tool_provider_options_serde_shape() {
+        use super::Tool;
+
+        let bare: Tool =
+            serde_json::from_value(json!({ "name": "get_weather" })).expect("最小工具应可解码");
+        assert!(bare.provider_options.is_empty());
+        let encoded = serde_json::to_value(&bare).expect("工具应可序列化");
+        assert_eq!(encoded, json!({ "name": "get_weather" }), "空逃生舱不落盘");
+
+        let annotated = Tool {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: None,
+            provider_options: [(
+                "anthropic".to_string(),
+                json!({ "cache_control": { "type": "ephemeral", "ttl": "1h" } }),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let encoded = serde_json::to_value(&annotated).expect("工具应可序列化");
+        assert_eq!(
+            encoded["provider_options"]["anthropic"]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        let back: Tool = serde_json::from_value(encoded).expect("带逃生舱工具应可解码");
+        assert_eq!(back, annotated);
     }
 
     #[test]

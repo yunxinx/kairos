@@ -1,0 +1,66 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [{ "text": "上海天气？" }]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "text": "先查天气预报接口。",
+          "thought": true,
+          "thoughtSignature": "sig_thought"
+        },
+        {
+          "functionCall": {
+            "name": "get_weather",
+            "args": { "city": "上海" }
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {
+          "functionResponse": {
+            "name": "get_weather",
+            "response": { "result": "晴，26 度" }
+          }
+        }
+      ]
+    }
+  ],
+  "systemInstruction": {
+    "parts": [{ "text": "你是天气助手。" }]
+  },
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "get_weather",
+          "description": "查询城市天气",
+          "parameters": {
+            "type": "object",
+            "properties": { "city": { "type": "string" } }
+          }
+        }
+      ]
+    }
+  ],
+  "toolConfig": {
+    "functionCallingConfig": { "mode": "AUTO" }
+  },
+  "generationConfig": {
+    "temperature": 0.5,
+    "topP": 0.9,
+    "topK": 40,
+    "maxOutputTokens": 512,
+    "stopSequences": ["END"],
+    "thinkingConfig": { "thinkingBudget": 8192 }
+  },
+  "safetySettings": [
+    { "category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH" }
+  ]
+}

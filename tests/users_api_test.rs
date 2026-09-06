@@ -12,24 +12,26 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
 
 async fn json_req(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
         .expect("管理请求应可达")
 }
 
-async fn get_req(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn get_req(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -38,15 +40,13 @@ async fn get_req(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response
 async fn login(gw: &TestGateway, email: &str, password: &str) -> String {
     let resp = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": email, "password": password }))
         .send()
         .await
         .expect("登录应可达");
     assert_eq!(resp.status(), StatusCode::OK);
-    resp.json::<Value>().await.expect("登录应可解析")["token"]
-        .as_str()
-        .expect("应有会话")
-        .to_string()
+    common::session_cookie(&resp)
 }
 
 async fn create_role(gw: &TestGateway, email: &str, role: &str) -> (i64, String) {
@@ -128,7 +128,11 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
     let mine: Value = created.json().await.expect("令牌应可解析");
-    let mine_key = mine["token_key"].as_str().expect("应有 key").to_string();
+    // 创建响应携带一次性的明文 key；列表等读取面只有指纹。
+    let mine_key = mine["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
     let mine_id = mine["id"].as_i64().expect("应有 id");
 
     let user_list: Value = get_req(&gw, &user_token, "/tokens")
@@ -136,14 +140,17 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         .json()
         .await
         .expect("令牌列表应可解析");
-    let user_keys: Vec<&str> = user_list
+    let user_ids: Vec<i64> = user_list
         .as_array()
         .expect("应为数组")
         .iter()
-        .map(|t| t["token_key"].as_str().unwrap())
+        .map(|t| t["id"].as_i64().unwrap())
         .collect();
-    assert_eq!(user_keys, vec![mine_key.as_str()]);
-    assert!(!user_keys.contains(&TEST_TOKEN_KEY));
+    assert_eq!(user_ids, vec![mine_id]);
+    assert_ne!(
+        user_list[0]["token_key_fingerprint"], mine_key,
+        "列表不得回显明文 key"
+    );
 
     // admin 档默认名单为空；令牌候选也必须先由套餐名单授予。
     let plan = json_req(
@@ -183,13 +190,13 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     .await;
     assert_eq!(admin_creates.status(), StatusCode::CREATED);
     let admin_created: Value = admin_creates.json().await.expect("应可解析");
-    let admin_token_key = admin_created["token_key"]
+    let admin_token_key = admin_created["plaintext_key"]
         .as_str()
         .expect("应有 key")
         .to_string();
     let admin_token_id = admin_created["id"].as_i64().expect("应有 id");
     let owner: (i64,) = sqlx::query_as("SELECT user_id FROM tokens WHERE token_key = ?")
-        .bind(&admin_token_key)
+        .bind(kairos::store::token_key_fingerprint(&admin_token_key))
         .fetch_one(&gw.pool)
         .await
         .expect("应有归属");
@@ -205,7 +212,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     .await;
     assert_eq!(disable.status(), StatusCode::OK);
     let disabled_view: Value = disable.json().await.expect("禁用响应应可解析");
-    let disabled_key = disabled_view["token_key"]
+    let disabled_key = disabled_view["token_key_fingerprint"]
         .as_str()
         .expect("禁用响应应有 key");
     assert_ne!(disabled_key, mine_key, "跨归属操作不应回显明文 key");
@@ -226,7 +233,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     let enabled_view: Value = enable.json().await.expect("启用响应应可解析");
     assert_eq!(enabled_view["enabled"], true);
     assert!(
-        enabled_view["token_key"]
+        enabled_view["token_key_fingerprint"]
             .as_str()
             .is_some_and(|key| key.contains("******")),
         "跨归属启用也必须保持 key 脱敏"
@@ -274,7 +281,8 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
 
     let delete_others = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/tokens/{mine_id}")))
-        .bearer_auth(&admin_token)
+        .header(reqwest::header::COOKIE, &admin_token)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删除应可达");
@@ -344,13 +352,13 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         .json()
         .await
         .expect("令牌列表应可解析");
-    let admin_keys: Vec<&str> = admin_list
+    let admin_ids: Vec<i64> = admin_list
         .as_array()
         .expect("应为数组")
         .iter()
-        .map(|t| t["token_key"].as_str().unwrap())
+        .map(|t| t["id"].as_i64().unwrap())
         .collect();
-    assert_eq!(admin_keys, vec![admin_token_key.as_str()]);
+    assert_eq!(admin_ids, vec![admin_token_id]);
 
     let user_touch_seed = json_req(
         &gw,
@@ -376,7 +384,9 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         .expect("应能按 id 找到该令牌");
     assert_eq!(row["enabled"], false, "admin 应已禁用该令牌");
     // 他人令牌的 key 只给脱敏形态：运营按 id 操作，拿不到明文去花别人的余额。
-    let shown = row["token_key"].as_str().expect("应有 key 字段");
+    let shown = row["token_key_fingerprint"]
+        .as_str()
+        .expect("应有 key 字段");
     assert_ne!(shown, mine_key, "不应回显明文 key");
     assert!(shown.contains("******"), "应为脱敏形态，实际 {shown}");
 }
@@ -400,7 +410,10 @@ async fn deleting_user_archives_and_keeps_usage_history() {
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
     let owned: Value = created.json().await.expect("令牌应可解析");
-    let owned_key = owned["token_key"].as_str().expect("应有 key").to_string();
+    let owned_key = owned["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
 
     // 手写一条归属该用户的请求日志，模拟已产生的消费。
     sqlx::query(
@@ -417,7 +430,8 @@ async fn deleting_user_archives_and_keeps_usage_history() {
 
     let deleted = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/users/{user_id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("归档应可达");
@@ -514,7 +528,8 @@ async fn last_root_cannot_be_archived() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let resp = reqwest::Client::new()
         .delete(admin_url(&gw, "/users/1"))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("请求应可达");
@@ -592,15 +607,13 @@ async fn changing_password_revokes_other_sessions() {
     // 再登录一次，拿到第二条会话。
     let login2 = reqwest::Client::new()
         .post(format!("{}/login", gw.admin_base_url()))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "pwd@example.com", "password": "password1" }))
         .send()
         .await
         .expect("应可登录");
     assert_eq!(login2.status(), StatusCode::OK);
-    let session2 = login2.json::<Value>().await.expect("应可解析")["token"]
-        .as_str()
-        .expect("应有 token")
-        .to_string();
+    let session2 = common::session_cookie(&login2);
 
     // 两条会话都能访问 /me。
     assert_eq!(
@@ -707,6 +720,7 @@ async fn expired_session_does_not_count_toward_rate_limit() {
     // 正常登录仍可达，说明 IP 未被限流。
     let login = reqwest::Client::new()
         .post(format!("{}/login", gw.admin_base_url()))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "expire@example.com", "password": "password1" }))
         .send()
         .await
@@ -736,6 +750,7 @@ async fn expired_session_does_not_count_toward_rate_limit() {
     }
     let login_after_gc = reqwest::Client::new()
         .post(format!("{}/login", gw.admin_base_url()))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "expire@example.com", "password": "password1" }))
         .send()
         .await
@@ -838,6 +853,7 @@ async fn admin_can_fix_user_email_and_target_sessions_revoked() {
     // 旧邮箱登不上、被吊销的旧会话不可用，新邮箱可登录。
     let old_login = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "typo@example.com", "password": "password1" }))
         .send()
         .await

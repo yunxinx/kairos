@@ -127,6 +127,7 @@ const saveMutation = useMutation({
       ? apiClient.createUnifiedModel(body)
       : apiClient.updateUnifiedModel(props.initial.id, body),
   onSuccess: async () => {
+    emit('dirty-change', false);
     emit('close');
     await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },

@@ -1,5 +1,6 @@
 import { authedTest as test, expect } from './fixtures';
-import { e2eRootHeaders } from './helpers/session';
+import { E2E_ADMIN_EMAIL, E2E_ADMIN_ORIGIN, E2E_ADMIN_PASSWORD } from './helpers/gateway';
+import { e2eRootHeaders, loginViaApi } from './helpers/session';
 import { seedModelGroup } from './helpers/models';
 import { clickRowAction } from './helpers/table';
 import { seedUser } from './helpers/users';
@@ -63,23 +64,21 @@ test.describe('users page', () => {
 
     const created = await seedUser(page, { email: 'e2e-tokens@example.com', role: 'user' });
     const tokenResp = await page.request.post('/api/tokens', {
-      headers: await e2eRootHeaders(page.request),
+      headers: await e2eRootHeaders(page),
       data: { name: 'will-not-belong', balance_usd_micros: null, enabled: true },
     });
     expect(tokenResp.ok()).toBeTruthy();
 
-    const session = await page.request.post('/api/login', {
-      data: { email: 'e2e-tokens@example.com', password: 'password1' },
-    });
-    expect(session.ok()).toBeTruthy();
-    const sessionBody = (await session.json()) as { token: string };
+    await loginViaApi(page, 'e2e-tokens@example.com', 'password1');
     const own = await page.request.post('/api/tokens', {
-      headers: { Authorization: `Bearer ${sessionBody.token}` },
+      headers: { Origin: E2E_ADMIN_ORIGIN },
       data: { name: 'owned', balance_usd_micros: null, enabled: true },
     });
     expect(own.ok()).toBeTruthy();
     // 运营视图按库生成 id 定位：他人令牌的 key 只给脱敏形态。
-    const owned = (await own.json()) as { id: number; token_key: string };
+    const owned = (await own.json()) as { id: number; token_key_fingerprint: string };
+    // 以第二用户身份建完令牌后切回 root：/users 是 admin-only 页面。
+    await loginViaApi(page, E2E_ADMIN_EMAIL, E2E_ADMIN_PASSWORD);
 
     await page.goto('/users');
     const tokenOwner = page.locator(`[data-testid="user-row"][data-user-id="${created.id}"]`);
@@ -87,7 +86,7 @@ test.describe('users page', () => {
     await page.getByTestId('user-tab-tokens').click();
     const tokenRow = page.locator(`[data-testid="user-token-row"][data-token-id="${owned.id}"]`);
     await expect(tokenRow).toBeVisible();
-    await expect(tokenRow).not.toContainText(owned.token_key);
+    await expect(tokenRow).not.toContainText(owned.token_key_fingerprint);
     // 余额列与用户列表同款：纯 mono 数值，不再绘制额度进度条。
     await expect(tokenRow.getByTestId('token-balance')).toHaveText('Unlimited');
     await expect(tokenRow.locator('[data-testid="token-quota-track"]')).toHaveCount(0);

@@ -1,6 +1,6 @@
 //! 统一模型：管理 API CRUD、同组未隐藏撞名、有序 failover 与按实际模型计价。
 //!
-//! 主接缝：端到端 HTTP 黑盒。统一 ID 本身无价格行；失败跳不扣费；响应 `model`
+//! 主接缝：端到端 HTTP 黑盒。统一 ID 本身无价格行；每个出站尝试独立结算；响应 `model`
 //! 回显下游请求名。
 
 mod common;
@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -31,7 +32,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -42,7 +44,8 @@ async fn admin_json(
 async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -50,7 +53,7 @@ async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> re
 
 /// 以指定令牌向网关发一条 Chat Completions 请求。
 async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Response {
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base_url()))
         .bearer_auth(token)
         .json(&json!({
@@ -59,7 +62,9 @@ async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Re
         }))
         .send()
         .await
-        .expect("下游请求应能到达网关")
+        .expect("下游请求应能到达网关");
+    common::wait_for_request_persistence(&gw.pool).await;
+    response
 }
 
 fn completion_body(model: &str, prompt: u64, completion: u64) -> Value {
@@ -87,7 +92,7 @@ async fn balance_micros(gw: &TestGateway, key: &str) -> i64 {
          FROM tokens t JOIN user_balance ub ON ub.user_id = t.user_id \
          WHERE t.token_key = ?",
     )
-    .bind(key)
+    .bind(kairos::store::token_key_fingerprint(key))
     .fetch_one(&gw.pool)
     .await
     .expect("用户余额应存在")
@@ -359,9 +364,14 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             models: vec!["cheap".to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+            reasoning_output: Default::default(),
+            session_cache_key: Default::default(),
+            injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         },
         Channel {
             name: "ch-pricey".to_string(),
@@ -378,9 +388,14 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             models: vec!["pricey".to_string()],
             model_aliases: Default::default(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: kairos::store::resources::DEFAULT_MODEL_GROUP.to_string(),
+            reasoning_output: Default::default(),
+            session_cache_key: Default::default(),
+            injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         },
     ];
     seed.prices = vec![
@@ -391,6 +406,7 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             output_micros: 1_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         },
         Price {
             channel_id: SEED_PRICE_ATTACH_LISTING_CHANNELS,
@@ -399,12 +415,13 @@ fn two_member_seed(bases: &[String]) -> common::Seed {
             output_micros: 10_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         },
     ];
     seed.unified_models = vec![UnifiedModel {
         id: "bundle".to_string(),
         models: vec![member(1, "cheap"), member(2, "pricey")],
-        hide: false,
+        is_hidden: false,
     }];
     seed
 }
@@ -434,7 +451,7 @@ async fn ordered_failover_tries_one_member_at_a_time() {
     assert!(rows[0].1.is_some(), "新日志应有 request_id");
     assert_eq!(rows[0].1, rows[1].1, "同一下游请求的 hop 共用 request_id");
 
-    let lifetime = kairos::store::query_lifetime_stats(&gw.pool, None)
+    let lifetime = kairos::store::request_log::query_lifetime_stats(&gw.pool, None)
         .await
         .expect("应能聚合");
     assert_eq!(
@@ -468,7 +485,7 @@ async fn same_name_on_two_channels_are_independent_members() {
         seed.unified_models = vec![UnifiedModel {
             id: "bundle".to_string(),
             models: vec![member(1, "gpt-4o"), member(2, "gpt-4o")],
-            hide: false,
+            is_hidden: false,
         }];
         seed
     })
@@ -482,16 +499,13 @@ async fn same_name_on_two_channels_are_independent_members() {
     assert_eq!(ups[1].received().len(), 1, "渠道 1 失败后再打渠道 2");
     assert_eq!(ups[0].received()[0]["model"], "gpt-4o");
     assert_eq!(ups[1].received()[0]["model"], "gpt-4o");
-    assert_eq!(
-        balance_micros(&gw, TEST_TOKEN_KEY).await,
-        5_000_000 - 10_000,
-        "应按渠道 2 的单价扣费"
-    );
+    let balance = balance_micros(&gw, TEST_TOKEN_KEY).await;
+    assert_eq!(balance, 5_000_000 - 10_000, "失败尝试缺失 usage 不产生费用");
 }
 
-/// 按实际打到的成员计价；统一 ID 无价格行不 503；失败跳不扣费。
+/// 按实际打到的成员计价；统一 ID 无价格行不 503；失败尝试保留对账日志。
 #[tokio::test]
-async fn bills_served_member_and_does_not_charge_failed_hops() {
+async fn bills_served_member_and_records_failed_attempts() {
     let (gw, mut ups) = TestGateway::start_with_multi(2, two_member_seed).await;
     ups[0].set_behavior(UpstreamBehavior::Status429);
     ups[1].set_behavior(UpstreamBehavior::Json(completion_body("pricey", 1000, 0)));
@@ -499,11 +513,9 @@ async fn bills_served_member_and_does_not_charge_failed_hops() {
     let resp = chat_request(&gw, TEST_TOKEN_KEY, "bundle").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 1000 input × 10 USD/1M = 10_000 micros；失败的 cheap 跳不扣。
-    assert_eq!(
-        balance_micros(&gw, TEST_TOKEN_KEY).await,
-        5_000_000 - 10_000
-    );
+    // 成功成员按实际 usage 扣 10_000 micros，失败成员缺失 usage 不产生费用。
+    let balance = balance_micros(&gw, TEST_TOKEN_KEY).await;
+    assert_eq!(balance, 5_000_000 - 10_000);
 
     let row: (String, Option<String>, i64, String) = sqlx::query_as(
         "SELECT model, outbound_model, cost_usd_micros, channel FROM request_log \
@@ -543,7 +555,7 @@ async fn hidden_colliding_id_is_served_as_unified_model() {
         seed.unified_models = vec![UnifiedModel {
             id: "gpt-4o".to_string(),
             models: vec![member(1, "gpt-4o"), member(2, "pricey")],
-            hide: true,
+            is_hidden: true,
         }];
         seed
     })
@@ -566,7 +578,7 @@ async fn invalid_members_return_gateway_reason_not_acl() {
         seed.unified_models = vec![UnifiedModel {
             id: "bundle".to_string(),
             models: vec![member(1, "missing")],
-            hide: false,
+            is_hidden: false,
         }];
         seed
     })
@@ -607,9 +619,9 @@ async fn stale_member_is_skipped_then_next_serves() {
     assert_eq!(ups[1].received().len(), 0);
 }
 
-/// 删除钉住的渠道后，GET 统一模型把该成员标为 `available: false`。
+/// 删除渠道时同步移除统一模型和模型组中的引用。
 #[tokio::test]
-async fn deleted_channel_marks_unified_member_unavailable() {
+async fn deleting_channel_removes_dependent_model_references() {
     let gw = TestGateway::start_with_admin(common::test_seed).await;
     let channel_id = first_channel_id(&gw).await;
     let created = admin_json(
@@ -624,6 +636,21 @@ async fn deleted_channel_marks_unified_member_unavailable() {
     )
     .await;
     assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let group = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/model-groups",
+        json!({
+            "name": "channel-dependent",
+            "models": [
+                { "kind": "source", "channel_id": channel_id, "model": TEST_MODEL },
+                { "kind": "unified", "id": "bundle" }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(group.status(), reqwest::StatusCode::CREATED);
 
     let listed: Value = admin_get(&gw, "/unified-models")
         .await
@@ -645,10 +672,52 @@ async fn deleted_channel_marks_unified_member_unavailable() {
         .json()
         .await
         .expect("列表应可解析");
-    assert_eq!(listed[0]["id"], "bundle");
-    assert_eq!(listed[0]["models"][0]["channel_id"], channel_id);
-    assert_eq!(
-        listed[0]["models"][0]["available"], false,
-        "渠道删除后成员应标为不可用"
-    );
+    assert_eq!(listed, json!([]), "空统一模型应随最后一个成员一并删除");
+
+    let groups: Value = admin_get(&gw, "/model-groups")
+        .await
+        .json()
+        .await
+        .expect("模型组列表应可解析");
+    let dependent = groups
+        .as_array()
+        .expect("模型组列表应为数组")
+        .iter()
+        .find(|group| group["name"] == "channel-dependent")
+        .expect("模型组本身应保留");
+    assert_eq!(dependent["models"], json!([]));
+}
+
+/// 统一成员只有在渠道启用、登记、具备密钥且已定价时才标为可用。
+#[tokio::test]
+async fn unpriced_unified_member_is_marked_unavailable() {
+    let gw = TestGateway::start_with_admin(common::test_seed).await;
+    let channel_id = first_channel_id(&gw).await;
+    let created = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/unified-models",
+        json!({
+            "id": "unpriced-bundle",
+            "models": [member_json(channel_id, TEST_MODEL)],
+            "hide": false
+        }),
+    )
+    .await;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+
+    let deleted = admin_send(
+        &gw,
+        reqwest::Method::DELETE,
+        &format!("/prices/{channel_id}/{TEST_MODEL}"),
+    )
+    .await;
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+
+    let listed: Value = admin_get(&gw, "/unified-models")
+        .await
+        .json()
+        .await
+        .expect("列表应可解析");
+    assert_eq!(listed[0]["models"][0]["available"], false);
 }

@@ -29,6 +29,7 @@ pub(super) async fn initialize(pool: &SqlitePool) -> Result<(), super::StoreErro
         "SELECT MAX(id) FROM (
              SELECT id FROM smoke_probe
              UNION ALL SELECT id FROM request_log
+             UNION ALL SELECT id FROM request_log_outbox
              UNION ALL SELECT id FROM plans
              UNION ALL SELECT id FROM system_log
              UNION ALL SELECT id FROM users

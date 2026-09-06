@@ -3,6 +3,8 @@
 mod common;
 
 use common::TestGateway;
+use common::admin::{chat_request, make_successful_request};
+use common::{TEST_MODEL, TEST_TOKEN_KEY};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
@@ -13,7 +15,8 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
 async fn post(gw: &TestGateway, path: &str, body: Value) -> reqwest::Response {
     reqwest::Client::new()
         .post(admin_url(gw, path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -110,7 +113,8 @@ async fn token_attributes_and_balance_commands_have_disjoint_write_surfaces() {
 
     let bad_update = reqwest::Client::new()
         .put(admin_url(&gw, &format!("/tokens/{id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "must-not-land",
             "enabled": true,
@@ -123,7 +127,8 @@ async fn token_attributes_and_balance_commands_have_disjoint_write_surfaces() {
 
     let updated = reqwest::Client::new()
         .put(admin_url(&gw, &format!("/tokens/{id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "name": "renamed", "enabled": true }))
         .send()
         .await
@@ -188,7 +193,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let updated = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "atomic-after",
             "rate_limit_rpm": 60,
@@ -211,7 +217,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let replay = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "replayed-attributes",
             "rate_limit_rpm": 90,
@@ -233,7 +240,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let failed = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "must-roll-back",
             "rate_limit_rpm": 120,
@@ -251,7 +259,8 @@ async fn token_update_commits_attributes_and_balance_atomically() {
 
     let conflict = reqwest::Client::new()
         .put(admin_url(&gw, &path))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({
             "name": "must-also-roll-back",
             "rate_limit_rpm": 120,
@@ -297,7 +306,7 @@ async fn token_mode_changes_are_explicit_and_finite_balance_is_derived_from_sett
     assert_eq!(created.status(), StatusCode::CREATED);
     let created: Value = created.json().await.expect("令牌应可解析");
     let id = created["id"].as_i64().expect("应有令牌 id");
-    let key = created["token_key"].as_str().expect("应有 key");
+    let key = created["plaintext_key"].as_str().expect("应有 key");
     let path = format!("/tokens/{id}/balance-adjustments");
 
     let unlimited = post(
@@ -324,7 +333,7 @@ async fn token_mode_changes_are_explicit_and_finite_balance_is_derived_from_sett
     assert_eq!(invalid_adjustment.status(), StatusCode::CONFLICT);
 
     sqlx::query("UPDATE token_balance SET settled_usd_micros = 3_000_000 WHERE token_key = ?")
-        .bind(key)
+        .bind(kairos::store::token_key_fingerprint(key))
         .execute(&gw.pool)
         .await
         .expect("应能模拟累计结算");
@@ -372,16 +381,17 @@ async fn delete_token_returns_the_balance_observed_before_settlement_cleanup() {
     assert_eq!(created.status(), StatusCode::CREATED);
     let created: Value = created.json().await.expect("令牌应可解析");
     let id = created["id"].as_i64().expect("应有令牌 id");
-    let key = created["token_key"].as_str().expect("应有 key");
+    let key = created["plaintext_key"].as_str().expect("应有 key");
     sqlx::query("UPDATE token_balance SET settled_usd_micros = 3_000_000 WHERE token_key = ?")
-        .bind(key)
+        .bind(kairos::store::token_key_fingerprint(key))
         .execute(&gw.pool)
         .await
         .expect("应能模拟累计结算");
 
     let deleted = reqwest::Client::new()
         .delete(admin_url(&gw, &format!("/tokens/{id}")))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("删除请求应可达");
@@ -389,4 +399,45 @@ async fn delete_token_returns_the_balance_observed_before_settlement_cleanup() {
     let deleted: Value = deleted.json().await.expect("删除响应应可解析");
     assert_eq!(deleted["settled_usd_micros"], 3_000_000);
     assert_eq!(deleted["balance_usd_micros"], 7_000_000);
+}
+
+/// 余额调整为相对量：扣减至零余额 → 计费准入拒绝（402）；充值后恢复可用。
+#[tokio::test]
+async fn balance_adjustment_reflected_in_admission() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    let client = reqwest::Client::new();
+    let admin = gw.admin_base_url();
+
+    // 初始余额 5 USD = 5_000_000 micros，扣减至 0。
+    let resp = client
+        .post(format!("{admin}/users/1/balance-adjustments"))
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
+        .json(&json!({ "operation_id": "admin-balance-3", "delta_usd_micros": -5_000_000, "reason": "manual_adjustment" }))
+        .send()
+        .await
+        .expect("应可调整余额");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let adjustment: Value = resp.json().await.expect("余额操作应可解析");
+    assert_eq!(adjustment["after_balance_usd_micros"], 0);
+
+    // 零余额：计费准入拒绝。
+    let resp = chat_request(&gw, TEST_TOKEN_KEY, TEST_MODEL).await;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::PAYMENT_REQUIRED,
+        "零余额应 402"
+    );
+
+    // 充值后恢复可用。
+    let resp = client
+        .post(format!("{admin}/users/1/balance-adjustments"))
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
+        .json(&json!({ "operation_id": "admin-balance-4", "delta_usd_micros": 5_000_000, "reason": "manual_adjustment" }))
+        .send()
+        .await
+        .expect("应可充值");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    make_successful_request(&mut gw).await;
 }

@@ -1,7 +1,7 @@
 //! 运行时资源存储：渠道、令牌、价格、模型组、统一模型与运行时开关的读写原语。
 //!
 //! 资源 CRUD 写操作接受 `&mut SqliteConnection`，可组合进事务；读操作接受
-//! `&SqlitePool`。金额一律整数 micro-USD（ADR-0002）。wire 协议类型复用
+//! `&SqlitePool`。金额一律整数 micro-USD。wire 协议类型复用
 //! `crate::config::Protocol`，落库为其 serde rename 字符串。
 
 use std::collections::{HashMap, HashSet};
@@ -11,6 +11,8 @@ use serde_json::Value;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::config::Protocol;
+use crate::config::ReasoningOutputMode;
+use crate::config::SessionCacheKeyMode;
 use crate::store::StoreError;
 pub use crate::store::channel_keys::{
     ChannelKey, StoredChannelKey, channel_key_supports_model, select_channel_key,
@@ -48,12 +50,43 @@ pub struct Channel {
     pub models: Vec<String>,
     pub model_aliases: HashMap<String, String>,
     pub timeout_ms: u64,
+    /// 渠道级预首字节总时限（毫秒）：约束该渠道的连接、响应头、流首 peek 与
+    /// 同渠道重试退避（共享本预算）；failover 换渠道时按新渠道预算重锚。
+    /// 缺省 [`DEFAULT_REQUEST_TIMEOUT_MS`]，与原全局硬编码一致。
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
     pub max_retries: u32,
     /// 是否启用：禁用的渠道不参与路由候选与失败切换。
     pub enabled: bool,
     /// 添加可调用名时并入的模型组；[`DEFAULT_MODEL_GROUP`] 表示不自动入组。
     #[serde(default = "default_model_group")]
     pub model_group: String,
+    /// reasoning 思维链兼容输出模式；缺省 [`ReasoningOutputMode::Auto`]。
+    #[serde(default)]
+    pub reasoning_output: ReasoningOutputMode,
+    /// 会话缓存键回写模式；缺省 [`SessionCacheKeyMode::Off`]。
+    #[serde(default)]
+    pub session_cache_key: SessionCacheKeyMode,
+    /// 是否自动注入缓存断点：开启时面向 Anthropic 渠道的出站请求按
+    /// tools 尾 → system 尾 → 末条消息尾块的顺序补 `cache_control`。
+    /// 缺省 `false`，存量渠道出站行为不变。
+    #[serde(default)]
+    pub injects_cache_breakpoints: bool,
+    /// 下游断开时是否立即取消上游流消费：开启（缺省）则在下游断连后停止
+    /// 读取上游字节流并按已嗅探 usage 结算；关闭则维持既有语义，继续消费
+    /// 上游至自然收尾、按实际 usage 结算。
+    #[serde(default = "default_abort_on_disconnect")]
+    pub abort_on_disconnect: bool,
+}
+
+/// serde 缺省：渠道未写 `abort_on_disconnect` 时下游断连即取消上游消费。
+fn default_abort_on_disconnect() -> bool {
+    true
+}
+
+/// serde 缺省：渠道未写 `request_timeout_ms` 时沿用原全局 120s 总时限。
+fn default_request_timeout_ms() -> u64 {
+    DEFAULT_REQUEST_TIMEOUT_MS
 }
 
 /// 渠道的完整只读视图：库生成的稳定身份 + 定义字段。
@@ -185,7 +218,7 @@ impl std::fmt::Display for UnifiedMember {
     }
 }
 
-/// 统一模型：一个下游可调用名，按顺序尝试若干钉渠道的成员（ADR-0004）。
+/// 统一模型：一个下游可调用名，按顺序尝试若干钉渠道的成员。
 ///
 /// 管理 API 以其 JSON 形态作为 wire 契约；`deny_unknown_fields` 使字段拼写
 /// 错误直接报错而非静默忽略。统一 ID 本身没有价格行。
@@ -198,7 +231,8 @@ pub struct UnifiedModel {
     pub models: Vec<UnifiedMember>,
     /// 开隐藏则同名已登记模型在组内只表示本统一模型；默认影响下游列表。
     #[serde(default)]
-    pub hide: bool,
+    #[serde(rename = "hide")]
+    pub is_hidden: bool,
 }
 
 /// 渠道已登记的可调用名：`models` ∪ 别名 key。
@@ -286,8 +320,12 @@ pub fn registered_callable_names<'a>(
 }
 
 /// 未隐藏的统一模型 ID 与已登记模型/别名同名时无法在同组并存。
-pub fn unhidden_unified_id_collides(id: &str, hide: bool, registered: &HashSet<String>) -> bool {
-    !hide && registered.contains(id)
+pub fn unhidden_unified_id_collides(
+    id: &str,
+    is_hidden: bool,
+    registered: &HashSet<String>,
+) -> bool {
+    !is_hidden && registered.contains(id)
 }
 
 /// 令牌绑定组是否允许调用该名。
@@ -333,7 +371,7 @@ pub fn visible_model_ids<'a>(
 
     let hidden_members: HashSet<String> = unified_models
         .values()
-        .filter(|model| model.hide && names.contains(&model.id))
+        .filter(|model| model.is_hidden && names.contains(&model.id))
         .flat_map(|model| {
             model
                 .models
@@ -364,7 +402,8 @@ pub struct TokenRecord {
     pub last_used_at: Option<i64>,
 }
 
-/// 某一渠道上某一已登记模型名的四档单价（micro-USD / 1M tokens）；
+/// 某一渠道上某一已登记模型名的价格档（micro-USD / 1M tokens），
+/// cache 写入可细分 1h TTL 档；
 /// 缓存档 `None` 表示该档不计价。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -376,6 +415,9 @@ pub struct Price {
     pub output_micros: i64,
     pub cache_read_micros: Option<i64>,
     pub cache_write_micros: Option<i64>,
+    /// cache 写入 1h TTL 档单价；`None` 表示未配置，整行按 `cache_write`
+    /// 单一费率计。配置了即启用 1h 分档，是渠道级运营决策。
+    pub cache_write_1h_micros: Option<i64>,
 }
 
 /// 运行时开关键：是否落完整请求/响应 body。
@@ -402,17 +444,25 @@ pub const SETTING_RETRY_BACKOFF_CAP_MS: &str = "retry_backoff_cap_ms";
 pub const SETTING_RETRY_AFTER_CAP_SECS: &str = "retry_after_cap_secs";
 /// 运行时开关键：未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
 pub const SETTING_RATE_LIMIT_RPM: &str = "rate_limit_rpm";
+/// 运行时开关键：上游 400 的请求整流重试（错误模式匹配 + 最小修正）。
+pub const SETTING_REQUEST_RECTIFY: &str = "request_rectify";
+/// 运行时开关键：是否允许向解析为私网/环回/链路本地地址的上游发起请求。
+pub const SETTING_ALLOW_PRIVATE_NETWORKS: &str = "allow_private_networks";
+/// 运行时开关键：允许解析到私网的精确主机名或 IP 字面量列表。
+pub const SETTING_PRIVATE_NETWORK_ALLOWLIST: &str = "private_network_allowlist";
+/// 进程实例密钥：用于派生出站缓存亲和标识；不属于管理 API 设置契约。
+pub(crate) const SETTING_SESSION_CACHE_SECRET: &str = "session_cache_secret";
 /// 目录元数据键：上次成功同步的 unix 毫秒；缺省表示从未同步。不在 Settings 契约里。
 pub const SETTING_CATALOG_SYNCED_AT: &str = "catalog_synced_at";
 
-/// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片，与参考网关 bifrost
-/// 的 `max_request_body_size_mb: 100` 对齐。
-pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 100 * 1024 * 1024;
+/// 入站请求体大小上限的缺省值（字节）：覆盖常规 base64 图片请求；请求体
+/// 整体缓冲进内存，缺省档位同时约束 128 并发下的峰值内存（50MB × 128）。
+pub const DEFAULT_MAX_REQUEST_BYTES: u64 = 50 * 1024 * 1024;
 /// 上游非流式响应体上限缺省值（字节）：与入站上限同档，避免镜像/异常上游把
 /// 整段 JSON 读进内存撑爆进程。流式路径另有 `sse_reassembly_max_bytes`。
-pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024;
 /// 请求日志 body 截断缺省值（字节）：full_body 开启时单行日志的封顶，避免复用
-/// 入站 100MB 上限把 SQLite 撑慢。
+/// 入站上限把 SQLite 撑慢。
 pub const DEFAULT_LOG_BODY_MAX_BYTES: u64 = 1024 * 1024;
 /// 认证失败限流次数缺省值。
 pub const DEFAULT_AUTH_THROTTLE_MAX_FAILURES: u64 = 30;
@@ -428,6 +478,29 @@ pub const DEFAULT_RETRY_BACKOFF_CAP_MS: u64 = 5_000;
 pub const DEFAULT_RETRY_AFTER_CAP_SECS: u64 = 60;
 /// 全局每分钟请求兜底缺省值：`0` 表示不设全局上限（令牌也可显式不限速）。
 pub const DEFAULT_RATE_LIMIT_RPM: u64 = 0;
+/// 请求整流重试缺省开启：只作用于原本必败的 400 请求，动作可审计且随
+/// warnings 回传下游，风险低于让请求直接失败。
+pub const DEFAULT_REQUEST_RECTIFY: bool = true;
+/// 默认拒绝私网目标；需要内网渠道时由 root 在设置中显式放行。
+pub const DEFAULT_ALLOW_PRIVATE_NETWORKS: bool = false;
+/// 单次渠道调用的服务端超时下限（毫秒）：更小的值连常规握手都来不及完成，
+/// 每次调用都会退化为确定性超时。校验只拦新增写入；存量库中的更小旧值由
+/// 运行时钳制继续兼容。
+pub const MIN_CHANNEL_TIMEOUT_MS: u64 = 1_000;
+/// 单次渠道调用的服务端超时硬上限。管理面拒绝更大值，请求路径仍再次钳制，
+/// 使直接写库或旧快照也不能突破请求资源预算。
+pub const MAX_CHANNEL_TIMEOUT_MS: u64 = 120_000;
+/// 渠道级预首字节总时限缺省值（毫秒）：与原网关全局硬编码一致。
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 120_000;
+/// 渠道级预首字节总时限下限（毫秒）：连接、响应头与流首 peek 共享该预算，
+/// 短于一次常规握手加首字节的时长没有运营意义。校验只拦新增写入；存量库
+/// 中的更小旧值由运行时钳制继续兼容。
+pub const MIN_REQUEST_TIMEOUT_MS: u64 = 1_000;
+/// 渠道级预首字节总时限上限（毫秒）：深度推理/大 prompt 的合法长首字节
+/// 允许到 10 分钟，再长的应走异步化而非占用活动请求容量。
+pub const MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
+/// 每渠道同 key 重试硬上限；密钥轮换另受启用密钥数量的有限集合约束。
+pub const MAX_CHANNEL_RETRIES: u32 = 4;
 
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_auth_throttle_max_failures() -> u64 {
@@ -452,6 +525,13 @@ fn default_retry_backoff_cap_ms() -> u64 {
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_retry_after_cap_secs() -> u64 {
     DEFAULT_RETRY_AFTER_CAP_SECS
+}
+/// serde 缺省：PUT 省略该键时与空库加载一致。
+fn default_request_rectify() -> bool {
+    DEFAULT_REQUEST_RECTIFY
+}
+fn default_allow_private_networks() -> bool {
+    DEFAULT_ALLOW_PRIVATE_NETWORKS
 }
 /// serde 缺省：PUT 省略该键时与空库加载一致。
 fn default_log_body_max_bytes() -> u64 {
@@ -505,6 +585,15 @@ pub struct Settings {
     /// 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
     #[serde(default)]
     pub rate_limit_rpm: u64,
+    /// 上游 400 的请求整流重试（错误模式匹配 + 最小修正后重试一次）。
+    #[serde(default = "default_request_rectify")]
+    pub request_rectify: bool,
+    /// 是否允许私网、环回与链路本地上游地址。
+    #[serde(default = "default_allow_private_networks")]
+    pub allow_private_networks: bool,
+    /// 无需全局放开私网即可访问的精确主机名或 IP；不接受通配符和 URL。
+    #[serde(default)]
+    pub private_network_allowlist: Vec<String>,
 }
 
 impl Default for Settings {
@@ -522,16 +611,20 @@ impl Default for Settings {
             retry_backoff_cap_ms: DEFAULT_RETRY_BACKOFF_CAP_MS,
             retry_after_cap_secs: DEFAULT_RETRY_AFTER_CAP_SECS,
             rate_limit_rpm: DEFAULT_RATE_LIMIT_RPM,
+            request_rectify: DEFAULT_REQUEST_RECTIFY,
+            allow_private_networks: DEFAULT_ALLOW_PRIVATE_NETWORKS,
+            private_network_allowlist: Vec::new(),
         }
     }
 }
 
 /// `Protocol` 落库用的 wire 字符串。
-fn protocol_to_wire(p: Protocol) -> &'static str {
+pub(crate) fn protocol_to_wire(p: Protocol) -> &'static str {
     match p {
         Protocol::OpenAiChat => "openai_chat",
         Protocol::OpenAiResponses => "openai_responses",
         Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::Gemini => "gemini",
     }
 }
 
@@ -541,8 +634,51 @@ fn protocol_from_wire(s: &str) -> Result<Protocol, StoreError> {
         "openai_chat" => Ok(Protocol::OpenAiChat),
         "openai_responses" => Ok(Protocol::OpenAiResponses),
         "anthropic_messages" => Ok(Protocol::AnthropicMessages),
+        "gemini" => Ok(Protocol::Gemini),
         other => Err(StoreError::InvalidResource(format!(
             "未知渠道协议: {other}"
+        ))),
+    }
+}
+
+/// `ReasoningOutputMode` 落库用的 wire 字符串（与 serde rename 一致）。
+fn reasoning_output_to_wire(mode: ReasoningOutputMode) -> &'static str {
+    match mode {
+        ReasoningOutputMode::Auto => "auto",
+        ReasoningOutputMode::Always => "always",
+        ReasoningOutputMode::Off => "off",
+    }
+}
+
+/// 从库中读出 `ReasoningOutputMode`。
+fn reasoning_output_from_wire(s: &str) -> Result<ReasoningOutputMode, StoreError> {
+    match s {
+        "auto" => Ok(ReasoningOutputMode::Auto),
+        "always" => Ok(ReasoningOutputMode::Always),
+        "off" => Ok(ReasoningOutputMode::Off),
+        other => Err(StoreError::InvalidResource(format!(
+            "未知 reasoning 输出模式: {other}"
+        ))),
+    }
+}
+
+/// `SessionCacheKeyMode` 落库用的 wire 字符串（与 serde rename 一致）。
+fn session_cache_key_to_wire(mode: SessionCacheKeyMode) -> &'static str {
+    match mode {
+        SessionCacheKeyMode::Off => "off",
+        SessionCacheKeyMode::Auto => "auto",
+        SessionCacheKeyMode::Always => "always",
+    }
+}
+
+/// 从库中读出 `SessionCacheKeyMode`。
+fn session_cache_key_from_wire(s: &str) -> Result<SessionCacheKeyMode, StoreError> {
+    match s {
+        "off" => Ok(SessionCacheKeyMode::Off),
+        "auto" => Ok(SessionCacheKeyMode::Auto),
+        "always" => Ok(SessionCacheKeyMode::Always),
+        other => Err(StoreError::InvalidResource(format!(
+            "未知会话缓存键回写模式: {other}"
         ))),
     }
 }
@@ -611,13 +747,29 @@ pub async fn list_channel_records_on_conn(
 }
 
 const CHANNEL_RECORD_SELECT: &str = "SELECT id, name, protocol, base_url, models_json, \
-    model_aliases_json, timeout_ms, max_retries, enabled, model_group FROM channels";
+    model_aliases_json, timeout_ms, request_timeout_ms, max_retries, enabled, model_group, \
+    reasoning_output, session_cache_key, injects_cache_breakpoints, abort_on_disconnect \
+    FROM channels";
 
 /// 把渠道行映射为 `ChannelRecord`；`enabled` 以 0/1 整数落库，非 0 视为启用。
 fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, StoreError> {
     let name: String = row.try_get("name").map_err(StoreError::Query)?;
     let protocol_wire: String = row.try_get("protocol").map_err(StoreError::Query)?;
     let enabled: i64 = row.try_get("enabled").map_err(StoreError::Query)?;
+    let reasoning_output_wire: String =
+        row.try_get("reasoning_output").map_err(StoreError::Query)?;
+    let session_cache_key_wire: String = row
+        .try_get("session_cache_key")
+        .map_err(StoreError::Query)?;
+    let injects_cache_breakpoints: i64 = row
+        .try_get("injects_cache_breakpoints")
+        .map_err(StoreError::Query)?;
+    let abort_on_disconnect: i64 = row
+        .try_get("abort_on_disconnect")
+        .map_err(StoreError::Query)?;
+    let request_timeout_ms: i64 = row
+        .try_get("request_timeout_ms")
+        .map_err(StoreError::Query)?;
     // 先解析集合字段（错误信息需要引用 name），再构造结构体以避免移动后借用。
     let models: Vec<String> = serde_json::from_str(
         &row.try_get::<String, _>("models_json")
@@ -636,6 +788,7 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             base_url: row.try_get("base_url").map_err(StoreError::Query)?,
             keys: Vec::new(),
             timeout_ms: row.try_get("timeout_ms").map_err(StoreError::Query)?,
+            request_timeout_ms: request_timeout_ms.max(0) as u64,
             max_retries: row.try_get("max_retries").map_err(StoreError::Query)?,
             enabled: enabled != 0,
             name,
@@ -643,6 +796,10 @@ fn map_channel_record(row: &sqlx::sqlite::SqliteRow) -> Result<ChannelRecord, St
             models,
             model_aliases,
             model_group: row.try_get("model_group").map_err(StoreError::Query)?,
+            reasoning_output: reasoning_output_from_wire(&reasoning_output_wire)?,
+            session_cache_key: session_cache_key_from_wire(&session_cache_key_wire)?,
+            injects_cache_breakpoints: injects_cache_breakpoints != 0,
+            abort_on_disconnect: abort_on_disconnect != 0,
         },
         keys: Vec::new(),
     })
@@ -794,8 +951,9 @@ pub async fn insert_channel(
     let result = sqlx::query(
         "INSERT INTO channels \
          (name, protocol, base_url, models_json, model_aliases_json, \
-          timeout_ms, max_retries, enabled, model_group) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          timeout_ms, request_timeout_ms, max_retries, enabled, model_group, reasoning_output, \
+          session_cache_key, injects_cache_breakpoints, abort_on_disconnect) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&channel.name)
     .bind(protocol_to_wire(channel.protocol))
@@ -803,9 +961,14 @@ pub async fn insert_channel(
     .bind(&models_json)
     .bind(&aliases_json)
     .bind(channel.timeout_ms as i64)
+    .bind(channel.request_timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
     .bind(&channel.model_group)
+    .bind(reasoning_output_to_wire(channel.reasoning_output))
+    .bind(session_cache_key_to_wire(channel.session_cache_key))
+    .bind(channel.injects_cache_breakpoints)
+    .bind(channel.abort_on_disconnect)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -856,8 +1019,9 @@ pub async fn update_channel(
         "UPDATE channels SET \
            name = ?, protocol = ?, base_url = ?, \
            models_json = ?, model_aliases_json = ?, \
-           timeout_ms = ?, max_retries = ?, enabled = ?, \
-           model_group = ? \
+           timeout_ms = ?, request_timeout_ms = ?, max_retries = ?, enabled = ?, \
+           model_group = ?, reasoning_output = ?, session_cache_key = ?, \
+           injects_cache_breakpoints = ?, abort_on_disconnect = ? \
          WHERE id = ?",
     )
     .bind(&channel.name)
@@ -866,9 +1030,14 @@ pub async fn update_channel(
     .bind(&models_json)
     .bind(&aliases_json)
     .bind(channel.timeout_ms as i64)
+    .bind(channel.request_timeout_ms as i64)
     .bind(channel.max_retries)
     .bind(channel.enabled)
     .bind(&channel.model_group)
+    .bind(reasoning_output_to_wire(channel.reasoning_output))
+    .bind(session_cache_key_to_wire(channel.session_cache_key))
+    .bind(channel.injects_cache_breakpoints)
+    .bind(channel.abort_on_disconnect)
     .bind(id)
     .execute(&mut *conn)
     .await
@@ -914,6 +1083,34 @@ pub async fn update_channel(
 
 /// 按 `id` 删除渠道；不存在视为成功（幂等）。
 pub async fn delete_channel(conn: &mut SqliteConnection, id: i64) -> Result<(), StoreError> {
+    let unified = list_unified_models_on_conn(conn).await?;
+    let mut deleted_unified_ids = Vec::new();
+    for mut model in unified {
+        let before = model.models.len();
+        model.models.retain(|member| member.channel_id != id);
+        if model.models.len() == before {
+            continue;
+        }
+        if model.models.is_empty() {
+            delete_unified_model(conn, &model.id).await?;
+            deleted_unified_ids.push(model.id);
+        } else {
+            upsert_unified_model(conn, &model).await?;
+        }
+    }
+
+    let mut groups = list_model_groups_on_conn(conn).await?;
+    for group in &mut groups {
+        let before = group.models.len();
+        group.models.retain(|entry| match entry {
+            GroupModel::Source { channel_id, .. } => *channel_id != id,
+            GroupModel::Unified { id } => !deleted_unified_ids.iter().any(|deleted| deleted == id),
+        });
+        if group.models.len() != before {
+            upsert_model_group(conn, group).await?;
+        }
+    }
+
     sqlx::query("DELETE FROM channels WHERE id = ?")
         .bind(id)
         .execute(&mut *conn)
@@ -1171,6 +1368,16 @@ pub async fn list_model_groups(pool: &SqlitePool) -> Result<Vec<ModelGroup>, Sto
     rows.iter().map(map_model_group).collect()
 }
 
+async fn list_model_groups_on_conn(
+    conn: &mut SqliteConnection,
+) -> Result<Vec<ModelGroup>, StoreError> {
+    let rows = sqlx::query("SELECT name, models_json FROM model_groups")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(StoreError::Query)?;
+    rows.iter().map(map_model_group).collect()
+}
+
 /// 把模型组行映射为 `ModelGroup`。
 fn map_model_group(row: &sqlx::sqlite::SqliteRow) -> Result<ModelGroup, StoreError> {
     let name: String = row.try_get("name").map_err(StoreError::Query)?;
@@ -1255,7 +1462,7 @@ fn map_unified_model(row: &sqlx::sqlite::SqliteRow) -> Result<UnifiedModel, Stor
     Ok(UnifiedModel {
         id,
         models,
-        hide: hide != 0,
+        is_hidden: hide != 0,
     })
 }
 
@@ -1271,7 +1478,7 @@ pub async fn upsert_unified_model(
     )
     .bind(&model.id)
     .bind(&models_json)
-    .bind(model.hide)
+    .bind(model.is_hidden)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -1305,7 +1512,7 @@ pub async fn rebind_channels_to_default(
 /// 读出全部价格（每渠道每模型一行）。
 pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
     let rows = sqlx::query(
-        "SELECT channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros \
+        "SELECT channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros, cache_write_1h_micros \
          FROM prices",
     )
     .fetch_all(pool)
@@ -1326,6 +1533,9 @@ pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
                 cache_write_micros: row
                     .try_get("cache_write_micros")
                     .map_err(StoreError::Query)?,
+                cache_write_1h_micros: row
+                    .try_get("cache_write_1h_micros")
+                    .map_err(StoreError::Query)?,
             })
         })
         .collect::<Result<Vec<_>, StoreError>>()?;
@@ -1336,12 +1546,13 @@ pub async fn list_prices(pool: &SqlitePool) -> Result<Vec<Price>, StoreError> {
 pub async fn upsert_price(conn: &mut SqliteConnection, price: &Price) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO prices \
-         (channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros) \
-         VALUES (?, ?, ?, ?, ?, ?) \
+         (channel_id, model, input_micros, output_micros, cache_read_micros, cache_write_micros, cache_write_1h_micros) \
+         VALUES (?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(channel_id, model) DO UPDATE SET \
            input_micros = excluded.input_micros, output_micros = excluded.output_micros, \
            cache_read_micros = excluded.cache_read_micros, \
-           cache_write_micros = excluded.cache_write_micros",
+           cache_write_micros = excluded.cache_write_micros, \
+           cache_write_1h_micros = excluded.cache_write_1h_micros",
     )
     .bind(price.channel_id)
     .bind(&price.model)
@@ -1349,6 +1560,7 @@ pub async fn upsert_price(conn: &mut SqliteConnection, price: &Price) -> Result<
     .bind(price.output_micros)
     .bind(price.cache_read_micros)
     .bind(price.cache_write_micros)
+    .bind(price.cache_write_1h_micros)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::Query)?;
@@ -1367,33 +1579,6 @@ pub async fn delete_price(
         .execute(&mut *conn)
         .await
         .map_err(StoreError::Query)?;
-    Ok(())
-}
-
-/// 删掉该渠道上已不在可调用名集合中的价格行。
-pub async fn retain_channel_prices(
-    conn: &mut SqliteConnection,
-    channel_id: i64,
-    names: &HashSet<String>,
-) -> Result<(), StoreError> {
-    if names.is_empty() {
-        sqlx::query("DELETE FROM prices WHERE channel_id = ?")
-            .bind(channel_id)
-            .execute(&mut *conn)
-            .await
-            .map_err(StoreError::Query)?;
-        return Ok(());
-    }
-    let listed = serde_json::to_string(names).map_err(serde_error)?;
-    sqlx::query(
-        "DELETE FROM prices WHERE channel_id = ? \
-         AND model NOT IN (SELECT value FROM json_each(?))",
-    )
-    .bind(channel_id)
-    .bind(&listed)
-    .execute(&mut *conn)
-    .await
-    .map_err(StoreError::Query)?;
     Ok(())
 }
 
@@ -1432,6 +1617,82 @@ pub async fn list_settings(pool: &SqlitePool) -> Result<HashMap<String, Value>, 
         settings.insert(key, value);
     }
     Ok(settings)
+}
+
+/// 读取或创建实例级会话派生密钥。
+pub(crate) async fn load_or_create_session_cache_secret(
+    pool: &SqlitePool,
+) -> Result<[u8; 32], StoreError> {
+    let settings = list_settings(pool).await?;
+    if let Some(value) = settings.get(SETTING_SESSION_CACHE_SECRET) {
+        let encoded = value
+            .as_str()
+            .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥格式非法".to_string()))?;
+        return decode_session_cache_secret(encoded);
+    }
+
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    let encoded = hex_encode(&secret);
+    let mut conn = pool.acquire().await.map_err(StoreError::Query)?;
+    sqlx::query(
+        "INSERT INTO settings (setting_key, setting_value) VALUES (?, ?) \
+         ON CONFLICT(setting_key) DO NOTHING",
+    )
+    .bind(SETTING_SESSION_CACHE_SECRET)
+    .bind(serde_json::to_string(&Value::String(encoded)).map_err(serde_error)?)
+    .execute(&mut *conn)
+    .await
+    .map_err(StoreError::Query)?;
+    let stored: String =
+        sqlx::query_scalar("SELECT setting_value FROM settings WHERE setting_key = ?")
+            .bind(SETTING_SESSION_CACHE_SECRET)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(StoreError::Query)?;
+    let value: Value = serde_json::from_str(&stored)
+        .map_err(|_| StoreError::InvalidResource("会话缓存密钥值非法".to_string()))?;
+    let encoded = value
+        .as_str()
+        .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥格式非法".to_string()))?;
+    decode_session_cache_secret(encoded)
+}
+
+fn decode_session_cache_secret(encoded: &str) -> Result<[u8; 32], StoreError> {
+    if encoded.len() != 64 {
+        return Err(StoreError::InvalidResource(
+            "会话缓存密钥长度非法".to_string(),
+        ));
+    }
+    let mut secret = [0u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_digit(pair[0])
+            .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥包含非法字符".to_string()))?;
+        let low = hex_digit(pair[1])
+            .ok_or_else(|| StoreError::InvalidResource("会话缓存密钥包含非法字符".to_string()))?;
+        secret[index] = (high << 4) | low;
+    }
+    Ok(secret)
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 /// 按 `key` 删除一个运行时开关；不存在视为成功（幂等）。
@@ -1517,6 +1778,31 @@ pub async fn upsert_settings(
         conn,
         SETTING_RATE_LIMIT_RPM,
         &Value::from(settings.rate_limit_rpm),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_REQUEST_RECTIFY,
+        &Value::Bool(settings.request_rectify),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_ALLOW_PRIVATE_NETWORKS,
+        &Value::Bool(settings.allow_private_networks),
+    )
+    .await?;
+    set_setting(
+        conn,
+        SETTING_PRIVATE_NETWORK_ALLOWLIST,
+        &Value::Array(
+            settings
+                .private_network_allowlist
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        ),
     )
     .await?;
     Ok(())
@@ -1643,10 +1929,39 @@ mod tests {
             models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
             model_aliases: aliases,
             timeout_ms: 120_000,
+            request_timeout_ms: 120_000,
             max_retries: 2,
             enabled: true,
             model_group: DEFAULT_MODEL_GROUP.to_string(),
+            reasoning_output: Default::default(),
+            session_cache_key: Default::default(),
+            injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         }
+    }
+
+    /// 把期望渠道的密钥条目替换为读取面掩码形态：wire 读回的 `api_key`
+    /// 不含明文。
+    fn with_masked_keys(mut channel: Channel) -> Channel {
+        channel.keys = channel
+            .keys
+            .iter()
+            .map(|key| {
+                StoredChannelKey::new(
+                    0,
+                    0,
+                    key.name.clone(),
+                    key.api_key.clone(),
+                    key.weight,
+                    key.enabled,
+                    key.models.clone(),
+                    key.blocked_models.clone(),
+                    0,
+                )
+                .to_wire()
+            })
+            .collect();
+        channel
     }
 
     fn stored_key(
@@ -1889,7 +2204,83 @@ mod tests {
         let records = list_channel_records(&pool).await.expect("应能读渠道");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, id);
-        assert_eq!(records[0].channel, sample_channel());
+        assert_eq!(
+            records[0].channel,
+            with_masked_keys(sample_channel()),
+            "wire 读回的密钥应为掩码形态"
+        );
+
+        // reasoning 输出模式与会话缓存键回写模式三态落库往返；缺省（未写
+        // JSON 字段）为 auto / off。
+        for mode in [
+            ReasoningOutputMode::Auto,
+            ReasoningOutputMode::Always,
+            ReasoningOutputMode::Off,
+        ] {
+            let mut channel = sample_channel();
+            channel.name = format!("mode-{}", reasoning_output_to_wire(mode));
+            channel.reasoning_output = mode;
+            let mode_id = insert_channel(&mut conn, &channel)
+                .await
+                .expect("应能写渠道");
+            let records = list_channel_records(&pool).await.expect("应能读渠道");
+            let record = records
+                .iter()
+                .find(|record| record.id == mode_id)
+                .expect("应能读回该渠道");
+            assert_eq!(record.channel.reasoning_output, mode);
+        }
+        for mode in [
+            SessionCacheKeyMode::Off,
+            SessionCacheKeyMode::Auto,
+            SessionCacheKeyMode::Always,
+        ] {
+            let mut channel = sample_channel();
+            channel.name = format!("cache-key-{}", session_cache_key_to_wire(mode));
+            channel.session_cache_key = mode;
+            let mode_id = insert_channel(&mut conn, &channel)
+                .await
+                .expect("应能写渠道");
+            let records = list_channel_records(&pool).await.expect("应能读渠道");
+            let record = records
+                .iter()
+                .find(|record| record.id == mode_id)
+                .expect("应能读回该渠道");
+            assert_eq!(record.channel.session_cache_key, mode);
+        }
+
+        // 自动缓存断点注入开关落库往返；缺省 false。
+        for on in [true, false] {
+            let mut channel = sample_channel();
+            channel.name = format!("cache-inject-{on}");
+            channel.injects_cache_breakpoints = on;
+            let flag_id = insert_channel(&mut conn, &channel)
+                .await
+                .expect("应能写渠道");
+            let records = list_channel_records(&pool).await.expect("应能读渠道");
+            let record = records
+                .iter()
+                .find(|record| record.id == flag_id)
+                .expect("应能读回该渠道");
+            assert_eq!(record.channel.injects_cache_breakpoints, on);
+        }
+
+        // 断连止损开关落库往返；缺省开启，存量渠道行为随缺省保持一致。
+        assert!(sample_channel().abort_on_disconnect, "缺省应开启");
+        for on in [true, false] {
+            let mut channel = sample_channel();
+            channel.name = format!("abort-{on}");
+            channel.abort_on_disconnect = on;
+            let flag_id = insert_channel(&mut conn, &channel)
+                .await
+                .expect("应能写渠道");
+            let records = list_channel_records(&pool).await.expect("应能读渠道");
+            let record = records
+                .iter()
+                .find(|record| record.id == flag_id)
+                .expect("应能读回该渠道");
+            assert_eq!(record.channel.abort_on_disconnect, on);
+        }
     }
 
     /// 按 id 整体替换：可改字段也可改名，id 保持不变，不产生重复行。
@@ -1911,7 +2302,11 @@ mod tests {
         let records = list_channel_records(&pool).await.expect("应能读渠道");
         assert_eq!(records.len(), 1, "覆盖后仍为单行");
         assert_eq!(records[0].id, id, "改名不应改变 id");
-        assert_eq!(records[0].channel, updated, "字段与改名应整体生效");
+        assert_eq!(
+            records[0].channel,
+            with_masked_keys(updated),
+            "字段与改名应整体生效"
+        );
     }
 
     /// 按 id 删除渠道后读回为空；重复删除同一 id 幂等成功。
@@ -2045,7 +2440,7 @@ mod tests {
         )
         .await
         .expect("应能写令牌");
-        crate::store::initialize_token_settlement(&mut conn, "sk-a", 3_000_000, 1)
+        crate::store::settlement::initialize_token_settlement(&mut conn, "sk-a", 3_000_000, 1)
             .await
             .expect("应能初始化余额");
         let before = list_tokens(&pool).await.expect("应能读令牌");
@@ -2069,7 +2464,7 @@ mod tests {
         .await
         .expect("应能更新令牌");
 
-        let balance = crate::store::get_admission_snapshot(&mut conn, "sk-a")
+        let balance = crate::store::settlement::get_admission_snapshot(&mut conn, "sk-a")
             .await
             .expect("应能读余额")
             .expect("余额应存在");
@@ -2230,7 +2625,7 @@ mod tests {
                     channel_id,
                     model: "gpt-4o".to_string(),
                 }],
-                hide: false,
+                is_hidden: false,
             },
         )
         .await
@@ -2332,7 +2727,7 @@ mod tests {
                     channel_id: 1,
                     model: "gpt-4o".to_string(),
                 }],
-                hide: true,
+                is_hidden: true,
             },
         );
 
@@ -2397,7 +2792,7 @@ mod tests {
                     model: "fast".to_string(),
                 },
             ],
-            hide: true,
+            is_hidden: true,
         };
         upsert_unified_model(&mut conn, &model)
             .await
@@ -2436,9 +2831,14 @@ mod tests {
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         )
         .await
@@ -2450,6 +2850,7 @@ mod tests {
             output_micros: 10_000_000,
             cache_read_micros: Some(1_250_000),
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         upsert_price(&mut conn, &price).await.expect("应能写价格");
 
@@ -2480,6 +2881,7 @@ mod tests {
             output_micros: 2_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         let right_price = Price {
             channel_id: right_id,
@@ -2488,6 +2890,7 @@ mod tests {
             output_micros: 8_000_000,
             cache_read_micros: None,
             cache_write_micros: None,
+            cache_write_1h_micros: None,
         };
         upsert_price(&mut conn, &left_price)
             .await
@@ -2513,13 +2916,13 @@ mod tests {
         assert_eq!(listed_left.input_micros, 3_000_000);
         assert_eq!(listed_right.input_micros, 9_000_000);
 
-        retain_channel_prices(&mut conn, left_id, &HashSet::new())
+        delete_price(&mut conn, left_id, "gpt-4o")
             .await
-            .expect("应能清掉左渠道价格");
+            .expect("应能删除左渠道价格");
         let prices = list_prices(&pool).await.expect("应能读价格");
         assert!(
             prices.iter().all(|price| price.channel_id != left_id),
-            "左渠道价格应被 retain 清掉"
+            "左渠道价格应被显式删除"
         );
         assert!(
             prices
@@ -2566,6 +2969,43 @@ mod tests {
         let settings = list_settings(&pool).await.expect("应能读开关");
         assert!(!settings.contains_key(SETTING_FULL_BODY));
         assert!(settings.contains_key(SETTING_MAX_REQUEST_BYTES));
+    }
+
+    #[tokio::test]
+    async fn session_cache_secret_is_persistent_and_validated() {
+        let (_dir, pool) = test_pool().await;
+        let first = load_or_create_session_cache_secret(&pool)
+            .await
+            .expect("首次加载应创建实例密钥");
+        let second = load_or_create_session_cache_secret(&pool)
+            .await
+            .expect("再次加载应读取实例密钥");
+        assert_eq!(first, second, "同一数据库应保持实例密钥稳定");
+
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        set_setting(
+            &mut conn,
+            SETTING_SESSION_CACHE_SECRET,
+            &Value::String("short".to_string()),
+        )
+        .await
+        .expect("应能写入损坏样例");
+        assert!(matches!(
+            load_or_create_session_cache_secret(&pool).await,
+            Err(StoreError::InvalidResource(_))
+        ));
+
+        set_setting(
+            &mut conn,
+            SETTING_SESSION_CACHE_SECRET,
+            &Value::String("z".repeat(64)),
+        )
+        .await
+        .expect("应能写入损坏样例");
+        assert!(matches!(
+            load_or_create_session_cache_secret(&pool).await,
+            Err(StoreError::InvalidResource(_))
+        ));
     }
 
     /// 设置成对写入 → 读回往返一致；覆盖后单份值更新。

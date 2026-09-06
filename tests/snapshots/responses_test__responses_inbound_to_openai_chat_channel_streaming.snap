@@ -19,8 +19,9 @@ expression: frames
     "event": "response.output_item.added",
     "data": {
       "item": {
+        "content": [],
         "id": "0",
-        "phase": "final_answer",
+        "role": "assistant",
         "type": "message"
       },
       "output_index": 0,
@@ -62,13 +63,71 @@ expression: frames
     }
   },
   {
+    "event": "response.output_text.done",
+    "data": {
+      "content_index": 0,
+      "item_id": "0",
+      "output_index": 0,
+      "text": "Hello",
+      "type": "response.output_text.done"
+    }
+  },
+  {
+    "event": "response.content_part.done",
+    "data": {
+      "content_index": 0,
+      "item_id": "0",
+      "output_index": 0,
+      "part": {
+        "annotations": [],
+        "text": "Hello",
+        "type": "output_text"
+      },
+      "type": "response.content_part.done"
+    }
+  },
+  {
+    "event": "response.output_item.done",
+    "data": {
+      "item": {
+        "content": [
+          {
+            "annotations": [],
+            "text": "Hello",
+            "type": "output_text"
+          }
+        ],
+        "id": "0",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "output_index": 0,
+      "type": "response.output_item.done"
+    }
+  },
+  {
     "event": "response.completed",
     "data": {
       "response": {
         "id": "chatcmpl-9",
         "model": "gpt-4o",
         "object": "response",
-        "output": [],
+        "output": [
+          {
+            "content": [
+              {
+                "annotations": [],
+                "text": "Hello",
+                "type": "output_text"
+              }
+            ],
+            "id": "0",
+            "role": "assistant",
+            "status": "completed",
+            "type": "message"
+          }
+        ],
         "status": "completed",
         "usage": {
           "input_tokens": 10,

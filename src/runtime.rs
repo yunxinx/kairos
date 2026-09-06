@@ -19,19 +19,21 @@ use crate::store::StoreError;
 use crate::store::plans;
 pub use crate::store::plans::PlanCapabilities;
 use crate::store::resources::{
-    self, SETTING_AUTH_THROTTLE_MAX_FAILURES, SETTING_AUTH_THROTTLE_WINDOW_SECS,
-    SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY, SETTING_LOG_BODY_MAX_BYTES,
-    SETTING_MAX_REQUEST_BYTES, SETTING_MAX_RESPONSE_BYTES, SETTING_RATE_LIMIT_RPM,
+    self, SETTING_ALLOW_PRIVATE_NETWORKS, SETTING_AUTH_THROTTLE_MAX_FAILURES,
+    SETTING_AUTH_THROTTLE_WINDOW_SECS, SETTING_CATALOG_SYNC_INTERVAL_DAYS, SETTING_FULL_BODY,
+    SETTING_LOG_BODY_MAX_BYTES, SETTING_MAX_REQUEST_BYTES, SETTING_MAX_RESPONSE_BYTES,
+    SETTING_PRIVATE_NETWORK_ALLOWLIST, SETTING_RATE_LIMIT_RPM, SETTING_REQUEST_RECTIFY,
     SETTING_RETRY_AFTER_CAP_SECS, SETTING_RETRY_BACKOFF_CAP_MS, SETTING_RETRY_BACKOFF_MS,
     SETTING_SSE_REASSEMBLY_MAX_BYTES,
 };
 use crate::store::users::{self, ManagementRole};
 
 pub use crate::store::resources::{
-    DEFAULT_AUTH_THROTTLE_MAX_FAILURES, DEFAULT_AUTH_THROTTLE_WINDOW_SECS,
-    DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
-    DEFAULT_RATE_LIMIT_RPM, DEFAULT_RETRY_AFTER_CAP_SECS, DEFAULT_RETRY_BACKOFF_CAP_MS,
-    DEFAULT_RETRY_BACKOFF_MS, DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
+    DEFAULT_ALLOW_PRIVATE_NETWORKS, DEFAULT_AUTH_THROTTLE_MAX_FAILURES,
+    DEFAULT_AUTH_THROTTLE_WINDOW_SECS, DEFAULT_LOG_BODY_MAX_BYTES, DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_RATE_LIMIT_RPM, DEFAULT_REQUEST_RECTIFY,
+    DEFAULT_RETRY_AFTER_CAP_SECS, DEFAULT_RETRY_BACKOFF_CAP_MS, DEFAULT_RETRY_BACKOFF_MS,
+    DEFAULT_SSE_REASSEMBLY_MAX_BYTES,
 };
 
 /// 网关运行时资源的内存快照：不可变整体，原子替换。
@@ -44,6 +46,8 @@ pub struct RuntimeSnapshot {
     pub channels: Vec<resources::ChannelRecord>,
     /// 同名可调用名的显式渠道尝试顺序；缺少行的候选由路由按渠道 id 兜底。
     pub channel_model_order: Vec<resources::ChannelModelOrder>,
+    /// 已启用渠道按可调用名预排的候选下标，请求路由直接索引。
+    pub routing_candidates: HashMap<String, Vec<usize>>,
     /// 令牌定义，按 `token_key` 索引（认证查找）。
     pub tokens: HashMap<String, resources::Token>,
     /// 价格表，外层按渠道稳定 id、内层按可调用名索引（计费准入）。
@@ -80,6 +84,14 @@ pub struct RuntimeSnapshot {
     pub retry_after_cap_secs: u64,
     /// 未单独配置限速的令牌使用的每分钟请求兜底；`0` 表示不设全局上限。
     pub rate_limit_rpm: u64,
+    /// 上游 400 的请求整流重试（错误模式匹配 + 最小修正后重试一次）。
+    pub request_rectify: bool,
+    /// 是否允许私网、环回与链路本地上游地址。
+    pub allow_private_networks: bool,
+    /// 显式信任的精确私网主机名或 IP；请求路径与管理探测读取同一快照字段。
+    pub private_network_allowlist: Vec<String>,
+    /// 实例级密钥，仅用于派生出站缓存亲和标识。
+    pub session_cache_secret: [u8; 32],
 }
 
 /// 用户与套餐的绑定：root 不挂档，用类型把「没有套餐」这个合法状态表达出来。
@@ -185,6 +197,9 @@ impl RuntimeSnapshot {
             retry_backoff_cap_ms: self.retry_backoff_cap_ms,
             retry_after_cap_secs: self.retry_after_cap_secs,
             rate_limit_rpm: self.rate_limit_rpm,
+            request_rectify: self.request_rectify,
+            allow_private_networks: self.allow_private_networks,
+            private_network_allowlist: self.private_network_allowlist.clone(),
         }
     }
 }
@@ -208,6 +223,7 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
     let unified_rows = resources::list_unified_models(pool).await?;
     let plan_rows = plans::list_plans_for_snapshot(pool).await?;
     let settings = resources::list_settings(pool).await?;
+    let session_cache_secret = resources::load_or_create_session_cache_secret(pool).await?;
 
     let tokens = token_rows
         .into_iter()
@@ -269,9 +285,11 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
         );
     }
 
+    let routing_candidates = build_routing_candidates(&channels, &channel_model_order);
     Ok(RuntimeSnapshot {
         channels,
         channel_model_order,
+        routing_candidates,
         tokens,
         prices,
         model_groups,
@@ -322,12 +340,73 @@ pub async fn load_snapshot(pool: &SqlitePool) -> Result<RuntimeSnapshot, StoreEr
             DEFAULT_RETRY_AFTER_CAP_SECS,
         ),
         rate_limit_rpm: load_u64(&settings, SETTING_RATE_LIMIT_RPM, DEFAULT_RATE_LIMIT_RPM),
+        request_rectify: load_bool(&settings, SETTING_REQUEST_RECTIFY, DEFAULT_REQUEST_RECTIFY),
+        allow_private_networks: load_bool(
+            &settings,
+            SETTING_ALLOW_PRIVATE_NETWORKS,
+            DEFAULT_ALLOW_PRIVATE_NETWORKS,
+        ),
+        private_network_allowlist: load_string_list(&settings, SETTING_PRIVATE_NETWORK_ALLOWLIST),
+        session_cache_secret,
     })
+}
+
+fn build_routing_candidates(
+    channels: &[resources::ChannelRecord],
+    order: &[resources::ChannelModelOrder],
+) -> HashMap<String, Vec<usize>> {
+    let positions: HashMap<(&str, i64), i64> = order
+        .iter()
+        .map(|entry| ((entry.model.as_str(), entry.channel_id), entry.position))
+        .collect();
+    let mut candidates: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, record) in channels.iter().enumerate() {
+        if !record.channel.enabled {
+            continue;
+        }
+        for model in resources::channel_callable_names(&record.channel) {
+            candidates.entry(model).or_default().push(index);
+        }
+    }
+    for (model, indices) in &mut candidates {
+        indices.sort_unstable_by_key(|index| {
+            let record = &channels[*index];
+            match positions.get(&(model.as_str(), record.id)) {
+                Some(position) => (0, *position, record.id),
+                None => (1, 0, record.id),
+            }
+        });
+    }
+    candidates
+}
+
+/// 从开关表解析布尔值：缺键或非布尔时用 `default`。
+fn load_bool(settings: &HashMap<String, Value>, key: &str, default: bool) -> bool {
+    settings
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
 }
 
 /// 从开关表解析无符号整数：缺键或非整数时用 `default`。
 fn load_u64(settings: &HashMap<String, Value>, key: &str, default: u64) -> u64 {
     settings.get(key).and_then(Value::as_u64).unwrap_or(default)
+}
+
+/// 从开关表解析字符串数组；非法元素使整项回落为空，避免部分接受配置后形成
+/// 管理面显示与实际网络策略不一致的状态。
+fn load_string_list(settings: &HashMap<String, Value>, key: &str) -> Vec<String> {
+    let Some(values) = settings.get(key).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// 从开关表解析 `full_body`：缺省关闭。
@@ -432,6 +511,7 @@ mod tests {
         assert_eq!(snap.retry_backoff_cap_ms, DEFAULT_RETRY_BACKOFF_CAP_MS);
         assert_eq!(snap.retry_after_cap_secs, DEFAULT_RETRY_AFTER_CAP_SECS);
         assert_eq!(snap.rate_limit_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert!(snap.request_rectify, "请求整流缺省开启");
     }
 
     /// 播种资源与开关后加载：快照反映库内状态。
@@ -457,9 +537,14 @@ mod tests {
                 models: vec!["gpt-4o".to_string()],
                 model_aliases: HashMap::new(),
                 timeout_ms: 1000,
+                request_timeout_ms: 120_000,
                 max_retries: 0,
                 enabled: true,
                 model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
+                reasoning_output: Default::default(),
+                session_cache_key: Default::default(),
+                injects_cache_breakpoints: false,
+                abort_on_disconnect: true,
             },
         )
         .await
@@ -488,6 +573,7 @@ mod tests {
                 output_micros: 10_000_000,
                 cache_read_micros: None,
                 cache_write_micros: None,
+                cache_write_1h_micros: None,
             },
         )
         .await
@@ -507,7 +593,7 @@ mod tests {
                     channel_id,
                     model: "gpt-4o".to_string(),
                 }],
-                hide: false,
+                is_hidden: false,
             },
         )
         .await
@@ -586,6 +672,10 @@ mod tests {
                 settle_waive: true,
                 toggle_user_tokens: true,
                 view_own_plan_groups: true,
+                view_channels: true,
+                view_prices: true,
+                view_model_groups: true,
+                view_unified_models: true,
                 ..PlanCapabilities::default()
             }
         );

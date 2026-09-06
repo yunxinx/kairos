@@ -1,0 +1,53 @@
+{
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 1024,
+  "cache_control": { "type": "ephemeral" },
+  "system": [
+    {
+      "type": "text",
+      "text": "你是天气助手",
+      "cache_control": { "type": "ephemeral", "ttl": "1h" }
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "查询城市天气",
+      "input_schema": {
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"]
+      },
+      "cache_control": { "type": "ephemeral" }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "上海天气如何？",
+          "cache_control": { "type": "ephemeral" }
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "上海" } }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_1",
+          "content": "晴，26 度",
+          "cache_control": { "type": "ephemeral" }
+        }
+      ]
+    }
+  ]
+}

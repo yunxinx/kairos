@@ -420,7 +420,7 @@ export function generateCurlCommand(entry: LogEntry, rawRequestJson: string | nu
 
   const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8080';
   const url = `${origin}${endpoint}`;
-  const authHeader = `Authorization: Bearer ${entry.token_key || '<TOKEN_KEY>'}`;
+  const authHeader = 'Authorization: Bearer <TOKEN_KEY>';
 
   let bodyStr = rawRequestJson?.trim() ?? '';
   if (!bodyStr) {

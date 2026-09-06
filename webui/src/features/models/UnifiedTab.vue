@@ -35,6 +35,7 @@ import { unifiedUsesChannel } from '@/lib/unified-sources';
 import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent, type FloatingWindowAnchor } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type UnifiedWindowPayload =
   | { kind: 'editor'; model: UnifiedModel | null }
@@ -70,6 +71,7 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
   setDirty,
   bringToFront,
 } = useWindowStack<UnifiedWindowPayload>();
@@ -168,7 +170,7 @@ const deleteMutation = useMutation({
     const entry = windows.value.find(
       (item) => item.payload.kind === 'delete' && item.payload.model.id === id,
     );
-    if (entry) closeWindow(entry.id);
+    if (entry) closeWindow(entry.id, true);
     await queryClient.invalidateQueries({ queryKey: ['unified-models'] });
   },
   onError: (err, id) => {
@@ -411,7 +413,7 @@ function openBulkDelete() {
         confirm-test-id="unified-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="deleteMutation.mutate(win.payload.model.id)"
       />
       <ConfirmWindow
@@ -428,9 +430,16 @@ function openBulkDelete() {
         confirm-test-id="unified-bulk-delete-confirm"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @dirty-change="(dirty) => setDirty(win.id, dirty)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
         @confirm="bulkDelete.mutate([...selection.selected.value])"
       />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>

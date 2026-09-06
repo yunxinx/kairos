@@ -1,15 +1,28 @@
-import { computed, onScopeDispose, ref, type ComputedRef, type Ref } from 'vue';
+import { computed, onScopeDispose, ref, watch, type ComputedRef, type Ref } from 'vue';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
+import { declareUnsavedWork } from '@/lib/session';
 
 /** 单页浮窗上限；超出时按打开顺序淘汰最旧窗口。 */
 export const MAX_FLOATING_WINDOWS = 5;
+
+/** 守卫确认窗的渲染投影：close 触发脏守卫时置起，确认/取消后清除。 */
+export interface CloseGuardConfirmation {
+  /** 待确认关闭的窗口 id。 */
+  windowId: number;
+  /** 确认文案键；与被守卫窗口的 confirmKey 一致（表单草稿 / 一次性明文）。 */
+  confirmKey: string;
+}
 
 export interface WindowStackEntry<T> {
   id: number;
   /** 层叠序号，越大越靠前；渲染时叠加在 --z-window 之上。 */
   z: number;
-  /** 草稿是否有未保存更改，决定淘汰时能否直接关闭。 */
+  /** 窗口是否有需要保留的未完成状态，决定 FIFO 淘汰策略。 */
   dirty: boolean;
+  /** 是否在用户关闭时要求确认；操作确认窗只需防止淘汰，不拦正常关闭。 */
+  closeGuard: boolean;
+  /** 关闭脏窗口时的确认文案键；不同脏形态丢失的东西不同（表单草稿 / 一次性明文）。 */
+  confirmKey: string;
   /** 淘汰被阻止时的短暂提示动画。 */
   attention: boolean;
   anchor: FloatingWindowAnchor | null;
@@ -20,16 +33,23 @@ export interface WindowStackEntry<T> {
  * 浮窗栈：按打开顺序维护窗口列表，支持置顶、脏检查与 FIFO 淘汰。
  * 打开第 6 个窗口时，最旧窗口干净则直接关闭腾位；脏则置顶并提示，
  * 打开请求被拒绝，由用户处理旧窗口后再次触发。
+ *
+ * 用户主动关闭带草稿的编辑窗口时不再弹原生 confirm：守卫命中置起
+ * `pendingConfirmation`，由调用方渲染 ConfirmWindow 并在用户确认后
+ * 以 `force` 关闭——确认窗与被守卫窗共用同一栈的层叠语义。
  */
 export function useWindowStack<T>(): {
   windows: Ref<WindowStackEntry<T>[]>;
   topmostId: ComputedRef<number | null>;
+  /** 脏关闭守卫的确认窗投影；null 表示无待确认。 */
+  pendingConfirmation: Ref<CloseGuardConfirmation | null>;
   open: (anchor: FloatingWindowAnchor | null, payload: T) => WindowStackEntry<T> | null;
-  close: (id: number) => void;
-  setDirty: (id: number, dirty: boolean) => void;
+  close: (id: number, force?: boolean) => boolean;
+  setDirty: (id: number, dirty: boolean, closeGuard?: boolean, confirmKey?: string) => void;
   bringToFront: (id: number) => void;
 } {
   const windows = ref<WindowStackEntry<T>[]>([]) as Ref<WindowStackEntry<T>[]>;
+  const pendingConfirmation = ref<CloseGuardConfirmation | null>(null);
   let nextId = 1;
   let nextZ = 1;
   const attentionTimers = new Map<number, ReturnType<typeof setTimeout>>();
@@ -61,15 +81,34 @@ export function useWindowStack<T>(): {
     normalizeZOrder();
   }
 
-  function close(id: number): void {
+  function close(id: number, force = false): boolean {
+    const entry = findEntry(id);
+    if (!entry) return false;
+    // 脏守卫：弹栈内 ConfirmWindow（pendingConfirmation），用户确认后以 force 关闭。
+    // 淘汰路径（open 的 FIFO）只关心 dirty 本身，不触发守卫确认——脏窗口
+    // 淘汰被直接拒绝并提示，不弹确认。
+    if (!force && entry.dirty && entry.closeGuard) {
+      bringToFront(id);
+      pendingConfirmation.value = { windowId: id, confirmKey: entry.confirmKey };
+      return false;
+    }
+    if (pendingConfirmation.value?.windowId === id) {
+      pendingConfirmation.value = null;
+    }
     clearTimeout(attentionTimers.get(id));
     attentionTimers.delete(id);
     windows.value = windows.value.filter((entry) => entry.id !== id);
+    return true;
   }
 
-  function setDirty(id: number, dirty: boolean): void {
+  /** 未携带文案键时回退默认「放弃未保存更改」，窗口脏形态切换即随之切换。 */
+  function setDirty(id: number, dirty: boolean, closeGuard = true, confirmKey?: string): void {
     const entry = findEntry(id);
-    if (entry) entry.dirty = dirty;
+    if (entry) {
+      entry.dirty = dirty;
+      entry.closeGuard = closeGuard;
+      entry.confirmKey = confirmKey ?? 'common.discardUnsavedChanges';
+    }
   }
 
   function open(anchor: FloatingWindowAnchor | null, payload: T): WindowStackEntry<T> | null {
@@ -95,6 +134,8 @@ export function useWindowStack<T>(): {
       id: nextId++,
       z: nextZ++,
       dirty: false,
+      closeGuard: true,
+      confirmKey: 'common.discardUnsavedChanges',
       attention: false,
       anchor,
       payload,
@@ -109,5 +150,13 @@ export function useWindowStack<T>(): {
     attentionTimers.clear();
   });
 
-  return { windows, topmostId, open, close, setDirty, bringToFront };
+  // 声明本栈的未保存工作状态（响应式同步给会话失效守卫）：任一窗口脏即
+  // 视为存在草稿，401 失效路径据此暂停跳转登录。栈销毁自动注销声明。
+  const stackId = `window-stack:${nextId}`;
+  const hasDirtyWindow = computed(() => windows.value.some((entry) => entry.dirty));
+  const declaration = declareUnsavedWork(stackId);
+  watch(hasDirtyWindow, (dirty) => declaration.set(dirty));
+  onScopeDispose(declaration.stop);
+
+  return { windows, topmostId, pendingConfirmation, open, close, setDirty, bringToFront };
 }

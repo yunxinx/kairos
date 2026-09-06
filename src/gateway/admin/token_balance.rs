@@ -129,11 +129,12 @@ pub(super) async fn apply_token_balance_command(
         return Ok(record);
     }
 
-    let settled_usd_micros = store::get_token_settlement(conn, &existing.token.token_key)
-        .await
-        .map_err(AdminError::Store)?
-        .map(|settlement| settlement.settled_usd_micros)
-        .unwrap_or(0);
+    let settled_usd_micros =
+        store::settlement::get_token_settlement(conn, &existing.token.token_key)
+            .await
+            .map_err(AdminError::Store)?
+            .map(|settlement| settlement.settled_usd_micros)
+            .unwrap_or(0);
     let before_usd_micros = available_balance(existing.token.limit_usd_micros, settled_usd_micros)?;
 
     let (next_limit_usd_micros, after_usd_micros, audit_message) = match command {

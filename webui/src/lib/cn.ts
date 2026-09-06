@@ -2,7 +2,7 @@ import type { HTMLAttributes } from 'vue';
 
 type ClassNameInput = HTMLAttributes['class'];
 
-/** 合并 Tailwind 类名；与 shadcn `cn()` 用途相同，不引入额外依赖。 */
+/** 合并 Tailwind 类名，并忽略空值与重复冲突。 */
 export function cn(...parts: ClassNameInput[]): string {
   return parts
     .flatMap((part) => {

@@ -18,7 +18,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -28,7 +29,8 @@ async fn admin_json(
 async fn first_channel_id(gw: &TestGateway) -> i64 {
     let channels: Value = reqwest::Client::new()
         .get(format!("{}/channels", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("渠道列表应可达")
@@ -175,7 +177,7 @@ async fn list_models_follows_token_group_on_all_protocols() {
     .await;
     assert_eq!(created_token.status(), reqwest::StatusCode::CREATED);
     let token: Value = created_token.json().await.expect("令牌应可解析");
-    let coding_key = token["token_key"].as_str().expect("应有 key");
+    let coding_key = token["plaintext_key"].as_str().expect("应有 key");
 
     for (label, resp) in [
         ("openai_chat", list_openai(&gw, coding_key).await),
@@ -249,7 +251,10 @@ async fn hide_drops_collected_members_but_keeps_them_callable() {
     )
     .await;
     let token: Value = created_token.json().await.expect("令牌应可解析");
-    let pack_key = token["token_key"].as_str().expect("应有 key").to_string();
+    let pack_key = token["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
     let topped = admin_json(
         &gw,
         reqwest::Method::POST,

@@ -13,6 +13,8 @@
 
 #![allow(dead_code)]
 
+pub mod admin;
+
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -38,6 +40,21 @@ use kairos::{config, gateway, runtime, store};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
+/// 等待请求结果从持久化队列进入最终日志与余额表。
+pub async fn wait_for_request_persistence(pool: &sqlx::SqlitePool) {
+    for _ in 0..200 {
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_log_outbox")
+            .fetch_one(pool)
+            .await
+            .expect("应能读取请求持久化队列");
+        if pending == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("请求持久化队列未在期限内清空");
+}
+
 /// mock 上游的响应行为，按请求逐次消费。
 #[derive(Debug, Clone, PartialEq)]
 pub enum UpstreamBehavior {
@@ -47,6 +64,14 @@ pub enum UpstreamBehavior {
     RawSse(Vec<Vec<u8>>),
     /// 返回有固定块间隔的原始 SSE 字节块，用于构造下游中途断开。
     DelayedRawSse { chunks: Vec<Vec<u8>>, delay_ms: u64 },
+    /// 返回原始 SSE 字节块：前缀块立即逐块下发，其余块每块之前沉默
+    /// `gap_ms`。用于构造「流已建立后上游长时间沉默」的场景，区分渠道
+    /// 空闲超时与请求总时限的截断语义。
+    GappedRawSse {
+        prefix: Vec<Vec<u8>>,
+        gap_ms: u64,
+        tail: Vec<Vec<u8>>,
+    },
     /// 返回普通 JSON 响应。
     Json(Value),
     /// 返回 429（可重试）。
@@ -55,6 +80,8 @@ pub enum UpstreamBehavior {
     Status5xx(u16),
     /// 返回任意给定状态码（不可重试 4xx 用于测试）。
     Status(u16),
+    /// 返回给定状态码与 JSON 错误体（错误消息形态的测试用）。
+    Error { status: u16, body: Value },
     /// 发送部分字节后突然断开连接。
     Disconnect,
     /// 接收请求后永不响应，供渠道探测超时。
@@ -72,6 +99,8 @@ impl UpstreamBehavior {
 #[derive(Debug, Default)]
 pub struct ReceivedLog {
     pub requests: Vec<Value>,
+    /// 请求路径（含查询串），供 model-in-path 的出站 URL 断言。
+    pub paths: Vec<String>,
     pub api_keys: Vec<Option<String>>,
     pub anthropic_versions: Vec<Option<String>>,
     pub anthropic_betas: Vec<Option<String>>,
@@ -85,6 +114,9 @@ pub struct MockUpstream {
     pub addr: SocketAddr,
     /// 行为队列，逐请求消费；`set_behavior` 追加，`push_behavior` 也追加。
     behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>>,
+    /// 按出站认证头匹配的持久行为：命中的 key 恒定返回对应行为，不消费
+    /// 行为队列（key 级故障对同一 key 的重试是稳定的）。
+    keyed: Arc<Mutex<Vec<(String, UpstreamBehavior)>>>,
     received: Arc<Mutex<ReceivedLog>>,
 }
 
@@ -93,21 +125,25 @@ impl MockUpstream {
     pub async fn start() -> Self {
         let behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>> =
             Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let keyed: Arc<Mutex<Vec<(String, UpstreamBehavior)>>> = Arc::new(Mutex::new(Vec::new()));
         let received: Arc<Mutex<ReceivedLog>> = Arc::new(Mutex::new(ReceivedLog::default()));
 
         let app = Router::new()
             .route("/chat/completions", post(handle))
             .route("/messages", post(handle))
             .route("/responses", post(handle))
+            .route("/v1beta/models/{*model_method}", post(handle))
             .layer(middleware::from_fn_with_state(
                 received.clone(),
-                capture_outbound_headers,
+                capture_outbound_request,
             ))
             .route("/models", get(handle_models))
+            .route("/v1beta/models", get(handle_models))
             // 禁用 axum 默认 2MB 上限：mock 上游需接收大请求体（模拟网关转发的多模态/base64）。
             .layer(DefaultBodyLimit::disable())
             .with_state(MockDeps {
                 behavior: behavior.clone(),
+                keyed: keyed.clone(),
                 received: received.clone(),
             });
 
@@ -124,6 +160,7 @@ impl MockUpstream {
         Self {
             addr,
             behavior,
+            keyed,
             received,
         }
     }
@@ -141,6 +178,18 @@ impl MockUpstream {
         self.set_behavior(behavior);
     }
 
+    /// 登记按出站认证头匹配的持久行为：认证头含 `pattern` 子串的请求恒定返回
+    /// `behavior`（优先于行为队列，不消费队列）。
+    ///
+    /// key 级故障（429/401/403）对同一 key 的重试是稳定的，用队列表达需要逐次
+    /// 展开，按 key 登记更贴近真实上游的行为。
+    pub fn set_key_behavior(&mut self, pattern: &str, behavior: UpstreamBehavior) {
+        self.keyed
+            .lock()
+            .expect("keyed 锁不应被污染")
+            .push((pattern.to_string(), behavior));
+    }
+
     /// base URL，供网关作为上游地址。
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
@@ -152,6 +201,18 @@ impl MockUpstream {
             .lock()
             .expect("received 锁不应被污染")
             .requests
+            .clone()
+    }
+
+    /// 拷贝收到的请求路径（含查询串），供 model-in-path 的出站 URL 断言。
+    ///
+    /// 与 `received` 同序：POST 路径在出站头捕获中间件记录，GET 模型列表
+    /// 在处理函数内记录。
+    pub fn received_paths(&self) -> Vec<String> {
+        self.received
+            .lock()
+            .expect("received 锁不应被污染")
+            .paths
             .clone()
     }
 
@@ -204,11 +265,39 @@ impl MockUpstream {
 #[derive(Clone)]
 struct MockDeps {
     behavior: Arc<Mutex<std::collections::VecDeque<UpstreamBehavior>>>,
+    keyed: Arc<Mutex<Vec<(String, UpstreamBehavior)>>>,
     received: Arc<Mutex<ReceivedLog>>,
 }
 
-/// 记录出站功能头；只挂在有请求体的 POST 路由上，避免 GET `/models` 错位。
-async fn capture_outbound_headers(
+/// 按本次请求的出站认证头查 keyed 行为登记表；命中即直接响应（不消费队列）。
+fn keyed_response(deps: &MockDeps) -> Option<Response> {
+    let key = deps
+        .received
+        .lock()
+        .expect("received 锁不应被污染")
+        .api_keys
+        .last()
+        .cloned()
+        .flatten()?;
+    let keyed = deps.keyed.lock().expect("keyed 锁不应被污染");
+    keyed
+        .iter()
+        .find(|(pattern, _)| key.contains(pattern.as_str()))
+        .map(|(_, behavior)| behavior.clone().into_response())
+}
+
+/// 请求路径（含查询串）的文本形态。
+fn request_path(request: &Request) -> String {
+    request
+        .uri()
+        .path_and_query()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| request.uri().path().to_string())
+}
+
+/// 记录出站请求的路径与功能头；只挂在有请求体的 POST 路由上，避免 GET
+/// 模型列表路由漏记路径（GET 的路径在其处理函数内补记）。
+async fn capture_outbound_request(
     State(received): State<Arc<Mutex<ReceivedLog>>>,
     request: Request,
     next: Next,
@@ -243,10 +332,18 @@ async fn capture_outbound_headers(
                 .get("x-api-key")
                 .and_then(|value| value.to_str().ok())
         })
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
         .map(str::to_string);
+    let path = request_path(&request);
     {
         let mut log = received.lock().expect("received 锁不应被污染");
         log.api_keys.push(api_key);
+        log.paths.push(path);
         log.anthropic_versions.push(version);
         log.anthropic_betas.push(beta);
         log.openai_organizations.push(organization);
@@ -262,11 +359,20 @@ async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Respon
         .requests
         .push(body);
 
+    if let Some(response) = keyed_response(&deps) {
+        return response;
+    }
     respond_next(&deps, UpstreamBehavior::Sse(vec![])).await
 }
 
 /// GET `/models` 无请求体；与 `handle` 共用行为队列，逐请求消费。
-async fn handle_models(State(deps): State<MockDeps>) -> Response {
+async fn handle_models(State(deps): State<MockDeps>, request: Request) -> Response {
+    deps.received
+        .lock()
+        .expect("received 锁不应被污染")
+        .paths
+        .push(request_path(&request));
+
     respond_next(
         &deps,
         UpstreamBehavior::Json(serde_json::json!({ "data": [] })),
@@ -317,6 +423,22 @@ impl IntoResponse for UpstreamBehavior {
                 };
                 raw_sse_response(Body::from_stream(stream))
             }
+            UpstreamBehavior::GappedRawSse {
+                prefix,
+                gap_ms,
+                tail,
+            } => {
+                let stream = async_stream::stream! {
+                    for chunk in prefix {
+                        yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk));
+                    }
+                    for chunk in tail {
+                        tokio::time::sleep(std::time::Duration::from_millis(gap_ms)).await;
+                        yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk));
+                    }
+                };
+                raw_sse_response(Body::from_stream(stream))
+            }
             UpstreamBehavior::Json(value) => Json(value).into_response(),
             UpstreamBehavior::Status429 => {
                 (axum::http::StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response()
@@ -332,6 +454,12 @@ impl IntoResponse for UpstreamBehavior {
                     panic!("UpstreamBehavior::Status 要求合法状态码，收到 {code}")
                 });
                 (status, "client error").into_response()
+            }
+            UpstreamBehavior::Error { status, body } => {
+                let status = StatusCode::from_u16(status).unwrap_or_else(|_| {
+                    panic!("UpstreamBehavior::Error 要求合法状态码，收到 {status}")
+                });
+                (status, Json(body)).into_response()
             }
             UpstreamBehavior::Disconnect => {
                 // 发送一个 SSE 帧后立即结束连接（axum 关闭响应体即断连）。
@@ -359,6 +487,12 @@ fn raw_sse_response(body: Body) -> Response {
 /// 测试用下游令牌 key。
 pub const TEST_TOKEN_KEY: &str = "sk-test-token";
 
+/// 明文 key 的库内指纹形态：直连 SQL 断言绑定库列前统一经此换算。
+/// HTTP 认证头仍用明文，不经过本函数。
+pub fn fingerprint(key: &str) -> String {
+    kairos::store::token_key_fingerprint(key)
+}
+
 /// 测试用可用模型。
 pub const TEST_MODEL: &str = "gpt-4o";
 
@@ -380,7 +514,7 @@ pub struct SeedToken {
 
 /// 测试资源清单：播种进 DB 后由网关加载进运行时快照。
 ///
-/// 替代 v1 的 `config::Config` 资源段；渠道/价格复用 `store::resources` 行类型，
+/// 替代旧 `config::Config` 资源段；渠道/价格复用 `store::resources` 行类型，
 /// 令牌因含初始余额而单独定义。
 pub struct Seed {
     pub channels: Vec<Channel>,
@@ -412,9 +546,14 @@ pub fn test_seed(upstream_base: &str) -> Seed {
                 .into_iter()
                 .collect(),
             timeout_ms: 1000,
+            request_timeout_ms: 120_000,
             max_retries: 0,
             enabled: true,
             model_group: resources::DEFAULT_MODEL_GROUP.to_string(),
+            reasoning_output: Default::default(),
+            session_cache_key: Default::default(),
+            injects_cache_breakpoints: false,
+            abort_on_disconnect: true,
         }],
         tokens: vec![SeedToken {
             token_key: TEST_TOKEN_KEY.to_string(),
@@ -431,6 +570,7 @@ pub fn test_seed(upstream_base: &str) -> Seed {
                 output_micros: 10_000_000,
                 cache_read_micros: Some(1_250_000),
                 cache_write_micros: Some(10_000_000),
+                cache_write_1h_micros: None,
             },
             // 别名短名 `fast` 也是计费模型名（本票按 request.model 计价）。
             Price {
@@ -440,10 +580,13 @@ pub fn test_seed(upstream_base: &str) -> Seed {
                 output_micros: 600_000,
                 cache_read_micros: None,
                 cache_write_micros: None,
+                cache_write_1h_micros: None,
             },
         ],
         unified_models: vec![],
-        settings: HashMap::new(),
+        settings: [("allow_private_networks".to_string(), Value::Bool(true))]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -454,7 +597,9 @@ pub fn empty_seed(_upstream_base: &str) -> Seed {
         tokens: vec![],
         prices: vec![],
         unified_models: vec![],
-        settings: HashMap::new(),
+        settings: [("allow_private_networks".to_string(), Value::Bool(true))]
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -469,10 +614,12 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         inserted.push((id, channel));
     }
     for token in &seed.tokens {
+        // 种子令牌的 key 以指纹形态入库：与生产库一致，认证以指纹查找。
+        let stored_key = store::token_key_fingerprint(&token.token_key);
         resources::insert_token(
             &mut conn,
             &Token {
-                token_key: token.token_key.clone(),
+                token_key: stored_key.clone(),
                 name: token.name.clone(),
                 limit_usd_micros: token
                     .limit_usd
@@ -487,9 +634,9 @@ pub async fn seed_into_db(pool: &sqlx::SqlitePool, seed: &Seed) {
         .await
         .expect("应能播种令牌");
         let initial_balance_usd_micros = (token.balance_usd * 1_000_000.0).round() as i64;
-        store::initialize_token_settlement(
+        store::settlement::initialize_token_settlement(
             &mut conn,
-            &token.token_key,
+            &stored_key,
             initial_balance_usd_micros,
             unix_millis(),
         )
@@ -540,10 +687,12 @@ pub const TEST_ROOT_PASSWORD: &str = "sk-admin-test";
 
 /// 按 key 查出令牌的库生成 id。
 ///
-/// 管理 API 按 id 寻址（明文 key 只对所有者返回），而多数测试手上只有播种时的 key。
+/// 管理 API 按 id 寻址（明文 key 只在创建响应返回一次），而多数测试手上只有
+/// 播种时的 key；库内以指纹存储，查找前先换算。
 pub async fn token_id(pool: &sqlx::SqlitePool, token_key: &str) -> i64 {
+    let fingerprint = store::token_key_fingerprint(token_key);
     sqlx::query_scalar("SELECT id FROM tokens WHERE token_key = ?")
-        .bind(token_key)
+        .bind(fingerprint)
         .fetch_one(pool)
         .await
         .expect("令牌应存在")
@@ -563,7 +712,7 @@ pub struct TestGateway {
     pub db_dir: tempfile::TempDir,
     /// 独立管理监听地址；未启用管理面时为 `None`。
     pub admin_addr: Option<SocketAddr>,
-    /// 管理面 root 会话（`ksess_…`）。未启用管理面时为空串。
+    /// 管理面 root 会话 Cookie。未启用管理面时为空串。
     pub session: String,
 }
 
@@ -583,7 +732,7 @@ impl TestGateway {
     }
 
     /// 带独立管理监听启动：协议面与 `start_with` 相同，另起管理监听。
-    /// 内置 root 用 `TEST_ROOT_EMAIL` / `TEST_ROOT_PASSWORD` 播种后登录，`session` 为会话 Bearer。
+    /// 内置 root 用 `TEST_ROOT_EMAIL` / `TEST_ROOT_PASSWORD` 播种后登录。
     pub async fn start_with_admin(make_seed: impl Fn(&str) -> Seed) -> Self {
         Self::start_with_opts(make_seed, true).await
     }
@@ -607,10 +756,12 @@ impl TestGateway {
         let snapshot = runtime::snapshot_handle(snapshot);
 
         // 管理面与协议面共用同一快照句柄：管理写库后换快照，协议请求路径读到
-        // 新资源，端到端断言「写后即时生效」。
+        // 新资源，端到端断言「写后即时生效」。渠道冷却表同样两面共享：协议面
+        // 记账、管理面健康端点展示。
+        let channel_cooldowns = gateway::ChannelCooldowns::new();
         let (admin_addr, session) = if with_admin {
             // 测试不走 config.json：直接调用与进程启动相同的播种入口，再 `/login` 换会话。
-            // `session` 才是管理 API Bearer；`TEST_ROOT_PASSWORD` 只用于登录，不能当 Authorization。
+            // `TEST_ROOT_PASSWORD` 只用于登录，管理 API 由会话 Cookie 认证。
             kairos::store::users::seed_builtin_root(
                 &pool,
                 Some(TEST_ROOT_EMAIL),
@@ -618,7 +769,12 @@ impl TestGateway {
             )
             .await
             .expect("测试 root 应能播种登录凭证");
-            let admin_app = gateway::admin_router(pool.clone(), snapshot.clone(), db_path.clone());
+            let admin_app = gateway::admin_router(
+                pool.clone(),
+                snapshot.clone(),
+                db_path.clone(),
+                channel_cooldowns.clone(),
+            );
             let admin_listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("管理监听应能绑定随机端口");
@@ -639,7 +795,7 @@ impl TestGateway {
             (None, String::new())
         };
 
-        let app = gateway::router(pool.clone(), snapshot).await;
+        let app = gateway::router(pool.clone(), snapshot, channel_cooldowns).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -691,7 +847,7 @@ impl TestGateway {
             .await
             .expect("应能加载运行时快照");
         let snapshot = runtime::snapshot_handle(snapshot);
-        let app = gateway::router(pool.clone(), snapshot).await;
+        let app = gateway::router(pool.clone(), snapshot, gateway::ChannelCooldowns::new()).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -753,7 +909,8 @@ impl TestGateway {
             .await
             .expect("重启应从库加载快照");
         let snapshot = runtime::snapshot_handle(snapshot);
-        let app = gateway::router(pool, snapshot).await;
+        // 重启模拟：冷却表是进程内存态，新实例从空表开始（自愈语义）。
+        let app = gateway::router(pool, snapshot, gateway::ChannelCooldowns::new()).await;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("网关应能绑定随机端口");
@@ -772,8 +929,13 @@ impl TestGateway {
 
 /// 用测试 root 邮箱密码换会话。管理面必须已经完成播种。
 async fn login_root_session(admin_base: &str) -> String {
+    // 登录端点要求同源浏览器信号；测试以自身 base 作为 Origin。
+    let origin = admin_base
+        .strip_suffix("/api")
+        .expect("管理基址应含 /api 前缀");
     let resp = reqwest::Client::new()
         .post(format!("{admin_base}/login"))
+        .header(reqwest::header::ORIGIN, origin)
         .json(&serde_json::json!({
             "email": TEST_ROOT_EMAIL,
             "password": TEST_ROOT_PASSWORD
@@ -782,16 +944,30 @@ async fn login_root_session(admin_base: &str) -> String {
         .await
         .expect("测试 root 登录应可达");
     let status = resp.status();
+    let session = session_cookie(&resp);
     let body: Value = resp.json().await.expect("登录响应应可解析");
     assert_eq!(
         status,
         reqwest::StatusCode::OK,
         "测试 root 应能登录: {body}"
     );
-    body["token"]
-        .as_str()
-        .expect("登录应返回会话令牌")
-        .to_string()
+    assert!(body.get("token").is_none(), "登录响应不应暴露会话令牌");
+    session
+}
+
+/// 从登录响应提取管理会话的 Cookie 请求头值。
+pub fn session_cookie(response: &reqwest::Response) -> String {
+    let value = response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("登录应返回 Set-Cookie");
+    let pair = value.split(';').next().expect("Set-Cookie 应包含名称和值");
+    assert!(
+        pair.starts_with("kairos_session=ksess_"),
+        "登录应返回管理会话 Cookie"
+    );
+    pair.to_string()
 }
 
 // ---- 下游 SSE 响应解析 ----
@@ -807,42 +983,55 @@ pub struct DownstreamFrame {
     pub data: Value,
 }
 
+/// 收取下游 SSE 响应体的原始字节。
+///
+/// 哨兵有无（如 Gemini 流无 `[DONE]`）要对原始字节断言，`collect_sse_frames`
+/// 会把 `[DONE]` 过滤掉，故拆出本接缝。
+pub async fn collect_sse_body(resp: reqwest::Response) -> bytes::Bytes {
+    use futures_util::StreamExt;
+
+    let mut buffer = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        buffer.extend_from_slice(&chunk.expect("响应流应可读"));
+    }
+    bytes::Bytes::from(buffer)
+}
+
 /// 解析下游 SSE 响应体为帧序列，跳过空载荷与 `[DONE]` 哨兵。
 ///
 /// 此前各测试二进制各持一份实现，形状还不一致（有的丢弃 `event:`）。收敛到夹具
 /// 后，帧序列本身可直接作为快照值，事件名与载荷的对应关系也不再丢失。
-pub async fn collect_sse_frames(resp: reqwest::Response) -> Vec<DownstreamFrame> {
-    use futures_util::StreamExt;
-
+pub fn parse_sse_frames(body: &[u8]) -> Vec<DownstreamFrame> {
     let mut frames = Vec::new();
-    let mut buffer = String::new();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("响应流应可读");
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(end) = buffer.find("\n\n") {
-            let raw: String = buffer.drain(..end + 2).collect();
-            let mut event = None;
-            let mut data = None;
-            for line in raw.lines() {
-                if let Some(name) = line.strip_prefix("event:") {
-                    event = Some(name.trim().to_string());
-                } else if let Some(payload) = line.strip_prefix("data:") {
-                    let payload = payload.trim();
-                    if payload.is_empty() || payload == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(value) = serde_json::from_str::<Value>(payload) {
-                        data = Some(value);
-                    }
+    let mut buffer = String::from_utf8_lossy(body).into_owned();
+    while let Some(end) = buffer.find("\n\n") {
+        let raw: String = buffer.drain(..end + 2).collect();
+        let mut event = None;
+        let mut data = None;
+        for line in raw.lines() {
+            if let Some(name) = line.strip_prefix("event:") {
+                event = Some(name.trim().to_string());
+            } else if let Some(payload) = line.strip_prefix("data:") {
+                let payload = payload.trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                    data = Some(value);
                 }
             }
-            if let Some(data) = data {
-                frames.push(DownstreamFrame { event, data });
-            }
+        }
+        if let Some(data) = data {
+            frames.push(DownstreamFrame { event, data });
         }
     }
     frames
+}
+
+/// 收取下游 SSE 响应体并解析为帧序列。
+pub async fn collect_sse_frames(resp: reqwest::Response) -> Vec<DownstreamFrame> {
+    parse_sse_frames(&collect_sse_body(resp).await)
 }
 
 /// 帧序列中所有 `data:` 载荷，供只关心载荷的断言使用。

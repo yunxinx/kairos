@@ -1,6 +1,6 @@
 //! 请求日志与只读聚合的归属隔离：普通用户只见自己的行，补扣/豁免限 admin+。
 //!
-//! ADR-0009 给 `user` 的可见面只有「自己的令牌、余额与用量」。这些断言钉住的是
+//! `user` 的可见面只有「自己的令牌、余额与用量」。这些断言钉住的是
 //! 「登录本身不等于可见全站」：曾经 `/logs`、`/stats`、`/logs/{id}/waive` 都只挂在
 //! 「已登录」层，普通用户可读他人对话 body、也能直接豁免自己的欠账。
 
@@ -14,10 +14,11 @@ fn admin_url(gw: &TestGateway, path: &str) -> String {
     format!("{}{path}", gw.admin_base_url())
 }
 
-async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Response {
+async fn admin_get(gw: &TestGateway, session: &str, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -25,14 +26,15 @@ async fn admin_get(gw: &TestGateway, token: &str, path: &str) -> reqwest::Respon
 
 async fn admin_json(
     gw: &TestGateway,
-    token: &str,
+    session: &str,
     method: reqwest::Method,
     path: &str,
     body: Value,
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, admin_url(gw, path))
-        .bearer_auth(token)
+        .header(reqwest::header::COOKIE, session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -42,15 +44,13 @@ async fn admin_json(
 async fn login(gw: &TestGateway, email: &str) -> String {
     let resp = reqwest::Client::new()
         .post(admin_url(gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": email, "password": "password1" }))
         .send()
         .await
         .expect("登录应可达");
     assert_eq!(resp.status(), StatusCode::OK);
-    resp.json::<Value>().await.expect("登录应可解析")["token"]
-        .as_str()
-        .expect("应有会话")
-        .to_string()
+    common::session_cookie(&resp)
 }
 
 /// 建一个指定角色的用户并登录，返回 `(id, 会话)`。
@@ -102,7 +102,7 @@ async fn spend_once(gw: &TestGateway, session: &str, user_id: i64, name: &str) -
     )
     .await;
     assert_eq!(created.status(), StatusCode::CREATED);
-    let key = created.json::<Value>().await.expect("令牌应可解析")["token_key"]
+    let key = created.json::<Value>().await.expect("令牌应可解析")["plaintext_key"]
         .as_str()
         .expect("应有 key")
         .to_string();
@@ -186,13 +186,9 @@ async fn request_logs_and_stats_are_scoped_to_owner() {
     let root_reads_bob = admin_get(&gw, &gw.session, &format!("/logs/{}", bob_ids[0])).await;
     assert_eq!(root_reads_bob.status(), StatusCode::OK);
 
-    // 查询参数不能拿来越权：显式指定他人令牌仍只在自己的范围内过滤。
-    let forged: Value = admin_get(&gw, &alice, "/logs?token_key=bob-key")
-        .await
-        .json()
-        .await
-        .expect("日志页应可解析");
-    assert_eq!(forged["total"], 0);
+    // 凭证不是日志查询维度；旧式精确 key 参数会被拒绝，而不是进入查询层。
+    let forged = admin_get(&gw, &alice, "/logs?token_key=bob-key").await;
+    assert_eq!(forged.status(), StatusCode::BAD_REQUEST);
 
     let alice_stats: Value = admin_get(&gw, &alice, "/stats")
         .await
@@ -297,6 +293,7 @@ async fn settling_requires_admin() {
         "root-key",
     )
     .await;
+    common::wait_for_request_persistence(&gw.pool).await;
     let root_page: Value = admin_get(&gw, &gw.session, "/logs?token_name=root-key")
         .await
         .json()
@@ -333,6 +330,7 @@ async fn system_logs_show_users_only_their_own_audit_rows() {
     // 无 actor 的运维事件：登录失败只记邮箱，认不出是谁。
     let failed = reqwest::Client::new()
         .post(admin_url(&gw, "/login"))
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&json!({ "email": "alice@example.com", "password": "wrong-password" }))
         .send()
         .await

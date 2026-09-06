@@ -81,7 +81,10 @@ function priceText(range: PriceRange | undefined): string | null {
   return `${formatUsdMicros(range.min_micros)}–${formatUsdMicros(range.max_micros)}`;
 }
 
-function tierText(model: MyModelView, tier: 'input' | 'output' | 'cache_read' | 'cache_write') {
+function tierText(
+  model: MyModelView,
+  tier: 'input' | 'output' | 'cache_read' | 'cache_write' | 'cache_write_1h',
+) {
   return priceText(model[tier]);
 }
 </script>
@@ -139,10 +142,11 @@ function tierText(model: MyModelView, tier: 'input' | 'output' | 'cache_read' | 
             <TableHead align="right">{{ t('models.myPriceOutput') }}</TableHead>
             <TableHead align="right">{{ t('models.myPriceCacheRead') }}</TableHead>
             <TableHead align="right">{{ t('models.myPriceCacheWrite') }}</TableHead>
+            <TableHead align="right">{{ t('models.myPriceCacheWrite1h') }}</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
-          <TableRowsSkeleton v-if="showTableSkeleton" :columns="5" />
+          <TableRowsSkeleton v-if="showTableSkeleton" :columns="6" />
           <template v-else>
             <template v-for="section in visibleSections" :key="section.name">
               <TableRow
@@ -150,7 +154,7 @@ function tierText(model: MyModelView, tier: 'input' | 'output' | 'cache_read' | 
                 data-testid="my-models-section"
                 :data-group="section.name"
               >
-                <TableCell :colspan="5" class="inventory-section-cell">
+                <TableCell :colspan="6" class="inventory-section-cell">
                   {{ section.label }}
                 </TableCell>
               </TableRow>
@@ -195,11 +199,17 @@ function tierText(model: MyModelView, tier: 'input' | 'output' | 'cache_read' | 
                   </span>
                   <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
                 </TableCell>
+                <TableCell align="right" class="font-mono">
+                  <span v-if="tierText(model, 'cache_write_1h')">
+                    {{ tierText(model, 'cache_write_1h') }}
+                  </span>
+                  <span v-else class="text-fg-muted">{{ t('common.emptyCell') }}</span>
+                </TableCell>
               </TableRow>
             </template>
             <!-- 两种空态分开：搜不到 ≠ 套餐里没有。后者才该提示去找管理员。 -->
             <TableRow v-if="visibleSections.length === 0">
-              <TableCell :colspan="5" class="h-24 whitespace-normal">
+              <TableCell :colspan="6" class="h-24 whitespace-normal">
                 <EmptyState
                   v-if="searchFilteredAll"
                   :title="t('models.mySearchEmpty')"

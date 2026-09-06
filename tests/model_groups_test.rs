@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 async fn admin_get(gw: &TestGateway, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .get(format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -27,7 +28,8 @@ async fn admin_json(
 ) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .json(&body)
         .send()
         .await
@@ -38,7 +40,8 @@ async fn admin_json(
 async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> reqwest::Response {
     reqwest::Client::new()
         .request(method, format!("{}{path}", gw.admin_base_url()))
-        .bearer_auth(&gw.session)
+        .header(reqwest::header::COOKIE, &gw.session)
+        .header(reqwest::header::ORIGIN, gw.admin_origin())
         .send()
         .await
         .expect("管理请求应可达")
@@ -46,7 +49,7 @@ async fn admin_send(gw: &TestGateway, method: reqwest::Method, path: &str) -> re
 
 /// 以指定令牌向网关发一条 Chat Completions 请求。
 async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Response {
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base_url()))
         .bearer_auth(token)
         .json(&json!({
@@ -55,7 +58,9 @@ async fn chat_request(gw: &TestGateway, token: &str, model: &str) -> reqwest::Re
         }))
         .send()
         .await
-        .expect("下游请求应能到达网关")
+        .expect("下游请求应能到达网关");
+    common::wait_for_request_persistence(&gw.pool).await;
+    response
 }
 
 /// mock 上游返回的合法 Chat Completions 成功体。
@@ -336,7 +341,7 @@ async fn token_binds_exactly_one_group() {
     assert_eq!(created.status(), reqwest::StatusCode::CREATED);
     let token: Value = created.json().await.expect("令牌应可解析");
     assert_eq!(token["model_group"], "default", "未指定则 default");
-    let default_key = token["token_key"].as_str().expect("应有 key");
+    let default_key = token["plaintext_key"].as_str().expect("应有 key");
 
     let coded = admin_json(
         &gw,
@@ -348,7 +353,6 @@ async fn token_binds_exactly_one_group() {
     assert_eq!(coded.status(), reqwest::StatusCode::CREATED);
     let token: Value = coded.json().await.expect("令牌应可解析");
     assert_eq!(token["model_group"], "coding");
-    let coding_key = token["token_key"].as_str().expect("应有 key").to_string();
     let coding_id = token["id"].as_i64().expect("应有 id");
     let default_id = common::token_id(&gw.pool, default_key).await;
 
@@ -393,7 +397,7 @@ async fn token_binds_exactly_one_group() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["token_key"] == coding_key)
+        .find(|t| t["id"] == coding_id)
         .expect("coder 应仍在列表");
     assert_eq!(coder["model_group"], "coding", "失败的改绑不应落库");
 }
@@ -417,7 +421,11 @@ async fn delete_group_nulls_token_group_without_rebind() {
     )
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
-    let key = token["token_key"].as_str().expect("应有 key").to_string();
+    let key = token["plaintext_key"]
+        .as_str()
+        .expect("应有 key")
+        .to_string();
+    let token_id = token["id"].as_i64().expect("应有 id");
     admin_json(
         &gw,
         reqwest::Method::POST,
@@ -451,7 +459,7 @@ async fn delete_group_nulls_token_group_without_rebind() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["token_key"] == key)
+        .find(|t| t["id"] == token_id)
         .expect("令牌应仍在");
     assert_eq!(cleared["model_group"], "");
 
@@ -490,7 +498,7 @@ async fn out_of_group_model_is_not_found_not_503() {
     )
     .await;
     let token: Value = created.json().await.expect("令牌应可解析");
-    let coding_key = token["token_key"].as_str().expect("应有 key");
+    let coding_key = token["plaintext_key"].as_str().expect("应有 key");
     admin_json(
         &gw,
         reqwest::Method::POST,
@@ -886,7 +894,7 @@ async fn pinned_group_source_routes_only_that_channel() {
     )
     .await;
     let token: Value = token_resp.json().await.expect("令牌应可解析");
-    let coding_key = token["token_key"].as_str().expect("应有 key");
+    let coding_key = token["plaintext_key"].as_str().expect("应有 key");
     admin_json(
         &gw,
         reqwest::Method::POST,

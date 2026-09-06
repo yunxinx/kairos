@@ -17,6 +17,7 @@ import InlineError from '@/components/ui/InlineError.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
+import ConfirmWindow from '@/components/ui/ConfirmWindow.vue';
 import DataTable from '@/components/ui/data-table/DataTable.vue';
 import DataTableColumnHeader from '@/components/ui/data-table/DataTableColumnHeader.vue';
 import DataTablePagination from '@/components/ui/data-table/DataTablePagination.vue';
@@ -36,17 +37,17 @@ import { useChannelDirectory } from '@/composables/useChannelDirectory';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
-import { formatDiscountBp } from '@/lib/format';
+import { formatDiscountBp, formatUsdMicros } from '@/lib/format';
 import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 import { anchorFromEvent } from '@/lib/window-anchor';
+import WindowStackGuard from '@/components/ui/WindowStackGuard.vue';
 
 type RequestLogWindowType = 'billing' | 'body';
 
-type RequestLogWindowPayload = {
-  type: RequestLogWindowType;
-  entry: LogEntry;
-};
+type RequestLogWindowPayload =
+  | { type: RequestLogWindowType; entry: LogEntry }
+  | { type: 'settlement'; entry: LogEntry; action: 'settle' | 'waive' };
 
 type RequestLogColumnId =
   | 'created'
@@ -122,6 +123,8 @@ const {
   topmostId,
   open: openWindow,
   close: closeWindow,
+  pendingConfirmation,
+  setDirty,
   bringToFront,
 } = useWindowStack<RequestLogWindowPayload>();
 
@@ -134,6 +137,7 @@ const appliedTokenName = ref<string | null>(null);
 const details = ref<Map<number, LogEntry>>(new Map());
 const detailLoading = ref<Set<number>>(new Set());
 const detailErrors = ref<Map<number, string>>(new Map());
+const settlementErrors = ref<Record<number, string>>({});
 const autoRefreshSeconds = ref<string>('0');
 
 const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
@@ -341,12 +345,29 @@ const closeMutation = useMutation({
       if (win.payload.entry.id === vars.id) {
         win.payload.entry = { ...win.payload.entry, settled: true };
       }
+      if (
+        win.payload.type === 'settlement' &&
+        win.payload.entry.id === vars.id &&
+        win.payload.action === vars.action
+      ) {
+        closeWindow(win.id, true);
+      }
     }
     await queryClient.invalidateQueries({ queryKey: ['logs'] });
     await queryClient.invalidateQueries({ queryKey: ['tokens'] });
   },
-  onError: (err) => {
-    error(extractApiError(err).message);
+  onError: (err, vars) => {
+    const message = extractApiError(err).message;
+    error(message);
+    for (const win of windows.value) {
+      if (
+        win.payload.type === 'settlement' &&
+        win.payload.entry.id === vars.id &&
+        win.payload.action === vars.action
+      ) {
+        settlementErrors.value[win.id] = message;
+      }
+    }
   },
 });
 
@@ -420,6 +441,29 @@ function openBodyWindow(event: MouseEvent, entry: LogEntry) {
   if (!details.value.has(entry.id)) {
     void loadDetail(entry.id);
   }
+}
+
+function openSettlementConfirmation(
+  event: MouseEvent,
+  entry: LogEntry,
+  action: 'settle' | 'waive',
+) {
+  const existing = windows.value.find(
+    (win) =>
+      win.payload.type === 'settlement' &&
+      win.payload.entry.id === entry.id &&
+      win.payload.action === action,
+  );
+  if (existing) {
+    bringToFront(existing.id);
+    return;
+  }
+  const opened = openWindow(anchorFromEvent(event), { type: 'settlement', entry, action });
+  if (opened) settlementErrors.value[opened.id] = '';
+}
+
+function settlementAction(payload: RequestLogWindowPayload): 'settle' | 'waive' {
+  return payload.type === 'settlement' ? payload.action : 'waive';
 }
 
 function clearKeyword() {
@@ -698,8 +742,8 @@ function onFilterToken(tokenName: string) {
         :topmost="win.id === topmostId"
         @close="closeWindow(win.id)"
         @raise="bringToFront(win.id)"
-        @settle="(id) => closeMutation.mutate({ id, action: 'settle' })"
-        @waive="(id) => closeMutation.mutate({ id, action: 'waive' })"
+        @settle="(event, entry) => openSettlementConfirmation(event, entry, 'settle')"
+        @waive="(event, entry) => openSettlementConfirmation(event, entry, 'waive')"
         @filter-model="onFilterModel"
         @filter-channel="onFilterChannel"
         @filter-token="onFilterToken"
@@ -720,6 +764,49 @@ function onFilterToken(tokenName: string) {
         @raise="bringToFront(win.id)"
         @retry-detail="loadDetail(win.payload.entry.id)"
       />
+      <ConfirmWindow
+        v-else
+        :title="
+          settlementAction(win.payload) === 'settle'
+            ? t('logs.settleConfirmTitle')
+            : t('logs.waiveConfirmTitle')
+        "
+        :message="
+          settlementAction(win.payload) === 'settle'
+            ? t('logs.settleConfirmMessage', {
+                amount: formatUsdMicros(win.payload.entry.cost_usd_micros),
+              })
+            : t('logs.waiveConfirmMessage')
+        "
+        :anchor="win.anchor"
+        :stack-order="win.z"
+        :cascade="index"
+        :attention="win.attention"
+        :topmost="win.id === topmostId"
+        :error="settlementErrors[win.id] ?? ''"
+        :busy="closingId === win.payload.entry.id"
+        :confirm-label="
+          settlementAction(win.payload) === 'settle'
+            ? t('logs.settleCharge')
+            : t('logs.waiveCharge')
+        "
+        :confirm-test-id="
+          settlementAction(win.payload) === 'settle' ? 'log-settle-confirm' : 'log-waive-confirm'
+        "
+        @close="closeWindow(win.id)"
+        @raise="bringToFront(win.id)"
+        @dirty-change="(dirty) => setDirty(win.id, dirty, false)"
+        @confirm="
+          closeMutation.mutate({ id: win.payload.entry.id, action: settlementAction(win.payload) })
+        "
+      />
     </template>
+    <!-- 脏关闭守卫确认窗：栈内置起投影，此处渲染并回接关闭动作。 -->
+    <WindowStackGuard
+      :confirmation="pendingConfirmation"
+      :stack-order="windows.length + 1"
+      @confirm="(windowId) => closeWindow(windowId, true)"
+      @cancel="pendingConfirmation = null"
+    />
   </div>
 </template>
