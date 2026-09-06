@@ -1509,6 +1509,41 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     None
 }
 
+/// [`sniff_usage`] 的逐帧入口：只物化 usage 所在子树，不整树建 DOM。
+///
+/// 流式终端事件 `response.completed` 等携带**完整 response 对象含 `output`
+/// 全量数组**——是整条流里最大的帧，整树解析会把全部输出物化成 `Value`。
+/// 探测结构只声明嗅探读取的键（顶层 `usage`、终端事件的 `type` 与
+/// `response.usage`），serde 流式跳过其余字段。物化子树装回同形状迷你
+/// 视图后复用 [`sniff_usage`] 单一逻辑，口径与整树解析严格一致。
+pub fn sniff_usage_str(frame: &str) -> Option<Usage> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default, rename = "type")]
+        event_type: Option<String>,
+        #[serde(default)]
+        usage: Option<Value>,
+        #[serde(default)]
+        response: Option<ResponseProbe>,
+    }
+    #[derive(Deserialize)]
+    struct ResponseProbe {
+        #[serde(default)]
+        usage: Option<Value>,
+    }
+    let probe: Probe = serde_json::from_str(frame).ok()?;
+    // 顶层 usage（非流式/独立帧）优先；否则组装终端事件形状的迷你视图，
+    // 由 sniff_usage 按 type 门控决定是否提取。
+    let view = match probe.usage {
+        Some(usage) => json!({ "usage": usage }),
+        None => json!({
+            "type": probe.event_type,
+            "response": { "usage": probe.response?.usage },
+        }),
+    };
+    sniff_usage(&view)
+}
+
 /// 判断非流式 Responses 对象是否明确以失败状态结束。
 pub fn response_is_failed(value: &Value) -> bool {
     value.get("status").and_then(Value::as_str) == Some("failed")
@@ -3354,6 +3389,33 @@ mod tests {
         );
         assert!(sniff_usage(&json!({ "usage": { "input_tokens": "invalid" } })).is_none());
         assert!(sniff_usage(&json!({ "usage": { "unrelated": 1 } })).is_none());
+    }
+
+    /// 逐帧嗅探入口与 Value 版口径一致：终端帧提取 usage，增量帧与坏 JSON
+    /// 返回 None。终端帧的 `output` 全量数组不物化（probe 只读 usage 所在
+    /// 子树）；非终端事件携带 response.usage 时 type 门控拒绝提取。
+    #[test]
+    fn sniff_usage_str_matches_value_sniff() {
+        let terminal = r#"{"type":"response.completed","response":{"id":"r","output":[{"type":"message","content":[{"type":"output_text","text":"long output text"}]}],"usage":{"input_tokens":1250,"output_tokens":100,"total_tokens":1350,"input_tokens_details":{"cached_tokens":200,"cache_write_tokens":50}}}}"#;
+        let usage = sniff_usage_str(terminal).expect("终端帧应提取 usage");
+        assert_eq!(
+            usage.input_tokens, 1000,
+            "input = total - cached - cache_write"
+        );
+        assert_eq!(usage.cache_write_tokens, 50);
+
+        // 非终端事件携带 response.usage：type 门控拒绝，不提取。
+        let non_terminal =
+            r#"{"type":"response.output_item.done","response":{"usage":{"input_tokens":5}}}"#;
+        assert!(sniff_usage_str(non_terminal).is_none());
+
+        // 终端事件缺 usage：None。
+        let no_usage = r#"{"type":"response.completed","response":{"id":"r"}}"#;
+        assert!(sniff_usage_str(no_usage).is_none());
+
+        let delta = r#"{"type":"response.output_text.delta","delta":"hi"}"#;
+        assert!(sniff_usage_str(delta).is_none());
+        assert!(sniff_usage_str("not json").is_none());
     }
 
     #[test]

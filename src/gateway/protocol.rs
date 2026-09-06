@@ -172,6 +172,22 @@ pub fn sniff_usage(value: &Value, protocol: Protocol) -> Option<Usage> {
     }
 }
 
+/// 流式热路径的逐帧 usage 嗅探：帧文本直接进入，适配器按需物化。
+///
+/// 与 [`sniff_usage`] 的差异只在成本模型：调用方先以 `"usage"` 子串门控
+/// （四协议的 usage 键名都含 `usage`，`usageMetadata` 亦然）排除无计费数据
+/// 的增量帧，再进入本函数；chat 与 Gemini（usage 挂在每帧）只物化 usage
+/// 子树，Anthropic/Responses（usage 只在流首/终局小帧）整帧解析。计费口径
+/// 与 [`sniff_usage`] 严格一致（各适配器的逐帧入口复用同一实现）。
+pub fn sniff_usage_str(frame: &str, protocol: Protocol) -> Option<Usage> {
+    match protocol {
+        Protocol::OpenAiChat => crate::core::openai_chat::sniff_chat_usage_str(frame),
+        Protocol::AnthropicMessages => crate::core::anthropic_messages::sniff_usage_str(frame),
+        Protocol::OpenAiResponses => crate::core::openai_responses::sniff_usage_str(frame),
+        Protocol::Gemini => crate::core::gemini::sniff_usage_str(frame),
+    }
+}
+
 /// 编码为入站协议的错误格式。
 pub fn encode_error(status: u16, message: &str, protocol: Protocol) -> Value {
     match protocol {
@@ -383,6 +399,45 @@ impl ChatStreamEncoder for GeminiStreamEncoder {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 逐帧嗅探分派：各协议帧文本直达适配器逐帧入口，计费口径与 Value 版
+    /// 一致；`"usage"` 子串门控（调用方职责）漏过的假阳性帧由适配器自行
+    /// 返回 None。
+    #[test]
+    fn sniff_usage_str_dispatches_per_protocol() {
+        let chat = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#;
+        let usage = sniff_usage_str(chat, Protocol::OpenAiChat).expect("chat 帧应提取");
+        assert_eq!(usage.input_tokens, 10);
+
+        let anthropic =
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":0}}}"#;
+        let usage =
+            sniff_usage_str(anthropic, Protocol::AnthropicMessages).expect("anthropic 帧应提取");
+        assert_eq!(usage.input_tokens, 7);
+
+        let responses = r#"{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":1}}}"#;
+        let usage =
+            sniff_usage_str(responses, Protocol::OpenAiResponses).expect("responses 帧应提取");
+        assert_eq!(usage.input_tokens, 5);
+
+        let gemini = r#"{"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1}}"#;
+        let usage = sniff_usage_str(gemini, Protocol::Gemini).expect("gemini 帧应提取");
+        assert_eq!(usage.input_tokens, 9);
+
+        // 门控漏过的假阳性：帧文本含 "usage" 但形状不符，各适配器返回 None。
+        let false_positive = r#"{"delta":"usage一词出现在文本里"}"#;
+        for protocol in [
+            Protocol::OpenAiChat,
+            Protocol::AnthropicMessages,
+            Protocol::OpenAiResponses,
+            Protocol::Gemini,
+        ] {
+            assert!(
+                sniff_usage_str(false_positive, protocol).is_none(),
+                "{protocol:?} 假阳性帧应返回 None"
+            );
+        }
+    }
 
     /// 出站路径构造：静态协议忽略模型名与流式；Gemini 的模型名承载在路径
     /// 端点上，流式走 `:streamGenerateContent?alt=sse`。

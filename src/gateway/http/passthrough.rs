@@ -894,25 +894,27 @@ async fn pipe_passthrough_stream<S>(
             if frame.is_empty() {
                 continue;
             }
-            // 帧以 UTF-8 文本交给解码器直解 wire 类型；usage 嗅探按需自行解析。
+            // 帧以 UTF-8 文本交给解码器直解 wire 类型；usage 嗅探先经子串
+            // 门控再由适配器按需物化（与 pipe_stream 同路径）。两者互不依赖：
+            // 坏帧嗅探不出 usage，但同样进解码器留痕（warn + 按语义跳过）。
             let frame_text = String::from_utf8_lossy(&frame);
-            if let Ok(value) = serde_json::from_str::<Value>(&frame_text) {
-                if let Some(sniffed) = protocol::sniff_usage(&value, ctx.protocol) {
-                    usage_reported = true;
-                    usage.union_max(sniffed);
+            if frame_text.contains("usage")
+                && let Some(sniffed) = protocol::sniff_usage_str(&frame_text, ctx.protocol)
+            {
+                usage_reported = true;
+                usage.union_max(sniffed);
+            }
+            let decoded = decoder.process(&frame_text);
+            if decoded.events.iter().any(|event| match event {
+                StreamEvent::Error { .. } => true,
+                StreamEvent::Finish { finish_reason, .. } => {
+                    finish_reason.unified == crate::core::ir::FinishReasonUnified::Error
                 }
-                let decoded = decoder.process(&frame_text);
-                if decoded.events.iter().any(|event| match event {
-                    StreamEvent::Error { .. } => true,
-                    StreamEvent::Finish { finish_reason, .. } => {
-                        finish_reason.unified == crate::core::ir::FinishReasonUnified::Error
-                    }
-                    _ => false,
-                }) {
-                    // 响应头已经发出后无法再改变 HTTP 状态；日志仍记录失败终态，
-                    // 避免 200 掩盖 provider 的明确失败。
-                    ctx.status_code = 502;
-                }
+                _ => false,
+            }) {
+                // 响应头已经发出后无法再改变 HTTP 状态；日志仍记录失败终态，
+                // 避免 200 掩盖 provider 的明确失败。
+                ctx.status_code = 502;
             }
         }
         if sse_buffer.len() > ctx.snapshot.sse_reassembly_max() {

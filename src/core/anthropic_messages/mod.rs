@@ -2273,6 +2273,15 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     None
 }
 
+/// [`sniff_usage`] 的逐帧入口：整帧解析，供流式热路径逐帧嗅探。
+///
+/// usage 只出现在流首 `message_start` 与流尾 `message_delta`（网关先以
+/// `"usage"` 子串门控排除增量帧），命中的都是携带 usage 的小帧，局部物化
+/// 无收益，直接整帧建 DOM 复用 [`sniff_usage`]。
+pub fn sniff_usage_str(frame: &str) -> Option<Usage> {
+    sniff_usage(&serde_json::from_str(frame).ok()?)
+}
+
 /// 从 usage 对象解析 IR 四分量与 1h 写入明细。
 fn parse_usage_object(usage: &serde_json::Map<String, Value>) -> Option<Usage> {
     let mut has_metric = false;
@@ -4496,6 +4505,20 @@ mod tests {
         assert!(sniff_usage(&json!({ "content_block_start": true })).is_none());
         assert!(sniff_usage(&json!({ "usage": { "output_tokens": "invalid" } })).is_none());
         assert!(sniff_usage(&json!({ "usage": { "unrelated": 1 } })).is_none());
+    }
+
+    /// 逐帧嗅探入口与 Value 版口径一致：流首/流尾帧提取，增量帧与坏 JSON
+    /// 返回 None。
+    #[test]
+    fn sniff_usage_str_matches_value_sniff() {
+        let start = r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":0}}}"#;
+        let usage = sniff_usage_str(start).expect("message_start 应提取 usage");
+        assert_eq!(usage.input_tokens, 10);
+
+        let delta =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        assert!(sniff_usage_str(delta).is_none());
+        assert!(sniff_usage_str("not json").is_none());
     }
 
     /// Anthropic 强制要求 max_tokens：IR 缺省时补默认 4096，避免跨协议请求被拒。

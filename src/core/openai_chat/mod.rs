@@ -1378,6 +1378,25 @@ pub fn sniff_chat_usage(value: &Value) -> Option<Usage> {
     Some(convert_usage(wire))
 }
 
+/// [`sniff_chat_usage`] 的逐帧入口：只物化 `usage` 子树，不整树建 DOM。
+///
+/// 网关对流式开启 `stream_options.include_usage` 后每个增量帧都携带
+/// `"usage": null`，逐帧整树解析会把整条流的 delta 全部物化成 `Value`。
+/// 探测结构只声明嗅探读取的键，serde 流式跳过其余字段；`usage: null`
+/// （或缺失）在此短路返回，不建迷你视图，增量帧零堆分配。物化的子树装回
+/// 同形状迷你视图后复用 [`sniff_chat_usage`] 单一逻辑，口径与整树解析
+/// 严格一致。
+pub fn sniff_chat_usage_str(frame: &str) -> Option<Usage> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        usage: Option<Value>,
+    }
+    let probe: Probe = serde_json::from_str(frame).ok()?;
+    let usage = probe.usage?;
+    sniff_chat_usage(&json!({ "usage": usage }))
+}
+
 /// usage 四分量折算：input = prompt - cached - cache_write，output = completion。
 /// `raw` 保留上游原始 usage 形状。
 fn convert_usage(wire: WireUsage) -> Usage {
@@ -3231,6 +3250,23 @@ mod tests {
         assert!(sniff_chat_usage(&no_usage).is_none());
         assert!(sniff_chat_usage(&json!({ "usage": { "prompt_tokens": "invalid" } })).is_none());
         assert!(sniff_chat_usage(&json!({ "usage": { "unrelated": 1 } })).is_none());
+    }
+
+    /// 逐帧嗅探入口与 Value 版口径一致：增量帧的 `usage: null` 与无 usage
+    /// 帧零提取；终帧提取四分量；坏 JSON 返回 None。
+    #[test]
+    fn sniff_chat_usage_str_matches_value_sniff() {
+        // include_usage 开启时每个增量帧都携带 `"usage": null`——不得提取。
+        let delta = r#"{"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}"#;
+        assert!(sniff_chat_usage_str(delta).is_none());
+
+        let terminal = r#"{"id":"c","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":1250,"completion_tokens":100,"total_tokens":1350,"prompt_tokens_details":{"cached_tokens":200,"cache_write_tokens":50}}}"#;
+        let usage = sniff_chat_usage_str(terminal).expect("终帧应提取 usage");
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cache_read_tokens, 200);
+
+        assert!(sniff_chat_usage_str(r#"{"choices":[]}"#).is_none());
+        assert!(sniff_chat_usage_str("not json").is_none());
     }
 
     /// 流内错误编码：chat 无协议内错误通道，以独立 `data:` 帧下发错误 JSON，

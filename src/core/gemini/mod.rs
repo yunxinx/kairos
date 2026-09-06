@@ -1479,6 +1479,25 @@ pub fn sniff_usage(value: &Value) -> Option<Usage> {
     Some(convert_usage(usage))
 }
 
+/// [`sniff_usage`] 的逐帧入口：只物化 `usageMetadata` 子树，不整树建 DOM。
+///
+/// Gemini 每个流式 chunk 都携带累计 `usageMetadata`（中断流按已观察帧结算
+/// 的语义要求逐帧嗅探），整树解析会把 candidates 与 parts 增量全部物化成
+/// `Value`。探测结构只声明嗅探读取的键（camelCase 主名 + proto JSON 的
+/// snake_case 别名，与 [`sniff_usage`] 的双名读取同口径），serde 流式跳过
+/// 其余字段；`usageMetadata` 缺失在此短路返回，不建迷你视图。物化子树装回
+/// 同形状迷你视图后复用 [`sniff_usage`] 单一逻辑，口径与整树解析严格一致。
+pub fn sniff_usage_str(frame: &str) -> Option<Usage> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default, rename = "usageMetadata", alias = "usage_metadata")]
+        usage_metadata: Option<Value>,
+    }
+    let probe: Probe = serde_json::from_str(frame).ok()?;
+    let usage_metadata = probe.usage_metadata?;
+    sniff_usage(&json!({ "usageMetadata": usage_metadata }))
+}
+
 // ---- 流式：上游 chunk → IR 流事件 ----
 
 /// 单个 chunk 解码结果：IR 事件 + 是否产出任何输出内容。
@@ -2420,6 +2439,26 @@ mod tests {
             sniff_usage(&json!({ "usageMetadata": { "promptTokenCount": "invalid" } })).is_none()
         );
         assert!(sniff_usage(&json!({ "usageMetadata": { "unrelated": 1 } })).is_none());
+    }
+
+    /// 逐帧嗅探入口与 Value 版同口径：chunk 携带 parts 增量与累计
+    /// usageMetadata 时只提取计费分量；snake_case 别名同样生效；坏 JSON
+    /// 返回 None。
+    #[test]
+    fn sniff_usage_str_matches_value_sniff() {
+        let chunk = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]}}],"usageMetadata":{"promptTokenCount":130,"candidatesTokenCount":40,"thoughtsTokenCount":10,"cachedContentTokenCount":30}}"#;
+        let usage = sniff_usage_str(chunk).expect("chunk 应提取 usage");
+        assert_eq!(usage.input_tokens, 100, "input = prompt - cached");
+        assert_eq!(usage.output_tokens, 50, "输出 = 候选 + 思考");
+
+        // proto JSON 的 snake_case 别名。
+        let snake = r#"{"usage_metadata":{"prompt_token_count":100,"candidates_token_count":2}}"#;
+        let usage = sniff_usage_str(snake).expect("snake_case 别名应提取");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 2);
+
+        assert!(sniff_usage_str(r#"{"candidates":[]}"#).is_none());
+        assert!(sniff_usage_str("not json").is_none());
     }
 
     /// finish 双轨：functionCall part 在场时 STOP 归 ToolCalls；

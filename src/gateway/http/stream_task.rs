@@ -369,10 +369,12 @@ pub(super) async fn pipe_stream<S>(
             if frame.is_empty() {
                 continue;
             }
-            // 帧以 UTF-8 文本交给解码器直解 wire 类型；usage 嗅探按需自行解析。
+            // 帧以 UTF-8 文本交给解码器直解 wire 类型；usage 嗅探先经子串
+            // 门控再由适配器按需物化（chat/Gemini 只建 usage 子树，不整树
+            // 建 DOM——流式 delta 帧占绝对多数，整树解析是热路径主要浪费）。
             let frame_text = String::from_utf8_lossy(&frame);
-            if let Ok(value) = serde_json::from_str::<Value>(&frame_text)
-                && let Some(sniffed) = protocol::sniff_usage(&value, ctx.channel.protocol)
+            if frame_text.contains("usage")
+                && let Some(sniffed) = protocol::sniff_usage_str(&frame_text, ctx.channel.protocol)
             {
                 usage_reported = true;
                 usage.union_max(sniffed);
