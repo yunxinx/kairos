@@ -85,8 +85,16 @@ fn example_config_file_is_valid() {
     let path = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.json"));
     let cfg = config::Config::load(path).expect("示例配置应可解析");
     assert_eq!(cfg.listen.port, 8787);
-    assert!(cfg.admin_email.is_none());
-    assert!(cfg.admin_password.is_none());
+    assert_eq!(
+        cfg.admin_email.as_deref(),
+        Some("root@example.com"),
+        "示例应演示首次启动播种的管理账号"
+    );
+    assert_eq!(
+        cfg.admin_password.as_deref(),
+        Some("change-me"),
+        "示例应演示首次启动播种的管理口令"
+    );
     let admin = cfg.admin_listen.expect("示例配置应含管理监听");
     assert_eq!(admin.port, 8788);
     assert_eq!(
