@@ -13,7 +13,7 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useToast } from '@/composables/useToast';
-import { formatUsdMicros, maskTokenKey } from '@/lib/format';
+import { formatUsdMicros } from '@/lib/format';
 import { groupDisplayName, tokenGroupUsable } from '@/lib/visible-models';
 
 const props = defineProps<{
@@ -88,10 +88,10 @@ const toggleMutation = useMutation({
               <TableCell class="max-w-32 font-medium">
                 <span class="block truncate" :title="token.name">{{ token.name }}</span>
               </TableCell>
-              <!-- 接口只返回掩码指纹：同用户多把令牌靠前后缀区分，运营按 id 操作。 -->
+              <!-- 接口只返回掩码 key：同用户多把令牌靠前后缀区分，运营按 id 操作。 -->
               <TableCell>
                 <span class="text-fg-muted font-mono text-xs" data-testid="user-token-key">
-                  {{ maskTokenKey(token.token_key_fingerprint) }}
+                  {{ token.token_key_masked }}
                 </span>
               </TableCell>
               <TableCell class="font-mono text-xs" data-testid="user-token-model-group">

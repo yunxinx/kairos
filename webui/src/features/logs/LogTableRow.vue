@@ -11,7 +11,6 @@ import {
   formatUnixMillis,
   formatUsdMicros,
   formatTokensCount,
-  maskTokenKey,
   computeCacheHitRatio,
 } from '@/lib/format';
 import { resolveOutboundProtocol } from '@/lib/protocol';
@@ -139,9 +138,9 @@ function handleRowClick(event: MouseEvent) {
         </div>
         <div
           class="text-fg-muted truncate font-mono text-[10px] opacity-80"
-          :title="entry.token_key_fingerprint"
+          :title="entry.token_key_masked"
         >
-          {{ maskTokenKey(entry.token_key_fingerprint) }}
+          {{ entry.token_key_masked }}
         </div>
       </div>
     </TableCell>

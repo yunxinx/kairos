@@ -84,18 +84,6 @@ export function formatUnixMillis(millis: number, locale?: string): string {
   return new Date(millis).toLocaleString(resolveNumberLocale(locale));
 }
 
-/** 长 key 掩码时保留明文边缘的长度。 */
-const TOKEN_KEY_VISIBLE_EDGE = 8;
-const TOKEN_KEY_MASK = '******';
-
-/** 令牌 key 掩码展示：短 key 全量掩码，长 key 前、后各保留 8 位明文。 */
-export function maskTokenKey(key: string): string {
-  if (key.length <= TOKEN_KEY_VISIBLE_EDGE * 2) {
-    return TOKEN_KEY_MASK;
-  }
-  return `${key.slice(0, TOKEN_KEY_VISIBLE_EDGE)}${TOKEN_KEY_MASK}${key.slice(-TOKEN_KEY_VISIBLE_EDGE)}`;
-}
-
 const MILLIS_PER_SECOND = 1_000;
 const DAYS_PER_MONTH = 30;
 const DAYS_PER_YEAR = 365;

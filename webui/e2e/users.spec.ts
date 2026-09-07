@@ -79,7 +79,7 @@ test.describe('users page', () => {
     // 视图同款，明文从不出现。
     const owned = (await own.json()) as {
       id: number;
-      token_key_fingerprint: string;
+      token_key_masked: string;
       plaintext_key: string;
     };
     // 以第二用户身份建完令牌后切回 root：/users 是 admin-only 页面。

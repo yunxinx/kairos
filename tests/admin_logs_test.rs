@@ -292,7 +292,7 @@ async fn logs_redact_long_token_keys() {
         .iter()
         .find(|item| item["token_name"] == "long")
         .expect("应有长 key 行");
-    let masked = long_entry["token_key_fingerprint"]
+    let masked = long_entry["token_key_masked"]
         .as_str()
         .expect("token_key 应为字符串");
     assert_eq!(
@@ -353,7 +353,7 @@ async fn logs_redact_long_token_keys() {
         .iter()
         .find(|item| item["token_name"] == "short")
         .expect("应有短 key 行");
-    assert_eq!(short_entry["token_key_fingerprint"], "******");
+    assert_eq!(short_entry["token_key_masked"], "******");
 }
 
 /// GET `/logs` 按 Unicode 标量掩码多字节 token_key，不会按字节切片 panic。
@@ -413,7 +413,7 @@ async fn logs_mask_multibyte_token_keys_without_panic() {
         .chain(['*', '*', '*', '*', '*', '*'].iter())
         .chain(chars[chars.len() - 8..].iter())
         .collect();
-    assert_eq!(entry["token_key_fingerprint"], expected);
+    assert_eq!(entry["token_key_masked"], expected);
 }
 
 /// GET `/logs?settled=` 过滤，且 `unsettled_total` 忽略 settled 维。
@@ -643,9 +643,7 @@ async fn unsettled_log_survives_token_deletion_and_user_archival() {
     assert_eq!(token.status(), reqwest::StatusCode::CREATED);
     let token: Value = token.json().await.expect("令牌应可解析");
     let token_id = token["id"].as_i64().expect("应有令牌 id");
-    let token_key = token["token_key_fingerprint"]
-        .as_str()
-        .expect("应有令牌 key");
+    let token_key = token["token_key_masked"].as_str().expect("应有令牌 key");
 
     let mut log = store::request_log::RequestLog {
         id: 0,

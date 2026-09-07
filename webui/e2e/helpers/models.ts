@@ -93,7 +93,7 @@ export async function seedModelGroup(page: Page, body: ModelGroup): Promise<void
 export async function seedToken(
   page: Page,
   body: Partial<{ name: string; model_group: string }> & { name: string },
-): Promise<{ token_key_fingerprint: string; plaintext_key: string }> {
+): Promise<{ token_key_masked: string; plaintext_key: string }> {
   const resp = await page.request.post('/api/tokens', {
     headers: await e2eRootHeaders(page),
     data: {
@@ -104,8 +104,8 @@ export async function seedToken(
     },
   });
   expect(resp.ok(), await resp.text()).toBeTruthy();
-  // token_key_fingerprint 是掩码（与列表读取面比对用），协议面凭证用创建响应的明文 plaintext_key。
-  return (await resp.json()) as { token_key_fingerprint: string; plaintext_key: string };
+  // token_key_masked 是掩码（与列表读取面比对用），协议面凭证用创建响应的明文 plaintext_key。
+  return (await resp.json()) as { token_key_masked: string; plaintext_key: string };
 }
 
 /** 经管理 API 整表替换价格目录缓存。 */

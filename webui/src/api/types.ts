@@ -83,7 +83,7 @@ export interface TokenView extends TokenAttributes {
   /** 库生成的稳定身份；管理面按它定位令牌。 */
   id: number;
   /** 令牌 key 的掩码形态（前 8 位 + ****** + 后 8 位）；明文经取回端点按需获得。 */
-  token_key_fingerprint: string;
+  token_key_masked: string;
   /** 累计消费上限；`null` 表示无限额。 */
   limit_usd_micros: number | null;
   /** 派生可用余额 = 累计消费上限 - 累计已结算；`null` 表示无限额。 */
@@ -531,8 +531,8 @@ export interface LogEntry {
   id: number;
   created_at: number;
   token_name: string;
-  /** 令牌 key 的掩码指纹（不可逆，非凭证）。 */
-  token_key_fingerprint: string;
+  /** 令牌 key 的掩码形态（前 8 位 + ****** + 后 8 位；归属展示用，非凭证）。 */
+  token_key_masked: string;
   inbound_protocol: string;
   model: string;
   /** 实际出站模型名；旧行可能为 null。 */
@@ -594,7 +594,7 @@ export type SystemLogSortBy = 'created';
 
 /** 日志列表查询。 */
 export interface LogQuery {
-  /** 按令牌展示名精确过滤；列表里的 `token_key_fingerprint` 已脱敏，行内筛选用这个。 */
+  /** 按令牌展示名精确过滤；列表里的 `token_key_masked` 已脱敏，行内筛选用这个。 */
   token_name?: string;
   model?: string;
   /** 按渠道名精确过滤。 */
@@ -733,15 +733,20 @@ export interface ChannelProbeResult {
   upstream_body: string | null;
 }
 
-/** 拉取上游模型列表的请求：按未保存草稿（自带密钥）或已保存渠道（密钥取库中定义）。 */
-export type UpstreamModelsDraft =
-  | {
-      protocol: Protocol;
-      base_url: string;
-      api_key: string;
-      timeout_ms: number;
-    }
-  | { channel_id: number };
+/**
+ * 拉取上游模型列表的请求：地址/协议/超时一律取编辑器当前草稿（未保存的
+ * 修改立即生效）；密钥二选一——`api_key` 为表单新填的明文，`channel_id`
+ * 为编辑既有渠道未改密钥时的「保留原值」形态（取库中第一把启用密钥）。
+ */
+export interface UpstreamModelsDraft {
+  protocol: Protocol;
+  base_url: string;
+  timeout_ms: number;
+  /** 表单新填的明文密钥；与 `channel_id` 互斥。 */
+  api_key?: string;
+  /** 编辑既有渠道时按此取库中密钥；与 `api_key` 互斥。 */
+  channel_id?: number;
+}
 
 /** 上游模型列表响应：模型 id 数组（上游顺序）。 */
 export interface UpstreamModelsView {

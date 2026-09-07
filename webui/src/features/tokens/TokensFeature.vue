@@ -34,7 +34,6 @@ import {
   formatUnixMillis,
   formatUsdFixed2,
   formatUsdMicros,
-  maskTokenKey,
   relativeTimeParts,
 } from '@/lib/format';
 import { groupDisplayName } from '@/lib/visible-models';
@@ -426,7 +425,7 @@ function openBulkDelete() {
               </TableCell>
               <TableCell>
                 <span class="inline-flex items-center gap-1">
-                  <!-- 剪贴板不可用时就地展开明文供手动复制（2s 后回落掩码）。 -->
+                  <!-- 剪贴板不可用时就地展开明文供手动复制（30s 后回落掩码）。 -->
                   <code
                     v-if="revealedKeyId === token.id"
                     class="code-chip rounded px-2 py-0.5 font-mono text-xs"
@@ -435,7 +434,7 @@ function openBulkDelete() {
                     {{ tokenPlaintext(token) }}
                   </code>
                   <code v-else class="code-chip rounded px-2 py-0.5 font-mono text-xs">
-                    {{ maskTokenKey(token.token_key_fingerprint) }}
+                    {{ token.token_key_masked }}
                   </code>
                   <button
                     type="button"

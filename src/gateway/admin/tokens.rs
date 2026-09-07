@@ -40,7 +40,7 @@ pub(super) fn routes() -> Router<AdminDeps> {
 pub(super) struct TokenView {
     pub(super) id: i64,
     /// 令牌 key 的掩码形态；明文只在创建响应与 [`reveal_token_key`] 出现。
-    pub(super) token_key_fingerprint: String,
+    pub(super) token_key_masked: String,
     pub(super) name: String,
     pub(super) limit_usd_micros: Option<i64>,
     pub(super) rate_limit_rpm: Option<u64>,
@@ -59,7 +59,7 @@ impl TokenView {
             available_balance(record.token.limit_usd_micros, settled_usd_micros)?;
         Ok(Self {
             id: record.id,
-            token_key_fingerprint: record.token.token_key,
+            token_key_masked: record.token.token_key,
             name: record.token.name,
             limit_usd_micros: record.token.limit_usd_micros,
             rate_limit_rpm: record.token.rate_limit_rpm,
@@ -78,7 +78,7 @@ impl TokenView {
     ) -> Result<Self, AdminError> {
         let masked = mask_token_key(&record.token.token_key);
         let mut view = Self::from_record(record, settled_usd_micros)?;
-        view.token_key_fingerprint = masked;
+        view.token_key_masked = masked;
         Ok(view)
     }
 }
@@ -592,7 +592,7 @@ pub(super) async fn delete_token(
     reload_and_swap(&deps).await?;
     let masked = mask_token_key(&deleted.token.token_key);
     let mut view = TokenView::from_record(deleted, settled)?;
-    view.token_key_fingerprint = masked;
+    view.token_key_masked = masked;
     Ok(Json(view))
 }
 

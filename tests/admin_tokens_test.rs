@@ -46,10 +46,7 @@ async fn token_crud_roundtrip_and_immediate_effect() {
         .iter()
         .find(|t| t["id"] == new_id)
         .expect("新建令牌应出现在列表");
-    assert_ne!(
-        listed["token_key_fingerprint"], new_key,
-        "列表不得回显明文 key"
-    );
+    assert_ne!(listed["token_key_masked"], new_key, "列表不得回显明文 key");
     let revealed: Value = admin_get(&gw, &format!("/tokens/{new_id}/key"))
         .await
         .json()

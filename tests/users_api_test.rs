@@ -148,7 +148,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         .collect();
     assert_eq!(user_ids, vec![mine_id]);
     assert_ne!(
-        user_list[0]["token_key_fingerprint"], mine_key,
+        user_list[0]["token_key_masked"], mine_key,
         "所有者列表也不得回显明文 key"
     );
 
@@ -212,7 +212,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     .await;
     assert_eq!(disable.status(), StatusCode::OK);
     let disabled_view: Value = disable.json().await.expect("禁用响应应可解析");
-    let disabled_key = disabled_view["token_key_fingerprint"]
+    let disabled_key = disabled_view["token_key_masked"]
         .as_str()
         .expect("禁用响应应有 key");
     assert_ne!(disabled_key, mine_key, "跨归属操作不应回显明文 key");
@@ -233,7 +233,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
     let enabled_view: Value = enable.json().await.expect("启用响应应可解析");
     assert_eq!(enabled_view["enabled"], true);
     assert!(
-        enabled_view["token_key_fingerprint"]
+        enabled_view["token_key_masked"]
             .as_str()
             .is_some_and(|key| key.contains("******")),
         "跨归属启用也必须保持 key 脱敏"
@@ -397,9 +397,7 @@ async fn tokens_are_owned_by_session_user_and_admin_can_toggle_enabled() {
         .expect("应能按 id 找到该令牌");
     assert_eq!(row["enabled"], false, "admin 应已禁用该令牌");
     // 他人令牌的 key 只给脱敏形态：运营按 id 操作，拿不到明文去花别人的余额。
-    let shown = row["token_key_fingerprint"]
-        .as_str()
-        .expect("应有 key 字段");
+    let shown = row["token_key_masked"].as_str().expect("应有 key 字段");
     assert_ne!(shown, mine_key, "不应回显明文 key");
     assert!(shown.contains("******"), "应为脱敏形态，实际 {shown}");
 }

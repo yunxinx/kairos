@@ -41,7 +41,7 @@ pub(super) struct LogEntry {
     created_at: i64,
     token_name: String,
     /// 令牌 key 的掩码形态（前 8 位 + ****** + 后 8 位；日志归属展示用，非凭证）。
-    token_key_fingerprint: String,
+    token_key_masked: String,
     inbound_protocol: String,
     model: String,
     outbound_model: Option<String>,
@@ -89,7 +89,7 @@ impl LogEntry {
             id: log.id,
             created_at: log.created_at,
             token_name: log.token_name,
-            token_key_fingerprint: mask_token_key(&log.token_key),
+            token_key_masked: mask_token_key(&log.token_key),
             inbound_protocol: log.inbound_protocol,
             model: log.model,
             outbound_model: reveal_topology.then_some(log.outbound_model).flatten(),

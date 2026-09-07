@@ -387,7 +387,7 @@ test.describe('channel manual model add', () => {
         data: { name: 'manual-add-token', balance_usd_micros: null, enabled: true },
       });
       expect(tokenResp.ok()).toBeTruthy();
-      // 协议面凭证是创建响应一次性返回的明文 key；token_key 列只承载指纹。
+      // 协议面凭证用创建响应交付的明文 key；token_key 列只承载掩码形态。
       const token = (await tokenResp.json()) as { plaintext_key: string };
 
       await page.goto('/channels');
