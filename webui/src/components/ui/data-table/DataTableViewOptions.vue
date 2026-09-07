@@ -2,6 +2,7 @@
 import {
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuItemIndicator,
   DropdownMenuLabel,
   DropdownMenuPortal,
@@ -18,14 +19,18 @@ withDefaults(
     items: ColumnVisibilityItem<Id>[];
     labels: Record<Id, string>;
     testId?: string;
+    /** 页面接了列宽拖拽时才渲染「重置列宽」入口。 */
+    resetWidths?: boolean;
   }>(),
   {
     testId: 'table-columns',
+    resetWidths: false,
   },
 );
 
 const emit = defineEmits<{
   toggle: [id: Id, visible: boolean];
+  resetWidths: [];
 }>();
 
 const { t } = useI18n();
@@ -50,6 +55,15 @@ const { t } = useI18n();
           {{ t('common.toggleColumns') }}
         </DropdownMenuLabel>
         <DropdownMenuSeparator class="data-table-menu-separator" />
+        <DropdownMenuItem
+          v-if="resetWidths"
+          class="data-table-menu-item"
+          :data-testid="`${testId}-reset-widths`"
+          @select="emit('resetWidths')"
+        >
+          <UiIcon name="refresh-cw" :size="14" />
+          {{ t('common.resetColumnWidths') }}
+        </DropdownMenuItem>
         <DropdownMenuCheckboxItem
           v-for="item in items"
           :key="item.id"

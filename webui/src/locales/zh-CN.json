@@ -95,6 +95,8 @@
     "actions": "操作",
     "columns": "列",
     "toggleColumns": "显示列",
+    "resizeColumn": "调整列宽（拖动或方向键，双击恢复默认）",
+    "resetColumnWidths": "重置列宽",
     "sortAscending": "升序",
     "sortDescending": "降序",
     "clearSort": "取消排序",

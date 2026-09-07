@@ -5,6 +5,7 @@ import { TabsContent, TabsIndicator, TabsList, TabsRoot, TabsTrigger } from 'rek
 import PageHeader from '@/app/layout/PageHeader.vue';
 import RequestLogsPanel from '@/features/logs/RequestLogsPanel.vue';
 import SystemLogsPanel from '@/features/logs/SystemLogsPanel.vue';
+import { useRouteTab } from '@/composables/useRouteTab';
 import { hasCapability } from '@/lib/capabilities';
 import { useCurrentUser } from '@/lib/session';
 
@@ -25,10 +26,18 @@ const canReadSystemLogs = computed(
 const systemTabLabel = computed(() =>
   isPlainUser.value ? t('logs.kind.ownAudit') : t('logs.kind.system'),
 );
+
+// tab 持久化走 /logs?kind=…（replace 写回）；system tab 对无能力用户收敛回 request。
+const activeKind = useRouteTab<'request' | 'system'>({
+  from: '/logs',
+  param: 'kind',
+  allowed: () => (canReadSystemLogs.value ? ['request', 'system'] : ['request']),
+  fallback: 'request',
+});
 </script>
 
 <template>
-  <TabsRoot default-value="request" class="flex flex-col">
+  <TabsRoot v-model="activeKind" class="flex flex-col">
     <PageHeader>
       <template #leading>
         <TabsList class="page-tab-switch" :aria-label="t('logs.kinds')">

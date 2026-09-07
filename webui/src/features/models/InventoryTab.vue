@@ -27,6 +27,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { invalidateChannelCaches, useChannelDirectory } from '@/composables/useChannelDirectory';
+import { useRouteFilters } from '@/composables/useRouteFilters';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -65,9 +66,11 @@ const me = useCurrentUser();
 const canEditPrices = computed(() => hasCapability(me.value, 'edit_prices'));
 const canEditCatalog = computed(() => hasCapability(me.value, 'edit_price_catalog'));
 
-const searchText = ref('');
-const statusFilter = ref<string[]>([]);
-const selectedChannels = ref<string[]>([]);
+// 清单筛选走 /models?q=…&status=…&channel=…（与 tab 同 URL，replace 写回，搜索词防抖）。
+const { listParam, debouncedSearchParam } = useRouteFilters('/models', ['q', 'status', 'channel']);
+const { draft: searchText } = debouncedSearchParam('q');
+const statusFilter = listParam('status');
+const selectedChannels = listParam('channel');
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 const canRewriteChannels = computed(() => me.value?.role === 'root');
 const canSelectRows = computed(() => canEditCatalog.value || canRewriteChannels.value);

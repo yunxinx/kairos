@@ -452,9 +452,7 @@ const syncKeySource = computed<SyncKeySource | null>(() => {
 
 /** 地址已填且密钥来源明确即可同步；编辑既有渠道未改密钥时恒可用（走库中密钥）。
  * 已保存渠道没有任何启用密钥时后端会在同步时报错，前端不预判禁用。 */
-const canSync = computed(
-  () => editorBaseUrl.value.trim() !== '' && syncKeySource.value !== null,
-);
+const canSync = computed(() => editorBaseUrl.value.trim() !== '' && syncKeySource.value !== null);
 
 /** 同步视图只在 canSync 为真时可进入（按钮否则禁用），此处按该不变量收窄非空。 */
 const syncKeySourceRequired = computed<SyncKeySource>(() => {

@@ -468,7 +468,7 @@ function settlementAction(payload: RequestLogWindowPayload): 'settle' | 'waive' 
 
 function clearKeyword() {
   draftKeyword.value = '';
-  appliedKeyword.value = '';
+  applyKeywordNow();
 }
 
 function onFilterModel(model: string) {

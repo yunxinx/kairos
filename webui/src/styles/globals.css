@@ -1143,6 +1143,49 @@ html[lang='zh-CN'] .font-serif {
   min-height: 2.5rem;
 }
 
+/* ── Column resize handle（表头右缘拖拽把手）── */
+.column-resize-handle {
+  flex: none;
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 100%;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+  /* 键盘焦点圈只留 2px 内缘，避免盖过相邻列内容。 */
+  border-radius: 2px;
+}
+.column-resize-handle::after {
+  content: '';
+  position: absolute;
+  inset: 25% 2px 25% auto;
+  width: 2px;
+  background: var(--seed-border);
+  opacity: 0;
+  transition: opacity 120ms ease-in-out;
+}
+.column-resize-handle:hover,
+.column-resize-handle:focus-visible,
+.column-resize-handle-active,
+.column-resize-handle-visible {
+  outline: none;
+}
+.column-resize-handle:hover::after,
+.column-resize-handle:focus-visible::after,
+.column-resize-handle-active::after,
+.column-resize-handle-visible::after {
+  opacity: 1;
+  background: var(--seed-primary);
+}
+.column-resize-handle:focus-visible::after {
+  box-shadow: 0 0 0 1px var(--seed-primary);
+}
+[data-slot='table-head'] {
+  /* 把手绝对定位的锚点；th 自身不 relative 也不影响内容布局。 */
+  position: relative;
+}
+
 /* ── Data table row menu（Reka DropdownMenu）── */
 .data-table-menu {
   box-sizing: border-box;

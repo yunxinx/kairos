@@ -28,7 +28,9 @@ import TableHeader from '@/components/ui/table/TableHeader.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete } from '@/composables/useBulkDelete';
+import { useColumnResize } from '@/composables/useColumnResize';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
+import { useRouteFilters } from '@/composables/useRouteFilters';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -93,10 +95,17 @@ const { error } = useToast();
 const queryClient = useQueryClient();
 const navigate = useNavigate();
 const me = useCurrentUser();
-const searchText = ref('');
-const roleFilter = ref<string[]>([]);
-const statusFilter = ref<string[]>([]);
-const planFilter = ref<string[]>([]);
+// 搜索词与角色/状态/套餐筛选走 /users?q=…&role=…（replace 写回，搜索词防抖）。
+const { listParam, debouncedSearchParam } = useRouteFilters('/users', [
+  'q',
+  'role',
+  'status',
+  'plan',
+]);
+const { draft: searchText } = debouncedSearchParam('q');
+const roleFilter = listParam('role');
+const statusFilter = listParam('status');
+const planFilter = listParam('plan');
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
 
 const sortBy = ref<UserSortBy | null>(null);
@@ -106,6 +115,17 @@ const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
   'kairos-users-columns',
   USER_COLUMNS,
 );
+
+// 列宽拖拽 + 持久化。复选框/操作列不参与；身份列（邮箱/昵称/套餐）不设默认宽，吃剩余宽度。
+const { widths, resize, commit, reset, resetAll } = useColumnResize('kairos-users-column-widths', [
+  { id: 'role', width: 96, minWidth: 64 },
+  { id: 'balance', width: 112, minWidth: 80 },
+  { id: 'rateLimitRpm', width: 144, minWidth: 96 },
+  { id: 'requestCount', width: 112, minWidth: 80 },
+  { id: 'tokensUsage', width: 112, minWidth: 80 },
+  { id: 'lastUsedAt', width: 160, minWidth: 112 },
+  { id: 'status', width: 96, minWidth: 64 },
+]);
 
 const columnMenuItems = computed(() => menuItems(USER_HIDEABLE));
 
@@ -449,7 +469,9 @@ watch(users, (rows) => {
                 :items="columnMenuItems"
                 :labels="columnLabels"
                 test-id="users-columns"
+                reset-widths
                 @toggle="setVisible"
+                @reset-widths="resetAll"
               />
               <button
                 type="button"
@@ -476,8 +498,24 @@ watch(users, (rows) => {
             </TableHead>
             <TableHead v-if="visible.email">{{ t('users.email') }}</TableHead>
             <TableHead v-if="visible.displayName">{{ t('users.displayName') }}</TableHead>
-            <TableHead v-if="visible.role" class="w-24">{{ t('users.role') }}</TableHead>
-            <TableHead v-if="visible.balance" class="w-28" :aria-sort="ariaSort('balance')">
+            <TableHead
+              v-if="visible.role"
+              :style="{ width: `${widths.role}px` }"
+              :resizable="{ id: 'role' }"
+              @resize="resize"
+              @resize-commit="commit"
+              @resize-reset="reset"
+              >{{ t('users.role') }}</TableHead
+            >
+            <TableHead
+              v-if="visible.balance"
+              :style="{ width: `${widths.balance}px` }"
+              :resizable="{ id: 'balance' }"
+              :aria-sort="ariaSort('balance')"
+              @resize="resize"
+              @resize-commit="commit"
+              @resize-reset="reset"
+            >
               <DataTableColumnHeader
                 :label="t('users.balance')"
                 :sorted="sortedState('balance')"
@@ -488,8 +526,12 @@ watch(users, (rows) => {
             </TableHead>
             <TableHead
               v-if="visible.rateLimitRpm"
-              class="w-36"
+              :style="{ width: `${widths.rateLimitRpm}px` }"
+              :resizable="{ id: 'rateLimitRpm' }"
               :aria-sort="ariaSort('rateLimitRpm')"
+              @resize="resize"
+              @resize-commit="commit"
+              @resize-reset="reset"
             >
               <DataTableColumnHeader
                 :label="t('users.rateLimitRpm')"
@@ -501,8 +543,12 @@ watch(users, (rows) => {
             </TableHead>
             <TableHead
               v-if="visible.requestCount"
-              class="w-28"
+              :style="{ width: `${widths.requestCount}px` }"
+              :resizable="{ id: 'requestCount' }"
               :aria-sort="ariaSort('requestCount')"
+              @resize="resize"
+              @resize-commit="commit"
+              @resize-reset="reset"
             >
               <DataTableColumnHeader
                 :label="t('users.requestCount')"
@@ -512,7 +558,15 @@ watch(users, (rows) => {
                 @clear="onClearSort"
               />
             </TableHead>
-            <TableHead v-if="visible.tokensUsage" class="w-28" :aria-sort="ariaSort('tokensUsage')">
+            <TableHead
+              v-if="visible.tokensUsage"
+              :style="{ width: `${widths.tokensUsage}px` }"
+              :resizable="{ id: 'tokensUsage' }"
+              :aria-sort="ariaSort('tokensUsage')"
+              @resize="resize"
+              @resize-commit="commit"
+              @resize-reset="reset"
+            >
               <DataTableColumnHeader
                 :label="t('users.tokensUsage')"
                 :sorted="sortedState('tokensUsage')"
@@ -521,7 +575,15 @@ watch(users, (rows) => {
                 @clear="onClearSort"
               />
             </TableHead>
-            <TableHead v-if="visible.lastUsedAt" class="w-40" :aria-sort="ariaSort('lastUsedAt')">
+            <TableHead
+              v-if="visible.lastUsedAt"
+              :style="{ width: `${widths.lastUsedAt}px` }"
+              :resizable="{ id: 'lastUsedAt' }"
+              :aria-sort="ariaSort('lastUsedAt')"
+              @resize="resize"
+              @resize-commit="commit"
+              @resize-reset="reset"
+            >
               <DataTableColumnHeader
                 :label="t('users.lastUsedAt')"
                 :sorted="sortedState('lastUsedAt')"
@@ -531,9 +593,16 @@ watch(users, (rows) => {
               />
             </TableHead>
             <TableHead v-if="visible.plan">{{ t('users.plan') }}</TableHead>
-            <TableHead v-if="visible.status" class="w-24" align="center">{{
-              t('users.status')
-            }}</TableHead>
+            <TableHead
+              v-if="visible.status"
+              :style="{ width: `${widths.status}px` }"
+              :resizable="{ id: 'status' }"
+              align="center"
+              @resize="resize"
+              @resize-commit="commit"
+              @resize-reset="reset"
+              >{{ t('users.status') }}</TableHead
+            >
             <TableHead v-if="visible.actions" class="w-24" align="center">{{
               t('common.actions')
             }}</TableHead>

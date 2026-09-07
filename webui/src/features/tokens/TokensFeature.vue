@@ -444,10 +444,7 @@ function openBulkDelete() {
                     :title="t('common.copy')"
                     @click="copyTokenKey(token)"
                   >
-                    <UiIcon
-                      :name="copiedKeyId === token.id ? 'check' : 'copy'"
-                      :size="14"
-                    />
+                    <UiIcon :name="copiedKeyId === token.id ? 'check' : 'copy'" :size="14" />
                   </button>
                 </span>
               </TableCell>

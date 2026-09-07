@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { TabsContent, TabsIndicator, TabsList, TabsRoot, TabsTrigger } from 'reka-ui';
 import PageHeader from '@/app/layout/PageHeader.vue';
@@ -11,6 +11,7 @@ import OrderTab from '@/features/models/OrderTab.vue';
 import UnifiedTab from '@/features/models/UnifiedTab.vue';
 import VisibleTab from '@/features/models/VisibleTab.vue';
 import { hasCapability, type ManagementCapability } from '@/lib/capabilities';
+import { useRouteTab } from '@/composables/useRouteTab';
 
 const { t } = useI18n();
 const me = useCurrentUser();
@@ -71,18 +72,14 @@ const authorizedTabs = computed(() =>
   ),
 );
 
-const activeTab = ref<ModelTabValue>('inventory');
-
-// 会话 hydrate 或套餐能力变更后，当前标签可能变成不可见；立即切到第一个仍可用的标签。
-watch(
-  authorizedTabs,
-  (tabs) => {
-    if (!tabs.some((tab) => tab.value === activeTab.value)) {
-      activeTab.value = tabs[0]?.value ?? 'inventory';
-    }
-  },
-  { immediate: true },
-);
+// tab 持久化走 /models?tab=…（replace 写回）。参数指向已授权 tab 时生效，
+// 否则回落 inventory；会话 hydrate 或能力收窄后 URL 同步收敛到第一个仍可用的 tab。
+const activeTab = useRouteTab<ModelTabValue>({
+  from: '/models',
+  param: 'tab',
+  allowed: () => authorizedTabs.value.map((tab) => tab.value),
+  fallback: 'inventory',
+});
 
 const canViewInventory = computed(() =>
   authorizedTabs.value.some((tab) => tab.value === 'inventory'),
@@ -98,11 +95,7 @@ const canViewVisible = computed(() => authorizedTabs.value.some((tab) => tab.val
     <PageHeader :title="t('nav.models')" />
     <MyModelsPanel />
   </div>
-  <TabsRoot
-    v-else-if="authorizedTabs.length > 0"
-    v-model="activeTab"
-    class="flex flex-col"
-  >
+  <TabsRoot v-else-if="authorizedTabs.length > 0" v-model="activeTab" class="flex flex-col">
     <PageHeader>
       <template #leading>
         <TabsList class="page-tab-switch" :aria-label="t('models.tabsLabel')">

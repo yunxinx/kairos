@@ -29,6 +29,7 @@ import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { CHANNEL_SUMMARY_KEY, invalidateChannelCaches } from '@/composables/useChannelDirectory';
 import { useChannelHealth } from '@/composables/useChannelHealth';
+import { useRouteFilters } from '@/composables/useRouteFilters';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -68,8 +69,10 @@ const {
 } = useWindowStack<ChannelWindowPayload>();
 
 const deleteErrors = ref<Record<number, string>>({});
-const searchText = ref('');
-const statusFilter = ref<string[]>([]);
+// 搜索词与状态筛选走 /channels?q=…&status=…（replace 写回，搜索词防抖）。
+const { listParam, debouncedSearchParam } = useRouteFilters('/channels', ['q', 'status']);
+const { draft: searchText } = debouncedSearchParam('q');
+const statusFilter = listParam('status');
 
 const channelsQuery = useQuery({
   queryKey: ['channels'],

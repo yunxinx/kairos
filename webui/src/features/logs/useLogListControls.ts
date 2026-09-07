@@ -1,20 +1,36 @@
-import { computed, onUnmounted, ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
+import { useRouteFilters } from '@/composables/useRouteFilters';
 import { LOGS_INITIAL_PAGE, LOGS_INITIAL_PAGE_SIZE } from '@/lib/admin-query-defaults';
 import type { DateRange } from '@/lib/date-range';
+import { readValidatedNumber, writePlainNumber } from '@/lib/preferences';
 import { scrollMainToTop } from '@/lib/main-scroll';
 
 const PAGE_SIZE_OPTIONS = [20, 50, 100, 200] as const;
-const KEYWORD_DEBOUNCE_MS = 300;
+const PAGE_SIZE_KEY = 'kairos-logs-page-size';
 
-/** 请求日志与系统日志共用的关键字/时间/分页控件。 */
+function readStoredPageSize(): number {
+  return readValidatedNumber(PAGE_SIZE_KEY, PAGE_SIZE_OPTIONS, LOGS_INITIAL_PAGE_SIZE);
+}
+
+/**
+ * 请求日志与系统日志共用的关键字/时间/分页控件。
+ * 关键字走 /logs?q=…（replace 写回、300ms 防抖），两个面板共用同一条 URL 状态。
+ * page size 属个人偏好，落 localStorage（合法档位校验，页码不持久化）。
+ */
 export function useLogListControls() {
   const { t } = useI18n();
-  const draftKeyword = ref('');
-  const appliedKeyword = ref('');
+  const { debouncedSearchParam } = useRouteFilters('/logs', ['q']);
+  // 草稿逐键进输入框；applied 是 URL 落定值（防抖/回车后才变），
+  // 查询 queryKey 只绑它，保持「输入停顿才发请求」的原有防抖语义。
+  const {
+    draft: draftKeyword,
+    applied: appliedKeyword,
+    commitNow: applyKeywordNow,
+  } = debouncedSearchParam('q');
   const appliedRange = ref<DateRange>({ from: null, to: null });
   const page = ref(LOGS_INITIAL_PAGE);
-  const pageSize = ref(LOGS_INITIAL_PAGE_SIZE);
+  const pageSize = ref(readStoredPageSize());
   const appliedFrom = computed(() => appliedRange.value.from);
   const appliedTo = computed(() => appliedRange.value.to);
 
@@ -26,6 +42,7 @@ export function useLogListControls() {
         return;
       }
       pageSize.value = parsed;
+      writePlainNumber(PAGE_SIZE_KEY, parsed);
       page.value = 1;
     },
   });
@@ -41,37 +58,14 @@ export function useLogListControls() {
     page.value = 1;
   }
 
-  let keywordTimer: number | undefined;
-
-  function applyKeywordNow() {
-    window.clearTimeout(keywordTimer);
-    keywordTimer = undefined;
-    if (appliedKeyword.value === draftKeyword.value) {
-      return;
-    }
-    appliedKeyword.value = draftKeyword.value;
-    resetResults();
-  }
-
-  watch(draftKeyword, () => {
-    window.clearTimeout(keywordTimer);
-    keywordTimer = window.setTimeout(applyKeywordNow, KEYWORD_DEBOUNCE_MS);
-  });
-
+  watch(appliedKeyword, resetResults);
   watch(appliedRange, resetResults);
   watch(page, () => {
     scrollMainToTop();
   });
 
-  onUnmounted(() => {
-    window.clearTimeout(keywordTimer);
-  });
-
   function clearBaseFilters() {
-    window.clearTimeout(keywordTimer);
-    keywordTimer = undefined;
     draftKeyword.value = '';
-    appliedKeyword.value = '';
     appliedRange.value = { from: null, to: null };
     resetResults();
   }

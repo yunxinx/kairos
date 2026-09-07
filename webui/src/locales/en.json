@@ -95,6 +95,8 @@
     "actions": "Actions",
     "columns": "Columns",
     "toggleColumns": "Toggle columns",
+    "resizeColumn": "Resize column (drag or arrow keys, double-click to reset)",
+    "resetColumnWidths": "Reset column widths",
     "sortAscending": "Asc",
     "sortDescending": "Desc",
     "clearSort": "Clear sort",

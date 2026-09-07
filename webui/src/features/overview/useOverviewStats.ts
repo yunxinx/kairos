@@ -1,14 +1,20 @@
-import { computed, ref, type ComputedRef, type Ref } from 'vue';
+import { computed, ref, watch, type ComputedRef, type Ref } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
 import { apiClient, extractApiError } from '@/api/client';
 import type { DailyPoint, LifetimeStats, StatsSummary } from '@/api/types';
 import { OVERVIEW_DEFAULT_DAYS } from '@/lib/admin-query-defaults';
+import { readValidatedNumber, writePlainNumber } from '@/lib/preferences';
 
 export interface OverviewShareRow {
   name: string;
   requestCount: number;
   costUsdMicros: number;
 }
+
+const OVERVIEW_DAYS_OPTIONS = [1, 7, 30, 90] as const;
+const OVERVIEW_DAYS_KEY = 'kairos-overview-days';
+
+export { OVERVIEW_DAYS_OPTIONS };
 
 export function useOverviewStats(): {
   days: Ref<string>;
@@ -25,7 +31,17 @@ export function useOverviewStats(): {
   retryStats: () => void;
   retryLifetime: () => void;
 } {
-  const days = ref(String(OVERVIEW_DEFAULT_DAYS));
+  // 天数档位属个人偏好，落 localStorage（合法档位校验，非法值回落默认 7 天）。
+  const days = ref(
+    String(readValidatedNumber(OVERVIEW_DAYS_KEY, OVERVIEW_DAYS_OPTIONS, OVERVIEW_DEFAULT_DAYS)),
+  );
+
+  watch(days, (next) => {
+    const parsed = Number.parseInt(next, 10);
+    if (OVERVIEW_DAYS_OPTIONS.includes(parsed as (typeof OVERVIEW_DAYS_OPTIONS)[number])) {
+      writePlainNumber(OVERVIEW_DAYS_KEY, parsed);
+    }
+  });
 
   const statsQuery = useQuery({
     queryKey: ['stats', days],

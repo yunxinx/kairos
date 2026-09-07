@@ -38,7 +38,9 @@ const isSecretConfirmation = computed(
     :stack-order="stackOrder"
     :topmost="true"
     confirm-test-id="close-guard-confirm"
-    :confirm-label="t(isSecretConfirmation ? 'common.confirmDiscardAnyway' : 'common.confirmDiscard')"
+    :confirm-label="
+      t(isSecretConfirmation ? 'common.confirmDiscardAnyway' : 'common.confirmDiscard')
+    "
     @close="emit('cancel')"
     @confirm="emit('confirm', confirmation.windowId)"
   />

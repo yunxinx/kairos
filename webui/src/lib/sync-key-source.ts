@@ -4,5 +4,4 @@
  * （留空 = 保留原值）时按库中定义取（`saved`）。
  */
 export type SyncKeySource =
-  | { kind: 'typed'; apiKey: string }
-  | { kind: 'saved'; channelId: number };
+  { kind: 'typed'; apiKey: string } | { kind: 'saved'; channelId: number };

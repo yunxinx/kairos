@@ -14,6 +14,12 @@ async function beforeLoad() {
 
 export const Route = createFileRoute('/logs')({
   beforeLoad,
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { kind?: string | undefined; q?: string | undefined } => ({
+    kind: typeof search.kind === 'string' ? search.kind : undefined,
+    q: typeof search.q === 'string' ? search.q : undefined,
+  }),
   component: LogsFeature,
   staticData: { titleKey: 'nav.logs' },
 });

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query';
-import { useSearch } from '@tanstack/vue-router';
 import { useI18n } from 'vue-i18n';
 import { apiClient, extractApiError } from '@/api/client';
 import type { PlanAudience, PlanView } from '@/api/types';
@@ -29,6 +28,7 @@ import TableRow from '@/components/ui/table/TableRow.vue';
 import TableRowsSkeleton from '@/components/ui/table/TableRowsSkeleton.vue';
 import { useBulkDelete, type BulkDeletePayload } from '@/composables/useBulkDelete';
 import { useColumnVisibility, type ColumnVisibilitySpec } from '@/composables/useColumnVisibility';
+import { useRouteFilters } from '@/composables/useRouteFilters';
 import { useRowSelection } from '@/composables/useRowSelection';
 import { useWindowStack } from '@/composables/useWindowStack';
 import { useToast } from '@/composables/useToast';
@@ -56,10 +56,11 @@ const { t, locale } = useI18n();
 const { error } = useToast();
 const queryClient = useQueryClient();
 const pendingAnchor = ref<FloatingWindowAnchor | null>(null);
-const routeSearch = useSearch({ from: '/plans' });
-const searchText = ref(routeSearch.value.q ?? '');
-const audienceFilter = ref<string[]>([]);
-const flagFilter = ref<string[]>([]);
+// 搜索词与受众/属性筛选走 /plans?q=…&audience=…（replace 写回，搜索词防抖）。
+const { listParam, debouncedSearchParam } = useRouteFilters('/plans', ['q', 'audience', 'flag']);
+const { draft: searchText } = debouncedSearchParam('q');
+const audienceFilter = listParam('audience');
+const flagFilter = listParam('flag');
 const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
   'kairos-plans-columns',
   PLAN_COLUMNS,
@@ -72,13 +73,6 @@ const columnLabels = computed((): Record<PlanColumnId, string> => ({
   createdAt: t('plans.createdAt'),
 }));
 const visibleColumnCount = computed(() => 8 + columnCount.value);
-
-watch(
-  () => routeSearch.value.q,
-  (nextQ) => {
-    searchText.value = nextQ ?? '';
-  },
-);
 
 function takePendingAnchor(): FloatingWindowAnchor | null {
   const anchor = pendingAnchor.value;

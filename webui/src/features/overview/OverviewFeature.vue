@@ -11,7 +11,7 @@ import OverviewHeatmap from '@/features/overview/OverviewHeatmap.vue';
 import OverviewLifetime from '@/features/overview/OverviewLifetime.vue';
 import ChartPanelSkeleton from '@/features/overview/ChartPanelSkeleton.vue';
 import { OverviewTrendChart } from '@/features/overview/overview-charts.async';
-import { useOverviewStats } from '@/features/overview/useOverviewStats';
+import { OVERVIEW_DAYS_OPTIONS, useOverviewStats } from '@/features/overview/useOverviewStats';
 
 const { t } = useI18n();
 
@@ -32,8 +32,8 @@ const {
 } = useOverviewStats();
 
 const dayOptions = computed(() =>
-  ['1', '7', '30', '90'].map((value) => ({
-    value,
+  OVERVIEW_DAYS_OPTIONS.map((value) => ({
+    value: String(value),
     label: t(`overview.daysOption.${value}`),
   })),
 );

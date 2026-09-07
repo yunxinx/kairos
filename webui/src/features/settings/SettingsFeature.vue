@@ -15,17 +15,26 @@ import SkeletonBlock from '@/components/ui/SkeletonBlock.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
 import UiSelect from '@/components/ui/UiSelect.vue';
 import { useFormValidation } from '@/composables/useFormValidation';
+import { useRouteTab } from '@/composables/useRouteTab';
 import { useToast } from '@/composables/useToast';
 import { formatBytesAsMb, formatCount, formatUnixMillis, parseMbToBytes } from '@/lib/format';
 
 type SettingsSection = 'logging' | 'gateway' | 'catalog' | 'maintenance';
+
+const SETTINGS_SECTIONS = ['logging', 'gateway', 'catalog', 'maintenance'] as const;
 
 /** 日志清理窗口预设（天）：按占用量手动选档，不做自动周期。 */
 const CLEANUP_WINDOWS = [7, 14, 30, 90, 180, 365] as const;
 
 const { t, locale } = useI18n();
 const { error, success } = useToast();
-const section = ref<SettingsSection>('logging');
+// section 持久化走 /settings?section=…（replace 写回）。
+const section = useRouteTab<SettingsSection>({
+  from: '/settings',
+  param: 'section',
+  allowed: () => SETTINGS_SECTIONS,
+  fallback: 'logging',
+});
 const queryClient = useQueryClient();
 const { fieldError, fieldInputHandlers, clearErrors, showFieldError, validate } =
   useFormValidation();

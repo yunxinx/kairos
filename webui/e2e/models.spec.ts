@@ -82,9 +82,14 @@ test.describe('models page', () => {
 
     await page.getByTestId('models-tab-groups').click();
     await expect(page.getByTestId('models-tab-groups')).toHaveAttribute('data-state', 'active');
+    // tab 走 URL：刷新回到同一 tab，且地址栏带 ?tab= 供分享。
     await page.reload();
-    await expect(page.getByTestId('models-tab-inventory')).toHaveAttribute('data-state', 'active');
-    await expect(page.getByTestId('models-tab-groups')).not.toHaveAttribute('data-state', 'active');
+    await expect(page).toHaveURL(/\/models\?tab=groups/);
+    await expect(page.getByTestId('models-tab-groups')).toHaveAttribute('data-state', 'active');
+    // 切走再切回（经其他页面路由），tab 仍由 URL 决定而非组件初始态。
+    await page.getByRole('link', { name: /^overview$/i }).click();
+    await page.goBack();
+    await expect(page.getByTestId('models-tab-groups')).toHaveAttribute('data-state', 'active');
   });
 
   test('order tab lists only multi-channel names, lets dragging reorder, and persists', async ({
@@ -845,7 +850,10 @@ test.describe('models page', () => {
     const listed = await page.request.get('/api/tokens', {
       headers: await e2eRootHeaders(page),
     });
-    const tokens = (await listed.json()) as Array<{ token_key_masked: string; model_group: string }>;
+    const tokens = (await listed.json()) as Array<{
+      token_key_masked: string;
+      model_group: string;
+    }>;
     expect(
       tokens.find((item) => item.token_key_masked === token.token_key_masked)?.model_group,
     ).toBe('');
