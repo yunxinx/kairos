@@ -21,6 +21,7 @@ import TableHead from '@/components/ui/table/TableHead.vue';
 import TableRow from '@/components/ui/table/TableRow.vue';
 import VirtualTable from '@/components/ui/table/VirtualTable.vue';
 import { commitSyncListing, compareModels } from '@/lib/model-list';
+import type { SyncKeySource } from '@/lib/sync-key-source';
 import type { FloatingWindowAnchor } from '@/lib/window-anchor';
 
 /** 草稿超时非法时拉取上游模型的兜底超时，与新建渠道缺省超时一致。 */
@@ -75,16 +76,17 @@ const props = defineProps<{
   models: string[];
   /** 进入视图时的别名映射（别名 → 主模型名）：初始化别名列草稿。 */
   aliases: Record<string, string>;
-  /**
-   * 上游列表来源：新建走草稿（表单密钥），编辑既有渠道走 `channel_id`
-   * （库中密钥）。两种形态对应同一个同步端点，互斥。
-   */
-  source: { kind: 'draft'; protocol: Protocol; baseUrl: string; apiKey: string } | {
-    kind: 'channel';
-    channelId: number;
-  };
-  /** 草稿超时（毫秒）；非法时由父级传 null，本组件兜底缺省值。仅草稿形态使用。 */
+  /** 出站协议：取编辑器当前草稿（未保存的修改立即生效）。 */
+  protocol: Protocol;
+  /** 出站地址：取编辑器当前草稿。 */
+  baseUrl: string;
+  /** 草稿超时（毫秒）；非法时由父级传 null，本组件兜底缺省值。 */
   timeoutMs: number | null;
+  /**
+   * 密钥来源：表单新填的明文，或编辑既有渠道未改密钥时按 `channelId` 取库中
+   * 定义（与保存时「留空保留原值」同语义）。
+   */
+  keySource: SyncKeySource;
   /** 编辑器浮窗的窗口栈序号：失败浮窗叠在其上一级。 */
   stackOrder: number;
 }>();
@@ -116,16 +118,14 @@ const syncBtnEl = ref<HTMLElement | null>(null);
 
 const syncMutation = useMutation({
   mutationFn: () =>
-    apiClient.listUpstreamModels(
-      props.source.kind === 'draft'
-        ? {
-            protocol: props.source.protocol,
-            base_url: props.source.baseUrl,
-            api_key: props.source.apiKey,
-            timeout_ms: props.timeoutMs ?? SYNC_TIMEOUT_FALLBACK_MS,
-          }
-        : { channel_id: props.source.channelId },
-    ),
+    apiClient.listUpstreamModels({
+      protocol: props.protocol,
+      base_url: props.baseUrl,
+      timeout_ms: props.timeoutMs ?? SYNC_TIMEOUT_FALLBACK_MS,
+      ...(props.keySource.kind === 'typed'
+        ? { api_key: props.keySource.apiKey }
+        : { channel_id: props.keySource.channelId }),
+    }),
   onSuccess: (data) => {
     dismissSyncFailure();
     hasSynced.value = true;
@@ -745,9 +745,7 @@ function closeSync() {
       <div v-if="syncFailure.code" class="text-fg-muted space-y-1 text-xs">
         <p class="font-medium">{{ t('channel.syncErrorDetail') }}</p>
         <p class="font-mono">{{ t('channel.syncErrorCode') }}: {{ syncFailure.code }}</p>
-        <p v-if="source.kind === 'draft'" class="font-mono break-all">
-          {{ t('channel.syncErrorTarget') }}: {{ source.baseUrl }}
-        </p>
+        <p class="font-mono break-all">{{ t('channel.syncErrorTarget') }}: {{ baseUrl }}</p>
       </div>
     </div>
   </FloatingWindow>

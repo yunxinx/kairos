@@ -36,6 +36,7 @@ import { useToast } from '@/composables/useToast';
 import ChannelEditorChip from '@/features/channel/ChannelEditorChip.vue';
 import ChannelModelSync from '@/features/channel/ChannelModelSync.vue';
 import { compareModels, sameAliasMap, sameModelSet } from '@/lib/model-list';
+import type { SyncKeySource } from '@/lib/sync-key-source';
 import { parseOptionalUint } from '@/lib/uint-parse';
 import { DEFAULT_MODEL_GROUP, groupSelectOptions } from '@/lib/visible-models';
 import type { FieldValidationSpec } from '@/lib/form-validation';
@@ -433,35 +434,35 @@ interface FloatingWindowControls {
 const floatingWindow = useTemplateRef<FloatingWindowControls>('floatingWindow');
 const editorView = ref<EditorView>('form');
 
-/** 上游模型同步使用第一把非空密钥；同步视图只关心能否取到上游列表。 */
-const syncApiKey = computed(
-  () => editorKeys.value.find((key) => key.api_key.trim() !== '')?.api_key ?? '',
-);
-
 /**
- * 同步来源：编辑既有渠道走已保存渠道（库中密钥，表单不持有明文也能同步）；
- * 新建走表单草稿，要求地址与至少一把非空密钥已填。已保存渠道没有启用密钥
- * 时后端会明确报错，前端不再预判禁用。
+ * 同步密钥来源（形状见 `lib/sync-key-source`）：表单填了新密钥就用新密钥；
+ * 编辑既有渠道且未改密钥（留空 = 保留原值）时按库中定义取；新建没填密钥
+ * 则无来源。
  */
-const syncSource = computed<
-  | { kind: 'channel'; channelId: number }
-  | { kind: 'draft'; protocol: Protocol; baseUrl: string; apiKey: string }
->(() => {
-  if (props.initial !== null) {
-    return { kind: 'channel', channelId: props.initial.id };
+const syncKeySource = computed<SyncKeySource | null>(() => {
+  const typed = editorKeys.value.find((key) => key.api_key.trim() !== '');
+  if (typed) {
+    return { kind: 'typed', apiKey: typed.api_key.trim() };
   }
-  return {
-    kind: 'draft',
-    protocol: editorProtocol.value,
-    baseUrl: editorBaseUrl.value.trim(),
-    apiKey: syncApiKey.value,
-  };
+  if (props.initial !== null) {
+    return { kind: 'saved', channelId: props.initial.id };
+  }
+  return null;
 });
 
-/** 新建时出站三要素缺一即无法拉取上游模型；编辑始终可用（走已保存定义）。 */
+/** 地址已填且密钥来源明确即可同步；编辑既有渠道未改密钥时恒可用（走库中密钥）。
+ * 已保存渠道没有任何启用密钥时后端会在同步时报错，前端不预判禁用。 */
 const canSync = computed(
-  () => syncSource.value.kind === 'channel' || (syncSource.value.baseUrl !== '' && syncSource.value.apiKey !== ''),
+  () => editorBaseUrl.value.trim() !== '' && syncKeySource.value !== null,
 );
+
+/** 同步视图只在 canSync 为真时可进入（按钮否则禁用），此处按该不变量收窄非空。 */
+const syncKeySourceRequired = computed<SyncKeySource>(() => {
+  if (syncKeySource.value === null) {
+    throw new Error('同步视图要求密钥来源已就绪');
+  }
+  return syncKeySource.value;
+});
 
 /** 草稿超时解析结果；非法传 null，由同步视图兜底缺省值。 */
 const syncTimeoutMs = computed(() => parseOptionalUint(editorTimeoutMs.value));
@@ -1161,8 +1162,10 @@ function handleSave(removalConfirmed = false) {
       v-else
       :models="editorModels"
       :aliases="editorAliasesMap"
-      :source="syncSource"
+      :protocol="editorProtocol"
+      :base-url="editorBaseUrl.trim()"
       :timeout-ms="syncTimeoutMs"
+      :key-source="syncKeySourceRequired"
       :stack-order="stackOrder"
       @back="handleSyncBack"
       @cancel="leaveSyncView"

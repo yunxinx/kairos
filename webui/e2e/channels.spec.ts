@@ -156,6 +156,16 @@ test.describe('channel resource page', () => {
 
       // 二次同步：别名保留、主名已选择；关闭按钮不保存并返回；别名维度筛选可用；搜索/反选作用于可见行。
       await okRow.getByTestId('channel-edit').click();
+      // 草稿优先：改了未保存的地址后同步，请求打向新地址（配库中密钥）——
+      // failUpstream 的 /models 只回 gpt-4o-mini，能证明用的不是库中旧地址。
+      await page.locator('[id^="channel-editor-base-url"]').fill(failUpstream.baseUrl);
+      await page.getByTestId('channel-sync-models').click();
+      await page.getByTestId('channel-sync-run').click();
+      await expect(miniRow).toHaveCount(1);
+      await expect(fullRow).toHaveCount(0);
+      await page.getByTestId('channel-sync-back-form').click();
+      // 恢复草稿地址为已保存地址，后续同步回到双模型上游。
+      await page.locator('[id^="channel-editor-base-url"]').fill(okUpstream.baseUrl);
       // 编辑既有渠道：同步走已保存渠道的密钥，无需在表单里重填明文。
       await page.getByTestId('channel-sync-models').click();
       await page.getByTestId('channel-sync-run').click();

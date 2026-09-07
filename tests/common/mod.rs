@@ -365,14 +365,32 @@ async fn handle(State(deps): State<MockDeps>, Json(body): Json<Value>) -> Respon
     respond_next(&deps, UpstreamBehavior::Sse(vec![])).await
 }
 
-/// GET `/models` 无请求体；与 `handle` 共用行为队列，逐请求消费。
+/// GET `/models` 无请求体；与 `handle` 共用行为队列，逐请求消费。认证头与
+/// POST 路由的捕获中间件同款记录（GET 不经该层），供同步密钥断言使用。
 async fn handle_models(State(deps): State<MockDeps>, request: Request) -> Response {
-    deps.received
-        .lock()
-        .expect("received 锁不应被污染")
-        .paths
-        .push(request_path(&request));
-
+    let api_key = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::to_string);
+    let path = request_path(&request);
+    {
+        let mut received = deps.received.lock().expect("received 锁不应被污染");
+        received.paths.push(path);
+        received.api_keys.push(api_key);
+    }
     respond_next(
         &deps,
         UpstreamBehavior::Json(serde_json::json!({ "data": [] })),

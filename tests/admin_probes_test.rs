@@ -385,3 +385,137 @@ async fn list_upstream_models_errors_are_structured() {
     let resp = admin_json(&gw, reqwest::Method::POST, "/channels/models", unknown).await;
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
+
+/// 编辑既有渠道的同步形态：地址/协议/超时取草稿（未保存修改立即生效），密钥
+/// 按 `channel_id` 取库中定义；密钥来源冲突、缺席或渠道无启用密钥均 400。
+#[tokio::test]
+async fn list_upstream_models_channel_id_uses_draft_url_and_saved_key() {
+    let mut gw = TestGateway::start_with_admin(common::test_seed).await;
+    gw.upstream.set_behavior(UpstreamBehavior::Json(json!({
+        "data": [{ "id": "gpt-4o" }, { "id": "gpt-4o-mini" }]
+    })));
+
+    // 已保存渠道指向不可达地址、密钥为库中明文；同步用草稿地址（指向 mock）
+    // 请求——200 且出站认证携带库中密钥，共同证明「地址取草稿、密钥取库中」。
+    let mut saved = channel_body("draft-url", "http://127.0.0.1:1".to_string(), json!([]));
+    saved["keys"][0]["api_key"] = json!("sk-saved-key");
+    let resp = admin_json(&gw, reqwest::Method::POST, "/channels", saved).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("渠道应可解析");
+    let channel_id = created["id"].as_i64().expect("应有 id");
+
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels/models",
+        json!({
+            "protocol": "openai_chat",
+            "base_url": gw.upstream.base_url(),
+            "timeout_ms": 1000,
+            "channel_id": channel_id
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("模型列表应可解析");
+    assert_eq!(body["models"], json!(["gpt-4o", "gpt-4o-mini"]));
+    assert_eq!(
+        gw.upstream.received_api_keys(),
+        vec![Some("Bearer sk-saved-key".to_string())],
+        "出站认证应使用库中已保存密钥"
+    );
+
+    // api_key 与 channel_id 同时在场 → 400：两者互斥。
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels/models",
+        json!({
+            "protocol": "openai_chat",
+            "base_url": gw.upstream.base_url(),
+            "timeout_ms": 1000,
+            "api_key": "sk-upstream",
+            "channel_id": channel_id
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("不能同时提供"))
+    );
+
+    // 两者都缺席 → 400。
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels/models",
+        json!({
+            "protocol": "openai_chat",
+            "base_url": gw.upstream.base_url(),
+            "timeout_ms": 1000
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 不存在的渠道 → 404。
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels/models",
+        json!({
+            "protocol": "openai_chat",
+            "base_url": gw.upstream.base_url(),
+            "timeout_ms": 1000,
+            "channel_id": channel_id + 1_000
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 渠道没有任何启用密钥 → 400，明确报错而不是回落。
+    // 创建要求明文密钥；随后 PUT 整体替换把唯一密钥置为禁用（api_key 留空即保留原值）。
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels",
+        channel_body("keyless", gw.upstream.base_url(), json!([])),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: Value = resp.json().await.expect("渠道应可解析");
+    let keyless_id = created["id"].as_i64().expect("应有 id");
+    let mut disabled = channel_body("keyless", gw.upstream.base_url(), json!([]));
+    disabled["keys"][0]["enabled"] = json!(false);
+    disabled["keys"][0]["api_key"] = json!("");
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::PUT,
+        &format!("/channels/{keyless_id}"),
+        disabled,
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let resp = admin_json(
+        &gw,
+        reqwest::Method::POST,
+        "/channels/models",
+        json!({
+            "protocol": "openai_chat",
+            "base_url": gw.upstream.base_url(),
+            "timeout_ms": 1000,
+            "channel_id": keyless_id
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("应返回结构化错误");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("没有启用的密钥"))
+    );
+}

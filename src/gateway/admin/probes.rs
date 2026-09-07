@@ -123,6 +123,8 @@ async fn test_channel(
         )
         .post(&upstream_url)
         .timeout(Duration::from_millis(
+            // 写时校验、读时容忍：保存路径硬性拒绝低于 1000 的超时，但存量库
+            // 可能有更早的旧值——读路径夹回合法区间，坏历史值不阻塞探测。
             channel
                 .timeout_ms
                 .clamp(1, crate::store::resources::MAX_CHANNEL_TIMEOUT_MS),
@@ -227,35 +229,21 @@ fn elapsed_ms(started: Instant) -> u64 {
 const UPSTREAM_MODELS_PATH: &str = "/models";
 const GEMINI_UPSTREAM_MODELS_PATH: &str = "/v1beta/models";
 
-/// 拉取上游模型列表的来源：按渠道草稿（未保存，密钥随请求）或按已保存渠道
-/// （密钥与地址取库中定义）。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, untagged)]
-enum UpstreamModelsSource {
-    /// 渠道草稿：新建向导在保存前同步模型；密钥为调用方提供的明文。
-    Draft(UpstreamModelsDraft),
-    /// 已保存渠道：编辑器对既有渠道同步模型，无需在表单里回显或重填密钥。
-    Channel { channel_id: i64 },
-}
-
-/// 拉取上游模型列表的草稿请求：仅含出站相关字段，渠道无需已保存。
-///
-/// 管理面新建渠道向导可在保存前同步模型；`timeout_ms` 沿用为本次请求超时。
+/// 拉取上游模型列表的请求：地址/协议/超时一律取编辑器当前草稿（未保存的
+/// 修改立即生效）；密钥二选一——`api_key` 为表单新填的明文，`channel_id`
+/// 为编辑既有渠道未改密钥时的「保留原值」形态（取库中第一把启用密钥）。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpstreamModelsDraft {
     protocol: Protocol,
     base_url: String,
-    api_key: String,
     timeout_ms: u64,
-}
-
-/// 解析后的出站请求材料：认证密钥与模型列表 URL 所需的协议、地址与超时。
-struct UpstreamTarget {
-    protocol: Protocol,
-    base_url: String,
-    key: StoredChannelKey,
-    timeout_ms: u64,
+    /// 表单新填的明文密钥；空串视为未填。与 `channel_id` 互斥。
+    #[serde(default)]
+    api_key: Option<String>,
+    /// 编辑既有渠道时按此取库中密钥；与 `api_key` 互斥。
+    #[serde(default)]
+    channel_id: Option<i64>,
 }
 
 /// 上游模型列表响应：模型 id 数组，保持上游返回顺序，排序由调用方负责。
@@ -264,27 +252,37 @@ struct UpstreamModelsView {
     models: Vec<String>,
 }
 
-/// 按渠道草稿或已保存渠道拉取上游模型列表：GET `{base_url}/models`。
+/// 按编辑器草稿拉取上游模型列表：GET `{draft.base_url}/models`，密钥取
+/// 草稿明文或库中已保存渠道（见 [`UpstreamModelsDraft`]）。
 ///
 /// OpenAI（chat/responses）与 Anthropic（messages）的模型列表同为
 /// `{"data": [{"id": ...}]}` 形态，故统一解析；认证头按协议复用 `OutboundAuth`。
 /// 上游不可达/非 2xx/响应形态非法均映射为 502 `upstream_error`。
 async fn list_upstream_models(
     State(deps): State<AdminDeps>,
-    body: Result<Json<UpstreamModelsSource>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<UpstreamModelsDraft>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<UpstreamModelsView>, AdminError> {
-    let Json(source) = body.map_err(AdminError::bad_body)?;
-    let target = match source {
-        UpstreamModelsSource::Draft(draft) => resolve_draft_target(draft)?,
-        UpstreamModelsSource::Channel { channel_id } => {
-            resolve_saved_channel_target(&deps, channel_id).await?
-        }
-    };
-    let models_path = match target.protocol {
+    let Json(draft) = body.map_err(AdminError::bad_body)?;
+    if draft.base_url.trim().is_empty() {
+        return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
+    }
+    reject_non_http_url(&draft.base_url)?;
+    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
+        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
+        .contains(&draft.timeout_ms)
+    {
+        return Err(AdminError::InvalidBody(format!(
+            "timeout_ms 必须在 {}..={} 之间",
+            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
+            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
+        )));
+    }
+    let key = resolve_sync_key(&deps, &draft).await?;
+    let models_path = match draft.protocol {
         Protocol::Gemini => GEMINI_UPSTREAM_MODELS_PATH,
         _ => UPSTREAM_MODELS_PATH,
     };
-    let url = format!("{}{}", target.base_url.trim_end_matches('/'), models_path);
+    let url = format!("{}{}", draft.base_url.trim_end_matches('/'), models_path);
     let snapshot = deps.snapshot.read().await.clone();
     let allow_private_networks = snapshot.allow_private_networks;
     let network_policy =
@@ -296,8 +294,8 @@ async fn list_upstream_models(
         .outbound_clients
         .for_policy(&network_policy, network_policy.target_allowlisted(&url))
         .get(&url)
-        .timeout(Duration::from_millis(target.timeout_ms))
-        .apply_outbound_auth(target.protocol, &target.key)
+        .timeout(Duration::from_millis(draft.timeout_ms))
+        .apply_outbound_auth(draft.protocol, &key)
         .send()
         .await;
     let response = match send {
@@ -316,74 +314,51 @@ async fn list_upstream_models(
             status_code,
         )));
     }
-    let models = parse_upstream_models(&body_text, target.protocol)?;
+    let models = parse_upstream_models(&body_text, draft.protocol)?;
     Ok(Json(UpstreamModelsView { models }))
 }
 
-/// 草稿形态：地址、协议、密钥与超时都由请求体给出，渠道无需已保存。
-fn resolve_draft_target(draft: UpstreamModelsDraft) -> Result<UpstreamTarget, AdminError> {
-    if draft.base_url.trim().is_empty() {
-        return Err(AdminError::InvalidBody("base_url 不能为空".to_string()));
-    }
-    reject_non_http_url(&draft.base_url)?;
-    if draft.api_key.trim().is_empty() {
-        return Err(AdminError::InvalidBody("api_key 不能为空".to_string()));
-    }
-    if !(crate::store::resources::MIN_CHANNEL_TIMEOUT_MS
-        ..=crate::store::resources::MAX_CHANNEL_TIMEOUT_MS)
-        .contains(&draft.timeout_ms)
-    {
-        return Err(AdminError::InvalidBody(format!(
-            "timeout_ms 必须在 {}..={} 之间",
-            crate::store::resources::MIN_CHANNEL_TIMEOUT_MS,
-            crate::store::resources::MAX_CHANNEL_TIMEOUT_MS
-        )));
-    }
-    // 草稿密钥不属于任何渠道：id 置 0，仅承载认证明文。
-    let key = StoredChannelKey::new(
-        0,
-        0,
-        "draft".to_string(),
-        draft.api_key,
-        1,
-        true,
-        None,
-        None,
-        0,
-    );
-    Ok(UpstreamTarget {
-        protocol: draft.protocol,
-        base_url: draft.base_url,
-        key,
-        timeout_ms: draft.timeout_ms,
-    })
-}
-
-/// 已保存渠道形态：地址、协议、超时取库中定义，密钥选第一把启用的。
-///
-/// 编辑器对既有渠道同步模型走这里——密钥不回显也不要求重填，管理面无需
-/// 在表单里持有明文。渠道没有任何启用密钥时明确拒绝，而不是回落到草稿。
-async fn resolve_saved_channel_target(
+/// 解析同步用密钥：`api_key`（表单新填的明文）与 `channel_id`（库中第一把
+/// 启用密钥，编辑既有渠道未改密钥时的「保留原值」）二选一——同时在场、
+/// 双双缺席都拒绝；渠道没有任何启用密钥时明确拒绝。
+async fn resolve_sync_key(
     deps: &AdminDeps,
-    channel_id: i64,
-) -> Result<UpstreamTarget, AdminError> {
+    draft: &UpstreamModelsDraft,
+) -> Result<StoredChannelKey, AdminError> {
+    let typed = draft
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    if typed.is_some() && draft.channel_id.is_some() {
+        return Err(AdminError::InvalidBody(
+            "api_key 与 channel_id 不能同时提供".to_string(),
+        ));
+    }
+    if let Some(api_key) = typed {
+        // 草稿密钥不属于任何渠道：id 置 0，仅承载认证明文。
+        return Ok(StoredChannelKey::new(
+            0,
+            0,
+            "draft".to_string(),
+            api_key.to_string(),
+            1,
+            true,
+            None,
+            None,
+            0,
+        ));
+    }
+    let channel_id = draft
+        .channel_id
+        .ok_or_else(|| AdminError::InvalidBody("api_key 与 channel_id 至少提供一个".to_string()))?;
     let record = read_channel_record(deps, channel_id).await?;
-    let channel = &record.channel;
-    reject_non_http_url(&channel.base_url)?;
-    let key = record
+    record
         .keys
         .iter()
         .find(|key| key.enabled)
-        .ok_or_else(|| AdminError::InvalidBody(format!("渠道 {channel_id} 没有启用的密钥")))?
-        .clone();
-    Ok(UpstreamTarget {
-        protocol: channel.protocol,
-        base_url: channel.base_url.clone(),
-        key,
-        timeout_ms: channel
-            .timeout_ms
-            .clamp(1, crate::store::resources::MAX_CHANNEL_TIMEOUT_MS),
-    })
+        .cloned()
+        .ok_or_else(|| AdminError::InvalidBody(format!("渠道 {channel_id} 没有启用的密钥")))
 }
 
 /// 按协议解析上游模型列表：OpenAI/Anthropic 为 `{"data":[{"id"}]}`；
