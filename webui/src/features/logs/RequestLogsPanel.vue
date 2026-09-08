@@ -572,7 +572,7 @@ function onFilterToken(tokenName: string) {
           </button>
           <p
             v-if="unsettledTotal > 0"
-            class="rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-xs font-semibold text-amber-600 dark:text-amber-400"
+            class="log-tint-warn text-warn rounded border px-2 py-1 text-xs font-semibold"
             data-testid="logs-unsettled-total"
           >
             {{ t('logs.unsettledTotal', { count: unsettledTotal }) }}

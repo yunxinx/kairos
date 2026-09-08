@@ -66,7 +66,7 @@ function statusBadgeClass(statusCode: number): string {
   >
     <template #header-extra>
       <div class="mr-2 ml-auto flex items-center gap-1.5">
-        <span class="badge text-[11px]" :class="statusBadgeClass(entry.status_code)">
+        <span class="badge" :class="statusBadgeClass(entry.status_code)">
           {{ entry.status_code }}
         </span>
       </div>

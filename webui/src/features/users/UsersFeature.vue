@@ -641,7 +641,7 @@ watch(users, (rows) => {
                 <span v-if="user.rate_limit_rpm && user.rate_limit_rpm > 0">
                   {{ formatCount(user.rate_limit_rpm, locale) }}
                 </span>
-                <span v-else class="badge badge-neutral font-mono text-xs">
+                <span v-else class="badge badge-neutral font-mono">
                   {{ t('common.unlimited') }}
                 </span>
               </TableCell>
@@ -667,16 +667,13 @@ watch(users, (rows) => {
                 <button
                   v-if="user.plan_display_name"
                   type="button"
-                  class="badge badge-neutral hover:text-fg cursor-pointer font-mono text-xs transition-colors"
+                  class="badge badge-neutral cursor-pointer font-mono transition-colors hover:text-[var(--seed-fg)]"
                   data-testid="user-plan-link"
                   @click="goToPlan(user.plan_display_name)"
                 >
                   {{ user.plan_display_name }}
                 </button>
-                <span
-                  v-else-if="user.role === 'root'"
-                  class="badge badge-neutral font-mono text-xs"
-                >
+                <span v-else-if="user.role === 'root'" class="badge badge-neutral font-mono">
                   {{ t('common.unlimited') }}
                 </span>
                 <span v-else class="text-fg-muted font-mono text-xs"> — </span>

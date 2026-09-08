@@ -118,7 +118,7 @@ function copyMessage() {
 
         <dl class="grid grid-cols-2 gap-x-6 gap-y-3 text-xs sm:grid-cols-3">
           <div>
-            <dt class="text-fg-muted flex items-center gap-1 text-[11px]">
+            <dt class="text-fg-muted text-2xs flex items-center gap-1">
               <span>{{ t('logs.level') }}</span>
               <button
                 type="button"
@@ -130,14 +130,14 @@ function copyMessage() {
               </button>
             </dt>
             <dd class="mt-1 font-mono font-semibold">
-              <span class="badge text-[10px]" :class="levelBadgeClass(entry.level)">
+              <span class="badge" :class="levelBadgeClass(entry.level)">
                 {{ levelLabel(entry.level) }}
               </span>
             </dd>
           </div>
 
           <div>
-            <dt class="text-fg-muted flex items-center gap-1 text-[11px]">
+            <dt class="text-fg-muted text-2xs flex items-center gap-1">
               <span>{{ t('logs.target') }}</span>
               <button
                 type="button"
@@ -155,7 +155,7 @@ function copyMessage() {
 
           <!-- 运维事件由系统自身产生，没有操作者；审计事件才有。 -->
           <div class="col-span-2 sm:col-span-1">
-            <dt class="text-fg-muted text-[11px]">{{ t('logs.actor') }}</dt>
+            <dt class="text-fg-muted text-2xs">{{ t('logs.actor') }}</dt>
             <dd class="mt-1 font-mono text-xs" data-testid="system-log-detail-actor">
               <span v-if="entry.actor_email">
                 {{ entry.actor_email }}

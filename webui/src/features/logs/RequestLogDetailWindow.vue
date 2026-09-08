@@ -181,7 +181,7 @@ const calculationSteps = computed(() => {
   >
     <template #header-extra>
       <div class="mr-2 ml-auto flex items-center gap-1.5">
-        <span class="badge text-[11px]" :class="statusBadgeClass(entry.status_code)">
+        <span class="badge" :class="statusBadgeClass(entry.status_code)">
           {{ entry.status_code }}
         </span>
       </div>
@@ -203,7 +203,7 @@ const calculationSteps = computed(() => {
           <!-- 第一行：模型、渠道、令牌 (3 项) -->
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div>
-              <dt class="text-fg-muted flex items-center gap-1 text-[11px]">
+              <dt class="text-fg-muted text-2xs flex items-center gap-1">
                 <span>{{ t('logs.model') }}</span>
                 <button
                   type="button"
@@ -219,7 +219,7 @@ const calculationSteps = computed(() => {
               </dd>
               <div
                 v-if="entry.outbound_model && entry.outbound_model !== entry.model"
-                class="text-fg-muted mt-0.5 flex items-center gap-0.5 font-mono text-[10px] opacity-85"
+                class="text-fg-muted text-3xs mt-0.5 flex items-center gap-0.5 font-mono opacity-85"
               >
                 <UiIcon name="arrow-right" :size="9" />
                 <span data-testid="log-outbound-model">{{ entry.outbound_model }}</span>
@@ -227,7 +227,7 @@ const calculationSteps = computed(() => {
             </div>
 
             <div>
-              <dt class="text-fg-muted flex items-center gap-1 text-[11px]">
+              <dt class="text-fg-muted text-2xs flex items-center gap-1">
                 <span>{{ t('logs.channel') }}</span>
                 <button
                   type="button"
@@ -239,14 +239,14 @@ const calculationSteps = computed(() => {
                 </button>
               </dt>
               <dd class="mt-1 font-mono" data-testid="log-detail-channel">
-                <span class="badge badge-info max-w-[12rem] min-w-0 truncate font-mono text-xs">{{
+                <span class="badge badge-info max-w-[12rem] min-w-0 truncate font-mono">{{
                   entry.channel
                 }}</span>
               </dd>
             </div>
 
             <div>
-              <dt class="text-fg-muted flex items-center gap-1 text-[11px]">
+              <dt class="text-fg-muted text-2xs flex items-center gap-1">
                 <span>{{ t('logs.token') }}</span>
                 <button
                   type="button"
@@ -262,7 +262,7 @@ const calculationSteps = computed(() => {
                 :title="`${entry.token_name} (${entry.token_key_masked})`"
               >
                 <span class="font-medium text-[var(--seed-fg)]">{{ entry.token_name }}</span>
-                <span class="text-fg-muted text-[10px] opacity-75"
+                <span class="text-fg-muted text-3xs opacity-75"
                   >({{ entry.token_key_masked }})</span
                 >
               </dd>
@@ -271,7 +271,7 @@ const calculationSteps = computed(() => {
 
           <!-- 第二行：请求协议（单独一行完整展示） -->
           <div>
-            <dt class="text-fg-muted text-[11px]">{{ t('logs.requestProtocol') }}</dt>
+            <dt class="text-fg-muted text-2xs">{{ t('logs.requestProtocol') }}</dt>
             <dd class="mt-1 flex flex-wrap items-center gap-2">
               <div
                 v-if="outbound.status === 'converted'"
@@ -279,18 +279,16 @@ const calculationSteps = computed(() => {
                 :title="`${t('logs.protocolConversion')}: ${protocolTitle(entry.inbound_protocol)} ⇄ ${protocolTitle(outbound.protocol)}`"
               >
                 <div class="inline-flex items-center gap-1">
-                  <span
-                    class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-                    >{{ t('logs.protoIn') }}</span
-                  >
+                  <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+                    t('logs.protoIn')
+                  }}</span>
                   <ProtocolBadge :protocol="entry.inbound_protocol" />
                 </div>
                 <UiIcon name="arrow-right" :size="12" class="text-fg-muted shrink-0 opacity-80" />
                 <div class="inline-flex items-center gap-1">
-                  <span
-                    class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-                    >{{ t('logs.protoOut') }}</span
-                  >
+                  <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+                    t('logs.protoOut')
+                  }}</span>
                   <ProtocolBadge :protocol="outbound.protocol" />
                 </div>
               </div>
@@ -300,19 +298,17 @@ const calculationSteps = computed(() => {
                 data-testid="log-detail-outbound-protocol-unknown"
               >
                 <div class="inline-flex items-center gap-1">
-                  <span
-                    class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-                    >{{ t('logs.protoIn') }}</span
-                  >
+                  <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+                    t('logs.protoIn')
+                  }}</span>
                   <ProtocolBadge :protocol="entry.inbound_protocol" />
                 </div>
                 <UiIcon name="arrow-right" :size="12" class="text-fg-muted shrink-0 opacity-80" />
                 <div class="inline-flex items-center gap-1">
-                  <span
-                    class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-                    >{{ t('logs.protoOut') }}</span
-                  >
-                  <span class="badge badge-neutral w-fit text-[10px]">{{
+                  <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+                    t('logs.protoOut')
+                  }}</span>
+                  <span class="badge badge-neutral w-fit">{{
                     t('logs.outboundProtocolUnknown')
                   }}</span>
                 </div>
@@ -326,7 +322,7 @@ const calculationSteps = computed(() => {
           <!-- 第三行：Token 消耗（含缓存命中率）与耗时速率 -->
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <dt class="text-fg-muted text-[11px]">{{ t('logs.tokens') }}</dt>
+              <dt class="text-fg-muted text-2xs">{{ t('logs.tokens') }}</dt>
               <dd class="mt-1 flex flex-wrap items-center gap-3 font-mono text-xs">
                 <div class="flex flex-col gap-0.5">
                   <span class="text-fg-muted" :title="t('logs.promptTokens')">
@@ -343,25 +339,19 @@ const calculationSteps = computed(() => {
                   v-if="hasCache"
                   class="flex items-center gap-2 border-l border-[var(--seed-border)]/60 pl-3"
                 >
-                  <div class="flex flex-col gap-0.5 text-[11px]">
-                    <span
-                      v-if="entry.cache_read_tokens > 0"
-                      class="text-blue-600 dark:text-blue-400"
-                    >
+                  <div class="text-2xs flex flex-col gap-0.5">
+                    <span v-if="entry.cache_read_tokens > 0" class="text-info">
                       {{ t('logs.cacheReadShort') }}
                       {{ formatTokensCount(entry.cache_read_tokens) }}
                     </span>
-                    <span
-                      v-if="entry.cache_write_tokens > 0"
-                      class="text-purple-600 dark:text-purple-400"
-                    >
+                    <span v-if="entry.cache_write_tokens > 0" class="text-violet">
                       {{ t('logs.cacheWriteShort') }}
                       {{ formatTokensCount(entry.cache_write_tokens) }}
                     </span>
                   </div>
                   <span
                     v-if="cacheHitRatio !== null"
-                    class="badge inline-block w-fit border-blue-500/20 bg-blue-500/10 font-mono text-[10px] text-blue-600 dark:text-blue-400"
+                    class="badge badge-info inline-block w-fit font-mono"
                     :title="t('logs.cacheHit')"
                   >
                     ⚡ {{ cacheHitRatio }}%
@@ -371,7 +361,7 @@ const calculationSteps = computed(() => {
             </div>
 
             <div>
-              <dt class="text-fg-muted text-[11px]">{{ t('logs.latencyAndSpeed') }}</dt>
+              <dt class="text-fg-muted text-2xs">{{ t('logs.latencyAndSpeed') }}</dt>
               <dd class="mt-1">
                 <LatencyMeter :latency-ms="entry.latency_ms" :output-tokens="entry.output_tokens" />
               </dd>
@@ -393,7 +383,7 @@ const calculationSteps = computed(() => {
         <div class="overflow-x-auto">
           <table class="w-full text-left font-mono text-xs">
             <thead>
-              <tr class="text-fg-muted border-b border-[var(--seed-border)] text-[11px]">
+              <tr class="text-fg-muted text-2xs border-b border-[var(--seed-border)]">
                 <th class="pb-1.5 font-medium">{{ t('pricing.model') }}</th>
                 <th class="pb-1.5 font-medium">{{ t('logs.tokensUnit') }}</th>
                 <th class="pb-1.5 font-medium">{{ t('logs.pricingPerMillion') }}</th>
@@ -402,10 +392,7 @@ const calculationSteps = computed(() => {
             </thead>
             <tbody class="divide-y divide-[var(--seed-border)]/30 text-xs">
               <tr v-for="step in calculationSteps" :key="step.name">
-                <td
-                  class="py-2"
-                  :class="step.isCache ? 'text-blue-600 dark:text-blue-400' : 'text-fg-muted'"
-                >
+                <td class="py-2" :class="step.isCache ? 'text-info' : 'text-fg-muted'">
                   {{ step.name }}
                 </td>
                 <td class="py-2">{{ step.tokens.toLocaleString() }}</td>
@@ -460,9 +447,7 @@ const calculationSteps = computed(() => {
         class="mt-1 flex flex-wrap items-center gap-2 border-t border-[var(--seed-border)]/60 pt-3.5"
         data-testid="log-unsettled-actions"
       >
-        <span class="text-xs font-medium text-amber-600 dark:text-amber-400">
-          {{ t('logs.unsettled') }}:
-        </span>
+        <span class="text-warn text-xs font-medium"> {{ t('logs.unsettled') }}: </span>
         <button
           type="button"
           class="btn btn-sm btn-subtle"

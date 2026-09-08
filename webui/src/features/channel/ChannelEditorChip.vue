@@ -46,7 +46,7 @@ function onChipKeydown(event: KeyboardEvent) {
       <span class="min-w-0 flex-1 truncate font-mono text-xs">{{ props.name }}</span>
       <button
         type="button"
-        class="text-fg-subtle hover:text-danger cursor-pointer rounded p-0.5 hover:bg-[var(--danger-bg)]"
+        class="text-fg-subtle cursor-pointer rounded p-0.5 hover:bg-[var(--danger-bg)] hover:text-[var(--danger)]"
         data-testid="channel-model-remove"
         :aria-label="t('channel.removeModel', { model: props.name })"
         @click.stop="emit('remove')"

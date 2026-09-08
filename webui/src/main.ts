@@ -7,7 +7,7 @@ import { router } from '@/router';
 import { initTheme } from '@/lib/theme';
 import { hasUnsavedWork, onSessionInvalidated } from '@/lib/session';
 import { useToast } from '@/composables/useToast';
-import '@/styles/tokens.css';
+import '@/styles/globals.css';
 
 initTheme();
 syncDocumentLocale(i18n.global.locale.value);

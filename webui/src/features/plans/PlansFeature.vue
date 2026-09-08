@@ -398,13 +398,13 @@ watch(plans, (rows) => {
               <TableCell data-testid="plan-display">
                 <span class="inline-flex min-w-0 items-center gap-1.5">
                   <span class="min-w-0 shrink truncate">{{ plan.display_name }}</span>
-                  <span v-if="plan.builtin" class="badge badge-neutral shrink-0 text-[10px]">
+                  <span v-if="plan.builtin" class="badge badge-neutral shrink-0">
                     {{ t('plans.builtin') }}
                   </span>
                   <!-- 默认档：新用户会落到这一档，运营最常问的就是「现在默认是哪个」。 -->
                   <span
                     v-if="plan.is_default"
-                    class="badge badge-success shrink-0 text-[10px] whitespace-nowrap"
+                    class="badge badge-success shrink-0 whitespace-nowrap"
                     data-testid="plan-default-badge"
                   >
                     {{ t('plans.defaultBadge') }}

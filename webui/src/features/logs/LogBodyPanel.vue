@@ -84,15 +84,15 @@ function bodyTestId(side: 'request' | 'response', decoded: DecodedLogBody): stri
 function roleBadgeClass(role: string): string {
   switch (role.toLowerCase()) {
     case 'system':
-      return 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30';
+      return 'log-role-system';
     case 'user':
-      return 'bg-blue-500/15 text-blue-600 dark:text-blue-400 border border-blue-500/30';
+      return 'log-role-user';
     case 'assistant':
-      return 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30';
+      return 'log-role-assistant';
     case 'tool':
-      return 'bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/30';
+      return 'log-role-tool';
     default:
-      return 'bg-slate-500/15 text-slate-600 dark:text-slate-400 border border-slate-500/30';
+      return 'log-role-muted';
   }
 }
 
@@ -158,14 +158,10 @@ function roleLabel(role: string): string {
     <div v-if="viewMode === 'visual' && inspection.isChat" class="flex flex-col gap-3 py-1">
       <div
         v-if="inspection.systemPrompt"
-        class="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-relaxed"
+        class="log-tint-warn rounded-md border p-3 text-xs leading-relaxed"
       >
-        <div
-          class="mb-1.5 flex items-center gap-1.5 font-semibold text-amber-600 dark:text-amber-400"
-        >
-          <span
-            class="rounded bg-amber-500/20 px-1.5 py-0.5 font-mono text-[10px] tracking-wide uppercase"
-          >
+        <div class="text-warn mb-1.5 flex items-center gap-1.5 font-semibold">
+          <span class="log-role log-role-system">
             {{ roleLabel('system') }}
           </span>
           <span>{{ t('logs.systemPrompt') }}</span>
@@ -197,7 +193,7 @@ function roleLabel(role: string): string {
             class="rounded border border-[var(--seed-border)] bg-[var(--seed-surface-alt)] p-2 font-mono text-xs"
           >
             <div class="font-bold text-[var(--seed-primary)]">{{ tool.name }}</div>
-            <div v-if="tool.description" class="text-fg-muted mt-0.5 text-[11px]">
+            <div v-if="tool.description" class="text-fg-muted text-2xs mt-0.5">
               {{ tool.description }}
             </div>
           </div>
@@ -208,16 +204,13 @@ function roleLabel(role: string): string {
         <div
           v-for="(msg, index) in inspection.messages"
           :key="index"
-          class="rounded-lg border border-[var(--seed-border)] bg-[var(--seed-surface)] p-3 shadow-xs"
+          class="rounded-lg border border-[var(--seed-border)] bg-[var(--seed-surface)] p-3"
         >
           <div class="mb-2 flex items-center justify-between gap-2">
-            <span
-              class="rounded px-2 py-0.5 font-mono text-[10px] font-bold tracking-wider uppercase"
-              :class="roleBadgeClass(msg.role)"
-            >
+            <span class="log-role" :class="roleBadgeClass(msg.role)">
               {{ roleLabel(msg.role) }} {{ msg.name ? `(${msg.name})` : '' }}
             </span>
-            <span v-if="msg.toolUseId" class="font-mono text-[10px] text-[var(--fg-muted)]">
+            <span v-if="msg.toolUseId" class="text-3xs font-mono text-[var(--fg-muted)]">
               {{ t('logs.callId') }}: {{ msg.toolUseId }}
             </span>
           </div>
@@ -226,16 +219,14 @@ function roleLabel(role: string): string {
             <div
               v-for="(tc, tcIdx) in msg.toolCalls"
               :key="tcIdx"
-              class="rounded border border-purple-500/30 bg-purple-500/5 p-2 font-mono text-xs"
+              class="log-tint-violet rounded border p-2 font-mono text-xs"
             >
-              <div
-                class="flex items-center gap-1 font-semibold text-purple-600 dark:text-purple-400"
-              >
+              <div class="text-violet flex items-center gap-1 font-semibold">
                 <UiIcon name="code" :size="13" />
                 <span>{{ tc.name }}</span>
               </div>
               <pre
-                class="mt-1 max-h-40 overflow-auto text-[11px] whitespace-pre-wrap text-[var(--seed-fg)]"
+                class="text-2xs mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-[var(--seed-fg)]"
                 >{{ formatJsonArgs(tc.arguments) }}</pre>
             </div>
           </div>
@@ -249,36 +240,25 @@ function roleLabel(role: string): string {
         </div>
       </div>
 
-      <div
-        v-if="inspection.response"
-        class="rounded-lg border border-emerald-500/40 bg-[var(--seed-surface)] p-3 shadow-xs"
-      >
+      <div v-if="inspection.response" class="log-tint-success rounded-lg border p-3">
         <div class="mb-2 flex items-center justify-between gap-2">
           <div class="flex items-center gap-2">
-            <span
-              class="rounded border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 font-mono text-[10px] font-bold tracking-wider text-emerald-600 uppercase dark:text-emerald-400"
-            >
+            <span class="log-role log-role-assistant">
               {{ t('logs.assistantResponse') }}
             </span>
-            <span v-if="inspection.response.isStream" class="badge badge-info text-[10px]">
+            <span v-if="inspection.response.isStream" class="badge badge-info">
               {{ t('logs.sseStream') }}
             </span>
           </div>
-          <span
-            v-if="inspection.response.finishReason"
-            class="badge bg-[var(--seed-surface-alt)] font-mono text-[10px] text-[var(--fg-muted)]"
-          >
+          <span v-if="inspection.response.finishReason" class="badge badge-neutral font-mono">
             {{ t('logs.finishReason') }}: {{ inspection.response.finishReason }}
           </span>
         </div>
 
-        <div
-          v-if="inspection.response.reasoning"
-          class="mb-3 rounded border border-blue-500/30 bg-blue-500/5 p-2.5"
-        >
+        <div v-if="inspection.response.reasoning" class="log-tint-info mb-3 rounded border p-2.5">
           <button
             type="button"
-            class="flex w-full items-center justify-between text-left text-xs font-semibold text-blue-600 dark:text-blue-400"
+            class="text-info flex w-full items-center justify-between text-left text-xs font-semibold"
             @click="showThinking = !showThinking"
           >
             <span class="flex items-center gap-1.5">
@@ -300,14 +280,14 @@ function roleLabel(role: string): string {
           <div
             v-for="(tc, tcIdx) in inspection.response.toolCalls"
             :key="tcIdx"
-            class="rounded border border-purple-500/30 bg-purple-500/5 p-2 font-mono text-xs"
+            class="log-tint-violet rounded border p-2 font-mono text-xs"
           >
-            <div class="flex items-center gap-1 font-semibold text-purple-600 dark:text-purple-400">
+            <div class="text-violet flex items-center gap-1 font-semibold">
               <UiIcon name="code" :size="13" />
               <span>{{ tc.name }}</span>
             </div>
             <pre
-              class="mt-1 max-h-40 overflow-auto text-[11px] whitespace-pre-wrap text-[var(--seed-fg)]"
+              class="text-2xs mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-[var(--seed-fg)]"
               >{{ tc.arguments }}</pre>
           </div>
         </div>

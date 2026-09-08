@@ -18,18 +18,9 @@ const props = defineProps<{
 const { t } = useI18n();
 
 const LATENCY_TONE: Record<LatencyHealth, { bar: string; value: string }> = {
-  excellent: {
-    bar: 'bg-emerald-600 dark:bg-emerald-500',
-    value: 'text-emerald-700 dark:text-emerald-400',
-  },
-  normal: {
-    bar: 'bg-amber-500',
-    value: 'text-amber-700 dark:text-amber-400',
-  },
-  slow: {
-    bar: 'bg-rose-500',
-    value: 'text-rose-600 dark:text-rose-400',
-  },
+  excellent: { bar: 'bg-success', value: 'text-success' },
+  normal: { bar: 'bg-warn', value: 'text-warn' },
+  slow: { bar: 'bg-danger', value: 'text-danger' },
 };
 
 const health = computed(() => evaluateLatencyHealth(props.latencyMs, props.outputTokens));

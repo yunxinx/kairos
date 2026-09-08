@@ -279,14 +279,14 @@ function refetchAll() {
                       {{ index + 1 }}
                     </span>
                     <span
-                      class="badge badge-info max-w-[12rem] min-w-0 truncate font-mono text-xs"
+                      class="badge badge-info max-w-[12rem] min-w-0 truncate font-mono"
                       :title="channel.name"
                     >
                       {{ channel.name }}
                     </span>
                     <span
                       v-if="channel.enabled === false"
-                      class="badge badge-danger shrink-0 text-[10px] whitespace-nowrap"
+                      class="badge badge-danger shrink-0 whitespace-nowrap"
                       data-testid="order-channel-disabled"
                     >
                       {{ t('channel.statusDisabled') }}

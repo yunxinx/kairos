@@ -191,7 +191,7 @@ function handleChangePassword() {
             <!-- 头像区域 -->
             <div class="group relative size-14 shrink-0">
               <div
-                class="border-seed bg-surface-elevated text-fg-muted relative flex size-full items-center justify-center overflow-hidden rounded-full border text-xl font-bold shadow-sm"
+                class="border-seed text-fg-muted relative flex size-full items-center justify-center overflow-hidden rounded-full border bg-[var(--seed-surface)] text-xl font-bold"
               >
                 <img
                   v-if="avatarData"
@@ -245,7 +245,7 @@ function handleChangePassword() {
 
           <!-- 余额总览与套餐/模型组指标 -->
           <div
-            class="bg-surface-elevated border-seed flex shrink-0 items-center justify-between gap-6 rounded-md border px-5 py-3 sm:min-w-64"
+            class="border-seed flex shrink-0 items-center justify-between gap-6 rounded-md border bg-[var(--seed-surface)] px-5 py-3 sm:min-w-64"
           >
             <div>
               <p class="text-fg-muted text-xs font-medium">{{ t('account.balance') }}</p>

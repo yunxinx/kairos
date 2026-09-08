@@ -15,7 +15,7 @@ const props = defineProps<{
     v-bind="$attrs"
     :class="
       cn(
-        'border-b border-[var(--seed-border)] transition-colors hover:bg-[color-mix(in_srgb,var(--seed-surface-alt)_50%,transparent)] data-[state=selected]:bg-[color-mix(in_srgb,var(--seed-surface-alt)_65%,transparent)]',
+        'border-b border-[var(--seed-border)] transition-colors hover:bg-[var(--row-hover)] data-[state=selected]:bg-[var(--row-selected)]',
         props.class,
       )
     "

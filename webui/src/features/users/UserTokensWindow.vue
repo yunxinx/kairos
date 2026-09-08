@@ -99,7 +99,7 @@ const toggleMutation = useMutation({
                   {{ groupDisplayName(token.model_group, t('models.ungrouped')) }}
                   <span
                     v-if="!tokenGroupUsable(token.model_group, user.role, user.assigned_groups)"
-                    class="badge badge-danger text-[10px]"
+                    class="badge badge-danger"
                     data-testid="token-group-unusable"
                     :title="t('tokens.groupUnusableHint')"
                   >
@@ -117,7 +117,7 @@ const toggleMutation = useMutation({
               <TableCell align="center">
                 <button
                   type="button"
-                  class="badge cursor-pointer text-[10px]"
+                  class="badge cursor-pointer"
                   :class="token.enabled ? 'badge-success' : 'badge-danger'"
                   data-testid="user-token-toggle-enabled"
                   :disabled="togglingId === token.id"

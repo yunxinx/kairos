@@ -96,7 +96,7 @@ async function handleLogout() {
       <DropdownMenuTrigger as-child>
         <button
           type="button"
-          class="hover:bg-surface-elevated flex h-8 max-w-64 cursor-pointer items-center gap-2 rounded-full px-2 py-1 text-xs font-medium transition-colors"
+          class="flex h-8 max-w-64 cursor-pointer items-center gap-2 rounded-full px-2 py-1 text-xs font-medium transition-colors hover:bg-[var(--seed-surface-alt)]"
           data-testid="account-menu-trigger"
           :title="me ? `${label} (${formatUsdMicros(me.balance_usd_micros)})` : label"
           @pointerdown="
@@ -109,7 +109,7 @@ async function handleLogout() {
           <!-- 头像 -->
           <div
             v-if="showNavAvatar"
-            class="border-seed bg-surface-elevated text-fg-muted relative flex size-6 shrink-0 items-center justify-center overflow-hidden rounded-full border text-xs font-bold"
+            class="border-seed text-fg-muted relative flex size-6 shrink-0 items-center justify-center overflow-hidden rounded-full border bg-[var(--seed-surface)] text-xs font-bold"
             data-testid="account-menu-avatar"
           >
             <img v-if="me?.avatar" :src="me.avatar" alt="avatar" class="size-full object-cover" />
@@ -122,7 +122,7 @@ async function handleLogout() {
           <!-- 余额 -->
           <span
             v-if="me"
-            class="rounded-full border border-[color-mix(in_srgb,var(--seed-primary)_30%,transparent)] bg-[color-mix(in_srgb,var(--seed-primary)_14%,var(--seed-surface))] px-2 py-0.5 font-mono text-xs font-semibold tracking-tight text-[var(--seed-primary)]"
+            class="balance-badge rounded-full px-2 py-0.5 font-mono text-xs font-semibold tracking-tight"
           >
             {{ formatUsdMicros(me.balance_usd_micros) }}
           </span>
@@ -141,7 +141,7 @@ async function handleLogout() {
               <p class="truncate text-sm font-semibold">
                 {{ me?.display_name || t('nav.account') }}
               </p>
-              <span v-if="me" class="badge text-[10px]" :class="roleBadgeClass">
+              <span v-if="me" class="badge" :class="roleBadgeClass">
                 {{ roleLabel }}
               </span>
             </div>
@@ -226,7 +226,7 @@ async function handleLogout() {
           </DropdownMenuSub>
           <DropdownMenuSeparator class="data-table-menu-separator" />
           <DropdownMenuItem
-            class="data-table-menu-item hover:bg-danger/20 mt-1 flex items-center gap-2 bg-[var(--danger-bg)] font-medium text-[var(--danger)] transition-colors"
+            class="data-table-menu-item data-table-menu-item-danger-filled flex items-center gap-2"
             data-testid="nav-logout"
             @select="handleLogout"
           >

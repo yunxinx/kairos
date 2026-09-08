@@ -1,5 +1,31 @@
-@import './globals.css';
+/* ── 设计令牌清单 ──────────────────────────────────────────────
+   颜色、字族、字号、圆角、间距与层级集中在此；globals.css 只保留组件规则。
+   深色主题由 .dark 覆盖同名变量实现。
 
+   注意：chart-theme.ts 会读取色变量的原值（getPropertyValue）并按 hex
+   解析后喂给 ECharts 画布——色值必须是纯 hex/rgba 字面量，不能改用
+   light-dark() 或嵌套 var()。 */
+
+/* 字号刻度（rem，随浏览器字号设置缩放）：
+   10 微标签 / 11 徽章 / 12 密集 / 13 控件（--font-size-control）/ 14 正文；
+   18、24 为展示档；营销页大标题走 home.css 的 clamp。 */
+@theme {
+  --text-3xs: 0.625rem;
+  --text-2xs: 0.6875rem;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --text-lg: 1.125rem;
+  --text-2xl: 1.5rem;
+}
+
+/* 字族：全部系统字体，不依赖第三方字体 CDN（离线可用、无供应链面）；
+   楷体标题的中文回退见文件末尾 html[lang='zh-CN']。 */
+@theme {
+  --font-serif: Charter, Georgia, Cambria, 'Times New Roman', serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+/* 布局尺寸与层级 */
 @theme inline {
   --spacing-page-x: 1.5rem;
   --spacing-page-y: 2.5rem;
@@ -24,74 +50,124 @@
   --spacing-overview-activity-gap: 0.75rem;
 }
 
-.max-w-content {
-  max-width: var(--width-content);
+/* ── 色板 ── */
+:root {
+  color-scheme: light;
+
+  /* 圆角刻度（与 Tailwind rounded-xs/sm/md/lg 同值；胶囊与圆用 full）：
+     2 微件内侧 / 4 默认 / 6 次级表面 / 8 大表面；
+     嵌套元素（菜单项、分段滑块）按「父级圆角 - 1~2px」的 calc 收敛。 */
+  --radius-xs: 0.125rem;
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-full: 9999px;
+
+  /* 中性阶：底板 → 页面 → 次级面 → 边框 → 次文本 → 弱化文本 → 正文 */
+  --seed-bg: #f1f3f9;
+  --seed-surface: #fafcff;
+  --seed-surface-alt: #f1f3f9;
+  --seed-border: #dce0eb;
+  --fg-subtle: #a8b2c8;
+  --fg-muted: #64708b;
+  --seed-fg: #0a0e1c;
+  --fg-on-primary: #ffffff;
+
+  /* 主色与衍生 */
+  --seed-primary: #3b82f6;
+  --primary-hover: #2563eb;
+  --primary-shadow: #2563eb;
+  --blue-light: #93c5fd;
+  --blue-lighter: #dbeafe;
+
+  /* 状态色 */
+  --success: #16a34a;
+  --success-bg: #f0fdf4;
+  --danger: #dc2626;
+  --danger-bg: #fef2f2;
+  --danger-filled: #dc2626;
+  --warn: #b45309;
+  --info: #3b82f6;
+  --info-bg: #eff6ff;
+
+  /* 实底危险菜单项（退出登录）：明暗两态同色，取深色态观感；悬停亮一档 */
+  --danger-menu-bg: #7f1d1d;
+  --danger-menu-bg-hover: #991b1b;
+  --danger-menu-fg: #fca5a5;
+
+  /* 协议色 */
+  --proto-chat: #0d9488;
+  --proto-chat-bg: #ccfbf1;
+  --proto-responses: #4f46e5;
+  --proto-responses-bg: #e0e7ff;
+  --proto-anthropic: #c2410c;
+  --proto-anthropic-bg: #ffedd5;
+  --proto-gemini: #2563eb;
+  --proto-gemini-bg: #dbeafe;
+
+  /* 日志数据色：对话角色与缓存标记。状态语义（结算/命中/延迟）复用
+     上面的状态色；violet 是「工具角色 / 缓存写」的独立色相。 */
+  --violet: #9333ea;
+
+  /* 别名（info 的语义别名）与点阵底色。
+     点阵：边框色 20% 混入底板，明暗两态同一强度，自适配无需 .dark 覆盖 */
+  --alias: var(--info);
+  --alias-bg: var(--info-bg);
+  --dot-color: color-mix(in srgb, var(--seed-border) 20%, var(--seed-bg));
+
+  /* 阴影与焦点：硬投影是本设计的立体语言，不用弥散阴影 */
+  --card-shadow: rgba(220, 224, 235, 0.4);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--seed-primary) 22%, transparent);
+
+  /* 表格行水洗：半透明以便与失败行底色等叠加 */
+  --row-hover: color-mix(in srgb, var(--seed-surface-alt) 50%, transparent);
+  --row-selected: color-mix(in srgb, var(--seed-surface-alt) 65%, transparent);
+
+  /* 输入框内幽灵图标（清除/密码显隐）与其焦点描边 */
+  --icon-muted: color-mix(in srgb, var(--fg-muted) 68%, transparent);
+  --icon-muted-hover: color-mix(in srgb, var(--fg-muted) 88%, var(--seed-fg));
+  --outline-muted: color-mix(in srgb, var(--fg-muted) 35%, transparent);
+
+  /* 控件字号（13px）：按钮、标签页、菜单项，介于 xs(12) 与 sm(14) 之间 */
+  --font-size-control: 0.8125rem;
 }
 
-.px-page-x {
-  padding-left: var(--spacing-page-x);
-  padding-right: var(--spacing-page-x);
+/* 深色：底板保持原色；层次靠抬升次级表面与更实的硬阴影 */
+.dark {
+  color-scheme: dark;
+  --seed-bg: #111827;
+  --seed-fg: #f3f4f8;
+  --seed-surface: #1e293b;
+  --seed-surface-alt: #2a3a4f;
+  --seed-border: #52657c;
+  --fg-muted: #cbd5e1;
+  --fg-subtle: #94a3b8;
+  --success: #4ade80;
+  --success-bg: #14532d;
+  --danger: #fca5a5;
+  --danger-bg: #7f1d1d;
+  --danger-filled: #ef4444;
+  --warn: #fde047;
+  --info: #93c5fd;
+  --info-bg: #1e3a8a;
+  --proto-chat: #2dd4bf;
+  --proto-chat-bg: color-mix(in srgb, var(--proto-chat) 16%, var(--seed-surface));
+  --proto-responses: #a5b4fc;
+  --proto-responses-bg: color-mix(in srgb, var(--proto-responses) 16%, var(--seed-surface));
+  --proto-anthropic: #fdba74;
+  --proto-anthropic-bg: color-mix(in srgb, var(--proto-anthropic) 16%, var(--seed-surface));
+  --proto-gemini: #93c5fd;
+  --proto-gemini-bg: color-mix(in srgb, var(--proto-gemini) 16%, var(--seed-surface));
+  --violet: #c084fc;
+  --primary-hover: #60a5fa;
+  --primary-shadow: #1d4ed8;
+  --card-shadow: rgba(0, 0, 0, 0.72);
+  --blue-light: #60a5fa;
+  --blue-lighter: #1e40af;
 }
 
-.py-page-y {
-  padding-top: var(--spacing-page-y);
-  padding-bottom: var(--spacing-page-y);
-}
-
-.gap-stack {
-  gap: var(--spacing-stack);
-}
-
-.gap-page {
-  gap: var(--spacing-page);
-}
-
-.not-found-stage {
-  display: flex;
-  width: 100%;
-  min-height: calc(100dvh - 2 * var(--spacing-page-y));
-  align-items: center;
-  justify-content: center;
-}
-
-@media (min-width: 768px) {
-  .not-found-stage {
-    min-height: calc(100dvh - var(--height-topnav) - 2 * var(--spacing-page-y));
-  }
-}
-
-.h-topnav {
-  height: var(--height-topnav);
-}
-
-.z-topnav {
-  z-index: var(--z-topnav);
-}
-
-.z-overlay-backdrop {
-  z-index: var(--z-overlay-backdrop);
-}
-
-.z-overlay {
-  z-index: var(--z-overlay);
-}
-
-.z-floating {
-  z-index: var(--z-floating);
-}
-
-.z-toast {
-  z-index: var(--z-toast);
-}
-
-.min-h-touch {
-  min-height: var(--spacing-touch);
-}
-
-.h-chart {
-  height: var(--height-chart);
-}
-
-.h-overview-panel {
-  height: var(--height-overview-bottom-column);
+/* 楷体气质的标题用系统楷体栈兜底 */
+html[lang='zh-CN'] {
+  --font-serif:
+    'Kaiti SC', KaiTi, STKaiti, 'Source Han Serif SC', 'Noto Serif CJK SC', 'Songti SC', serif;
 }

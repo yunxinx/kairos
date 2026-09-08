@@ -209,7 +209,7 @@ onUnmounted(() => scrollRoot.removeEventListener('scroll', handleScroll));
 .fab-btn {
   width: 32px;
   height: 32px;
-  border-radius: 50%;
+  border-radius: var(--radius-full);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -279,7 +279,7 @@ onUnmounted(() => scrollRoot.removeEventListener('scroll', handleScroll));
   color: var(--fg-muted);
   background: none;
   border: none;
-  border-radius: calc(var(--seed-radius) - 2px);
+  border-radius: calc(var(--radius-sm) - 2px);
   cursor: pointer;
   transition:
     color 150ms ease-in-out,
@@ -304,7 +304,7 @@ onUnmounted(() => scrollRoot.removeEventListener('scroll', handleScroll));
   display: block;
   flex-shrink: 0;
   padding: 10px 16px;
-  font-size: 13px;
+  font-size: var(--font-size-control);
   font-weight: 500;
   color: var(--fg-muted);
   text-decoration: none;

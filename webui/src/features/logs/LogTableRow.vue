@@ -78,16 +78,8 @@ const cacheHitRatio = computed(() =>
   computeCacheHitRatio(props.entry.cache_read_tokens, props.entry.input_tokens),
 );
 
-const rowClass = computed(() => {
-  if (isFailed.value) {
-    return props.active
-      ? 'bg-[color-mix(in_srgb,var(--danger)_16%,var(--seed-surface))] font-medium hover:bg-[color-mix(in_srgb,var(--danger)_22%,var(--seed-surface))]'
-      : 'bg-[color-mix(in_srgb,var(--danger)_10%,var(--seed-surface))] hover:bg-[color-mix(in_srgb,var(--danger)_16%,var(--seed-surface))]';
-  }
-  return props.active
-    ? 'bg-[var(--seed-surface-alt)]/50 font-medium hover:bg-[var(--seed-surface-alt)]/60'
-    : 'hover:bg-[var(--seed-surface-alt)]/60';
-});
+/* 失败行整行淡红(log-row-failed);普通行的悬停/选中由 TableRow 原语渲染 */
+const rowClass = computed(() => (isFailed.value ? 'log-row-failed' : ''));
 
 function handleRowClick(event: MouseEvent) {
   if ((event.target as HTMLElement).closest('button')) return;
@@ -101,8 +93,9 @@ function handleRowClick(event: MouseEvent) {
     :data-log-id="String(entry.id)"
     :data-model="entry.model"
     :data-status-code="String(entry.status_code)"
-    class="group cursor-pointer transition-colors"
+    class="log-row group cursor-pointer transition-colors"
     :class="rowClass"
+    :data-state="active ? 'selected' : undefined"
     @click="handleRowClick"
   >
     <TableCell class="text-fg-muted font-mono text-xs whitespace-nowrap">
@@ -111,7 +104,7 @@ function handleRowClick(event: MouseEvent) {
         <!-- 未出站即终局的请求（余额拒绝、无可用渠道等）：仅在字段明确为 false 时渲染。 -->
         <span
           v-if="entry.dispatched === false"
-          class="badge badge-neutral text-fg-muted w-fit px-1 py-0 text-[9px] font-medium"
+          class="badge badge-neutral text-fg-muted w-fit px-1 py-0 font-medium"
           :title="t('logs.notDispatched')"
           data-testid="log-not-dispatched"
         >
@@ -137,7 +130,7 @@ function handleRowClick(event: MouseEvent) {
           </button>
         </div>
         <div
-          class="text-fg-muted truncate font-mono text-[10px] opacity-80"
+          class="text-fg-muted text-3xs truncate font-mono opacity-80"
           :title="entry.token_key_masked"
         >
           {{ entry.token_key_masked }}
@@ -166,7 +159,7 @@ function handleRowClick(event: MouseEvent) {
         </div>
         <div
           v-if="entry.outbound_model && entry.outbound_model !== entry.model"
-          class="text-fg-muted inline-flex items-center gap-0.5 truncate font-mono text-[10px] opacity-80"
+          class="text-fg-muted text-3xs inline-flex items-center gap-0.5 truncate font-mono opacity-80"
           :title="`${t('logs.outboundModel')}: ${entry.outbound_model}`"
           data-testid="log-row-outbound-model"
         >
@@ -179,7 +172,7 @@ function handleRowClick(event: MouseEvent) {
     <TableCell v-if="visible.channel">
       <div class="inline-flex max-w-full items-center gap-1">
         <span
-          class="code-chip truncate rounded px-1.5 py-0.5 font-mono text-[11px]"
+          class="code-chip text-2xs truncate rounded px-1.5 py-0.5 font-mono"
           data-testid="log-channel"
         >
           {{ entry.channel }}
@@ -200,10 +193,9 @@ function handleRowClick(event: MouseEvent) {
       <div class="flex min-w-0 flex-col items-start gap-1" data-testid="log-inbound-protocol">
         <div v-if="outbound.status === 'converted'" class="flex flex-col gap-1">
           <div class="inline-flex items-center gap-1">
-            <span
-              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-              >{{ t('logs.protoIn') }}</span
-            >
+            <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+              t('logs.protoIn')
+            }}</span>
             <ProtocolBadge :protocol="entry.inbound_protocol" />
           </div>
           <div
@@ -211,29 +203,24 @@ function handleRowClick(event: MouseEvent) {
             data-testid="log-row-outbound-protocol"
             :title="`${t('logs.protocolConversion')}: ${entry.inbound_protocol} → ${outbound.protocol}`"
           >
-            <span
-              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-              >{{ t('logs.protoOut') }}</span
-            >
+            <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+              t('logs.protoOut')
+            }}</span>
             <ProtocolBadge :protocol="outbound.protocol" />
           </div>
         </div>
         <div v-else-if="outbound.status === 'unknown'" class="flex flex-col gap-1">
           <div class="inline-flex items-center gap-1">
-            <span
-              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-              >{{ t('logs.protoIn') }}</span
-            >
+            <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+              t('logs.protoIn')
+            }}</span>
             <ProtocolBadge :protocol="entry.inbound_protocol" />
           </div>
           <div class="inline-flex items-center gap-1" data-testid="log-outbound-protocol-unknown">
-            <span
-              class="badge badge-neutral text-fg-muted px-1 py-0 text-[9px] font-medium uppercase"
-              >{{ t('logs.protoOut') }}</span
-            >
-            <span class="badge badge-neutral w-fit text-[10px]">{{
-              t('logs.outboundProtocolUnknown')
+            <span class="badge badge-neutral text-fg-muted px-1 py-0 font-medium uppercase">{{
+              t('logs.protoOut')
             }}</span>
+            <span class="badge badge-neutral w-fit">{{ t('logs.outboundProtocolUnknown') }}</span>
           </div>
         </div>
         <div v-else class="inline-flex items-center gap-1">
@@ -265,10 +252,10 @@ function handleRowClick(event: MouseEvent) {
 
     <TableCell v-if="visible.cache" class="font-mono text-xs">
       <div v-if="hasCache" class="flex flex-col gap-0.5">
-        <span v-if="entry.cache_read_tokens > 0" class="text-blue-600 dark:text-blue-400">
+        <span v-if="entry.cache_read_tokens > 0" class="text-info">
           {{ t('logs.cacheReadShort') }} {{ formatTokensCount(entry.cache_read_tokens) }}
         </span>
-        <span v-if="entry.cache_write_tokens > 0" class="text-purple-600 dark:text-purple-400">
+        <span v-if="entry.cache_write_tokens > 0" class="text-violet">
           {{ t('logs.cacheWriteShort') }} {{ formatTokensCount(entry.cache_write_tokens) }}
         </span>
       </div>
@@ -278,7 +265,7 @@ function handleRowClick(event: MouseEvent) {
     <TableCell v-if="visible.cacheHit" class="font-mono text-xs">
       <span
         v-if="hasCache && cacheHitRatio !== null"
-        class="badge inline-block w-fit border-blue-500/20 bg-blue-500/10 font-mono text-[10px] text-blue-600 dark:text-blue-400"
+        class="badge badge-info inline-block w-fit font-mono"
         :title="t('logs.cacheHit')"
         data-testid="log-cache-hit"
       >
@@ -294,12 +281,12 @@ function handleRowClick(event: MouseEvent) {
     </TableCell>
 
     <TableCell v-if="visible.settled" class="font-mono text-xs whitespace-nowrap">
-      <span v-if="entry.settled" class="font-medium text-emerald-600 dark:text-emerald-400">
+      <span v-if="entry.settled" class="text-success font-medium">
         {{ t('logs.settledYes') }}
       </span>
       <span
         v-else
-        class="font-medium text-amber-600 dark:text-amber-400"
+        class="text-warn font-medium"
         data-testid="log-unsettled"
         :title="t('logs.unsettled')"
       >

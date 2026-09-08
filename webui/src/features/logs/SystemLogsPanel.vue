@@ -388,7 +388,7 @@ function levelLabel(level: string): string {
             </TableCell>
             <TableCell v-if="visible.level">
               <span
-                class="badge text-[10px]"
+                class="badge"
                 :class="levelBadgeClass(entry.level)"
                 data-testid="system-log-level"
               >

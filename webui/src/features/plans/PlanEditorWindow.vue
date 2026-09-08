@@ -492,7 +492,7 @@ function updateCapability(key: keyof PlanCapabilities, checked: boolean): void {
               <p class="form-field-label m-0">
                 {{ t('plans.modelGroups') }}
               </p>
-              <span class="badge badge-neutral text-xs" data-testid="plan-groups-count">
+              <span class="badge badge-neutral" data-testid="plan-groups-count">
                 {{ t('plans.groupsSelected', { count: selectedGroups.length }) }}
               </span>
             </div>
@@ -564,7 +564,7 @@ function updateCapability(key: keyof PlanCapabilities, checked: boolean): void {
               v-for="key in PLAN_CAPABILITY_KEYS"
               :key="key"
               :for="`plan-capability-${key}`"
-              class="border-seed hover:bg-surface-alt flex cursor-pointer items-center gap-2 rounded-md border p-2 text-xs"
+              class="border-seed flex cursor-pointer items-center gap-2 rounded-md border p-2 text-xs hover:bg-[var(--seed-surface-alt)]"
             >
               <Checkbox
                 :id="`plan-capability-${key}`"

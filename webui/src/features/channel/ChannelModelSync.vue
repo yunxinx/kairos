@@ -547,7 +547,7 @@ function closeSync() {
           <PopoverContent
             align="start"
             :side-offset="4"
-            class="z-10 w-50 rounded-md border border-[var(--seed-border)] bg-[var(--seed-surface)] p-1 shadow-md"
+            class="shadow-card z-10 w-50 rounded-md border border-[var(--seed-border)] bg-[var(--seed-surface)] p-1"
             data-testid="channel-sync-filter-menu"
           >
             <button
