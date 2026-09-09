@@ -55,9 +55,11 @@ const emit = defineEmits<{
 
 const { t, locale } = useI18n();
 
-const windowTitle = computed(
-  () => `#${props.entry.id} · ${props.entry.model} · ${t('logs.billingTitle')}`,
-);
+/** 标题带归属邮箱：正文只保留模型/渠道/令牌，拥挤度不回升；截断时靠悬浮提示看全。 */
+const windowTitle = computed(() => {
+  const owner = props.entry.user_email ?? t('logs.userUnknown');
+  return `#${props.entry.id} · ${owner} · ${t('logs.billingTitle')}`;
+});
 
 function statusBadgeClass(statusCode: number): string {
   if (statusCode >= 200 && statusCode < 300) return 'badge-success';
@@ -200,7 +202,7 @@ const calculationSteps = computed(() => {
         </div>
 
         <dl class="flex flex-col gap-4 text-xs">
-          <!-- 第一行：模型、渠道、令牌 (3 项) -->
+          <!-- 第一行：模型、渠道、令牌 (3 项)；用户在标题栏，见 windowTitle -->
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div>
               <dt class="text-fg-muted text-2xs flex items-center gap-1">

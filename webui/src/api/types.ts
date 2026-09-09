@@ -533,6 +533,11 @@ export interface LogEntry {
   token_name: string;
   /** 令牌 key 的掩码形态（前 8 位 + ****** + 后 8 位；归属展示用，非凭证）。 */
   token_key_masked: string;
+  /**
+   * 归属用户邮箱；日志行只存 user_id（令牌删除、用户归档后归属仍在），读取时
+   * 按页回查。user_id 为 0（迁移前归属未知）或用户行已不存在时为 null。
+   */
+  user_email: string | null;
   inbound_protocol: string;
   model: string;
   /** 实际出站模型名；旧行可能为 null。 */

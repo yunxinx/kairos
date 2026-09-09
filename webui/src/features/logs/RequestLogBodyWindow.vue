@@ -40,9 +40,7 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 
-const windowTitle = computed(
-  () => `#${props.entry.id} · ${props.entry.model} · ${t('logs.bodyTitle')}`,
-);
+const windowTitle = computed(() => `#${props.entry.id} · ${t('logs.bodyTitle')}`);
 
 function statusBadgeClass(statusCode: number): string {
   if (statusCode >= 200 && statusCode < 300) return 'badge-success';

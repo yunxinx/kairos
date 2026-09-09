@@ -181,6 +181,58 @@ mod tests {
         assert!(rate_limit_rpm_to_db(Some(u64::MAX)).is_err());
         assert!(rate_limit_rpm_from_db(Some(-1)).is_err());
     }
+
+    /// 批量邮箱回查：存在的 id 命中（含归档行）、0 与不存在的 id 缺席。
+    #[tokio::test]
+    async fn map_user_emails_resolves_ids_including_archived() {
+        let (_dir, pool) = test_pool().await;
+        seed_builtin_root(&pool, Some("root@example.com"), Some("password1"))
+            .await
+            .expect("应能播种");
+        let mut conn = pool.acquire().await.expect("应能获取连接");
+        // 直接插一行用户（role='user' 不受 last-root 保护），再归档它：
+        // 历史消费归属不随归档消失，回查应仍能给出邮箱（改写后的归档地址）。
+        sqlx::query(
+            "INSERT INTO users (id, email, display_name, password_hash, role, enabled, created_at) \
+             VALUES (2, 'archived@example.com', 'gone', NULL, 'user', 0, 0)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("应能插入用户");
+        delete_user(&mut conn, 2, 1).await.expect("应能归档");
+        sqlx::query(
+            "INSERT INTO users (id, email, display_name, password_hash, role, enabled, created_at) \
+             VALUES (3, 'live@example.com', 'live', NULL, 'user', 1, 0)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("应能插入用户");
+
+        let emails = map_user_emails(&pool, [1, 2, 3, 0, 999].into_iter())
+            .await
+            .expect("应能回查");
+        assert_eq!(
+            emails.get(&1).map(String::as_str),
+            Some("root@example.com")
+        );
+        assert_eq!(
+            emails.get(&2).map(String::as_str),
+            Some("deleted.2.archived@example.com"),
+            "归档行的邮箱改写后仍应可回查"
+        );
+        assert_eq!(
+            emails.get(&3).map(String::as_str),
+            Some("live@example.com")
+        );
+        assert!(!emails.contains_key(&0), "0 是归属未知的哨兵值，不该命中");
+        assert!(!emails.contains_key(&999), "不存在的 id 不该命中");
+
+        // 空输入短路，不出查询。
+        let empty = map_user_emails(&pool, std::iter::empty())
+            .await
+            .expect("空输入应成功");
+        assert!(empty.is_empty());
+    }
 }
 
 /// 管理用户（不含密码哈希）。
@@ -546,6 +598,36 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>, StoreError
     .await
     .map_err(StoreError::Query)?;
     rows.iter().map(map_user_row).collect()
+}
+
+/// 批量把用户 id 解析成邮箱（含已归档行——历史消费归属不随归档消失）。
+///
+/// 仅供日志展示：0（迁移前归属未知）与已不存在的 id 返回 `None`，
+/// 调用方把 `None` 渲染为占位符而不是空字符串。
+pub async fn map_user_emails(
+    pool: &SqlitePool,
+    ids: impl Iterator<Item = i64>,
+) -> Result<std::collections::BTreeMap<i64, String>, StoreError> {
+    let wanted: Vec<i64> = ids.collect();
+    if wanted.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let mut qb = sqlx::QueryBuilder::new("SELECT id, email FROM users WHERE id IN (");
+    let mut first = true;
+    for id in &wanted {
+        if !first {
+            qb.push(", ");
+        }
+        first = false;
+        qb.push_bind(id);
+    }
+    qb.push(")");
+    let rows = qb
+        .build_query_as::<(i64, String)>()
+        .fetch_all(pool)
+        .await
+        .map_err(StoreError::Query)?;
+    Ok(rows.into_iter().collect())
 }
 
 /// 快照专用的用户投影：只取请求路径要用的字段。

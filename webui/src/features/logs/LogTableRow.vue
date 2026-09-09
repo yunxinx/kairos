@@ -16,6 +16,7 @@ import {
 import { resolveOutboundProtocol } from '@/lib/protocol';
 
 export type RequestLogVisibleColumns = {
+  user: boolean;
   token: boolean;
   model: boolean;
   channel: boolean;
@@ -109,6 +110,29 @@ function handleRowClick(event: MouseEvent) {
           data-testid="log-not-dispatched"
         >
           {{ t('logs.notDispatched') }}
+        </span>
+      </div>
+    </TableCell>
+
+    <TableCell v-if="visible.user" class="text-xs">
+      <div class="flex min-w-0 flex-col items-start">
+        <!-- user_id 冗余在日志行上（令牌删除、用户归档后归属仍在）；展示用邮箱
+             由后端按页回查，0（迁移前归属未知）或用户行已不存在时为 null。 -->
+        <span
+          v-if="entry.user_email"
+          class="truncate font-mono"
+          :title="entry.user_email"
+          data-testid="log-user"
+        >
+          {{ entry.user_email }}
+        </span>
+        <span
+          v-else
+          class="text-fg-muted text-3xs"
+          :title="t('logs.userUnknown')"
+          data-testid="log-user"
+        >
+          {{ t('logs.userUnknown') }}
         </span>
       </div>
     </TableCell>

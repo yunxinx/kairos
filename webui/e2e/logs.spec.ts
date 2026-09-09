@@ -139,6 +139,58 @@ test.describe('request logs page', () => {
     await expect(page.getByTestId('log-detail-channel')).toHaveText('alias-channel');
   });
 
+  test('user column is off by default, shows the owner email once enabled', async ({ page }) => {
+    seedRequestLogs([
+      {
+        created_at: Date.now(),
+        token_key: 'sk-e2e-logs-user',
+        token_name: 'User token',
+        model: 'e2e-user-model',
+        channel: 'e2e-user-channel',
+        status_code: 200,
+      },
+      {
+        created_at: Date.now() - 1_000,
+        token_key: 'sk-e2e-logs-unknown-user',
+        token_name: 'Unknown user token',
+        model: 'e2e-unknown-user-model',
+        channel: 'e2e-user-channel',
+        status_code: 200,
+        // 0 是迁移前归属未知的哨兵值，用户列应显示占位符而不是空串。
+        user_id: 0,
+      },
+    ]);
+
+    await page.addInitScript(() => {
+      localStorage.removeItem('kairos-logs-columns');
+    });
+    await page.goto('/logs');
+    await page.locator('#logs-search').fill('sk-e2e-logs-user');
+    const row = page.locator('[data-testid="log-row"][data-model="e2e-user-model"]');
+    await expect(row).toBeVisible();
+    await expect(page.getByRole('columnheader', { name: 'User', exact: true })).toHaveCount(0);
+
+    await page.getByTestId('logs-columns').click();
+    await page.locator('[data-testid="logs-columns-option"][data-value="user"]').click();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('columnheader', { name: 'User', exact: true })).toBeVisible();
+    await expect(row.getByTestId('log-user')).toHaveText('root@localhost');
+
+    // 详情面板：标题栏带归属邮箱、不带模型名（模型仍在基础信息里）。
+    await row.getByTestId('log-expand').click();
+    const detailWindow = page.getByTestId('request-log-detail-window');
+    await expect(detailWindow.getByRole('heading')).toHaveText(
+      /#\d+ · root@localhost · Billing Details/,
+    );
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('request-log-detail-window')).toHaveCount(0);
+
+    await page.locator('#logs-search').fill('sk-e2e-logs-unknown-user');
+    const unknownRow = page.locator('[data-testid="log-row"][data-model="e2e-unknown-user-model"]');
+    await expect(unknownRow).toHaveCount(1);
+    await expect(unknownRow.getByTestId('log-user')).toHaveText('Unknown');
+  });
+
   test('filters unsettled request logs and lists system logs on a separate tab', async ({
     page,
   }) => {
@@ -178,8 +230,11 @@ test.describe('request logs page', () => {
     ]);
 
     await page.goto('/logs');
-    await expect(page.getByTestId('logs-unsettled-total')).toContainText('1');
     await page.getByTestId('logs-settled-filter').click();
+    // 未结算计数显示在「未结算」选项右侧，与折扣筛选的计数同款。
+    await expect(
+      page.locator('[data-testid="logs-settled-filter-option"][data-value="false"]'),
+    ).toContainText('1');
     await page.locator('[data-testid="logs-settled-filter-option"][data-value="false"]').click();
     await expect(page.getByTestId('log-row')).toHaveCount(1);
     await expect(page.getByTestId('log-unsettled')).toBeVisible();

@@ -23,6 +23,8 @@ export interface SeedLogInput {
   settled?: boolean;
   request_body?: Uint8Array | null;
   response_body?: Uint8Array | null;
+  /** 归属用户 id；缺省 1（root），对应 e2e 会话身份。 */
+  user_id?: number;
 }
 
 /** UTC 日历日起点（unix 毫秒），与存储层 `div_euclid` 日切口径一致。 */
@@ -48,8 +50,8 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
          cache_write_tokens, input_price_usd_micros, output_price_usd_micros,
          cache_read_price_usd_micros, cache_write_price_usd_micros,
          base_cost_usd_micros, discount_bp, cost_usd_micros,
-         settled, request_body, response_body
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?)`,
+         settled, request_body, response_body, user_id
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const ids: number[] = [];
     db.exec('BEGIN');
@@ -73,6 +75,7 @@ export function seedRequestLogs(logs: SeedLogInput[]): number[] {
           log.settled === false ? 0 : 1,
           log.request_body ?? null,
           log.response_body ?? null,
+          log.user_id ?? 1,
         );
         ids.push(Number(result.lastInsertRowid));
       }

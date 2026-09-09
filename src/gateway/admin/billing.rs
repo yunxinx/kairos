@@ -78,6 +78,13 @@ async fn query_isolated(
     .await
     .map_err(AdminError::Store)?;
     let reveal_topology = identity.role().at_least(ManagementRole::Admin);
+    // 隔离队列以 user_id 为主维度展示；邮箱回查失败不阻断列表。
+    let user_emails = users::map_user_emails(
+        &deps.pool,
+        rows.iter().filter_map(|row| row.log.as_ref().map(|log| log.user_id)),
+    )
+    .await
+    .unwrap_or_default();
     Ok(Json(IsolatedPage {
         items: rows
             .into_iter()
@@ -95,7 +102,7 @@ async fn query_isolated(
                 response_body_present: row.response_body.is_some(),
                 log: row
                     .log
-                    .map(|log| LogEntry::from_store_log(log, reveal_topology)),
+                    .map(|log| LogEntry::from_store_log(log, reveal_topology, &user_emails)),
             })
             .collect(),
     }))
@@ -294,5 +301,12 @@ async fn close_unsettled_log(
         .await
         .map_err(AdminError::Store)?
         .ok_or_else(|| AdminError::NotFound(format!("日志 {id} 不存在")))?;
-    Ok(Json(LogEntry::from_store_log(log, true)))
+    let user_emails = users::map_user_emails(&deps.pool, std::iter::once(log.user_id))
+        .await
+        .unwrap_or_default();
+    Ok(Json(LogEntry::from_store_log(
+        log,
+        true,
+        &user_emails,
+    )))
 }

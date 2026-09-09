@@ -13,6 +13,7 @@ import {
 import DateRangePicker from '@/components/ui/DateRangePicker.vue';
 import EmptyState from '@/components/ui/EmptyState.vue';
 import FacetedFilter from '@/components/ui/FacetedFilter.vue';
+import type { FacetedFilterOption } from '@/lib/faceted-filter';
 import InlineError from '@/components/ui/InlineError.vue';
 import SearchInput from '@/components/ui/SearchInput.vue';
 import UiIcon from '@/components/ui/UiIcon.vue';
@@ -51,6 +52,7 @@ type RequestLogWindowPayload =
 
 type RequestLogColumnId =
   | 'created'
+  | 'user'
   | 'token'
   | 'model'
   | 'channel'
@@ -66,6 +68,7 @@ type RequestLogColumnId =
 
 const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
   { id: 'created', locked: true },
+  { id: 'user', defaultVisible: false },
   { id: 'token' },
   { id: 'model' },
   { id: 'channel' },
@@ -81,6 +84,7 @@ const REQUEST_LOG_COLUMNS: ColumnVisibilitySpec<RequestLogColumnId>[] = [
 ];
 
 const REQUEST_LOG_HIDEABLE: RequestLogColumnId[] = [
+  'user',
   'token',
   'model',
   'channel',
@@ -101,6 +105,14 @@ const me = useCurrentUser();
 /** 补扣/豁免是计费操作，要求生效能力 `settle_waive`；普通用户不渲染入口。 */
 const canSettleLogs = computed(() => hasCapability(me.value, 'settle_waive'));
 const queryClient = useQueryClient();
+
+/**
+ * 普通用户的归属范围由后端按身份钉死（`owner_scope`），整列恒为自己、无从比较，
+ * 故用户列与「显示列」开关里的对应项都不渲染。列偏好不写 localStorage 侧的
+ * 投影差异：列开关由 `columnMenuItems` 过滤，空行 colspan 由
+ * `effectiveColumnCount` 扣减。
+ */
+const showUserColumn = computed(() => me.value !== null && me.value.role !== 'user');
 
 const {
   draftKeyword,
@@ -146,6 +158,7 @@ const { visible, columnCount, setVisible, menuItems } = useColumnVisibility(
 );
 
 const rowVisible = computed((): RequestLogVisibleColumns => ({
+  user: showUserColumn.value && visible.value.user,
   token: visible.value.token,
   model: visible.value.model,
   channel: visible.value.channel,
@@ -159,7 +172,18 @@ const rowVisible = computed((): RequestLogVisibleColumns => ({
   body: visible.value.body,
 }));
 
-const columnMenuItems = computed(() => menuItems(REQUEST_LOG_HIDEABLE));
+// 普通用户视图不含用户列（整列恒为自己，无从比较）；用 filter 显式剔除而不是
+// 按下标切片，避免数组头部增删列时静默错位。
+const REQUEST_LOG_HIDEABLE_FOR_ROLE = computed(() =>
+  showUserColumn.value ? REQUEST_LOG_HIDEABLE : REQUEST_LOG_HIDEABLE.filter((id) => id !== 'user'),
+);
+
+const columnMenuItems = computed(() => menuItems(REQUEST_LOG_HIDEABLE_FOR_ROLE.value));
+
+/** 用户列按角色隐藏时，空行与骨架的 colspan 要把它扣掉。 */
+const effectiveColumnCount = computed(
+  () => columnCount.value - (!showUserColumn.value && visible.value.user ? 1 : 0),
+);
 
 const sortBy = ref<RequestLogSortBy>('created');
 const sortDir = ref<SortDir>('desc');
@@ -198,6 +222,7 @@ function onClearSort() {
 
 const columnLabels = computed((): Record<RequestLogColumnId, string> => ({
   created: t('logs.created'),
+  user: t('logs.user'),
   token: t('logs.token'),
   model: t('logs.model'),
   channel: t('logs.channel'),
@@ -214,10 +239,15 @@ const columnLabels = computed((): Record<RequestLogColumnId, string> => ({
 
 const activeLogIds = computed(() => new Set(windows.value.map((win) => win.payload.entry.id)));
 
-const settledOptions = computed(() => [
-  { value: 'true', label: t('logs.settledYes') },
-  { value: 'false', label: t('logs.settledNo') },
-]);
+const settledOptions = computed<FacetedFilterOption[]>(() => {
+  const options: FacetedFilterOption[] = [{ value: 'true', label: t('logs.settledYes') }];
+  // 未结算计数与列表同 query 语义（同一过滤、同一归属范围），供对账直选；
+  // 0 条时不显示计数，与折扣筛选一致。
+  const unsettled: FacetedFilterOption = { value: 'false', label: t('logs.settledNo') };
+  if (unsettledTotal.value > 0) unsettled.count = unsettledTotal.value;
+  options.push(unsettled);
+  return options;
+});
 
 const protocolOptions = computed(() =>
   PROTOCOLS.map((value) => ({
@@ -570,13 +600,6 @@ function onFilterToken(tokenName: string) {
             }}</span>
             <UiIcon name="close" :size="12" />
           </button>
-          <p
-            v-if="unsettledTotal > 0"
-            class="log-tint-warn text-warn rounded border px-2 py-1 text-xs font-semibold"
-            data-testid="logs-unsettled-total"
-          >
-            {{ t('logs.unsettledTotal', { count: unsettledTotal }) }}
-          </p>
 
           <template #actions>
             <div class="flex items-center gap-1.5 text-xs text-[var(--fg-muted)]">
@@ -634,6 +657,7 @@ function onFilterToken(tokenName: string) {
               @clear="onClearSort"
             />
           </TableHead>
+          <TableHead v-if="showUserColumn && visible.user">{{ t('logs.user') }}</TableHead>
           <TableHead v-if="visible.token">{{ t('logs.token') }}</TableHead>
           <TableHead v-if="visible.model">{{ t('logs.model') }}</TableHead>
           <TableHead v-if="visible.channel">{{ t('logs.channel') }}</TableHead>
@@ -688,7 +712,7 @@ function onFilterToken(tokenName: string) {
       </TableHeader>
 
       <TableBody>
-        <TableRowsSkeleton v-if="showTableSkeleton" :columns="columnCount" />
+        <TableRowsSkeleton v-if="showTableSkeleton" :columns="effectiveColumnCount" />
         <template v-else>
           <LogTableRow
             v-for="entry in items"
@@ -704,7 +728,7 @@ function onFilterToken(tokenName: string) {
             @filter-token="onFilterToken"
           />
           <TableRow v-if="items.length === 0" data-empty-row>
-            <TableCell :colspan="columnCount" class="whitespace-normal">
+            <TableCell :colspan="effectiveColumnCount" class="whitespace-normal">
               <EmptyState data-testid="logs-empty" :title="t('common.emptyList')" />
             </TableCell>
           </TableRow>

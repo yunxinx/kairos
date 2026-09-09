@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::store;
+use crate::store::users;
 
 use super::auth::{ManagementCapability, ManagementIdentity};
 use super::tokens::mask_token_key;
@@ -42,6 +43,11 @@ pub(super) struct LogEntry {
     token_name: String,
     /// 令牌 key 的掩码形态（前 8 位 + ****** + 后 8 位；日志归属展示用，非凭证）。
     token_key_masked: String,
+    /// 归属用户邮箱；`user_id` 为 0（迁移前归属未知）或用户行已不存在时为 `None`。
+    ///
+    /// 日志行冗余存 `user_id` 而非邮箱：令牌删除、用户归档后归属仍在。展示用
+    /// 邮箱在读取时按页批量回查（含归档行），失败/缺失不阻断日志列表。
+    user_email: Option<String>,
     inbound_protocol: String,
     model: String,
     outbound_model: Option<String>,
@@ -81,15 +87,19 @@ pub(super) struct LogEntry {
 
 impl LogEntry {
     /// 从存储行构造 wire 条目；完整 body 字节以 base64 编码，令牌 key 按管理面规则脱敏。
+    ///
+    /// `user_emails` 为本页/本条涉及的 `user_id → 邮箱` 映射；缺项落 `None`。
     pub(super) fn from_store_log(
         log: store::request_log::RequestLog,
         reveal_topology: bool,
+        user_emails: &std::collections::BTreeMap<i64, String>,
     ) -> Self {
         Self {
             id: log.id,
             created_at: log.created_at,
             token_name: log.token_name,
             token_key_masked: mask_token_key(&log.token_key),
+            user_email: user_emails.get(&log.user_id).cloned(),
             inbound_protocol: log.inbound_protocol,
             model: log.model,
             outbound_model: reveal_topology.then_some(log.outbound_model).flatten(),
@@ -187,10 +197,14 @@ pub(super) async fn query_logs(
         store::request_log::query_request_log_page(&deps.pool, &filter)
             .await
             .map_err(AdminError::Store)?;
+    // 邮箱回查失败不阻断日志列表：届时归属列渲染占位符，对账仍可按行内 id 定位。
+    let user_emails = users::map_user_emails(&deps.pool, rows.iter().map(|log| log.user_id))
+        .await
+        .unwrap_or_default();
     Ok(Json(LogPage {
         items: rows
             .into_iter()
-            .map(|log| LogEntry::from_store_log(log, reveal_topology))
+            .map(|log| LogEntry::from_store_log(log, reveal_topology, &user_emails))
             .collect(),
         page: filter.page,
         page_size: filter.page_size,
@@ -219,7 +233,14 @@ pub(super) async fn get_log(
     let reveal_topology = identity
         .role()
         .at_least(crate::store::users::ManagementRole::Admin);
-    Ok(Json(LogEntry::from_store_log(log, reveal_topology)))
+    let user_emails = users::map_user_emails(&deps.pool, std::iter::once(log.user_id))
+        .await
+        .unwrap_or_default();
+    Ok(Json(LogEntry::from_store_log(
+        log,
+        reveal_topology,
+        &user_emails,
+    )))
 }
 
 /// 解析路径中的日志 id；非整数视为不存在。
