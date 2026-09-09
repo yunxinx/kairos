@@ -467,16 +467,16 @@ test.describe('system log events', () => {
     await page.goto('/logs');
     await page.getByTestId('logs-tab-system').click();
     const row = page.getByTestId('system-log-row').filter({ hasText: 'I18n token' });
-    await expect(row).toContainText('Upstream usage was missing');
+    await expect(row).toContainText('Upstream returned no usage');
     await row.click();
     const detail = page.getByTestId('system-log-detail-window');
-    await expect(detail).toContainText('Upstream usage was missing');
+    await expect(detail).toContainText('Upstream returned no usage');
 
     await page.getByTestId('account-menu-trigger').hover();
     await page.getByTestId('nav-locale-toggle').hover();
     await page.getByTestId('nav-locale-zh').click();
-    await expect(row).toContainText('上游未回报 usage');
-    await expect(detail).toContainText('上游未回报 usage');
+    await expect(row).toContainText('上游未返回用量信息');
+    await expect(detail).toContainText('上游未返回用量信息');
     await expect(row).not.toContainText('fallback usage message');
   });
 });

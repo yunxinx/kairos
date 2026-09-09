@@ -727,8 +727,8 @@ watch(users, (rows) => {
                 </span>
               </TableCell>
             </TableRow>
-            <TableRow v-if="sortedAndFiltered.length === 0">
-              <TableCell :colspan="visibleColumnCount">
+            <TableRow v-if="sortedAndFiltered.length === 0" data-empty-row>
+              <TableCell :colspan="visibleColumnCount" class="whitespace-normal">
                 <EmptyState :title="t('common.emptyList')" />
               </TableCell>
             </TableRow>

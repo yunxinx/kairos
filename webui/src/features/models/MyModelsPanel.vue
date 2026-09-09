@@ -208,8 +208,8 @@ function tierText(
               </TableRow>
             </template>
             <!-- 两种空态分开：搜不到 ≠ 套餐里没有。后者才该提示去找管理员。 -->
-            <TableRow v-if="visibleSections.length === 0">
-              <TableCell :colspan="6" class="h-24 whitespace-normal">
+            <TableRow v-if="visibleSections.length === 0" data-empty-row>
+              <TableCell :colspan="6" class="whitespace-normal">
                 <EmptyState
                   v-if="searchFilteredAll"
                   :title="t('models.mySearchEmpty')"

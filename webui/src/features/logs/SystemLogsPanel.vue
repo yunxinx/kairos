@@ -455,8 +455,8 @@ function levelLabel(level: string): string {
             </TableCell>
           </TableRow>
 
-          <TableRow v-if="items.length === 0">
-            <TableCell :colspan="effectiveColumnCount" class="h-24 whitespace-normal">
+          <TableRow v-if="items.length === 0" data-empty-row>
+            <TableCell :colspan="effectiveColumnCount" class="whitespace-normal">
               <EmptyState data-testid="system-logs-empty" :title="t('common.emptyList')" />
             </TableCell>
           </TableRow>

@@ -538,8 +538,8 @@ function openBulkDelete() {
                 </span>
               </TableCell>
             </TableRow>
-            <TableRow v-if="filteredTokens.length === 0">
-              <TableCell :colspan="10" class="h-24 whitespace-normal">
+            <TableRow v-if="filteredTokens.length === 0" data-empty-row>
+              <TableCell :colspan="10" class="whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('tokens.create') }}

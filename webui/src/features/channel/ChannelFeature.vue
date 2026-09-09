@@ -455,8 +455,8 @@ function openProbe(channel: ChannelView) {
                 </span>
               </TableCell>
             </TableRow>
-            <TableRow v-if="filteredChannels.length === 0">
-              <TableCell :colspan="healthEnabled ? 7 : 6" class="h-24 whitespace-normal">
+            <TableRow v-if="filteredChannels.length === 0" data-empty-row>
+              <TableCell :colspan="healthEnabled ? 7 : 6" class="whitespace-normal">
                 <EmptyState :title="t('common.emptyList')">
                   <button type="button" class="btn btn-primary" @click="openCreate">
                     {{ t('channel.create') }}

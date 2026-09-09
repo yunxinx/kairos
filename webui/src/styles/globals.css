@@ -69,6 +69,15 @@ body:has(.dotted-bg)::before {
   min-height: 100dvh;
 }
 
+/*
+ * 页面级滚动容器永久预留滚动条槽位（scrollbar-gutter，浏览器原生机制）：
+ * 内容变长/变短时滚动条出现或消失，布局宽度纹丝不动，居中列不被挤偏。
+ * both-edges 两侧对称预留：居中内容列与全宽顶栏共用同一中轴线，天然对齐。
+ */
+#main-content {
+  scrollbar-gutter: stable both-edges;
+}
+
 /* ── Skip link ── */
 .skip-link {
   position: absolute;
@@ -1159,8 +1168,8 @@ html[lang='zh-CN'] .font-serif {
 .tab-link {
   display: inline-flex;
   align-items: center;
-  padding: 10px 12px;
-  font-size: var(--font-size-control);
+  padding: 10px 14px;
+  font-size: var(--text-sm);
   /* 固定字重：500↔600 会改字形宽度，导航切换时整行横跳 */
   font-weight: 600;
   color: var(--fg-muted);
@@ -1177,8 +1186,10 @@ html[lang='zh-CN'] .font-serif {
   outline: none;
   box-shadow: inset var(--focus-ring);
 }
+/* 选中态：主色文字 + 主色下划线，比仅描边更醒目，但不加背景块。
+   文字用对比度达标的变体（--seed-primary 本体在浅底上不足 AA）。 */
 .tab-link.router-link-active {
-  color: var(--seed-fg);
+  color: var(--seed-primary-text);
   border-bottom-color: var(--seed-primary);
 }
 
@@ -1220,6 +1231,38 @@ html[lang='zh-CN'] .font-serif {
 /* ── Table 语义；结构见 components/ui/table/* ── */
 .table-row-inactive {
   opacity: 0.58;
+}
+
+/* 空表：面板外壳透明化，只留表头与空态文字，表格按自然尺寸收缩。 */
+.data-table-panel-bare {
+  border-color: transparent;
+  background-color: transparent;
+}
+
+/*
+ * 骨架→数据的行入场：真实行按序淡入上浮（自上而下铺开），与骨架 stagger 同语言。
+ * 由 DataTable 在组件实例首次骨架→数据时挂一次性 class；翻页、筛选、改查询条件
+ * 引发的 busy 反复翻转不重播，空态行（data-empty-row）不参与。
+ * 行延迟封顶 ~480ms：长表头几行先行落地，尾部不必等完。
+ */
+@keyframes data-table-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.data-table-just-loaded [data-slot='table-body'] > [data-slot='table-row']:not([data-empty-row]) {
+  animation: data-table-row-in 160ms ease-out both;
+  animation-delay: calc(min(var(--row-index, 0), 20) * 24ms);
+}
+@media (prefers-reduced-motion: reduce) {
+  .data-table-just-loaded [data-slot='table-body'] > [data-slot='table-row']:not([data-empty-row]) {
+    animation: none;
+  }
 }
 
 [data-slot='table-cell'].whitespace-normal,

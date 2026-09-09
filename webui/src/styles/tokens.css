@@ -79,6 +79,9 @@
   --primary-shadow: #2563eb;
   --blue-light: #93c5fd;
   --blue-lighter: #dbeafe;
+  /* 主色作前景文字：--seed-primary 本体固定不变（图表按 hex 读取），文字用明暗各
+     自对比度达标的变体（AA ≥4.5:1），如顶栏选中 tab。 */
+  --seed-primary-text: #2563eb;
 
   /* 状态色 */
   --success: #16a34a;
@@ -161,6 +164,7 @@
   --violet: #c084fc;
   --primary-hover: #60a5fa;
   --primary-shadow: #1d4ed8;
+  --seed-primary-text: #60a5fa;
   --card-shadow: rgba(0, 0, 0, 0.72);
   --blue-light: #60a5fa;
   --blue-lighter: #1e40af;

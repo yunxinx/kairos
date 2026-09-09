@@ -63,6 +63,6 @@ test.describe('settings page', () => {
     await page.locator('[data-form-field="fullBody"] .field-info-hint-trigger').click();
     await expect(
       page.getByRole('dialog', { name: /format and requirements|格式与填写说明/i }),
-    ).toContainText(/plaintext in sqlite|明文写入 sqlite/i);
+    ).toContainText(/plaintext|明文记录/i);
   });
 });

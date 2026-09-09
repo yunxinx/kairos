@@ -703,8 +703,8 @@ function onFilterToken(tokenName: string) {
             @filter-channel="onFilterChannel"
             @filter-token="onFilterToken"
           />
-          <TableRow v-if="items.length === 0">
-            <TableCell :colspan="columnCount" class="h-24 whitespace-normal">
+          <TableRow v-if="items.length === 0" data-empty-row>
+            <TableCell :colspan="columnCount" class="whitespace-normal">
               <EmptyState data-testid="logs-empty" :title="t('common.emptyList')" />
             </TableCell>
           </TableRow>

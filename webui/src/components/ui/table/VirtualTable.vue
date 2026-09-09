@@ -91,7 +91,7 @@ const paddingBottom = computed(() => {
       </TableRow>
     </template>
     <TableRow v-else>
-      <TableCell :colspan="colspan" class="h-24 whitespace-normal">
+      <TableCell :colspan="colspan" class="whitespace-normal">
         <slot name="empty">
           <EmptyState v-if="emptyTitle" :title="emptyTitle" />
         </slot>

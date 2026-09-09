@@ -505,8 +505,8 @@ watch(plans, (rows) => {
                 </span>
               </TableCell>
             </TableRow>
-            <TableRow v-if="filteredPlans.length === 0">
-              <TableCell :colspan="visibleColumnCount" class="h-24 whitespace-normal">
+            <TableRow v-if="filteredPlans.length === 0" data-empty-row>
+              <TableCell :colspan="visibleColumnCount" class="whitespace-normal">
                 <!-- 一条都没有 vs 筛没了是两回事：后者给「新建」会把用户引向错误动作。 -->
                 <EmptyState :title="plans.length === 0 ? t('plans.empty') : t('common.emptyList')">
                   <button

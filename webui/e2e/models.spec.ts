@@ -361,7 +361,7 @@ test.describe('models page', () => {
     await row.getByTestId('inventory-select').click();
     await page.getByTestId('inventory-bulk-catalog').click();
     await expect(page.getByTestId('catalog-preview')).toBeVisible();
-    await expect(page.getByTestId('catalog-preview-status')).toHaveText('Pick');
+    await expect(page.getByTestId('catalog-preview-status')).toHaveText('Pick a provider');
     await expect(page.getByTestId('catalog-confirm')).toBeDisabled();
 
     await page.getByTestId('catalog-pick-from-dir').click();

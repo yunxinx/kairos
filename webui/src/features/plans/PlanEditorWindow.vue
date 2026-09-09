@@ -238,18 +238,9 @@ function handleSave() {
   const discountRaw = discountInput.replace(/%$/, '');
   const discountNumber = Number(discountRaw);
   if (!Number.isFinite(discountNumber) || discountNumber < 0) return;
-  let discountBp: number;
-  if (discountInput.endsWith('%')) {
-    discountBp = Math.round(discountNumber * 100);
-  } else if (discountNumber < 10 && discountRaw.includes('.')) {
-    // 支持规格中的倍率写法：0.8 → 8000 bp，1.2 → 12000 bp。
-    discountBp = Math.round(discountNumber * 10_000);
-  } else if (discountNumber === 1) {
-    // 1 按原价倍率理解。
-    discountBp = 10_000;
-  } else {
-    discountBp = Math.round(discountNumber * 100);
-  }
+  // 统一按百分比口径（与 guide 及编辑回填 discount_bp/100 一致）：
+  // 80 → 8000 bp，0.8 → 80 bp。不再兼容倍率写法（0.8 曾被放大成 80%，差 100 倍）。
+  const discountBp = Math.round(discountNumber * 100);
   const body: PlanUpdate = {
     display_name: displayName.value.trim(),
     note: note.value,

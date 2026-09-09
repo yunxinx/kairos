@@ -306,8 +306,8 @@ function refetchAll() {
                 </button>
               </TableCell>
             </TableRow>
-            <TableRow v-if="filteredRows.length === 0">
-              <TableCell :colspan="canEditOrder ? 3 : 2" class="h-24 whitespace-normal">
+            <TableRow v-if="filteredRows.length === 0" data-empty-row>
+              <TableCell :colspan="canEditOrder ? 3 : 2" class="whitespace-normal">
                 <EmptyState
                   :title="rows.length === 0 ? t('models.orderEmpty') : t('common.emptyList')"
                 />

@@ -347,7 +347,7 @@ const pickColumns = [{ width: '2.5rem' }, { width: '40%' }, { width: '60%' }];
                 </TableCell>
               </TableRow>
               <TableRow v-if="editorMembers.length === 0">
-                <TableCell :colspan="4" class="h-20 whitespace-normal">
+                <TableCell :colspan="4" class="whitespace-normal">
                   <EmptyState :title="t('models.unifiedMembersEmpty')" />
                 </TableCell>
               </TableRow>

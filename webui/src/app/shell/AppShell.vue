@@ -6,7 +6,6 @@ import Toaster from '@/components/ui/Toaster.vue';
 defineProps<{
   hideNav?: boolean;
   showPublicFooter?: boolean;
-  suppressContent?: boolean;
 }>();
 
 const { t } = useI18n();
@@ -31,12 +30,11 @@ const { t } = useI18n();
       :class="{ 'dotted-bg': !hideNav }"
     >
       <div
-        :class="[
+        :class="
           hideNav
             ? 'flex min-h-0 flex-1 flex-col'
-            : 'max-w-content px-page-x py-page-y mx-auto w-full',
-          suppressContent ? 'pointer-events-none opacity-0 transition-opacity duration-150' : '',
-        ]"
+            : 'max-w-content px-page-x py-page-y mx-auto w-full'
+        "
       >
         <slot />
       </div>

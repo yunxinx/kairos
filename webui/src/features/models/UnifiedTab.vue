@@ -349,8 +349,8 @@ function openBulkDelete() {
                 </span>
               </TableCell>
             </TableRow>
-            <TableRow v-if="filtered.length === 0">
-              <TableCell :colspan="tableColumnCount" class="h-24 whitespace-normal">
+            <TableRow v-if="filtered.length === 0" data-empty-row>
+              <TableCell :colspan="tableColumnCount" class="whitespace-normal">
                 <EmptyState :title="t('models.unifiedEmpty')">
                   <button
                     v-if="canEditUnified"

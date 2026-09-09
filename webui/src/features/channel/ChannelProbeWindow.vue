@@ -364,7 +364,7 @@ function runRow(probeModel: string, event: Event) {
               </TableCell>
             </TableRow>
             <TableRow v-if="filteredRows.length === 0">
-              <TableCell :colspan="5" class="h-24 whitespace-normal">
+              <TableCell :colspan="5" class="whitespace-normal">
                 <EmptyState :title="emptyTitle" />
               </TableCell>
             </TableRow>

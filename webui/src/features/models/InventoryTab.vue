@@ -572,8 +572,8 @@ function loadErrorMessage(): string {
                 </TableCell>
               </TableRow>
             </template>
-            <TableRow v-if="sections.length === 0">
-              <TableCell :colspan="tableColumnCount" class="h-24 whitespace-normal">
+            <TableRow v-if="sections.length === 0" data-empty-row>
+              <TableCell :colspan="tableColumnCount" class="whitespace-normal">
                 <EmptyState :title="t('models.emptyInventory')" />
               </TableCell>
             </TableRow>

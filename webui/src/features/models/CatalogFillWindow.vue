@@ -122,7 +122,7 @@ const statusOptions = computed(() => {
   return [
     { value: 'will-write', label: t('models.catalogWillWrite'), count: counts['will-write'] },
     { value: 'no-match', label: t('models.catalogNoMatch'), count: counts['no-match'] },
-    { value: 'need-host', label: t('models.catalogNeedHost'), count: counts['need-host'] },
+    { value: 'need-host', label: t('models.catalogStatusNeedHost'), count: counts['need-host'] },
     { value: 'unchanged', label: t('models.catalogSkipFilled'), count: counts.unchanged },
   ];
 });
@@ -431,7 +431,7 @@ function handleWindowClose() {
                 </TableRow>
               </template>
               <TableRow v-if="sections.length === 0">
-                <TableCell :colspan="7" class="h-24 whitespace-normal">
+                <TableCell :colspan="7" class="whitespace-normal">
                   <EmptyState :title="t('models.catalogEmpty')" />
                 </TableCell>
               </TableRow>
